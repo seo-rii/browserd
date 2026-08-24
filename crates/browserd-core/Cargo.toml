@@ -1,0 +1,10 @@
+[package]
+name = "browserd-core"
+description = "Domain types, state machines, policy primitives, and invariants for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "browserd"
+description = "All-in-one browserd development runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+browserd-core = { path = "../../crates/browserd-core" }
+
+[lints]
+workspace = true
