@@ -47,7 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = { version = "2.5", features = ["serde"] }
 utoipa = { version = "5.5", features = ["chrono", "uuid", "url"] }
-uuid = { version = "1.18", features = ["serde", "v7"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v7"] }
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Test-only dependencies are centralized so every crate uses one audited version.
