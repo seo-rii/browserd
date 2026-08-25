@@ -1,0 +1,16 @@
+{
+  "isolation": "shared_context",
+  "workload_class_hint": "interactive",
+  "viewport": {"width": 1280, "height": 720, "device_scale_factor": 1},
+  "locale": "ko-KR",
+  "timezone": "Asia/Seoul",
+  "user_agent": null,
+  "network_policy_id": "public-web-default",
+  "network_class": "public",
+  "checkpoint_ref": null,
+  "dialog_policy": "auto_dismiss",
+  "feature_profile": "standard",
+  "ttl_seconds": 1800,
+  "idle_timeout_seconds": 600,
+  "metadata": {}
+}

@@ -1,0 +1,30 @@
+[package]
+name = "browserd-api"
+description = "Transport-neutral public API contracts and in-memory routing for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browserd-actions = { path = "../browserd-actions" }
+browserd-artifacts = { path = "../browserd-artifacts" }
+browserd-auth = { path = "../browserd-auth" }
+browserd-core = { path = "../browserd-core" }
+browserd-operations = { path = "../browserd-operations" }
+browserd-policy = { path = "../browserd-policy" }
+browserd-session = { path = "../browserd-session" }
+browserd-viewer = { path = "../browserd-viewer" }
+base64.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+jsonwebtoken.workspace = true
