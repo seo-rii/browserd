@@ -113,6 +113,7 @@ pub enum DataPlaneError {
     Connect(String),
     Timeout(&'static str),
     RequestBodyTooLarge,
+    UpstreamResponseHeaderTooLarge,
     UnexpectedEof,
     Io(std::io::Error),
 }
@@ -221,6 +222,25 @@ where
         })
         .await
         .map_err(|_| DataPlaneError::Timeout("header"))??;
+        let websocket_upgrade_requested =
+            request.kind() == ProxyRequestKind::ForwardHttp && request.url().scheme() == "ws" && {
+                let head = String::from_utf8_lossy(request.upstream_head());
+                let mut connection_upgrade = false;
+                let mut websocket_upgrade = false;
+                for line in head.split("\r\n").skip(1) {
+                    let Some((name, value)) = line.split_once(':') else {
+                        continue;
+                    };
+                    if name.eq_ignore_ascii_case("connection") {
+                        connection_upgrade = value
+                            .split(',')
+                            .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+                    } else if name.eq_ignore_ascii_case("upgrade") {
+                        websocket_upgrade = value.trim().eq_ignore_ascii_case("websocket");
+                    }
+                }
+                connection_upgrade && websocket_upgrade
+            };
 
         let pre_dns = self.registry.authorize_dns(
             source.endpoint,
@@ -252,76 +272,233 @@ where
             }
         };
 
-        match request.kind() {
-            ProxyRequestKind::ConnectTunnel => {
-                if request.content_length().is_some() {
-                    return Err(DataPlaneError::Request(
-                        ProxyProtocolError::AmbiguousBodyFraming,
-                    ));
-                }
-                if !request.buffered_after_head().is_empty() {
-                    timeout(
-                        self.limits.write_timeout,
-                        upstream.write_all(request.buffered_after_head()),
-                    )
-                    .await
-                    .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
-                }
-                timeout(
-                    self.limits.write_timeout,
-                    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
-                )
-                .await
-                .map_err(|_| DataPlaneError::Timeout("client write"))??;
-            }
-            ProxyRequestKind::ForwardHttp => {
-                let content_length = request.content_length().unwrap_or(0);
-                if content_length > self.limits.max_request_body_bytes {
-                    return Err(DataPlaneError::RequestBodyTooLarge);
-                }
-                timeout(
-                    self.limits.write_timeout,
-                    upstream.write_all(request.upstream_head()),
-                )
-                .await
-                .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
-                if !request.buffered_after_head().is_empty() {
-                    timeout(
-                        self.limits.write_timeout,
-                        upstream.write_all(request.buffered_after_head()),
-                    )
-                    .await
-                    .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
-                }
-                let buffered = u64::try_from(request.buffered_after_head().len())
-                    .map_err(|_| DataPlaneError::RequestBodyTooLarge)?;
-                let mut remaining = content_length.saturating_sub(buffered);
-                let mut chunk = vec![0_u8; self.limits.io_buffer_bytes];
-                while remaining != 0 {
-                    let limit = usize::try_from(remaining)
-                        .unwrap_or(usize::MAX)
-                        .min(chunk.len());
-                    let read = timeout(self.limits.read_timeout, client.read(&mut chunk[..limit]))
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+            result = async {
+                match request.kind() {
+                    ProxyRequestKind::ConnectTunnel => {
+                        if request.content_length().is_some() {
+                            return Err(DataPlaneError::Request(
+                                ProxyProtocolError::AmbiguousBodyFraming,
+                            ));
+                        }
+                        if !request.buffered_after_head().is_empty() {
+                            timeout(
+                                self.limits.write_timeout,
+                                upstream.write_all(request.buffered_after_head()),
+                            )
+                            .await
+                            .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                        }
+                        timeout(
+                            self.limits.write_timeout,
+                            client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n"),
+                        )
                         .await
-                        .map_err(|_| DataPlaneError::Timeout("request body read"))??;
-                    if read == 0 {
-                        return Err(DataPlaneError::UnexpectedEof);
+                        .map_err(|_| DataPlaneError::Timeout("client write"))??;
                     }
-                    timeout(
-                        self.limits.write_timeout,
-                        upstream.write_all(&chunk[..read]),
-                    )
-                    .await
-                    .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
-                    remaining = remaining.saturating_sub(read as u64);
+                    ProxyRequestKind::ForwardHttp => {
+                        let content_length = request.content_length().unwrap_or(0);
+                        if content_length > self.limits.max_request_body_bytes {
+                            return Err(DataPlaneError::RequestBodyTooLarge);
+                        }
+                        timeout(
+                            self.limits.write_timeout,
+                            upstream.write_all(request.upstream_head()),
+                        )
+                        .await
+                        .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                        if !request.buffered_after_head().is_empty() {
+                            timeout(
+                                self.limits.write_timeout,
+                                upstream.write_all(request.buffered_after_head()),
+                            )
+                            .await
+                            .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                        }
+                        let buffered = u64::try_from(request.buffered_after_head().len())
+                            .map_err(|_| DataPlaneError::RequestBodyTooLarge)?;
+                        let mut remaining = content_length.saturating_sub(buffered);
+                        let mut chunk = vec![0_u8; self.limits.io_buffer_bytes];
+                        while remaining != 0 {
+                            let limit = usize::try_from(remaining)
+                                .unwrap_or(usize::MAX)
+                                .min(chunk.len());
+                            let read =
+                                timeout(self.limits.read_timeout, client.read(&mut chunk[..limit]))
+                                    .await
+                                    .map_err(|_| DataPlaneError::Timeout("request body read"))??;
+                            if read == 0 {
+                                return Err(DataPlaneError::UnexpectedEof);
+                            }
+                            timeout(
+                                self.limits.write_timeout,
+                                upstream.write_all(&chunk[..read]),
+                            )
+                            .await
+                            .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                            remaining = remaining.saturating_sub(read as u64);
+                        }
+                    }
+                }
+                Ok::<(), DataPlaneError>(())
+            } => result?,
+        }
+
+        let mut tunnel_established = request.kind() == ProxyRequestKind::ConnectTunnel;
+        if request.kind() == ProxyRequestKind::ForwardHttp && !websocket_upgrade_requested {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+                result = timeout(self.limits.write_timeout, upstream.shutdown()) => {
+                    result.map_err(|_| DataPlaneError::Timeout("upstream shutdown"))??;
+                }
+            }
+        } else if websocket_upgrade_requested {
+            let mut response = Vec::new();
+            let head_end = loop {
+                if let Some(position) = response.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    break position;
+                }
+                let remaining = self
+                    .limits
+                    .protocol
+                    .max_header_bytes
+                    .saturating_add(1)
+                    .saturating_sub(response.len());
+                if remaining == 0 {
+                    return Err(DataPlaneError::UpstreamResponseHeaderTooLarge);
+                }
+                let mut chunk = vec![0_u8; remaining.min(self.limits.io_buffer_bytes)];
+                let read = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+                    result = timeout(self.limits.header_timeout, upstream.read(&mut chunk)) => {
+                        result.map_err(|_| DataPlaneError::Timeout("upstream response header"))??
+                    }
+                };
+                if read == 0 {
+                    return Err(DataPlaneError::UnexpectedEof);
+                }
+                response.extend_from_slice(&chunk[..read]);
+            };
+            let consumed_head = head_end
+                .checked_add(4)
+                .ok_or(DataPlaneError::UpstreamResponseHeaderTooLarge)?;
+            if consumed_head > self.limits.protocol.max_header_bytes {
+                return Err(DataPlaneError::UpstreamResponseHeaderTooLarge);
+            }
+            let response_head = &response[..head_end];
+            let mut valid_response_bytes = response_head.iter().all(|byte| {
+                byte.is_ascii()
+                    && *byte != 0
+                    && (*byte >= 0x20 || matches!(*byte, b'\r' | b'\n' | b'\t'))
+                    && *byte != 0x7f
+            });
+            let response_head = String::from_utf8_lossy(response_head);
+            let mut lines = response_head.split("\r\n");
+            let status = lines.next().unwrap_or_default();
+            let status_parts = status.split(' ').collect::<Vec<_>>();
+            valid_response_bytes &= status_parts.len() >= 2
+                && status_parts[0] == "HTTP/1.1"
+                && status_parts[1] == "101";
+            let mut connection_upgrade = false;
+            let mut websocket_upgrade = false;
+            for line in lines {
+                let Some((name, value)) = line.split_once(':') else {
+                    valid_response_bytes = false;
+                    continue;
+                };
+                connection_upgrade |= name.eq_ignore_ascii_case("connection")
+                    && value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+                websocket_upgrade |= name.eq_ignore_ascii_case("upgrade")
+                    && value.trim().eq_ignore_ascii_case("websocket");
+            }
+            tunnel_established = valid_response_bytes && connection_upgrade && websocket_upgrade;
+            permit.record_egress_bytes(
+                response.len() as u64,
+                MonotonicMillis::new(now.value().saturating_add(
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                )),
+            )?;
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+                result = timeout(self.limits.write_timeout, client.write_all(&response)) => {
+                    result.map_err(|_| DataPlaneError::Timeout("client write"))??;
+                }
+            }
+            if !tunnel_established {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+                    result = timeout(self.limits.write_timeout, upstream.shutdown()) => {
+                        result.map_err(|_| DataPlaneError::Timeout("upstream shutdown"))??;
+                    }
                 }
             }
         }
 
         let (mut client_reader, mut client_writer) = tokio::io::split(client);
         let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream);
-        let mut client_chunk = vec![0_u8; self.limits.io_buffer_bytes];
         let mut upstream_chunk = vec![0_u8; self.limits.io_buffer_bytes];
+        if !tunnel_established {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+                    () = tokio::time::sleep(self.limits.idle_timeout) => {
+                        return Err(DataPlaneError::Timeout("response idle"));
+                    }
+                    result = upstream_reader.read(&mut upstream_chunk) => {
+                        let read = result?;
+                        if read == 0 {
+                            tokio::select! {
+                                biased;
+                                () = cancellation.cancelled() => {
+                                    return Err(DataPlaneError::RouteRevoked);
+                                }
+                                result = timeout(
+                                    self.limits.write_timeout,
+                                    client_writer.shutdown(),
+                                ) => {
+                                    result
+                                        .map_err(|_| DataPlaneError::Timeout("client shutdown"))??;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        permit.record_egress_bytes(
+                            read as u64,
+                            MonotonicMillis::new(
+                                now.value().saturating_add(
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                ),
+                            ),
+                        )?;
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                return Err(DataPlaneError::RouteRevoked);
+                            }
+                            result = timeout(
+                                self.limits.write_timeout,
+                                client_writer.write_all(&upstream_chunk[..read]),
+                            ) => {
+                                result.map_err(|_| DataPlaneError::Timeout("client write"))??;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut client_chunk = vec![0_u8; self.limits.io_buffer_bytes];
         loop {
             tokio::select! {
                 biased;
@@ -332,20 +509,50 @@ where
                 result = client_reader.read(&mut client_chunk) => {
                     let read = result?;
                     if read == 0 {
-                        upstream_writer.shutdown().await?;
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                return Err(DataPlaneError::RouteRevoked);
+                            }
+                            result = timeout(
+                                self.limits.write_timeout,
+                                upstream_writer.shutdown(),
+                            ) => {
+                                result
+                                    .map_err(|_| DataPlaneError::Timeout("upstream shutdown"))??;
+                            }
+                        }
                         return Ok(());
                     }
-                    timeout(
-                        self.limits.write_timeout,
-                        upstream_writer.write_all(&client_chunk[..read]),
-                    )
-                    .await
-                    .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err(DataPlaneError::RouteRevoked);
+                        }
+                        result = timeout(
+                            self.limits.write_timeout,
+                            upstream_writer.write_all(&client_chunk[..read]),
+                        ) => {
+                            result.map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                        }
+                    }
                 }
                 result = upstream_reader.read(&mut upstream_chunk) => {
                     let read = result?;
                     if read == 0 {
-                        client_writer.shutdown().await?;
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                return Err(DataPlaneError::RouteRevoked);
+                            }
+                            result = timeout(
+                                self.limits.write_timeout,
+                                client_writer.shutdown(),
+                            ) => {
+                                result
+                                    .map_err(|_| DataPlaneError::Timeout("client shutdown"))??;
+                            }
+                        }
                         return Ok(());
                     }
                     permit.record_egress_bytes(
@@ -357,12 +564,18 @@ where
                             ),
                         ),
                     )?;
-                    timeout(
-                        self.limits.write_timeout,
-                        client_writer.write_all(&upstream_chunk[..read]),
-                    )
-                    .await
-                    .map_err(|_| DataPlaneError::Timeout("client write"))??;
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => {
+                            return Err(DataPlaneError::RouteRevoked);
+                        }
+                        result = timeout(
+                            self.limits.write_timeout,
+                            client_writer.write_all(&upstream_chunk[..read]),
+                        ) => {
+                            result.map_err(|_| DataPlaneError::Timeout("client write"))??;
+                        }
+                    }
                 }
             }
         }

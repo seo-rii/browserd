@@ -152,9 +152,17 @@ struct RetiredRoute {
 #[derive(Debug)]
 struct ShardRoutes {
     worker_epoch: u64,
-    revoked: bool,
+    lifecycle: ShardRouteLifecycle,
     endpoints: HashSet<RouteEndpoint>,
     cancellation: CancellationToken,
+    active_connections: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShardRouteLifecycle {
+    Prepared,
+    Revoked,
+    Released,
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +170,7 @@ struct RouteState {
     active: HashMap<RouteEndpoint, RouteEntry>,
     retired: HashMap<RouteEndpoint, RetiredRoute>,
     shards: HashMap<ShardId, ShardRoutes>,
+    worker_epoch_high_watermark: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +234,84 @@ impl RouteRegistry {
         }
     }
 
+    pub fn prepare_shard(
+        &self,
+        source_shard: &ShardId,
+        worker_epoch: u64,
+    ) -> Result<(), RouteError> {
+        if worker_epoch == 0 {
+            return Err(RouteError::InvalidWorkerEpoch);
+        }
+        if self.max_lease_millis.is_none() || !self.limits.is_valid() {
+            return Err(RouteError::InvalidRegistryConfig);
+        }
+        let mut state = self.lock_state();
+        let advances_worker_epoch = state
+            .worker_epoch_high_watermark
+            .is_some_and(|high_watermark| worker_epoch > high_watermark);
+        if let Some(high_watermark) = state.worker_epoch_high_watermark {
+            if worker_epoch < high_watermark {
+                return Err(RouteError::WorkerEpochMismatch {
+                    expected: high_watermark,
+                    actual: worker_epoch,
+                });
+            }
+            if worker_epoch > high_watermark
+                && state
+                    .shards
+                    .values()
+                    .any(|shard| shard.lifecycle != ShardRouteLifecycle::Released)
+            {
+                return Err(RouteError::ShardNotReleased);
+            }
+        }
+        if advances_worker_epoch {
+            state.shards.clear();
+        }
+        let Some(shard) = state.shards.get_mut(source_shard) else {
+            if state.shards.len() >= self.limits.max_tracked_shards {
+                return Err(RouteError::ShardCapacityExceeded);
+            }
+            state.shards.insert(
+                source_shard.clone(),
+                ShardRoutes {
+                    worker_epoch,
+                    lifecycle: ShardRouteLifecycle::Prepared,
+                    endpoints: HashSet::new(),
+                    cancellation: CancellationToken::new(),
+                    active_connections: 0,
+                },
+            );
+            state.worker_epoch_high_watermark = Some(worker_epoch);
+            return Ok(());
+        };
+        if worker_epoch < shard.worker_epoch {
+            return Err(RouteError::WorkerEpochMismatch {
+                expected: shard.worker_epoch,
+                actual: worker_epoch,
+            });
+        }
+        if worker_epoch == shard.worker_epoch {
+            return match shard.lifecycle {
+                ShardRouteLifecycle::Prepared => Ok(()),
+                ShardRouteLifecycle::Revoked => Err(RouteError::ShardRevoked),
+                ShardRouteLifecycle::Released => Err(RouteError::ShardReleased),
+            };
+        }
+        if shard.lifecycle != ShardRouteLifecycle::Released {
+            return Err(RouteError::ShardNotReleased);
+        }
+        if !shard.endpoints.is_empty() {
+            return Err(RouteError::InconsistentRegistryState);
+        }
+        shard.worker_epoch = worker_epoch;
+        shard.lifecycle = ShardRouteLifecycle::Prepared;
+        shard.cancellation = CancellationToken::new();
+        shard.active_connections = 0;
+        state.worker_epoch_high_watermark = Some(worker_epoch);
+        Ok(())
+    }
+
     pub fn bind(
         &self,
         endpoint: RouteEndpoint,
@@ -249,36 +336,20 @@ impl RouteRegistry {
         {
             return Err(RouteError::RouteCapacityExceeded);
         }
-        let shard_is_new = !state.shards.contains_key(&binding.shard_id);
-        if shard_is_new && state.shards.len() >= self.limits.max_tracked_shards {
-            return Err(RouteError::ShardCapacityExceeded);
-        }
-        if let Some(shard) = state.shards.get(&binding.shard_id) {
-            if shard.worker_epoch != binding.worker_epoch {
-                if !shard.revoked || binding.worker_epoch < shard.worker_epoch {
-                    return Err(RouteError::WorkerEpochMismatch {
-                        expected: shard.worker_epoch,
-                        actual: binding.worker_epoch,
-                    });
-                }
-            } else if shard.revoked {
-                return Err(RouteError::ShardRevoked);
-            }
-        }
-
         let shard = state
             .shards
-            .entry(binding.shard_id.clone())
-            .or_insert_with(|| ShardRoutes {
-                worker_epoch: binding.worker_epoch,
-                revoked: false,
-                endpoints: HashSet::new(),
-                cancellation: CancellationToken::new(),
-            });
+            .get_mut(&binding.shard_id)
+            .ok_or(RouteError::ShardNotPrepared)?;
         if shard.worker_epoch != binding.worker_epoch {
-            shard.worker_epoch = binding.worker_epoch;
-            shard.revoked = false;
-            shard.cancellation = CancellationToken::new();
+            return Err(RouteError::WorkerEpochMismatch {
+                expected: shard.worker_epoch,
+                actual: binding.worker_epoch,
+            });
+        }
+        match shard.lifecycle {
+            ShardRouteLifecycle::Prepared => {}
+            ShardRouteLifecycle::Revoked => return Err(RouteError::ShardRevoked),
+            ShardRouteLifecycle::Released => return Err(RouteError::ShardReleased),
         }
         let cancellation = shard.cancellation.child_token();
         shard.endpoints.insert(endpoint);
@@ -389,7 +460,10 @@ impl RouteRegistry {
                     actual: worker_epoch,
                 });
             }
-            if shard.revoked {
+            if matches!(
+                shard.lifecycle,
+                ShardRouteLifecycle::Revoked | ShardRouteLifecycle::Released
+            ) {
                 return Ok(0);
             }
             shard.endpoints.iter().copied().collect::<Vec<_>>()
@@ -412,9 +486,47 @@ impl RouteRegistry {
             Self::retire_route(&mut state, *endpoint);
         }
         if let Some(shard) = state.shards.get_mut(source_shard) {
-            shard.revoked = true;
+            shard.lifecycle = ShardRouteLifecycle::Revoked;
         }
         Ok(endpoints.len())
+    }
+
+    pub fn release_shard(
+        &self,
+        source_shard: &ShardId,
+        worker_epoch: u64,
+    ) -> Result<(), RouteError> {
+        let mut state = self.lock_state();
+        let Some(shard) = state.shards.get_mut(source_shard) else {
+            return if state
+                .worker_epoch_high_watermark
+                .is_some_and(|high_watermark| worker_epoch < high_watermark)
+            {
+                Ok(())
+            } else {
+                Err(RouteError::ShardNotPrepared)
+            };
+        };
+        if shard.worker_epoch != worker_epoch {
+            return Err(RouteError::WorkerEpochMismatch {
+                expected: shard.worker_epoch,
+                actual: worker_epoch,
+            });
+        }
+        match shard.lifecycle {
+            ShardRouteLifecycle::Prepared => Err(RouteError::ShardNotRevoked),
+            ShardRouteLifecycle::Revoked => {
+                if !shard.endpoints.is_empty() {
+                    return Err(RouteError::InconsistentRegistryState);
+                }
+                if shard.active_connections != 0 {
+                    return Err(RouteError::ShardNotDrained);
+                }
+                shard.lifecycle = ShardRouteLifecycle::Released;
+                Ok(())
+            }
+            ShardRouteLifecycle::Released => Ok(()),
+        }
     }
 
     pub fn begin_connection(
@@ -437,21 +549,41 @@ impl RouteRegistry {
         now: MonotonicMillis,
     ) -> Result<PreDnsPermit, RouteError> {
         let mut state = self.lock_state();
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if &entry.shard_id != source_shard {
-            return Err(RouteError::SourceShardMismatch);
+        let (incarnation, shard_id, worker_epoch, cancellation) = {
+            let entry = Self::active_entry(&mut state, endpoint, now)?;
+            if &entry.shard_id != source_shard {
+                return Err(RouteError::SourceShardMismatch);
+            }
+            entry.planner.authorize(url).map_err(RouteError::Plan)?;
+            entry
+                .quota
+                .record_dns_query(now)
+                .map_err(RouteError::Quota)?;
+            (
+                entry.incarnation.clone(),
+                entry.shard_id.clone(),
+                entry.worker_epoch,
+                entry.cancellation.clone(),
+            )
+        };
+        let shard = state
+            .shards
+            .get_mut(&shard_id)
+            .ok_or(RouteError::InconsistentRegistryState)?;
+        if shard.worker_epoch != worker_epoch || shard.lifecycle != ShardRouteLifecycle::Prepared {
+            return Err(RouteError::InconsistentRegistryState);
         }
-        entry.planner.authorize(url).map_err(RouteError::Plan)?;
-        entry
-            .quota
-            .record_dns_query(now)
-            .map_err(RouteError::Quota)?;
+        shard.active_connections = shard
+            .active_connections
+            .checked_add(1)
+            .ok_or(RouteError::InconsistentRegistryState)?;
         Ok(PreDnsPermit {
             registry: self.clone(),
             endpoint,
-            incarnation: entry.incarnation.clone(),
+            incarnation,
             url: url.clone(),
-            cancellation: entry.cancellation.clone(),
+            cancellation,
+            drain_guard: ShardDrainGuard::new(self.clone(), shard_id, worker_epoch),
         })
     }
 
@@ -507,6 +639,17 @@ impl RouteRegistry {
         {
             entry.quota.close_connection(connection_id);
         }
+    }
+
+    fn close_shard_connection(&self, shard_id: &ShardId, worker_epoch: u64) {
+        let mut state = self.lock_state();
+        let Some(shard) = state.shards.get_mut(shard_id) else {
+            return;
+        };
+        if shard.worker_epoch != worker_epoch || shard.active_connections == 0 {
+            return;
+        }
+        shard.active_connections -= 1;
     }
 
     fn validate_expiry(
@@ -580,6 +723,7 @@ pub struct PreDnsPermit {
     incarnation: LeaseId,
     url: CanonicalUrl,
     cancellation: CancellationToken,
+    drain_guard: ShardDrainGuard,
 }
 
 impl PreDnsPermit {
@@ -613,6 +757,7 @@ impl PreDnsPermit {
             connection_id,
             plan,
             cancellation: entry.cancellation.clone(),
+            drain_guard: self.drain_guard,
             open: true,
         })
     }
@@ -626,6 +771,7 @@ pub struct RoutePermit {
     connection_id: ConnectionId,
     plan: ConnectPlan,
     cancellation: CancellationToken,
+    drain_guard: ShardDrainGuard,
     open: bool,
 }
 
@@ -663,12 +809,47 @@ impl RoutePermit {
         }
         self.registry
             .close_connection(self.endpoint, &self.incarnation, self.connection_id);
+        self.drain_guard.close();
         self.open = false;
         true
     }
 }
 
 impl Drop for RoutePermit {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[derive(Debug)]
+struct ShardDrainGuard {
+    registry: RouteRegistry,
+    shard_id: ShardId,
+    worker_epoch: u64,
+    open: bool,
+}
+
+impl ShardDrainGuard {
+    fn new(registry: RouteRegistry, shard_id: ShardId, worker_epoch: u64) -> Self {
+        Self {
+            registry,
+            shard_id,
+            worker_epoch,
+            open: true,
+        }
+    }
+
+    fn close(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.registry
+            .close_shard_connection(&self.shard_id, self.worker_epoch);
+        self.open = false;
+    }
+}
+
+impl Drop for ShardDrainGuard {
     fn drop(&mut self) {
         self.close();
     }
@@ -684,7 +865,12 @@ pub enum RouteError {
     EndpointRetired,
     RouteCapacityExceeded,
     ShardCapacityExceeded,
+    ShardNotPrepared,
+    ShardNotDrained,
+    ShardNotReleased,
+    ShardNotRevoked,
     ShardRevoked,
+    ShardReleased,
     RouteNotFound,
     RouteExpired,
     RouteRevoked,
