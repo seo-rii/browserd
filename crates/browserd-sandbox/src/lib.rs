@@ -1,5 +1,14 @@
 //! Shard sandbox supervisor contract, ownership leases, and cleanup ordering.
 
+mod linux;
+
+pub use linux::{
+    CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
+    EgressRouteBackend, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
+    ProcessSignal, ReadOnlyMount, SandboxFilesystem, SpawnRequest, StdLinuxProcessBackend,
+    StdSandboxFilesystem,
+};
+
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -193,12 +202,14 @@ pub struct InspectResources {
 pub enum CreateShardOutcome {
     Created,
     AlreadyExists,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KillShardOutcome {
     Terminated(CleanupResult),
     AlreadyTerminated,
+    CancellationRequested,
 }
 
 #[async_trait]
@@ -230,10 +241,16 @@ struct ActiveShard {
     handle: SandboxHandle,
 }
 
+#[derive(Debug)]
+struct ProvisioningShard {
+    ownership: WorkerOwnership,
+    cancellation: Option<CleanupReason>,
+}
+
 #[derive(Debug, Default)]
 struct SupervisorState {
     active: HashMap<ShardId, ActiveShard>,
-    provisioning: HashMap<ShardId, WorkerOwnership>,
+    provisioning: HashMap<ShardId, ProvisioningShard>,
     terminated: HashMap<ShardId, u64>,
 }
 
@@ -288,24 +305,45 @@ where
             let mut state = self.state.lock().await;
             if state.active.contains_key(&spec.shard_id)
                 || state.provisioning.contains_key(&spec.shard_id)
+                || state.terminated.contains_key(&spec.shard_id)
             {
                 return Ok(CreateShardOutcome::AlreadyExists);
             }
-            state.terminated.remove(&spec.shard_id);
-            state
-                .provisioning
-                .insert(spec.shard_id.clone(), ownership.clone());
+            state.provisioning.insert(
+                spec.shard_id.clone(),
+                ProvisioningShard {
+                    ownership: ownership.clone(),
+                    cancellation: None,
+                },
+            );
         }
 
         let provisioned = self.backend.provision(&spec).await;
         let mut state = self.state.lock().await;
-        state.provisioning.remove(&spec.shard_id);
+        let provisioning = state
+            .provisioning
+            .remove(&spec.shard_id)
+            .ok_or_else(|| SandboxError::Backend("provisioning state disappeared".into()))?;
         match provisioned {
             Ok(handle) => {
-                state
-                    .active
-                    .insert(spec.shard_id, ActiveShard { ownership, handle });
-                Ok(CreateShardOutcome::Created)
+                if let Some(reason) = provisioning.cancellation {
+                    state
+                        .terminated
+                        .insert(spec.shard_id.clone(), ownership.worker_epoch);
+                    drop(state);
+                    let cleanup = self.cleanup(&handle, reason).await;
+                    if cleanup.route_revoked && cleanup.cgroup_killed && cleanup.namespaces_cleaned
+                    {
+                        Ok(CreateShardOutcome::Cancelled)
+                    } else {
+                        Err(SandboxError::IncompleteCleanup { result: cleanup })
+                    }
+                } else {
+                    state
+                        .active
+                        .insert(spec.shard_id, ActiveShard { ownership, handle });
+                    Ok(CreateShardOutcome::Created)
+                }
             }
             Err(error) => Err(error),
         }
@@ -319,23 +357,29 @@ where
         new_expires_at: Instant,
     ) -> Result<(), RenewLeaseError> {
         let mut state = self.state.lock().await;
-        let active = state
-            .active
-            .get_mut(shard_id)
-            .ok_or(RenewLeaseError::ShardNotFound)?;
-        if active.ownership.worker_epoch != worker_epoch {
+        let ownership = if let Some(active) = state.active.get_mut(shard_id) {
+            &mut active.ownership
+        } else if let Some(provisioning) = state.provisioning.get_mut(shard_id) {
+            if provisioning.cancellation.is_some() {
+                return Err(RenewLeaseError::ShardNotFound);
+            }
+            &mut provisioning.ownership
+        } else {
+            return Err(RenewLeaseError::ShardNotFound);
+        };
+        if ownership.worker_epoch != worker_epoch {
             return Err(RenewLeaseError::WorkerEpochMismatch {
-                expected: active.ownership.worker_epoch,
+                expected: ownership.worker_epoch,
                 actual: worker_epoch,
             });
         }
-        if active.ownership.expires_at <= now {
+        if ownership.expires_at <= now {
             return Err(RenewLeaseError::LeaseExpired);
         }
         if new_expires_at <= now || new_expires_at > now + self.config.supervisor_lease_ttl {
             return Err(RenewLeaseError::InvalidNewExpiry);
         }
-        active.ownership.expires_at = new_expires_at;
+        ownership.expires_at = new_expires_at;
         Ok(())
     }
 
@@ -349,6 +393,21 @@ where
                     (active.ownership.expires_at <= now).then_some(shard_id.clone())
                 })
                 .collect::<Vec<_>>();
+            let expired_provisioning = state
+                .provisioning
+                .iter()
+                .filter_map(|(shard_id, provisioning)| {
+                    (provisioning.ownership.expires_at <= now
+                        && provisioning.cancellation.is_none())
+                    .then_some((shard_id.clone(), provisioning.ownership.worker_epoch))
+                })
+                .collect::<Vec<_>>();
+            for (shard_id, worker_epoch) in expired_provisioning {
+                if let Some(provisioning) = state.provisioning.get_mut(&shard_id) {
+                    provisioning.cancellation = Some(CleanupReason::WorkerLeaseExpired);
+                }
+                state.terminated.insert(shard_id, worker_epoch);
+            }
             expired_ids
                 .into_iter()
                 .filter_map(|shard_id| {
@@ -388,6 +447,17 @@ where
                     });
                 }
                 return Ok(KillShardOutcome::AlreadyTerminated);
+            }
+            if let Some(provisioning) = state.provisioning.get_mut(shard_id) {
+                if provisioning.ownership.worker_epoch != worker_epoch {
+                    return Err(SandboxError::WorkerEpochMismatch {
+                        expected: provisioning.ownership.worker_epoch,
+                        actual: worker_epoch,
+                    });
+                }
+                provisioning.cancellation = Some(reason);
+                state.terminated.insert(shard_id.clone(), worker_epoch);
+                return Ok(KillShardOutcome::CancellationRequested);
             }
             let active = state
                 .active
@@ -474,6 +544,8 @@ pub enum SandboxError {
     ShardNotFound,
     #[error("worker epoch mismatch: expected {expected}, received {actual}")]
     WorkerEpochMismatch { expected: u64, actual: u64 },
+    #[error("sandbox has incomplete cleanup: {result:?}")]
+    IncompleteCleanup { result: CleanupResult },
     #[error("sandbox backend failed: {0}")]
     Backend(String),
 }

@@ -9,8 +9,12 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 browserd-core = { path = "../browserd-core" }
+nix.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
