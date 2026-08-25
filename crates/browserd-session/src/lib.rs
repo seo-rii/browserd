@@ -590,23 +590,10 @@ impl SessionMachine {
             self.last_observed_at = now;
             self.accepting_targets = false;
             self.expire_cause = Some(cause);
+            self.reconcile_execution_for_shutdown()?;
             if cause == ExpireCause::OwnershipLease {
                 self.lifecycle = SessionLifecycle::Failed;
                 self.placement = PlacementState::Lost;
-                if let SessionExecution::Running(action_id) = self.execution.clone() {
-                    self.execution = self
-                        .execution
-                        .clone()
-                        .transition(SessionExecutionEvent::OutcomeUnknown(action_id))
-                        .map_err(|_| SessionError::ActionIdentityMismatch)?;
-                } else if let SessionExecution::PendingApproval(action_id) = self.execution.clone()
-                {
-                    self.execution = self
-                        .execution
-                        .clone()
-                        .transition(SessionExecutionEvent::KnownCompletion(action_id))
-                        .map_err(|_| SessionError::ActionIdentityMismatch)?;
-                }
                 self.reconnect_grants.clear();
                 return Ok(ExpireDecision::OwnershipLost);
             }
@@ -704,19 +691,7 @@ impl SessionMachine {
             });
         }
         self.observe_time(now)?;
-        if let SessionExecution::Running(action_id) = self.execution.clone() {
-            self.execution = self
-                .execution
-                .clone()
-                .transition(SessionExecutionEvent::OutcomeUnknown(action_id))
-                .map_err(|_| SessionError::ActionIdentityMismatch)?;
-        } else if let SessionExecution::PendingApproval(action_id) = self.execution.clone() {
-            self.execution = self
-                .execution
-                .clone()
-                .transition(SessionExecutionEvent::KnownCompletion(action_id))
-                .map_err(|_| SessionError::ActionIdentityMismatch)?;
-        }
+        self.reconcile_execution_for_shutdown()?;
         self.lifecycle = SessionLifecycle::Closing;
         self.accepting_targets = false;
         self.reconnect_grants.clear();
@@ -1139,6 +1114,23 @@ impl SessionMachine {
                 cause: ExpireCause::OwnershipLease,
                 expired_at: expires_at,
             });
+        }
+        Ok(())
+    }
+
+    fn reconcile_execution_for_shutdown(&mut self) -> Result<(), SessionError> {
+        if let SessionExecution::Running(action_id) = self.execution.clone() {
+            self.execution = self
+                .execution
+                .clone()
+                .transition(SessionExecutionEvent::OutcomeUnknown(action_id))
+                .map_err(|_| SessionError::ActionIdentityMismatch)?;
+        } else if let SessionExecution::PendingApproval(action_id) = self.execution.clone() {
+            self.execution = self
+                .execution
+                .clone()
+                .transition(SessionExecutionEvent::KnownCompletion(action_id))
+                .map_err(|_| SessionError::ActionIdentityMismatch)?;
         }
         Ok(())
     }

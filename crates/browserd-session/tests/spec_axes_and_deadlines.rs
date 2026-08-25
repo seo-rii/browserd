@@ -143,6 +143,47 @@ fn idle_and_absolute_ttl_expiry_are_distinguished() {
 }
 
 #[test]
+fn timeout_expiry_marks_a_dispatched_action_for_reconciliation() {
+    let lease = LeasePolicy::new(Duration::from_millis(500), Duration::from_millis(10));
+    let timeouts = SessionTimeoutPolicy::new(
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    );
+    assert!(lease.is_ok());
+    assert!(timeouts.is_ok());
+    let (Some(lease), Some(timeouts)) = (lease.ok(), timeouts.ok()) else {
+        return;
+    };
+    let Some(worker) = WorkerId::new("worker-timeout").ok() else {
+        return;
+    };
+    let (mut machine, fence) = SessionMachine::create_with_timeouts(
+        SessionId::new(),
+        OwnershipFence::new(worker, 1, 1, 1),
+        lease,
+        timeouts,
+        SessionTime::new(0),
+    );
+    assert!(machine.start(&fence, SessionTime::new(0)).is_ok());
+    assert!(machine.mark_running(&fence, SessionTime::new(1)).is_ok());
+    let action_id = ActionId::new();
+    assert!(
+        machine
+            .begin_action(&fence, action_id.clone(), SessionTime::new(2))
+            .is_ok()
+    );
+
+    assert_eq!(
+        machine.expire_due(&fence, SessionTime::new(100)),
+        Ok(browserd_session::ExpireDecision::BeganExpiring)
+    );
+    assert_eq!(
+        machine.snapshot().execution,
+        SessionExecution::ReconciliationRequired(action_id)
+    );
+}
+
+#[test]
 fn stale_owner_cannot_mutate_any_independent_axis() {
     let Some((mut machine, fence)) = configured() else {
         return;
