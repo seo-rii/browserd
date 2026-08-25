@@ -25,7 +25,7 @@ pub use proxy_protocol::{ProxyProtocolError, ProxyProtocolLimits, ProxyRequest, 
 pub use quota::{ConnectionId, MonotonicMillis, QuotaError, QuotaLedger, QuotaLimits, QuotaUsage};
 pub use route::{
     PreDnsPermit, RouteBinding, RouteEndpoint, RouteError, RouteIdentity, RoutePermit,
-    RouteRegistry,
+    RouteRegistry, RouteRegistryLimits,
 };
 pub use scheme::{NavigationScope, SchemeDecision, SchemePolicy};
 pub use upstream_proxy::{NetworkClass, UpstreamProxy, UpstreamProxyError, UpstreamProxyPolicy};

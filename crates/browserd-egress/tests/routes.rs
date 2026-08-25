@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -23,11 +25,15 @@ fn limits() -> QuotaLimits {
 }
 
 fn binding(shard_id: ShardId, expires_at: u64) -> RouteBinding {
+    binding_with_epoch(shard_id, 7, expires_at)
+}
+
+fn binding_with_epoch(shard_id: ShardId, worker_epoch: u64, expires_at: u64) -> RouteBinding {
     RouteBinding::new(
         TenantId::new(),
         SessionId::new(),
         shard_id,
-        7,
+        worker_epoch,
         EgressPolicy::public_web_default(),
         limits(),
         MonotonicMillis::new(expires_at),
@@ -374,4 +380,279 @@ fn revocation_fences_existing_permits_and_wins_races_with_new_connections() {
             Err(RouteError::RouteRevoked)
         );
     }
+}
+
+#[test]
+fn shard_revocation_is_atomic_idempotent_and_retires_every_bound_endpoint() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let shard = ShardId::new();
+    let other_shard = ShardId::new();
+    let first = RouteEndpoint::new(101).expect("endpoint should be valid");
+    let second = RouteEndpoint::new(102).expect("endpoint should be valid");
+    let unrelated = RouteEndpoint::new(103).expect("endpoint should be valid");
+    registry
+        .bind(
+            first,
+            binding(shard.clone(), 20_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("first route should bind");
+    registry
+        .bind(
+            second,
+            binding(shard.clone(), 20_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("second route should bind");
+    registry
+        .bind(
+            unrelated,
+            binding(other_shard.clone(), 20_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("unrelated route should bind");
+    let url = CanonicalUrl::parse("https://example.com/").expect("URL should be valid");
+    let first_permit = registry
+        .authorize_dns(first, &shard, &url, MonotonicMillis::new(1_001))
+        .expect("permit should be issued");
+    let second_permit = registry
+        .authorize_dns(second, &shard, &url, MonotonicMillis::new(1_001))
+        .expect("permit should be issued");
+    let first_cancellation = first_permit.cancellation_token();
+    let second_cancellation = second_permit.cancellation_token();
+
+    assert_eq!(registry.revoke_shard(&shard, 7), Ok(2));
+    assert!(first_cancellation.is_cancelled());
+    assert!(second_cancellation.is_cancelled());
+    assert_eq!(
+        registry.binding(first, &shard, MonotonicMillis::new(1_002)),
+        Err(RouteError::RouteRevoked)
+    );
+    assert_eq!(
+        registry.binding(second, &shard, MonotonicMillis::new(1_002)),
+        Err(RouteError::RouteRevoked)
+    );
+    assert!(
+        registry
+            .binding(unrelated, &other_shard, MonotonicMillis::new(1_002))
+            .is_ok()
+    );
+    assert_eq!(registry.revoke_shard(&shard, 7), Ok(0));
+    assert_eq!(
+        registry.bind(
+            first,
+            binding_with_epoch(shard.clone(), 8, 20_000),
+            MonotonicMillis::new(1_003),
+        ),
+        Err(RouteError::EndpointRetired)
+    );
+}
+
+#[test]
+fn stale_shard_revocation_rejects_before_mutating_any_route() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let shard = ShardId::new();
+    let first = RouteEndpoint::new(111).expect("endpoint should be valid");
+    let second = RouteEndpoint::new(112).expect("endpoint should be valid");
+    for endpoint in [first, second] {
+        registry
+            .bind(
+                endpoint,
+                binding(shard.clone(), 20_000),
+                MonotonicMillis::new(1_000),
+            )
+            .expect("route should bind");
+    }
+    let url = CanonicalUrl::parse("https://example.com/").expect("URL should be valid");
+    let permit = registry
+        .authorize_dns(first, &shard, &url, MonotonicMillis::new(1_001))
+        .expect("permit should be issued");
+    let cancellation = permit.cancellation_token();
+
+    assert_eq!(
+        registry.revoke_shard(&shard, 6),
+        Err(RouteError::WorkerEpochMismatch {
+            expected: 7,
+            actual: 6,
+        })
+    );
+    assert!(!cancellation.is_cancelled());
+    for endpoint in [first, second] {
+        assert!(
+            registry
+                .binding(endpoint, &shard, MonotonicMillis::new(1_002))
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn concurrent_bind_and_shard_revoke_never_leave_an_old_epoch_route_active() {
+    for iteration in 0..100 {
+        let registry = Arc::new(RouteRegistry::new(Duration::from_secs(30)));
+        let shard = ShardId::new();
+        let existing = RouteEndpoint::new(1_000 + iteration * 2).expect("endpoint should be valid");
+        let racing = RouteEndpoint::new(1_001 + iteration * 2).expect("endpoint should be valid");
+        registry
+            .bind(
+                existing,
+                binding(shard.clone(), 20_000),
+                MonotonicMillis::new(1_000),
+            )
+            .expect("existing route should bind");
+        let barrier = Arc::new(Barrier::new(3));
+        let binder = {
+            let registry = Arc::clone(&registry);
+            let shard = shard.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                registry.bind(racing, binding(shard, 20_000), MonotonicMillis::new(1_001))
+            })
+        };
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            let shard = shard.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                registry.revoke_shard(&shard, 7)
+            })
+        };
+        barrier.wait();
+
+        let bind_result = binder.join().expect("binder should not panic");
+        let revoked = revoker
+            .join()
+            .expect("revoker should not panic")
+            .expect("revocation should succeed");
+        assert_eq!(revoked, usize::from(bind_result.is_ok()) + 1);
+        assert_eq!(
+            registry.binding(existing, &shard, MonotonicMillis::new(1_002)),
+            Err(RouteError::RouteRevoked)
+        );
+        let rebound = registry.bind(
+            racing,
+            binding(shard.clone(), 20_000),
+            MonotonicMillis::new(1_003),
+        );
+        assert!(matches!(
+            rebound,
+            Err(RouteError::EndpointRetired | RouteError::ShardRevoked)
+        ));
+    }
+}
+
+#[test]
+fn concurrent_renew_and_shard_revoke_always_finish_revoked() {
+    for iteration in 0..100 {
+        let registry = Arc::new(RouteRegistry::new(Duration::from_secs(30)));
+        let shard = ShardId::new();
+        let endpoint = RouteEndpoint::new(2_000 + iteration).expect("endpoint should be valid");
+        registry
+            .bind(
+                endpoint,
+                binding(shard.clone(), 20_000),
+                MonotonicMillis::new(1_000),
+            )
+            .expect("route should bind");
+        let barrier = Arc::new(Barrier::new(3));
+        let renewer = {
+            let registry = Arc::clone(&registry);
+            let shard = shard.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                registry.renew(
+                    endpoint,
+                    &shard,
+                    7,
+                    MonotonicMillis::new(1_001),
+                    MonotonicMillis::new(20_001),
+                )
+            })
+        };
+        let revoker = {
+            let registry = Arc::clone(&registry);
+            let shard = shard.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                registry.revoke_shard(&shard, 7)
+            })
+        };
+        barrier.wait();
+
+        let renewal = renewer.join().expect("renewer should not panic");
+        assert!(matches!(renewal, Ok(()) | Err(RouteError::RouteRevoked)));
+        assert_eq!(revoker.join().expect("revoker should not panic"), Ok(1));
+        assert_eq!(
+            registry.binding(endpoint, &shard, MonotonicMillis::new(1_002)),
+            Err(RouteError::RouteRevoked)
+        );
+    }
+}
+
+#[test]
+fn registry_limits_bound_route_tombstones_and_shard_index_state() {
+    let limits = browserd_egress::RouteRegistryLimits::new(2, 1);
+    let registry = RouteRegistry::with_limits(Duration::from_secs(30), limits);
+    let shard = ShardId::new();
+    let first = RouteEndpoint::new(301).expect("endpoint should be valid");
+    let second = RouteEndpoint::new(302).expect("endpoint should be valid");
+    let third = RouteEndpoint::new(303).expect("endpoint should be valid");
+    registry
+        .bind(
+            first,
+            binding(shard.clone(), 20_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("first route should bind");
+    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    registry
+        .bind(
+            second,
+            binding_with_epoch(shard.clone(), 8, 20_000),
+            MonotonicMillis::new(1_001),
+        )
+        .expect("new shard epoch should bind");
+    assert_eq!(registry.revoke_shard(&shard, 8), Ok(1));
+
+    assert_eq!(
+        registry.bind(
+            third,
+            binding_with_epoch(shard.clone(), 9, 20_000),
+            MonotonicMillis::new(1_002),
+        ),
+        Err(RouteError::RouteCapacityExceeded)
+    );
+    assert_eq!(
+        registry.bind(
+            first,
+            binding_with_epoch(shard, 9, 20_000),
+            MonotonicMillis::new(1_002),
+        ),
+        Err(RouteError::EndpointRetired)
+    );
+
+    let other_shard = ShardId::new();
+    let shard_limited = RouteRegistry::with_limits(
+        Duration::from_secs(30),
+        browserd_egress::RouteRegistryLimits::new(2, 1),
+    );
+    shard_limited
+        .bind(
+            first,
+            binding(ShardId::new(), 20_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("first shard should bind");
+    assert_eq!(
+        shard_limited.bind(
+            second,
+            binding(other_shard, 20_000),
+            MonotonicMillis::new(1_000),
+        ),
+        Err(RouteError::ShardCapacityExceeded)
+    );
 }

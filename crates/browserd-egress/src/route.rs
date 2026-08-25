@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -149,26 +149,78 @@ struct RetiredRoute {
     worker_epoch: u64,
 }
 
+#[derive(Debug)]
+struct ShardRoutes {
+    worker_epoch: u64,
+    revoked: bool,
+    endpoints: HashSet<RouteEndpoint>,
+    cancellation: CancellationToken,
+}
+
 #[derive(Debug, Default)]
 struct RouteState {
     active: HashMap<RouteEndpoint, RouteEntry>,
     retired: HashMap<RouteEndpoint, RetiredRoute>,
+    shards: HashMap<ShardId, ShardRoutes>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RouteRegistryLimits {
+    max_tracked_routes: usize,
+    max_tracked_shards: usize,
+}
+
+impl RouteRegistryLimits {
+    #[must_use]
+    pub const fn new(max_tracked_routes: usize, max_tracked_shards: usize) -> Self {
+        Self {
+            max_tracked_routes,
+            max_tracked_shards,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_tracked_routes(self) -> usize {
+        self.max_tracked_routes
+    }
+
+    #[must_use]
+    pub const fn max_tracked_shards(self) -> usize {
+        self.max_tracked_shards
+    }
+
+    const fn is_valid(self) -> bool {
+        self.max_tracked_routes > 0 && self.max_tracked_shards > 0
+    }
+}
+
+impl Default for RouteRegistryLimits {
+    fn default() -> Self {
+        Self::new(65_536, 4_096)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct RouteRegistry {
     max_lease_millis: Option<u64>,
+    limits: RouteRegistryLimits,
     state: Arc<Mutex<RouteState>>,
 }
 
 impl RouteRegistry {
     #[must_use]
     pub fn new(max_lease: Duration) -> Self {
+        Self::with_limits(max_lease, RouteRegistryLimits::default())
+    }
+
+    #[must_use]
+    pub fn with_limits(max_lease: Duration, limits: RouteRegistryLimits) -> Self {
         let millis = max_lease.as_millis();
         Self {
             max_lease_millis: (millis > 0 && millis <= u128::from(u64::MAX))
                 .then(|| u64::try_from(millis).ok())
                 .flatten(),
+            limits,
             state: Arc::new(Mutex::new(RouteState::default())),
         }
     }
@@ -182,6 +234,9 @@ impl RouteRegistry {
         if binding.worker_epoch == 0 {
             return Err(RouteError::InvalidWorkerEpoch);
         }
+        if !self.limits.is_valid() {
+            return Err(RouteError::InvalidRegistryConfig);
+        }
         self.validate_expiry(now, binding.expires_at)?;
         let mut state = self.lock_state();
         if state.retired.contains_key(&endpoint) {
@@ -190,6 +245,43 @@ impl RouteRegistry {
         if state.active.contains_key(&endpoint) {
             return Err(RouteError::EndpointAlreadyBound);
         }
+        if state.active.len().saturating_add(state.retired.len()) >= self.limits.max_tracked_routes
+        {
+            return Err(RouteError::RouteCapacityExceeded);
+        }
+        let shard_is_new = !state.shards.contains_key(&binding.shard_id);
+        if shard_is_new && state.shards.len() >= self.limits.max_tracked_shards {
+            return Err(RouteError::ShardCapacityExceeded);
+        }
+        if let Some(shard) = state.shards.get(&binding.shard_id) {
+            if shard.worker_epoch != binding.worker_epoch {
+                if !shard.revoked || binding.worker_epoch < shard.worker_epoch {
+                    return Err(RouteError::WorkerEpochMismatch {
+                        expected: shard.worker_epoch,
+                        actual: binding.worker_epoch,
+                    });
+                }
+            } else if shard.revoked {
+                return Err(RouteError::ShardRevoked);
+            }
+        }
+
+        let shard = state
+            .shards
+            .entry(binding.shard_id.clone())
+            .or_insert_with(|| ShardRoutes {
+                worker_epoch: binding.worker_epoch,
+                revoked: false,
+                endpoints: HashSet::new(),
+                cancellation: CancellationToken::new(),
+            });
+        if shard.worker_epoch != binding.worker_epoch {
+            shard.worker_epoch = binding.worker_epoch;
+            shard.revoked = false;
+            shard.cancellation = CancellationToken::new();
+        }
+        let cancellation = shard.cancellation.child_token();
+        shard.endpoints.insert(endpoint);
         let entry = RouteEntry {
             incarnation: LeaseId::new(),
             tenant_id: binding.tenant_id,
@@ -199,7 +291,7 @@ impl RouteRegistry {
             expires_at: binding.expires_at,
             planner: ConnectionPlanner::new(binding.policy),
             quota: QuotaLedger::new(binding.quota_limits),
-            cancellation: CancellationToken::new(),
+            cancellation,
         };
         let identity = RouteIdentity::from(&entry);
         state.active.insert(endpoint, entry);
@@ -276,14 +368,53 @@ impl RouteRegistry {
                 actual: worker_epoch,
             });
         }
-        let retired = RetiredRoute {
-            shard_id: entry.shard_id.clone(),
-            worker_epoch: entry.worker_epoch,
-        };
-        entry.cancellation.cancel();
-        state.active.remove(&endpoint);
-        state.retired.insert(endpoint, retired);
+        Self::retire_route(&mut state, endpoint);
         Ok(())
+    }
+
+    pub fn revoke_shard(
+        &self,
+        source_shard: &ShardId,
+        worker_epoch: u64,
+    ) -> Result<usize, RouteError> {
+        let mut state = self.lock_state();
+        let endpoints = {
+            let shard = state
+                .shards
+                .get(source_shard)
+                .ok_or(RouteError::RouteNotFound)?;
+            if shard.worker_epoch != worker_epoch {
+                return Err(RouteError::WorkerEpochMismatch {
+                    expected: shard.worker_epoch,
+                    actual: worker_epoch,
+                });
+            }
+            if shard.revoked {
+                return Ok(0);
+            }
+            shard.endpoints.iter().copied().collect::<Vec<_>>()
+        };
+
+        for endpoint in &endpoints {
+            let entry = state
+                .active
+                .get(endpoint)
+                .ok_or(RouteError::InconsistentRegistryState)?;
+            if &entry.shard_id != source_shard || entry.worker_epoch != worker_epoch {
+                return Err(RouteError::InconsistentRegistryState);
+            }
+        }
+
+        if let Some(shard) = state.shards.get(source_shard) {
+            shard.cancellation.cancel();
+        }
+        for endpoint in &endpoints {
+            Self::retire_route(&mut state, *endpoint);
+        }
+        if let Some(shard) = state.shards.get_mut(source_shard) {
+            shard.revoked = true;
+        }
+        Ok(endpoints.len())
     }
 
     pub fn begin_connection(
@@ -332,16 +463,7 @@ impl RouteRegistry {
             .filter_map(|(endpoint, entry)| (entry.expires_at <= now).then_some(*endpoint))
             .collect::<Vec<_>>();
         for endpoint in &expired {
-            if let Some(entry) = state.active.remove(endpoint) {
-                entry.cancellation.cancel();
-                state.retired.insert(
-                    *endpoint,
-                    RetiredRoute {
-                        shard_id: entry.shard_id,
-                        worker_epoch: entry.worker_epoch,
-                    },
-                );
-            }
+            Self::retire_route(&mut state, *endpoint);
         }
         expired.len()
     }
@@ -403,21 +525,36 @@ impl RouteRegistry {
         Ok(())
     }
 
+    fn retire_route(state: &mut RouteState, endpoint: RouteEndpoint) {
+        let Some(entry) = state.active.remove(&endpoint) else {
+            return;
+        };
+        entry.cancellation.cancel();
+        if let Some(shard) = state.shards.get_mut(&entry.shard_id)
+            && shard.worker_epoch == entry.worker_epoch
+        {
+            shard.endpoints.remove(&endpoint);
+        }
+        state.retired.insert(
+            endpoint,
+            RetiredRoute {
+                shard_id: entry.shard_id,
+                worker_epoch: entry.worker_epoch,
+            },
+        );
+    }
+
     fn active_entry(
         state: &mut RouteState,
         endpoint: RouteEndpoint,
         now: MonotonicMillis,
     ) -> Result<&mut RouteEntry, RouteError> {
-        if let Some(entry) = state.active.get(&endpoint)
-            && entry.expires_at <= now
-        {
-            let retired = RetiredRoute {
-                shard_id: entry.shard_id.clone(),
-                worker_epoch: entry.worker_epoch,
-            };
-            entry.cancellation.cancel();
-            state.active.remove(&endpoint);
-            state.retired.insert(endpoint, retired);
+        let expired = state
+            .active
+            .get(&endpoint)
+            .is_some_and(|entry| entry.expires_at <= now);
+        if expired {
+            Self::retire_route(state, endpoint);
             return Err(RouteError::RouteExpired);
         }
         state.active.get_mut(&endpoint).ok_or_else(|| {
@@ -545,11 +682,15 @@ pub enum RouteError {
     InvalidLeaseExpiry,
     EndpointAlreadyBound,
     EndpointRetired,
+    RouteCapacityExceeded,
+    ShardCapacityExceeded,
+    ShardRevoked,
     RouteNotFound,
     RouteExpired,
     RouteRevoked,
     SourceShardMismatch,
     WorkerEpochMismatch { expected: u64, actual: u64 },
+    InconsistentRegistryState,
     Plan(PlanError),
     Quota(QuotaError),
     ConnectionClosed,
