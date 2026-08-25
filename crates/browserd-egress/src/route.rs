@@ -170,6 +170,7 @@ enum ShardRouteLifecycle {
 struct RouteState {
     active: HashMap<RouteEndpoint, RouteEntry>,
     retired: HashMap<RouteEndpoint, RetiredRoute>,
+    session_endpoints: HashMap<SessionId, RouteEndpoint>,
     shards: HashMap<ShardId, ShardRoutes>,
     worker_epoch_high_watermark: Option<u64>,
 }
@@ -333,6 +334,9 @@ impl RouteRegistry {
         if state.active.contains_key(&endpoint) {
             return Err(RouteError::EndpointAlreadyBound);
         }
+        if state.session_endpoints.contains_key(&binding.session_id) {
+            return Err(RouteError::SessionAlreadyBound);
+        }
         if state.active.len().saturating_add(state.retired.len()) >= self.limits.max_tracked_routes
         {
             return Err(RouteError::RouteCapacityExceeded);
@@ -354,6 +358,7 @@ impl RouteRegistry {
         }
         let cancellation = shard.cancellation.child_token();
         shard.endpoints.insert(endpoint);
+        let session_id = binding.session_id.clone();
         let entry = RouteEntry {
             incarnation: LeaseId::new(),
             tenant_id: binding.tenant_id,
@@ -367,6 +372,7 @@ impl RouteRegistry {
         };
         let identity = RouteIdentity::from(&entry);
         state.active.insert(endpoint, entry);
+        state.session_endpoints.insert(session_id, endpoint);
         Ok(identity)
     }
 
@@ -1060,6 +1066,7 @@ pub enum RouteError {
     InvalidRegistryConfig,
     InvalidLeaseExpiry,
     EndpointAlreadyBound,
+    SessionAlreadyBound,
     EndpointRetired,
     RouteCapacityExceeded,
     ShardCapacityExceeded,

@@ -93,6 +93,68 @@ fn route_is_bound_to_an_exact_source_shard_and_worker_epoch() {
 }
 
 #[test]
+fn a_session_cannot_split_or_reset_quota_across_route_endpoints() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let first = RouteEndpoint::new(42).expect("endpoint should be valid");
+    let second = RouteEndpoint::new(43).expect("endpoint should be valid");
+    let shard = ShardId::new();
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    prepare_shard(&registry, &shard, 7);
+    registry
+        .bind(
+            first,
+            RouteBinding::new(
+                tenant_id.clone(),
+                session_id.clone(),
+                shard.clone(),
+                7,
+                EgressPolicy::public_web_default(),
+                limits(),
+                MonotonicMillis::new(20_000),
+            ),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("first session route should bind");
+
+    assert!(matches!(
+        registry.bind(
+            second,
+            RouteBinding::new(
+                tenant_id.clone(),
+                session_id.clone(),
+                shard.clone(),
+                7,
+                EgressPolicy::public_web_default(),
+                limits(),
+                MonotonicMillis::new(20_000),
+            ),
+            MonotonicMillis::new(1_001),
+        ),
+        Err(RouteError::SessionAlreadyBound)
+    ));
+    registry
+        .revoke(first, &shard, 7)
+        .expect("first route should revoke");
+    assert!(matches!(
+        registry.bind(
+            second,
+            RouteBinding::new(
+                tenant_id,
+                session_id,
+                shard,
+                7,
+                EgressPolicy::public_web_default(),
+                limits(),
+                MonotonicMillis::new(20_000),
+            ),
+            MonotonicMillis::new(1_002),
+        ),
+        Err(RouteError::SessionAlreadyBound)
+    ));
+}
+
+#[test]
 fn expired_routes_fail_closed_and_endpoints_are_never_rebound() {
     let registry = RouteRegistry::new(Duration::from_secs(30));
     let endpoint = RouteEndpoint::new(7);
