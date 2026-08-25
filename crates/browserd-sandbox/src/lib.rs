@@ -1,6 +1,7 @@
 //! Shard sandbox supervisor contract, ownership leases, and cleanup ordering.
 
 mod linux;
+mod rpc;
 
 pub use linux::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
@@ -8,12 +9,16 @@ pub use linux::{
     ProcessSignal, ReadOnlyMount, SandboxFilesystem, SpawnRequest, StdLinuxProcessBackend,
     StdSandboxFilesystem,
 };
+pub use rpc::{
+    RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer,
+};
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{ShardId, WorkerId};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -175,7 +180,8 @@ impl SandboxHandle {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CleanupReason {
     WorkerLeaseExpired,
     SecurityViolation,
@@ -183,14 +189,14 @@ pub enum CleanupReason {
     BrowserFailure,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CleanupResult {
     pub route_revoked: bool,
     pub cgroup_killed: bool,
     pub namespaces_cleaned: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InspectResources {
     pub memory_current_bytes: u64,
     pub memory_peak_bytes: u64,
@@ -198,14 +204,16 @@ pub struct InspectResources {
     pub egress_route_active: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CreateShardOutcome {
     Created,
     AlreadyExists,
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KillShardOutcome {
     Terminated(CleanupResult),
     AlreadyTerminated,
@@ -278,6 +286,13 @@ where
         spec: LaunchSpec,
         ownership: WorkerOwnership,
     ) -> Result<CreateShardOutcome, SandboxError> {
+        let now = Instant::now();
+        if ownership.expires_at <= now
+            || ownership.expires_at.saturating_duration_since(now)
+                > self.config.supervisor_lease_ttl
+        {
+            return Err(SandboxError::InvalidOwnerLease);
+        }
         let capabilities = self.backend.capabilities();
         if let Some(name) = [
             ("user_namespace", capabilities.user_namespace),
@@ -303,10 +318,42 @@ where
 
         {
             let mut state = self.state.lock().await;
-            if state.active.contains_key(&spec.shard_id)
-                || state.provisioning.contains_key(&spec.shard_id)
-                || state.terminated.contains_key(&spec.shard_id)
-            {
+            let existing_owner = state
+                .active
+                .get(&spec.shard_id)
+                .map(|active| {
+                    (
+                        active.ownership.worker_id.clone(),
+                        active.ownership.worker_epoch,
+                    )
+                })
+                .or_else(|| {
+                    state.provisioning.get(&spec.shard_id).map(|provisioning| {
+                        (
+                            provisioning.ownership.worker_id.clone(),
+                            provisioning.ownership.worker_epoch,
+                        )
+                    })
+                });
+            if let Some((existing_worker_id, existing_worker_epoch)) = existing_owner {
+                if existing_worker_id != spec.worker_id {
+                    return Err(SandboxError::OwnershipMismatch);
+                }
+                if existing_worker_epoch != spec.worker_epoch {
+                    return Err(SandboxError::WorkerEpochMismatch {
+                        expected: existing_worker_epoch,
+                        actual: spec.worker_epoch,
+                    });
+                }
+                return Ok(CreateShardOutcome::AlreadyExists);
+            }
+            if let Some(existing_worker_epoch) = state.terminated.get(&spec.shard_id) {
+                if *existing_worker_epoch != spec.worker_epoch {
+                    return Err(SandboxError::WorkerEpochMismatch {
+                        expected: *existing_worker_epoch,
+                        actual: spec.worker_epoch,
+                    });
+                }
                 return Ok(CreateShardOutcome::AlreadyExists);
             }
             state.provisioning.insert(
@@ -540,6 +587,8 @@ pub enum SandboxError {
     MissingCapability { name: &'static str },
     #[error("launch spec and owner lease do not identify the same worker epoch")]
     OwnershipMismatch,
+    #[error("owner lease is expired or exceeds the configured supervisor TTL")]
+    InvalidOwnerLease,
     #[error("sandbox shard does not exist")]
     ShardNotFound,
     #[error("worker epoch mismatch: expected {expected}, received {actual}")]

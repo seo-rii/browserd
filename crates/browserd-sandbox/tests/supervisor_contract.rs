@@ -143,6 +143,27 @@ async fn production_creation_fails_closed_when_any_required_capability_is_missin
 }
 
 #[tokio::test]
+async fn creation_rejects_expired_or_overlong_owner_leases_before_provisioning() {
+    let backend = RecordingBackend::production_capable();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let now = Instant::now();
+
+    for expires_at in [
+        now.checked_sub(Duration::from_millis(1)).unwrap(),
+        now + Duration::from_secs(11),
+    ] {
+        let outcome = supervisor
+            .create_shard(
+                launch_spec(ShardId::new()),
+                WorkerOwnership::new(worker(), 17, expires_at),
+            )
+            .await;
+        assert_eq!(outcome, Err(SandboxError::InvalidOwnerLease));
+    }
+    assert!(backend.events().is_empty());
+}
+
+#[tokio::test]
 async fn stale_worker_epoch_cannot_renew_or_control_a_shard() {
     let backend = RecordingBackend::production_capable();
     let supervisor = SandboxSupervisor::new(config(), backend);
