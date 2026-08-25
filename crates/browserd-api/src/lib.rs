@@ -60,6 +60,7 @@ pub const PUBLIC_ROUTES: &[&str] = &[
     "GET /v1/approvals/{approval_id}",
     "POST /v1/approvals/{approval_id}/decision",
 ];
+pub const PUBLIC_V1_ROUTES: &[&str] = PUBLIC_ROUTES;
 
 pub const MAX_SESSION_METADATA_ENTRIES: usize = 32;
 pub const MAX_SESSION_METADATA_KEY_BYTES: usize = 64;
