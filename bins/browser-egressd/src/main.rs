@@ -178,6 +178,12 @@ struct RevokeRequest {
 }
 
 #[derive(Deserialize)]
+struct ShardRevokeRequest {
+    source_shard: ShardId,
+    worker_epoch: u64,
+}
+
+#[derive(Deserialize)]
 struct RouteStatusRequest {
     endpoint: u64,
     source_shard: ShardId,
@@ -285,6 +291,20 @@ async fn revoke_route(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn revoke_shard(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Json(request): Json<ShardRevokeRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    require_control(&headers, &state.token)
+        .map_err(|status| (status, "control authorization failed".to_owned()))?;
+    state
+        .registry
+        .revoke_shard(&request.source_shard, request.worker_epoch)
+        .map_err(|error| (StatusCode::CONFLICT, format!("{error:?}")))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn route_status(
     State(state): State<ControlState>,
     headers: HeaderMap,
@@ -360,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/routes/bind", post(bind_route))
         .route("/v1/routes/renew", post(renew_route))
         .route("/v1/routes/revoke", post(revoke_route))
+        .route("/v1/routes/revoke-shard", post(revoke_shard))
         .route("/v1/routes/status", get(route_status))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(TimeoutLayer::with_status_code(
@@ -460,7 +481,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ControlState, ControlToken, DaemonConfig, RouteStatusRequest, require_control, route_status,
+        ControlState, ControlToken, DaemonConfig, RouteStatusRequest, ShardRevokeRequest,
+        require_control, revoke_shard, route_status,
     };
     use axum::Json;
     use axum::extract::{Query, State};
@@ -579,5 +601,101 @@ mod tests {
         )
         .await;
         assert!(matches!(stale, Err((StatusCode::CONFLICT, _))));
+    }
+
+    #[tokio::test]
+    async fn shard_revoke_is_authenticated_epoch_fenced_and_idempotent() {
+        let registry = RouteRegistry::new(Duration::from_secs(30));
+        let shard = ShardId::new();
+        let first = RouteEndpoint::new(81).expect("endpoint is valid");
+        let second = RouteEndpoint::new(82).expect("endpoint is valid");
+        for endpoint in [first, second] {
+            registry
+                .bind(
+                    endpoint,
+                    RouteBinding::new(
+                        TenantId::new(),
+                        SessionId::new(),
+                        shard.clone(),
+                        9,
+                        EgressPolicy::public_web_default(),
+                        QuotaLimits {
+                            max_concurrent_connections: 4,
+                            max_connection_starts_per_window: 8,
+                            max_dns_queries_per_window: 8,
+                            max_egress_bytes_per_window: 4_096,
+                            max_total_egress_bytes: 8_192,
+                            max_response_bytes: Some(2_048),
+                            accounting_window: Duration::from_secs(60),
+                            idle_connection_timeout: Duration::from_secs(2),
+                        },
+                        MonotonicMillis::new(20_000),
+                    ),
+                    MonotonicMillis::new(1_000),
+                )
+                .expect("route binds");
+        }
+        let state = ControlState {
+            registry: registry.clone(),
+            listeners: Arc::new(HashMap::from([
+                (first, shard.clone()),
+                (second, shard.clone()),
+            ])),
+            started: Instant::now(),
+            ready: Arc::new(AtomicBool::new(true)),
+            token: ControlToken::new(&"d".repeat(32)).expect("token is strong enough"),
+        };
+        let request = || ShardRevokeRequest {
+            source_shard: shard.clone(),
+            worker_epoch: 9,
+        };
+
+        let missing = revoke_shard(State(state.clone()), HeaderMap::new(), Json(request())).await;
+        assert!(matches!(missing, Err((StatusCode::UNAUTHORIZED, _))));
+        let mut wrong_headers = HeaderMap::new();
+        wrong_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        );
+        let wrong = revoke_shard(State(state.clone()), wrong_headers, Json(request())).await;
+        assert!(matches!(wrong, Err((StatusCode::UNAUTHORIZED, _))));
+
+        let mut authorized = HeaderMap::new();
+        authorized.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer dddddddddddddddddddddddddddddddd"),
+        );
+        let stale = revoke_shard(
+            State(state.clone()),
+            authorized.clone(),
+            Json(ShardRevokeRequest {
+                source_shard: shard.clone(),
+                worker_epoch: 8,
+            }),
+        )
+        .await;
+        assert!(matches!(stale, Err((StatusCode::CONFLICT, _))));
+        for endpoint in [first, second] {
+            assert!(
+                registry
+                    .binding(endpoint, &shard, MonotonicMillis::new(1_001))
+                    .is_ok()
+            );
+        }
+
+        assert_eq!(
+            revoke_shard(State(state.clone()), authorized.clone(), Json(request())).await,
+            Ok(StatusCode::NO_CONTENT)
+        );
+        for endpoint in [first, second] {
+            assert_eq!(
+                registry.binding(endpoint, &shard, MonotonicMillis::new(1_002)),
+                Err(browserd_egress::RouteError::RouteRevoked)
+            );
+        }
+        assert_eq!(
+            revoke_shard(State(state), authorized, Json(request())).await,
+            Ok(StatusCode::NO_CONTENT)
+        );
     }
 }
