@@ -1,0 +1,16 @@
+[package]
+name = "browserd-sandbox"
+description = "Shard sandbox supervisor contract, ownership leases, and cleanup ordering"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+browserd-core = { path = "../browserd-core" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
