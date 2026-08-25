@@ -145,6 +145,29 @@ impl ProxyRequest {
             headers.push((name.to_owned(), value.to_owned()));
         }
 
+        let mut connection_named = BTreeSet::new();
+        let mut websocket_upgrade = false;
+        for (name, value) in &headers {
+            if name.eq_ignore_ascii_case("connection") {
+                for token in value.split(',') {
+                    let token = token.trim().to_ascii_lowercase();
+                    websocket_upgrade |= token == "upgrade";
+                    connection_named.insert(token);
+                }
+            }
+        }
+        if connection_named.iter().any(|name| {
+            matches!(
+                name.as_str(),
+                "content-length" | "host" | "transfer-encoding"
+            )
+        }) {
+            return Err(ProxyProtocolError::InvalidHeader);
+        }
+        websocket_upgrade &= headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("upgrade") && !value.is_empty());
+
         let host_values = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
@@ -233,21 +256,6 @@ impl ProxyRequest {
         let upstream_head = if kind == ProxyRequestKind::ConnectTunnel {
             Vec::new()
         } else {
-            let mut connection_named = BTreeSet::new();
-            let mut websocket_upgrade = false;
-            for (name, value) in &headers {
-                if name.eq_ignore_ascii_case("connection") {
-                    for token in value.split(',') {
-                        let token = token.trim().to_ascii_lowercase();
-                        websocket_upgrade |= token == "upgrade";
-                        connection_named.insert(token);
-                    }
-                }
-            }
-            websocket_upgrade &= headers
-                .iter()
-                .any(|(name, value)| name.eq_ignore_ascii_case("upgrade") && !value.is_empty());
-
             let mut head = format!("{method} {} HTTP/1.1\r\n", url.path_and_query()).into_bytes();
             let host = if url.host().contains(':') {
                 format!("[{}]", url.host())

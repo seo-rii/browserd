@@ -93,6 +93,23 @@ fn parser_rejects_request_smuggling_and_ambiguous_authority_forms() {
 }
 
 #[test]
+fn connection_header_cannot_nominate_framing_or_routing_headers() {
+    let invalid = [
+        b"POST http://example.com/ HTTP/1.1\r\nHost: example.com\r\ncOnNeCtIoN: keep-alive, CoNtEnT-LeNgTh\r\nContent-Length: 4\r\n\r\ndata".as_slice(),
+        b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\nCONNECTION: HOST\r\n\r\n".as_slice(),
+        b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nConnection: Transfer-Encoding\r\n\r\n".as_slice(),
+    ];
+
+    for request in invalid {
+        assert_eq!(
+            ProxyRequest::parse(request, limits()),
+            Err(ProxyProtocolError::InvalidHeader),
+            "connection-nominated routing and framing headers must fail closed"
+        );
+    }
+}
+
+#[test]
 fn parser_enforces_header_count_header_bytes_and_target_bytes() {
     let tiny_header = ProxyProtocolLimits {
         max_header_bytes: 32,
