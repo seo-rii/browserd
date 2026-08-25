@@ -1,0 +1,13 @@
+[package]
+name = "browserd-fleet"
+description = "Fair scheduling, worker reservations, and fenced shard placement for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+browserd-core = { path = "../browserd-core" }
+
+[lints]
+workspace = true
