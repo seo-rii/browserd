@@ -1,19 +1,20 @@
 use std::collections::VecDeque;
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use browserd_actions::{ActionKind, ResolutionKind};
-use browserd_core::{PageId, PrincipalId, TenantId, WorkerId};
+use browserd_actions::{ActionJournalLimits, ActionKind, ResolutionKind};
+use browserd_core::{LeaseId, PageId, PrincipalId, TenantId, WorkerId};
 use browserd_features::BuiltinFeature;
 use browserd_policy::ApprovalDecision;
 use browserd_session::{LeasePolicy, SessionLifecycle, SessionTime, SessionTimeoutPolicy};
 use browserd_viewer::ViewerScopes;
 use browserd_worker::{
-    ActionExecutionResult, ActionStatus, ArtifactUpload, AuthenticatedPeer, ChromiumDriver,
-    CreateSessionCommand, DependencyError, InternalEndpoint, SandboxClient, WorkerConfig,
-    WorkerControlPlane, WorkerError,
+    ActionExecutionResult, ActionJournalConfig, ActionStatus, ArtifactUpload, AuthenticatedPeer,
+    ChromiumDriver, CreateSessionCommand, DependencyError, InternalEndpoint, SandboxClient,
+    WorkerConfig, WorkerControlPlane, WorkerError,
 };
 
 #[derive(Default)]
@@ -165,6 +166,8 @@ fn config(queue_capacity: usize) -> Option<WorkerConfig> {
 }
 
 fn config_with_max_sessions(queue_capacity: usize, max_sessions: usize) -> Option<WorkerConfig> {
+    static JOURNAL_ROOT: OnceLock<Option<tempfile::TempDir>> = OnceLock::new();
+
     let worker_id = WorkerId::new("worker-test").ok()?;
     let endpoint =
         InternalEndpoint::loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9010)).ok()?;
@@ -172,6 +175,13 @@ fn config_with_max_sessions(queue_capacity: usize, max_sessions: usize) -> Optio
     let lease = LeasePolicy::new(Duration::from_millis(100), Duration::from_millis(20)).ok()?;
     let timeout =
         SessionTimeoutPolicy::new(Duration::from_millis(1_000), Duration::from_millis(500)).ok()?;
+    let root = JOURNAL_ROOT
+        .get_or_init(|| tempfile::tempdir().ok())
+        .as_ref()?;
+    let journal_directory = root.path().join(LeaseId::new().to_string());
+    fs::create_dir(&journal_directory).ok()?;
+    let journal =
+        ActionJournalConfig::new(journal_directory, ActionJournalLimits::default()).ok()?;
     WorkerConfig::new(
         worker_id,
         7,
@@ -181,6 +191,7 @@ fn config_with_max_sessions(queue_capacity: usize, max_sessions: usize) -> Optio
         queue_capacity,
         lease,
         timeout,
+        journal,
     )
     .ok()
 }

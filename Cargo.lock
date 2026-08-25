@@ -408,6 +408,7 @@ dependencies = [
  "browserd-targets",
  "browserd-viewer",
  "serde_json",
+ "sha2",
  "tempfile",
  "uuid",
 ]

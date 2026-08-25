@@ -8,8 +8,8 @@ use std::time::Duration;
 use browserd_core::WorkerId;
 use browserd_session::{LeasePolicy, SessionTimeoutPolicy};
 use browserd_worker::{
-    AuthenticatedPeer, DurableWorkerEpoch, InternalEndpoint, UnavailableChromiumDriver,
-    UnavailableSandboxClient, WorkerConfig, WorkerControlPlane,
+    ActionJournalConfig, AuthenticatedPeer, DurableWorkerEpoch, InternalEndpoint,
+    UnavailableChromiumDriver, UnavailableSandboxClient, WorkerConfig, WorkerControlPlane,
 };
 
 fn main() -> ExitCode {
@@ -49,6 +49,11 @@ fn run() -> Result<(), String> {
     let timeout_policy =
         SessionTimeoutPolicy::new(Duration::from_secs(30 * 60), Duration::from_secs(10 * 60))
             .map_err(|_| "invalid session timeout policy".to_owned())?;
+    let action_journal_directory = env::var_os("BROWSERD_ACTION_JOURNAL_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| "BROWSERD_ACTION_JOURNAL_DIR is required".to_owned())?;
+    let action_journal = ActionJournalConfig::with_default_limits(action_journal_directory)
+        .map_err(|_| "action journal directory must be absolute".to_owned())?;
     let config = WorkerConfig::new(
         worker_id,
         worker_epoch,
@@ -58,6 +63,7 @@ fn run() -> Result<(), String> {
         128,
         lease_policy,
         timeout_policy,
+        action_journal,
     )
     .map_err(|_| "invalid worker configuration".to_owned())?;
     let worker = WorkerControlPlane::new(

@@ -6,15 +6,23 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use browserd_actions::{ActionKind, ResolutionAnnotation, ResolutionKind};
+use browserd_actions::{
+    AcceptDecision, ActionJournalLimits, ActionKind, ActionLedger, ActionLedgerError,
+    ActionRequest, ActionSequence, BrowserResult, CanonicalRequestHash as ActionRequestHash,
+    DispatchDecision, DispatchPermit, FileActionJournal, IdempotencyKey as ActionIdempotencyKey,
+    KnownFailureReason, LedgerSession, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
+    ResolutionOutcome, ResolutionPolicy, ResultDigest, TransportLoss,
+};
 use browserd_artifacts::{Artifact, ArtifactEvent, ArtifactKey, ArtifactState};
 use browserd_core::{
-    ActionId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
+    ActionId, ActionState, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId,
+    TenantId, WorkerId,
 };
 use browserd_features::{BuiltinFeature, FeatureRegistry};
 use browserd_fleet::WorkerEpochRegistry;
@@ -25,11 +33,12 @@ use browserd_policy::{ApprovalDecision, ApprovalState};
 use browserd_sandbox::CleanupReason;
 use browserd_session::{
     CleanupBackend, CleanupFailure, CleanupStage, ExpireDecision, LeasePolicy, OwnershipFence,
-    SessionError, SessionExecution, SessionLifecycle, SessionMachine, SessionSnapshot, SessionTime,
+    SessionError, SessionLifecycle, SessionMachine, SessionSnapshot, SessionTime,
     SessionTimeoutPolicy, TargetId,
 };
 use browserd_viewer::{TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,6 +60,7 @@ pub enum WorkerError {
     ArtifactNotFound,
     InvalidActionTransition,
     InvalidApprovalTransition,
+    DurabilityUnavailable,
     DependencyUnavailable,
     CleanupFailed,
 }
@@ -151,6 +161,49 @@ impl InternalEndpoint {
 }
 
 #[derive(Clone, Debug)]
+pub struct ActionJournalConfig {
+    directory: PathBuf,
+    limits: ActionJournalLimits,
+}
+
+impl ActionJournalConfig {
+    pub fn new(
+        directory: impl Into<PathBuf>,
+        limits: ActionJournalLimits,
+    ) -> Result<Self, WorkerError> {
+        let directory = directory.into();
+        let config = Self { directory, limits };
+        if !config.directory.is_absolute()
+            || config.directory.as_os_str().is_empty()
+            || !config.qualify()
+        {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        Ok(config)
+    }
+
+    pub fn with_default_limits(directory: impl Into<PathBuf>) -> Result<Self, WorkerError> {
+        Self::new(directory, ActionJournalLimits::default())
+    }
+
+    fn session_path(&self, session_id: &SessionId) -> PathBuf {
+        self.directory.join(format!("{session_id}.wal"))
+    }
+
+    fn qualify(&self) -> bool {
+        if self.limits.max_record_bytes() == 0
+            || self.limits.max_records() == 0
+            || self.limits.max_file_bytes() < 8
+        {
+            return false;
+        }
+        std::fs::symlink_metadata(&self.directory).is_ok_and(|metadata| {
+            metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.mode() & 0o022 == 0
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct WorkerConfig {
     worker_id: WorkerId,
     worker_epoch: u64,
@@ -160,6 +213,7 @@ pub struct WorkerConfig {
     action_queue_capacity: usize,
     lease_policy: LeasePolicy,
     timeout_policy: SessionTimeoutPolicy,
+    action_journal: ActionJournalConfig,
 }
 
 impl WorkerConfig {
@@ -173,6 +227,7 @@ impl WorkerConfig {
         action_queue_capacity: usize,
         lease_policy: LeasePolicy,
         timeout_policy: SessionTimeoutPolicy,
+        action_journal: ActionJournalConfig,
     ) -> Result<Self, WorkerError> {
         if worker_epoch == 0 || max_sessions == 0 || action_queue_capacity == 0 {
             return Err(WorkerError::InvalidConfiguration);
@@ -186,6 +241,7 @@ impl WorkerConfig {
             action_queue_capacity,
             lease_policy,
             timeout_policy,
+            action_journal,
         })
     }
 
@@ -235,6 +291,7 @@ pub enum ActionStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerActionSnapshot {
     pub action_id: ActionId,
+    pub action_sequence: ActionSequence,
     pub status: ActionStatus,
     pub kind: ActionKind,
     pub feature: Option<BuiltinFeature>,
@@ -270,6 +327,7 @@ struct ActionRecord {
     page_id: Option<PageId>,
     payload: Vec<u8>,
     approval_id: Option<ApprovalId>,
+    dispatch_permit: Option<DispatchPermit>,
 }
 
 struct ArtifactRecord {
@@ -281,6 +339,25 @@ struct ArtifactRecord {
 struct ApprovalRecord {
     action_id: ActionId,
     state: ApprovalState,
+}
+
+struct SessionJournalGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for SessionJournalGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if std::fs::remove_file(&self.path).is_ok()
+            && let Some(parent) = self.path.parent()
+            && let Ok(directory) = File::open(parent)
+        {
+            let _ = directory.sync_all();
+        }
+    }
 }
 
 struct SessionState {
@@ -295,6 +372,8 @@ struct SessionState {
     action_queue: VecDeque<ActionId>,
     artifacts: HashMap<ArtifactId, ArtifactRecord>,
     approvals: HashMap<ApprovalId, ApprovalRecord>,
+    action_ledger: ActionLedger<FileActionJournal>,
+    durability_degraded: bool,
 }
 
 struct SessionExecutor {
@@ -360,6 +439,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         };
         !state.draining
             && !state.stopped
+            && state.sessions.values().all(|executor| {
+                executor
+                    .state
+                    .lock()
+                    .is_ok_and(|session| !session.durability_degraded)
+            })
+            && self.config.action_journal.qualify()
             && self.driver.qualify().is_ok()
             && self.sandbox.qualify().is_ok()
     }
@@ -442,6 +528,22 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 command.placement_version,
                 command.session_incarnation,
             );
+            let journal_path = self.config.action_journal.session_path(&session_id);
+            let journal =
+                FileActionJournal::create_new(&journal_path, self.config.action_journal.limits)
+                    .map_err(|_| WorkerError::DurabilityUnavailable)?;
+            let mut journal_guard = SessionJournalGuard {
+                path: journal_path,
+                committed: false,
+            };
+            let action_ledger = ActionLedger::new(
+                LedgerSession::new(
+                    command.tenant_id.clone(),
+                    session_id.clone(),
+                    fence.as_placement_fence(),
+                ),
+                Arc::new(journal),
+            );
             let (mut machine, _) = SessionMachine::create_with_timeouts(
                 session_id.clone(),
                 fence.clone(),
@@ -492,10 +594,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         action_queue: VecDeque::new(),
                         artifacts: HashMap::new(),
                         approvals: HashMap::new(),
+                        action_ledger,
+                        durability_degraded: false,
                     }),
                     action_owner: AtomicBool::new(false),
                 }),
             );
+            journal_guard.committed = true;
             Ok(CreateSessionOutcome {
                 operation_id: operation_id.clone(),
                 session_id,
@@ -548,8 +653,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .machine
             .begin_close(fence, now)
             .map_err(map_session_error)?;
+        let terminalization = terminalize_actions_for_shutdown(&mut session);
         if lifecycle != SessionLifecycle::Closed {
-            terminalize_actions_for_shutdown(&mut session);
             let mut cleanup = WorkerCleanup {
                 driver: &*self.driver,
                 sandbox: &*self.sandbox,
@@ -562,6 +667,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .map_err(|_| WorkerError::CleanupFailed)?;
             session.occupies_capacity = false;
         }
+        terminalization?;
         Ok(session.machine.snapshot())
     }
 
@@ -574,6 +680,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     ) -> Result<PageId, WorkerError> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
+        let _owner = ActionOwner::claim(&executor.action_owner)?;
         let mut session = executor
             .state
             .lock()
@@ -605,6 +712,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     ) -> Result<(), WorkerError> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
+        let _owner = ActionOwner::claim(&executor.action_owner)?;
         let mut session = executor
             .state
             .lock()
@@ -632,6 +740,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     ) -> Result<(), WorkerError> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
+        let _owner = ActionOwner::claim(&executor.action_owner)?;
         let mut session = executor
             .state
             .lock()
@@ -725,12 +834,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 Err(WorkerError::IdempotencyConflict)
             };
         }
-        let pending = session
-            .actions
-            .values()
-            .filter(|action| action.snapshot.status == ActionStatus::PendingApproval)
-            .count();
-        if session.action_queue.len().saturating_add(pending) >= self.config.action_queue_capacity {
+        if session.action_queue.len() >= self.config.action_queue_capacity {
             return Err(WorkerError::QueueFull);
         }
         if let Some(page_id) = &page_id
@@ -742,7 +846,85 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .machine
             .record_activity(fence, now)
             .map_err(map_session_error)?;
-        let action_id = ActionId::new();
+        let ledger_fence = fence.as_placement_fence();
+        let request = ActionRequest::new(
+            ActionIdempotencyKey::new(idempotency_key),
+            ActionRequestHash::new(request_hash),
+            kind,
+        );
+        let acceptance = session
+            .action_ledger
+            .accept(ledger_fence, request)
+            .map_err(map_action_ledger_error)?;
+        let action_id = acceptance.snapshot().action_id().clone();
+        let action_sequence = acceptance.snapshot().action_sequence();
+        if matches!(acceptance, AcceptDecision::Existing(_))
+            && session.actions.contains_key(&action_id)
+        {
+            return Ok(action_id);
+        }
+        let progression = (|| {
+            let mut durable_state = acceptance.snapshot().state();
+            if durable_state == ActionState::Accepted {
+                durable_state = session
+                    .action_ledger
+                    .enqueue(ledger_fence, &action_id)?
+                    .state();
+            }
+            if durable_state == ActionState::Queued {
+                durable_state = if requires_approval {
+                    session
+                        .action_ledger
+                        .require_approval(ledger_fence, &action_id)
+                } else {
+                    session.action_ledger.mark_ready(ledger_fence, &action_id)
+                }?
+                .state();
+            }
+            Ok::<_, ActionLedgerError>(durable_state)
+        })();
+        let durable_state = match progression {
+            Ok(state) => state,
+            Err(error) => {
+                if let Err(compensation_error) = session
+                    .action_ledger
+                    .cancel_before_dispatch(ledger_fence, &action_id)
+                {
+                    return Err(map_action_ledger_error(compensation_error));
+                }
+                session.action_idempotency.insert(
+                    idempotency_key.to_owned(),
+                    (request_hash, action_id.clone()),
+                );
+                session.actions.insert(
+                    action_id.clone(),
+                    ActionRecord {
+                        snapshot: WorkerActionSnapshot {
+                            action_id,
+                            action_sequence,
+                            status: ActionStatus::CancelledBeforeDispatch,
+                            kind,
+                            feature,
+                            result: None,
+                            resolution: None,
+                        },
+                        page_id,
+                        payload,
+                        approval_id: None,
+                        dispatch_permit: None,
+                    },
+                );
+                return Err(map_action_ledger_error(error));
+            }
+        };
+        let expected_state = if requires_approval {
+            ActionState::PendingApproval
+        } else {
+            ActionState::ReadyToDispatch
+        };
+        if durable_state != expected_state {
+            return Err(WorkerError::InvalidActionTransition);
+        }
         let status = if requires_approval {
             ActionStatus::PendingApproval
         } else {
@@ -758,6 +940,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             ActionRecord {
                 snapshot: WorkerActionSnapshot {
                     action_id: action_id.clone(),
+                    action_sequence,
                     status,
                     kind,
                     feature,
@@ -767,6 +950,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 page_id,
                 payload,
                 approval_id: approval_id.clone(),
+                dispatch_permit: None,
             },
         );
         if let Some(approval_id) = approval_id {
@@ -777,9 +961,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     state: ApprovalState::Pending,
                 },
             );
-        } else {
-            session.action_queue.push_back(action_id.clone());
         }
+        session.action_queue.push_back(action_id.clone());
         Ok(action_id)
     }
 
@@ -813,8 +996,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     ) -> Result<Option<WorkerActionSnapshot>, WorkerError> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
-        let owner = ActionOwner::claim(&executor.action_owner)?;
-        let (action_id, page_id, payload) = {
+        let _owner = ActionOwner::claim(&executor.action_owner)?;
+        let (action_id, page_id, payload, permit) = {
             let mut session = executor
                 .state
                 .lock()
@@ -823,6 +1006,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             let Some(action_id) = session.action_queue.front().cloned() else {
                 return Ok(None);
             };
+            if session
+                .actions
+                .get(&action_id)
+                .is_some_and(|action| action.snapshot.status == ActionStatus::PendingApproval)
+            {
+                return Ok(None);
+            }
             let (page_id, payload) = session
                 .actions
                 .get(&action_id)
@@ -833,6 +1023,26 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .machine
                 .begin_action(fence, action_id.clone(), now)
                 .map_err(map_session_error)?;
+            let permit = match session
+                .action_ledger
+                .prepare_dispatch(fence.as_placement_fence(), &action_id)
+            {
+                Ok(DispatchDecision::Dispatch(permit)) => permit,
+                Ok(DispatchDecision::DoNotReplay(_)) => {
+                    session
+                        .machine
+                        .finish_action(fence, &action_id, now)
+                        .map_err(map_session_error)?;
+                    return Err(WorkerError::InvalidActionTransition);
+                }
+                Err(error) => {
+                    session
+                        .machine
+                        .finish_action(fence, &action_id, now)
+                        .map_err(map_session_error)?;
+                    return Err(map_action_ledger_error(error));
+                }
+            };
             if session.action_queue.pop_front().as_ref() != Some(&action_id) {
                 return Err(WorkerError::StateUnavailable);
             }
@@ -841,7 +1051,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .get_mut(&action_id)
                 .ok_or(WorkerError::ActionNotFound)?;
             action.snapshot.status = ActionStatus::Running;
-            (action_id, page_id, payload)
+            action.dispatch_permit = Some(permit.clone());
+            (action_id, page_id, payload, permit)
         };
         let outcome = self
             .driver
@@ -851,12 +1062,69 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
+        if !session
+            .actions
+            .get(&action_id)
+            .is_some_and(|action| action.snapshot.status == ActionStatus::Running)
+        {
+            return Err(WorkerError::InvalidActionTransition);
+        }
+        let completion_now = now.max(session.machine.last_observed_at());
+        let mut completed_machine = session.machine.clone();
+        match &outcome {
+            ActionExecutionResult::Succeeded(_) | ActionExecutionResult::FailedKnown(_) => {
+                completed_machine
+                    .finish_action(fence, &action_id, completion_now)
+                    .map_err(map_session_error)?;
+            }
+            ActionExecutionResult::OutcomeUnknown => {
+                completed_machine
+                    .mark_action_outcome_unknown(fence, &action_id, completion_now)
+                    .map_err(map_session_error)?;
+            }
+        }
+        let durable_result = match &outcome {
+            ActionExecutionResult::Succeeded(result) => {
+                let digest = Sha256::digest(result);
+                session.action_ledger.record_result(
+                    fence.as_placement_fence(),
+                    &permit,
+                    BrowserResult::Succeeded(ResultDigest::new(digest.into())),
+                )
+            }
+            ActionExecutionResult::FailedKnown(_) => session.action_ledger.record_result(
+                fence.as_placement_fence(),
+                &permit,
+                BrowserResult::FailedKnown(KnownFailureReason::BrowserRejected),
+            ),
+            ActionExecutionResult::OutcomeUnknown => session.action_ledger.record_transport_loss(
+                fence.as_placement_fence(),
+                &permit,
+                TransportLoss::Ambiguous(OutcomeUnknownReason::AmbiguousTransportLoss),
+            ),
+        };
+        if let Err(error) = durable_result {
+            session.durability_degraded = true;
+            let still_running = session
+                .actions
+                .get(&action_id)
+                .is_some_and(|action| action.snapshot.status == ActionStatus::Running);
+            if still_running {
+                let _ =
+                    session
+                        .machine
+                        .mark_action_outcome_unknown(fence, &action_id, completion_now);
+            }
+            if let Some(action) = session.actions.get_mut(&action_id)
+                && still_running
+            {
+                action.snapshot.status = ActionStatus::OutcomeUnknown;
+            }
+            return Err(map_action_ledger_error(error));
+        }
+        session.machine = completed_machine;
         match outcome {
             ActionExecutionResult::Succeeded(result) => {
-                session
-                    .machine
-                    .finish_action(fence, &action_id, now)
-                    .map_err(map_session_error)?;
                 let action = session
                     .actions
                     .get_mut(&action_id)
@@ -865,10 +1133,6 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 action.snapshot.result = Some(result);
             }
             ActionExecutionResult::FailedKnown(reason) => {
-                session
-                    .machine
-                    .finish_action(fence, &action_id, now)
-                    .map_err(map_session_error)?;
                 let action = session
                     .actions
                     .get_mut(&action_id)
@@ -877,10 +1141,6 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 action.snapshot.result = Some(reason.into_bytes());
             }
             ActionExecutionResult::OutcomeUnknown => {
-                session
-                    .machine
-                    .mark_action_outcome_unknown(fence, &action_id, now)
-                    .map_err(map_session_error)?;
                 let action = session
                     .actions
                     .get_mut(&action_id)
@@ -888,13 +1148,12 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 action.snapshot.status = ActionStatus::OutcomeUnknown;
             }
         }
-        let snapshot = session
+        session
             .actions
             .get(&action_id)
             .map(|action| action.snapshot.clone())
-            .ok_or(WorkerError::ActionNotFound)?;
-        drop(owner);
-        Ok(Some(snapshot))
+            .ok_or(WorkerError::ActionNotFound)
+            .map(Some)
     }
 
     pub fn cancel_action(
@@ -918,20 +1177,37 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .map(|action| action.snapshot.status)
             .ok_or(WorkerError::ActionNotFound)?;
         match status {
-            ActionStatus::Queued => {
-                session.action_queue.retain(|queued| queued != action_id);
-                session
-                    .machine
+            ActionStatus::PendingApproval | ActionStatus::Queued => {
+                let mut next_machine = session.machine.clone();
+                next_machine
                     .record_activity(fence, now)
                     .map_err(map_session_error)?;
+                session
+                    .action_ledger
+                    .cancel_before_dispatch(fence.as_placement_fence(), action_id)
+                    .map_err(map_action_ledger_error)?;
+                session.machine = next_machine;
+                session.action_queue.retain(|queued| queued != action_id);
                 let action = session
                     .actions
                     .get_mut(action_id)
                     .ok_or(WorkerError::ActionNotFound)?;
                 action.snapshot.status = ActionStatus::CancelledBeforeDispatch;
-                Ok(action.snapshot.clone())
+                let approval_id = action.approval_id.clone();
+                let snapshot = action.snapshot.clone();
+                if let Some(approval_id) = approval_id
+                    && let Some(approval) = session.approvals.get_mut(&approval_id)
+                {
+                    approval.state = ApprovalState::Expired;
+                }
+                Ok(snapshot)
             }
             ActionStatus::Running => {
+                let completion_now = now.max(session.machine.last_observed_at());
+                let mut completed_machine = session.machine.clone();
+                completed_machine
+                    .finish_action(fence, action_id, completion_now)
+                    .map_err(map_session_error)?;
                 let confirmed = self
                     .driver
                     .cancel_action(session_id, action_id)
@@ -939,10 +1215,28 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 if !confirmed {
                     return Err(WorkerError::InvalidActionTransition);
                 }
-                session
-                    .machine
-                    .finish_action(fence, action_id, now)
-                    .map_err(map_session_error)?;
+                let permit = session
+                    .actions
+                    .get(action_id)
+                    .and_then(|action| action.dispatch_permit.clone())
+                    .ok_or(WorkerError::StateUnavailable)?;
+                if let Err(error) = session.action_ledger.record_result(
+                    fence.as_placement_fence(),
+                    &permit,
+                    BrowserResult::CancellationConfirmed,
+                ) {
+                    session.durability_degraded = true;
+                    let _ = session.machine.mark_action_outcome_unknown(
+                        fence,
+                        action_id,
+                        completion_now,
+                    );
+                    if let Some(action) = session.actions.get_mut(action_id) {
+                        action.snapshot.status = ActionStatus::OutcomeUnknown;
+                    }
+                    return Err(map_action_ledger_error(error));
+                }
+                session.machine = completed_machine;
                 let action = session
                     .actions
                     .get_mut(action_id)
@@ -997,20 +1291,33 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         if action.snapshot.status != ActionStatus::OutcomeUnknown {
             return Err(WorkerError::InvalidActionTransition);
         }
-        session
-            .machine
+        let annotation = ResolutionAnnotation::new(resolution, resolved_by, now.get(), basis);
+        let mut next_machine = session.machine.clone();
+        next_machine
             .resolve_action(fence, action_id, now)
             .map_err(map_session_error)?;
+        let durable_resolution = session
+            .action_ledger
+            .resolve(
+                fence.as_placement_fence(),
+                action_id,
+                annotation.clone(),
+                ResolutionPolicy::new(true),
+            )
+            .map_err(map_action_ledger_error)?;
+        let durable_annotation = match durable_resolution {
+            ResolutionOutcome::Recorded(snapshot)
+            | ResolutionOutcome::AlreadyRecorded(snapshot) => snapshot
+                .resolution()
+                .cloned()
+                .ok_or(WorkerError::StateUnavailable)?,
+        };
+        session.machine = next_machine;
         let action = session
             .actions
             .get_mut(action_id)
             .ok_or(WorkerError::ActionNotFound)?;
-        action.snapshot.resolution = Some(ResolutionAnnotation::new(
-            resolution,
-            resolved_by,
-            now.get(),
-            basis,
-        ));
+        action.snapshot.resolution = Some(durable_annotation);
         Ok(action.snapshot.clone())
     }
 
@@ -1145,7 +1452,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         }
         let state = match decision {
             ApprovalDecision::Approve => {
-                session.action_queue.push_back(action_id.clone());
+                session
+                    .action_ledger
+                    .grant_approval(fence.as_placement_fence(), &action_id)
+                    .map_err(map_action_ledger_error)?;
                 let action = session
                     .actions
                     .get_mut(&action_id)
@@ -1154,6 +1464,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ApprovalState::Approved { by: principal_id }
             }
             ApprovalDecision::Deny => {
+                session
+                    .action_ledger
+                    .deny_approval(fence.as_placement_fence(), &action_id)
+                    .map_err(map_action_ledger_error)?;
+                session.action_queue.retain(|queued| queued != &action_id);
                 let action = session
                     .actions
                     .get_mut(&action_id)
@@ -1246,6 +1561,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         let mut expired = 0usize;
         let mut ownership_lost = false;
         let mut cleanup_failed = false;
+        let mut durability_failed = false;
         for executor in sessions {
             let mut session = executor
                 .state
@@ -1265,7 +1581,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             {
                 ExpireDecision::NotDue { .. } => {}
                 ExpireDecision::BeganExpiring => {
-                    terminalize_actions_for_shutdown(&mut session);
+                    if terminalize_actions_for_shutdown(&mut session).is_err() {
+                        durability_failed = true;
+                    }
                     let session_id = session.machine.session_id().clone();
                     let mut cleanup = WorkerCleanup {
                         driver: &*self.driver,
@@ -1286,7 +1604,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 }
                 ExpireDecision::OwnershipLost => {
                     ownership_lost = true;
-                    terminalize_actions_for_shutdown(&mut session);
+                    if terminalize_actions_for_shutdown(&mut session).is_err() {
+                        durability_failed = true;
+                    }
                     let session_id = session.machine.session_id().clone();
                     match self
                         .sandbox
@@ -1308,6 +1628,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         refresh_heartbeat_deadline(&mut worker)?;
         if cleanup_failed {
             Err(WorkerError::CleanupFailed)
+        } else if durability_failed {
+            Err(WorkerError::DurabilityUnavailable)
         } else {
             Ok(expired)
         }
@@ -1451,32 +1773,102 @@ fn validate_fence(session: &SessionState, fence: &OwnershipFence) -> Result<(), 
     }
 }
 
-fn terminalize_actions_for_shutdown(session: &mut SessionState) {
-    if let SessionExecution::ReconciliationRequired(action_id) =
-        session.machine.snapshot().execution
-        && let Some(action) = session.actions.get_mut(&action_id)
-        && action.snapshot.status == ActionStatus::Running
-    {
-        action.snapshot.status = ActionStatus::OutcomeUnknown;
-    }
-    let queued = session.action_queue.drain(..).collect::<Vec<_>>();
-    for action_id in queued {
-        if let Some(action) = session.actions.get_mut(&action_id)
-            && action.snapshot.status == ActionStatus::Queued
+fn terminalize_actions_for_shutdown(session: &mut SessionState) -> Result<(), WorkerError> {
+    let fence = session.machine.snapshot().owner_fence.as_placement_fence();
+    let mut first_error = None;
+    let uncertain = session
+        .actions
+        .iter()
+        .filter(|(_, action)| {
+            action.dispatch_permit.is_some()
+                && matches!(
+                    action.snapshot.status,
+                    ActionStatus::Running | ActionStatus::OutcomeUnknown
+                )
+        })
+        .map(|(action_id, action)| {
+            (
+                action_id.clone(),
+                action
+                    .dispatch_permit
+                    .clone()
+                    .ok_or(WorkerError::StateUnavailable),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (action_id, permit) in uncertain {
+        let transition = permit.and_then(|permit| {
+            let snapshot = session
+                .action_ledger
+                .snapshot(fence, &action_id)
+                .map_err(map_action_ledger_error)?;
+            if snapshot.state() == ActionState::MayHaveExecuted {
+                session
+                    .action_ledger
+                    .record_transport_loss(
+                        fence,
+                        &permit,
+                        TransportLoss::Ambiguous(OutcomeUnknownReason::WorkerLost),
+                    )
+                    .map(|_| ())
+                    .map_err(map_action_ledger_error)
+            } else if snapshot.state().is_terminal() {
+                Ok(())
+            } else {
+                Err(WorkerError::StateUnavailable)
+            }
+        });
+        if let Err(error) = transition
+            && first_error.is_none()
         {
-            action.snapshot.status = ActionStatus::CancelledBeforeDispatch;
+            first_error = Some(error);
+        }
+        if let Some(action) = session.actions.get_mut(&action_id) {
+            action.snapshot.status = ActionStatus::OutcomeUnknown;
         }
     }
-    for action in session.actions.values_mut() {
-        if action.snapshot.status == ActionStatus::PendingApproval {
-            action.snapshot.status = ActionStatus::FailedKnown;
+    let queued = session.action_queue.iter().cloned().collect::<Vec<_>>();
+    let mut terminalized = BTreeSet::new();
+    for action_id in queued {
+        let status = session
+            .actions
+            .get(&action_id)
+            .map(|action| action.snapshot.status);
+        let transition = match status {
+            Some(ActionStatus::Queued) => session
+                .action_ledger
+                .cancel_before_dispatch(fence, &action_id),
+            Some(ActionStatus::PendingApproval) => {
+                session.action_ledger.expire_approval(fence, &action_id)
+            }
+            _ => continue,
+        };
+        match transition {
+            Ok(_) => {
+                terminalized.insert(action_id.clone());
+                if let Some(action) = session.actions.get_mut(&action_id) {
+                    action.snapshot.status = match status {
+                        Some(ActionStatus::PendingApproval) => ActionStatus::FailedKnown,
+                        _ => ActionStatus::CancelledBeforeDispatch,
+                    };
+                }
+            }
+            Err(error) if first_error.is_none() => {
+                first_error = Some(map_action_ledger_error(error));
+            }
+            Err(_) => {}
         }
     }
+    session
+        .action_queue
+        .retain(|action_id| !terminalized.contains(action_id));
     for approval in session.approvals.values_mut() {
-        if approval.state == ApprovalState::Pending {
+        if approval.state == ApprovalState::Pending && terminalized.contains(&approval.action_id) {
             approval.state = ApprovalState::Expired;
         }
     }
+    session.durability_degraded = first_error.is_some();
+    first_error.map_or(Ok(()), Err)
 }
 
 fn refresh_heartbeat_deadline(worker: &mut WorkerState) -> Result<(), WorkerError> {
@@ -1507,6 +1899,22 @@ fn map_session_error(error: SessionError) -> WorkerError {
         | SessionError::PlacementVersionMismatch { .. }
         | SessionError::SessionIncarnationMismatch { .. } => WorkerError::StaleFence,
         SessionError::StateUnavailable => WorkerError::StateUnavailable,
+        _ => WorkerError::InvalidActionTransition,
+    }
+}
+
+fn map_action_ledger_error(error: ActionLedgerError) -> WorkerError {
+    match error {
+        ActionLedgerError::JournalUnavailable(_) | ActionLedgerError::RecoveryInvalid(_) => {
+            WorkerError::DurabilityUnavailable
+        }
+        ActionLedgerError::StateUnavailable => WorkerError::StateUnavailable,
+        ActionLedgerError::StaleFence { .. } => WorkerError::StaleFence,
+        ActionLedgerError::IdempotencyConflict { .. } => WorkerError::IdempotencyConflict,
+        ActionLedgerError::ActionNotFound => WorkerError::ActionNotFound,
+        ActionLedgerError::ApprovalDecisionConflict { .. } => {
+            WorkerError::InvalidApprovalTransition
+        }
         _ => WorkerError::InvalidActionTransition,
     }
 }

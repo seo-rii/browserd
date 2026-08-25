@@ -426,6 +426,10 @@ impl SessionMachine {
         self.lease_expires_at
     }
 
+    pub const fn last_observed_at(&self) -> SessionTime {
+        self.last_observed_at
+    }
+
     pub const fn accepting_targets(&self) -> bool {
         self.accepting_targets
     }
