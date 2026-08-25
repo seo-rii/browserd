@@ -76,15 +76,35 @@ pub struct FileActionJournal {
     state: Mutex<FileJournalState>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileOpenMode {
+    OpenOrCreate,
+    CreateNew,
+}
+
 impl FileActionJournal {
     pub fn open(path: impl AsRef<Path>, limits: ActionJournalLimits) -> Result<Self, JournalError> {
+        Self::open_with_mode(path.as_ref(), limits, FileOpenMode::OpenOrCreate)
+    }
+
+    pub fn create_new(
+        path: impl AsRef<Path>,
+        limits: ActionJournalLimits,
+    ) -> Result<Self, JournalError> {
+        Self::open_with_mode(path.as_ref(), limits, FileOpenMode::CreateNew)
+    }
+
+    fn open_with_mode(
+        path: &Path,
+        limits: ActionJournalLimits,
+        mode: FileOpenMode,
+    ) -> Result<Self, JournalError> {
         if limits.max_record_bytes == 0
             || limits.max_records == 0
             || limits.max_file_bytes < FILE_HEADER.len()
         {
             return Err(JournalError::new("action journal limits are invalid"));
         }
-        let path = path.as_ref();
         if path.file_name().is_none() {
             return Err(JournalError::new("action journal path has no file name"));
         }
@@ -167,6 +187,11 @@ impl FileActionJournal {
         let (mut file, created) = match open_file(true) {
             Ok(file) => (file, true),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if mode == FileOpenMode::CreateNew {
+                    return Err(JournalError::new(format!(
+                        "action journal already exists: {error}"
+                    )));
+                }
                 let file = open_file(false).map_err(|open_error| {
                     JournalError::new(format!(
                         "action journal cannot be opened safely: {open_error}"
