@@ -1,0 +1,18 @@
+[package]
+name = "browserd-artifacts"
+description = "Session-scoped artifact state, quotas, streaming, and cleanup for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+browserd-core = { path = "../browserd-core" }
+bytes.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
