@@ -9,6 +9,12 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::codec::{Decoder, Encoder};
 
+mod transport;
+
+pub use transport::{
+    CdpClient, CdpCommandError, CdpDriver, CdpTransport, CdpTransportConfig, CdpTransportError,
+};
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CdpCommand {
@@ -258,6 +264,10 @@ impl PendingRegistry {
             self.late_responses = self.late_responses.saturating_add(1);
             ResolveOutcome::LateOrDuplicate
         }
+    }
+
+    pub fn abandon(&mut self, id: u64) -> Option<PendingCommand> {
+        self.pending.remove(&id)
     }
 
     pub fn close(&mut self) -> Vec<PendingCommand> {
