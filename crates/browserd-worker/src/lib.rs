@@ -213,6 +213,7 @@ pub struct WorkerConfig {
     action_queue_capacity: usize,
     lease_policy: LeasePolicy,
     timeout_policy: SessionTimeoutPolicy,
+    approval_timeout_millis: u64,
     action_journal: ActionJournalConfig,
 }
 
@@ -227,9 +228,16 @@ impl WorkerConfig {
         action_queue_capacity: usize,
         lease_policy: LeasePolicy,
         timeout_policy: SessionTimeoutPolicy,
+        approval_timeout: Duration,
         action_journal: ActionJournalConfig,
     ) -> Result<Self, WorkerError> {
-        if worker_epoch == 0 || max_sessions == 0 || action_queue_capacity == 0 {
+        let approval_timeout_millis = u64::try_from(approval_timeout.as_millis())
+            .map_err(|_| WorkerError::InvalidConfiguration)?;
+        if worker_epoch == 0
+            || max_sessions == 0
+            || action_queue_capacity == 0
+            || approval_timeout_millis == 0
+        {
             return Err(WorkerError::InvalidConfiguration);
         }
         Ok(Self {
@@ -241,6 +249,7 @@ impl WorkerConfig {
             action_queue_capacity,
             lease_policy,
             timeout_policy,
+            approval_timeout_millis,
             action_journal,
         })
     }
@@ -339,6 +348,7 @@ struct ArtifactRecord {
 struct ApprovalRecord {
     action_id: ActionId,
     state: ApprovalState,
+    expires_at: SessionTime,
 }
 
 struct SessionJournalGuard {
@@ -842,6 +852,15 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         {
             return Err(WorkerError::PageNotFound);
         }
+        let approval_expires_at = if requires_approval {
+            Some(SessionTime::new(
+                now.get()
+                    .checked_add(self.config.approval_timeout_millis)
+                    .ok_or(WorkerError::InvalidConfiguration)?,
+            ))
+        } else {
+            None
+        };
         session
             .machine
             .record_activity(fence, now)
@@ -959,6 +978,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ApprovalRecord {
                     action_id: action_id.clone(),
                     state: ApprovalState::Pending,
+                    expires_at: approval_expires_at.ok_or(WorkerError::StateUnavailable)?,
                 },
             );
         }
@@ -1433,10 +1453,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
-        session
-            .machine
-            .record_activity(fence, now)
-            .map_err(map_session_error)?;
+        expire_pending_approvals(&mut session, fence, now)?;
         let action_id = session
             .approvals
             .get(approval_id)
@@ -1450,6 +1467,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         if current != ApprovalState::Pending {
             return Err(WorkerError::InvalidApprovalTransition);
         }
+        let mut next_machine = session.machine.clone();
+        next_machine
+            .record_activity(fence, now)
+            .map_err(map_session_error)?;
         let state = match decision {
             ApprovalDecision::Approve => {
                 session
@@ -1477,6 +1498,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ApprovalState::Denied { by: principal_id }
             }
         };
+        session.machine = next_machine;
         let approval = session
             .approvals
             .get_mut(approval_id)
@@ -1574,6 +1596,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 continue;
             }
             let fence = session.machine.snapshot().owner_fence;
+            if expire_pending_approvals(&mut session, &fence, now).is_err() {
+                durability_failed = true;
+            }
             match session
                 .machine
                 .expire_due(&fence, now)
@@ -1771,6 +1796,52 @@ fn validate_fence(session: &SessionState, fence: &OwnershipFence) -> Result<(), 
     } else {
         Err(WorkerError::StaleFence)
     }
+}
+
+fn expire_pending_approvals(
+    session: &mut SessionState,
+    fence: &OwnershipFence,
+    now: SessionTime,
+) -> Result<usize, WorkerError> {
+    let due = session
+        .approvals
+        .iter()
+        .filter(|(_, approval)| {
+            approval.state == ApprovalState::Pending && now >= approval.expires_at
+        })
+        .map(|(approval_id, approval)| (approval_id.clone(), approval.action_id.clone()))
+        .collect::<Vec<_>>();
+    for (_, action_id) in &due {
+        if !session
+            .actions
+            .get(action_id)
+            .is_some_and(|action| action.snapshot.status == ActionStatus::PendingApproval)
+        {
+            return Err(WorkerError::StateUnavailable);
+        }
+    }
+    for (approval_id, action_id) in &due {
+        if let Err(error) = session
+            .action_ledger
+            .expire_approval(fence.as_placement_fence(), action_id)
+        {
+            session.durability_degraded = true;
+            return Err(map_action_ledger_error(error));
+        }
+        session.action_queue.retain(|queued| queued != action_id);
+        session
+            .actions
+            .get_mut(action_id)
+            .ok_or(WorkerError::StateUnavailable)?
+            .snapshot
+            .status = ActionStatus::FailedKnown;
+        session
+            .approvals
+            .get_mut(approval_id)
+            .ok_or(WorkerError::StateUnavailable)?
+            .state = ApprovalState::Expired;
+    }
+    Ok(due.len())
 }
 
 fn terminalize_actions_for_shutdown(session: &mut SessionState) -> Result<(), WorkerError> {

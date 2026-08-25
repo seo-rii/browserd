@@ -191,6 +191,7 @@ fn config_with_max_sessions(queue_capacity: usize, max_sessions: usize) -> Optio
         queue_capacity,
         lease,
         timeout,
+        Duration::from_millis(100),
         journal,
     )
     .ok()

@@ -63,6 +63,7 @@ fn run() -> Result<(), String> {
         128,
         lease_policy,
         timeout_policy,
+        Duration::from_secs(5 * 60),
         action_journal,
     )
     .map_err(|_| "invalid worker configuration".to_owned())?;

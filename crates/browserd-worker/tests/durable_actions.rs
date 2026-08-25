@@ -180,6 +180,7 @@ fn worker(
             .expect("lease policy should be valid"),
         SessionTimeoutPolicy::new(Duration::from_secs(60), Duration::from_secs(30))
             .expect("timeout policy should be valid"),
+        Duration::from_millis(5),
         journal,
     )
     .expect("worker configuration should be valid");
@@ -314,7 +315,7 @@ fn failed_dispatch_intent_never_calls_the_browser_driver() {
     assert_eq!(driver.executions.load(Ordering::Acquire), 0);
     assert_eq!(
         worker
-            .get_action(&peer, &session.session_id, &action_id, &session.fence,)
+            .get_action(&peer, &session.session_id, &action_id, &session.fence)
             .expect("action should remain queryable")
             .status,
         browserd_worker::ActionStatus::Queued
@@ -358,7 +359,7 @@ fn partial_submission_is_compensated_and_remains_idempotently_queryable() {
     let action_id = submit().expect("retry should return the durably compensated action");
     assert_eq!(
         worker
-            .get_action(&peer, &session.session_id, &action_id, &session.fence,)
+            .get_action(&peer, &session.session_id, &action_id, &session.fence)
             .expect("compensated action should remain queryable")
             .status,
         browserd_worker::ActionStatus::CancelledBeforeDispatch
@@ -436,6 +437,46 @@ fn pending_approval_at_queue_head_blocks_later_sequence() {
             .expect("payload lock should work")
             .as_slice(),
         [b"first".to_vec(), b"second".to_vec()]
+    );
+}
+
+#[test]
+fn pending_approval_expires_on_its_own_deadline_without_dispatch() {
+    let (worker, peer, driver, _sandbox, _journal_root) = worker(64, 8);
+    let session = create_session(&worker, &peer);
+    let action_id = submit(&worker, &peer, &session, "approval-timeout", b"click", true);
+    let approval_id = worker
+        .approval_for_action(&peer, &session.session_id, &action_id, &session.fence)
+        .expect("approval should exist");
+
+    assert_eq!(worker.expire_due(&peer, SessionTime::new(5)), Ok(0));
+    assert_eq!(
+        worker
+            .get_action(&peer, &session.session_id, &action_id, &session.fence,)
+            .expect("pending action should remain queryable")
+            .status,
+        browserd_worker::ActionStatus::PendingApproval
+    );
+    assert_eq!(worker.expire_due(&peer, SessionTime::new(6)), Ok(0));
+    assert_eq!(
+        worker
+            .get_action(&peer, &session.session_id, &action_id, &session.fence,)
+            .expect("expired action should remain queryable")
+            .status,
+        browserd_worker::ActionStatus::FailedKnown
+    );
+    assert_eq!(driver.executions.load(Ordering::Acquire), 0);
+    assert_eq!(
+        worker.decide_approval(
+            &peer,
+            &session.session_id,
+            &approval_id,
+            &session.fence,
+            ApprovalDecision::Approve,
+            PrincipalId::new(),
+            SessionTime::new(7),
+        ),
+        Err(WorkerError::InvalidApprovalTransition)
     );
 }
 
