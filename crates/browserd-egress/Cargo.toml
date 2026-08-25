@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+browserd-core = { path = "../browserd-core" }
 url.workspace = true
 
 [lints]
