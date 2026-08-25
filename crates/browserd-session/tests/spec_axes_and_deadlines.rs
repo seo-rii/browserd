@@ -145,10 +145,8 @@ fn idle_and_absolute_ttl_expiry_are_distinguished() {
 #[test]
 fn timeout_expiry_marks_a_dispatched_action_for_reconciliation() {
     let lease = LeasePolicy::new(Duration::from_millis(500), Duration::from_millis(10));
-    let timeouts = SessionTimeoutPolicy::new(
-        Duration::from_millis(100),
-        Duration::from_millis(500),
-    );
+    let timeouts =
+        SessionTimeoutPolicy::new(Duration::from_millis(100), Duration::from_millis(500));
     assert!(lease.is_ok());
     assert!(timeouts.is_ok());
     let (Some(lease), Some(timeouts)) = (lease.ok(), timeouts.ok()) else {
