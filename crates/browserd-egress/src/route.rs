@@ -653,6 +653,25 @@ impl RouteRegistry {
             .map_err(RouteError::Quota)
     }
 
+    fn record_request_bytes(
+        &self,
+        endpoint: RouteEndpoint,
+        incarnation: &LeaseId,
+        connection_id: ConnectionId,
+        bytes: u64,
+        now: MonotonicMillis,
+    ) -> Result<(), RouteError> {
+        let mut state = self.lock_state();
+        let entry = Self::active_entry(&mut state, endpoint, now)?;
+        if &entry.incarnation != incarnation {
+            return Err(RouteError::RouteRevoked);
+        }
+        entry
+            .quota
+            .record_request(connection_id, bytes, now)
+            .map_err(RouteError::Quota)
+    }
+
     fn close_connection(
         &self,
         endpoint: RouteEndpoint,
@@ -950,6 +969,23 @@ impl RoutePermit {
             return Err(RouteError::ConnectionClosed);
         }
         self.registry.record_egress_bytes(
+            self.endpoint,
+            &self.incarnation,
+            self.connection_id,
+            bytes,
+            now,
+        )
+    }
+
+    pub fn record_request_bytes(
+        &mut self,
+        bytes: u64,
+        now: MonotonicMillis,
+    ) -> Result<(), RouteError> {
+        if !self.open {
+            return Err(RouteError::ConnectionClosed);
+        }
+        self.registry.record_request_bytes(
             self.endpoint,
             &self.incarnation,
             self.connection_id,

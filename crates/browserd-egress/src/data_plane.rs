@@ -290,6 +290,14 @@ where
                             ));
                         }
                         if !request.buffered_after_head().is_empty() {
+                            permit.record_request_bytes(
+                                u64::try_from(request.buffered_after_head().len())
+                                    .map_err(|_| DataPlaneError::RequestBodyTooLarge)?,
+                                MonotonicMillis::new(now.value().saturating_add(
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                )),
+                            )?;
                             timeout(
                                 self.limits.write_timeout,
                                 upstream.write_all(request.buffered_after_head()),
@@ -309,13 +317,31 @@ where
                         if content_length > self.limits.max_request_body_bytes {
                             return Err(DataPlaneError::RequestBodyTooLarge);
                         }
+                        permit.record_request_bytes(
+                            u64::try_from(request.upstream_head().len()).map_err(|_| {
+                                DataPlaneError::Request(ProxyProtocolError::HeaderTooLarge)
+                            })?,
+                            MonotonicMillis::new(now.value().saturating_add(
+                                u64::try_from(started_at.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX),
+                            )),
+                        )?;
                         timeout(
                             self.limits.write_timeout,
                             upstream.write_all(request.upstream_head()),
                         )
                         .await
                         .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                        let buffered = u64::try_from(request.buffered_after_head().len())
+                            .map_err(|_| DataPlaneError::RequestBodyTooLarge)?;
                         if !request.buffered_after_head().is_empty() {
+                            permit.record_request_bytes(
+                                buffered,
+                                MonotonicMillis::new(now.value().saturating_add(
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                )),
+                            )?;
                             timeout(
                                 self.limits.write_timeout,
                                 upstream.write_all(request.buffered_after_head()),
@@ -323,8 +349,6 @@ where
                             .await
                             .map_err(|_| DataPlaneError::Timeout("upstream write"))??;
                         }
-                        let buffered = u64::try_from(request.buffered_after_head().len())
-                            .map_err(|_| DataPlaneError::RequestBodyTooLarge)?;
                         let mut remaining = content_length.saturating_sub(buffered);
                         let mut chunk = vec![0_u8; self.limits.io_buffer_bytes];
                         while remaining != 0 {
@@ -338,6 +362,14 @@ where
                             if read == 0 {
                                 return Err(DataPlaneError::UnexpectedEof);
                             }
+                            permit.record_request_bytes(
+                                u64::try_from(read)
+                                    .map_err(|_| DataPlaneError::RequestBodyTooLarge)?,
+                                MonotonicMillis::new(now.value().saturating_add(
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                )),
+                            )?;
                             timeout(
                                 self.limits.write_timeout,
                                 upstream.write_all(&chunk[..read]),
@@ -534,6 +566,15 @@ where
                         }
                         return Ok(());
                     }
+                    permit.record_request_bytes(
+                        u64::try_from(read).map_err(|_| DataPlaneError::RequestBodyTooLarge)?,
+                        MonotonicMillis::new(
+                            now.value().saturating_add(
+                                u64::try_from(started_at.elapsed().as_millis())
+                                    .unwrap_or(u64::MAX),
+                            ),
+                        ),
+                    )?;
                     tokio::select! {
                         biased;
                         () = cancellation.cancelled() => {

@@ -198,6 +198,27 @@ impl QuotaLedger {
         Ok(())
     }
 
+    pub fn record_request(
+        &mut self,
+        identifier: ConnectionId,
+        bytes: u64,
+        now: MonotonicMillis,
+    ) -> Result<(), QuotaError> {
+        self.advance_window(now)?;
+        if !self.connections.contains_key(&identifier) {
+            return Err(QuotaError::UnknownConnection);
+        }
+        let (window_bytes, total_bytes) = self.checked_byte_totals(bytes)?;
+
+        let Some(connection) = self.connections.get_mut(&identifier) else {
+            return Err(QuotaError::UnknownConnection);
+        };
+        connection.last_activity = now;
+        self.window_egress_bytes = window_bytes;
+        self.total_egress_bytes = total_bytes;
+        Ok(())
+    }
+
     pub fn record_egress(
         &mut self,
         identifier: ConnectionId,
@@ -208,25 +229,12 @@ impl QuotaLedger {
         let Some(connection) = self.connections.get(&identifier) else {
             return Err(QuotaError::UnknownConnection);
         };
-        let window_bytes = self
-            .window_egress_bytes
-            .checked_add(bytes)
-            .ok_or(QuotaError::ArithmeticOverflow)?;
-        let total_bytes = self
-            .total_egress_bytes
-            .checked_add(bytes)
-            .ok_or(QuotaError::ArithmeticOverflow)?;
+        let (window_bytes, total_bytes) = self.checked_byte_totals(bytes)?;
         let response_bytes = connection
             .response_bytes
             .checked_add(bytes)
             .ok_or(QuotaError::ArithmeticOverflow)?;
 
-        if window_bytes > self.limits.max_egress_bytes_per_window {
-            return Err(QuotaError::EgressBytesPerWindow);
-        }
-        if total_bytes > self.limits.max_total_egress_bytes {
-            return Err(QuotaError::TotalEgressBytes);
-        }
         if self
             .limits
             .max_response_bytes
@@ -243,6 +251,24 @@ impl QuotaLedger {
         self.window_egress_bytes = window_bytes;
         self.total_egress_bytes = total_bytes;
         Ok(())
+    }
+
+    fn checked_byte_totals(&self, bytes: u64) -> Result<(u64, u64), QuotaError> {
+        let window_bytes = self
+            .window_egress_bytes
+            .checked_add(bytes)
+            .ok_or(QuotaError::ArithmeticOverflow)?;
+        let total_bytes = self
+            .total_egress_bytes
+            .checked_add(bytes)
+            .ok_or(QuotaError::ArithmeticOverflow)?;
+        if window_bytes > self.limits.max_egress_bytes_per_window {
+            return Err(QuotaError::EgressBytesPerWindow);
+        }
+        if total_bytes > self.limits.max_total_egress_bytes {
+            return Err(QuotaError::TotalEgressBytes);
+        }
+        Ok((window_bytes, total_bytes))
     }
 
     pub fn expire_idle(&mut self, now: MonotonicMillis) -> usize {

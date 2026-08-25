@@ -434,6 +434,7 @@ async fn resolves_once_and_connects_only_the_inspected_socket_address() {
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
             .await
             .expect("origin response should write");
+        read
     });
     let (mut client, server) = tokio::io::duplex(4_096);
     client
@@ -455,7 +456,7 @@ async fn resolves_once_and_connects_only_the_inspected_socket_address() {
         .await
         .expect("response should read");
     assert!(serve.await.expect("serve task should join").is_ok());
-    origin_task.await.expect("origin task should join");
+    let request_bytes = origin_task.await.expect("origin task should join");
 
     assert_eq!(
         resolver_calls
@@ -474,7 +475,8 @@ async fn resolves_once_and_connects_only_the_inspected_socket_address() {
     assert!(response.ends_with(b"\r\n\r\nOK"));
     assert_eq!(
         registry.usage(endpoint).total_egress_bytes,
-        response.len() as u64
+        u64::try_from(response.len().saturating_add(request_bytes))
+            .expect("network usage should fit u64")
     );
 }
 
@@ -1251,6 +1253,60 @@ async fn websocket_upgrade_uses_the_same_bidirectional_bounded_tunnel() {
 }
 
 #[tokio::test]
+async fn request_body_quota_is_checked_before_bytes_are_forwarded() {
+    let expected_head = b"POST /upload HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\nContent-Length: 4\r\n\r\n";
+    let head_bytes = u64::try_from(expected_head.len()).expect("request head should fit u64");
+    let mut quota = limits();
+    quota.max_egress_bytes_per_window = head_bytes;
+    quota.max_total_egress_bytes = head_bytes;
+    let (registry, endpoint, shard) = setup_with_limits(quota);
+    let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
+    let service = DataPlane::new(
+        registry.clone(),
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(Some(proxy_upstream))),
+        },
+        data_limits(),
+    )
+    .expect("limits should be valid");
+    let origin_task = tokio::spawn(async move {
+        let mut received = Vec::new();
+        origin
+            .read_to_end(&mut received)
+            .await
+            .expect("origin should observe proxy close");
+        received
+    });
+    let (mut client, server) = tokio::io::duplex(4_096);
+    client
+        .write_all(
+            b"POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4\r\n\r\nbody",
+        )
+        .await
+        .expect("request should write");
+
+    let result = service
+        .serve_connection(
+            VerifiedRouteSource::new(endpoint, shard),
+            server,
+            MonotonicMillis::new(1_001),
+        )
+        .await;
+
+    assert!(matches!(result, Err(DataPlaneError::Route(_))));
+    assert_eq!(
+        origin_task.await.expect("origin task should join"),
+        expected_head
+    );
+    assert_eq!(registry.usage(endpoint).total_egress_bytes, head_bytes);
+}
+
+#[tokio::test]
 async fn response_quota_is_checked_before_bytes_are_forwarded() {
     let mut quota = limits();
     quota.max_response_bytes = Some(32);
@@ -1271,11 +1327,12 @@ async fn response_quota_is_checked_before_bytes_are_forwarded() {
     .expect("limits should be valid");
     let origin_task = tokio::spawn(async move {
         let mut request = vec![0; 1_024];
-        let _ = origin.read(&mut request).await.expect("origin should read");
+        let read = origin.read(&mut request).await.expect("origin should read");
         origin
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n0123456789012345678901234567890123456789012345678901234567890123")
             .await
             .expect("oversized response should write");
+        read
     });
     let (mut client, server) = tokio::io::duplex(4_096);
     client
@@ -1296,8 +1353,11 @@ async fn response_quota_is_checked_before_bytes_are_forwarded() {
         .await
         .expect("client should observe close");
     assert!(response.is_empty());
-    assert_eq!(registry.usage(endpoint).total_egress_bytes, 0);
-    origin_task.await.expect("origin task should join");
+    let request_bytes = origin_task.await.expect("origin task should join");
+    assert_eq!(
+        registry.usage(endpoint).total_egress_bytes,
+        u64::try_from(request_bytes).expect("request usage should fit u64")
+    );
 }
 
 #[tokio::test]
