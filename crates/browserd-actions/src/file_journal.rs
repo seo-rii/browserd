@@ -11,7 +11,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     ApprovalDecision, DurableActionJournal, JournalEntry, JournalEntryKind, JournalError,
-    KnownFailureReason, ReplayableActionJournal, TerminalDetail,
+    KnownFailureReason, OutcomeUnknownReason, ReplayableActionJournal, ResultDigest,
+    TerminalDetail,
 };
 
 const FILE_HEADER: &[u8; 8] = b"BRACTJ01";
@@ -66,6 +67,8 @@ struct FileJournalState {
     dispatch_intents: HashSet<ActionId>,
     approval_decisions: HashMap<ActionId, ApprovalDecision>,
     terminal_records: HashSet<ActionId>,
+    terminal_reserves: HashMap<ActionId, u64>,
+    reserved_terminal_bytes: u64,
     poisoned: bool,
 }
 
@@ -246,6 +249,8 @@ impl FileActionJournal {
         let mut dispatch_intents = HashSet::new();
         let mut approval_decisions = HashMap::new();
         let mut terminal_records = HashSet::new();
+        let mut terminal_reserves = HashMap::new();
+        let mut reserved_terminal_bytes = 0_u64;
         for entry in &entries {
             if matches!(entry.kind(), JournalEntryKind::Accepted { .. }) {
                 let expected = last_action_sequence.checked_add(1).ok_or_else(|| {
@@ -257,6 +262,18 @@ impl FileActionJournal {
                     ));
                 }
                 last_action_sequence = expected;
+                let reserve = terminal_reserve_frame_bytes(entry, limits)?;
+                if terminal_reserves
+                    .insert(entry.action_id().clone(), reserve)
+                    .is_some()
+                {
+                    return Err(JournalError::new(
+                        "action journal contains a duplicate accepted action",
+                    ));
+                }
+                reserved_terminal_bytes = reserved_terminal_bytes
+                    .checked_add(reserve)
+                    .ok_or_else(|| JournalError::new("action journal terminal reserve overflow"))?;
             }
             if matches!(entry.kind(), JournalEntryKind::DispatchIntent { .. })
                 && !dispatch_intents.insert(entry.action_id().clone())
@@ -281,6 +298,26 @@ impl FileActionJournal {
                     "action journal contains duplicate terminal records",
                 ));
             }
+            if matches!(entry.kind(), JournalEntryKind::Terminal { .. }) {
+                let reserve = terminal_reserves.remove(entry.action_id()).ok_or_else(|| {
+                    JournalError::new("action journal terminal record has no accepted action")
+                })?;
+                reserved_terminal_bytes =
+                    reserved_terminal_bytes
+                        .checked_sub(reserve)
+                        .ok_or_else(|| {
+                            JournalError::new("action journal terminal reserve underflow")
+                        })?;
+            }
+        }
+        if entries.len().saturating_add(terminal_reserves.len()) > limits.max_records
+            || file_bytes
+                .checked_add(reserved_terminal_bytes)
+                .is_none_or(|required| required > limits.max_file_bytes as u64)
+        {
+            return Err(JournalError::new(
+                "action journal cannot preserve terminal record reserves",
+            ));
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -293,6 +330,8 @@ impl FileActionJournal {
                 dispatch_intents,
                 approval_decisions,
                 terminal_records,
+                terminal_reserves,
+                reserved_terminal_bytes,
                 poisoned: false,
             }),
         })
@@ -339,9 +378,38 @@ impl DurableActionJournal for FileActionJournal {
                 "action journal is poisoned after a prior write failure",
             ));
         }
-        if state.records >= self.limits.max_records {
+        let accepted_terminal_reserve = matches!(entry.kind(), JournalEntryKind::Accepted { .. })
+            .then(|| terminal_reserve_frame_bytes(entry, self.limits))
+            .transpose()?;
+        let released_terminal_reserve = if matches!(entry.kind(), JournalEntryKind::Terminal { .. })
+        {
+            Some(
+                *state
+                    .terminal_reserves
+                    .get(entry.action_id())
+                    .ok_or_else(|| {
+                        JournalError::new("action journal terminal record has no reserved capacity")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let reserved_actions_after = state
+            .terminal_reserves
+            .len()
+            .checked_add(usize::from(accepted_terminal_reserve.is_some()))
+            .and_then(|count| count.checked_sub(usize::from(released_terminal_reserve.is_some())))
+            .ok_or_else(|| JournalError::new("action journal terminal reserve count overflow"))?;
+        let records_after = state
+            .records
+            .checked_add(1)
+            .ok_or_else(|| JournalError::new("action journal record count overflow"))?;
+        if records_after
+            .checked_add(reserved_actions_after)
+            .is_none_or(|required| required > self.limits.max_records)
+        {
             return Err(JournalError::new(
-                "action journal record count exceeds configured bound",
+                "action journal record count would consume terminal reserves",
             ));
         }
         let accepted_sequence = if matches!(entry.kind(), JournalEntryKind::Accepted { .. }) {
@@ -402,9 +470,17 @@ impl DurableActionJournal for FileActionJournal {
             .file_bytes
             .checked_add(frame_bytes)
             .ok_or_else(|| JournalError::new("action journal size overflow"))?;
-        if next_file_bytes > self.limits.max_file_bytes as u64 {
+        let reserved_terminal_bytes_after = state
+            .reserved_terminal_bytes
+            .checked_add(accepted_terminal_reserve.unwrap_or(0))
+            .and_then(|bytes| bytes.checked_sub(released_terminal_reserve.unwrap_or(0)))
+            .ok_or_else(|| JournalError::new("action journal terminal reserve size overflow"))?;
+        if next_file_bytes
+            .checked_add(reserved_terminal_bytes_after)
+            .is_none_or(|required| required > self.limits.max_file_bytes as u64)
+        {
             return Err(JournalError::new(
-                "action journal file exceeds configured bound",
+                "action journal file would consume terminal reserves",
             ));
         }
 
@@ -435,8 +511,56 @@ impl DurableActionJournal for FileActionJournal {
         if let Some(action_id) = terminal_action_id {
             state.terminal_records.insert(action_id);
         }
+        if let Some(reserve) = accepted_terminal_reserve {
+            state
+                .terminal_reserves
+                .insert(entry.action_id().clone(), reserve);
+        }
+        if released_terminal_reserve.is_some() {
+            state.terminal_reserves.remove(entry.action_id());
+        }
+        state.reserved_terminal_bytes = reserved_terminal_bytes_after;
         Ok(())
     }
+}
+
+fn terminal_reserve_frame_bytes(
+    entry: &JournalEntry,
+    limits: ActionJournalLimits,
+) -> Result<u64, JournalError> {
+    let candidates = [
+        TerminalDetail::Succeeded(ResultDigest::new([u8::MAX; 32])),
+        TerminalDetail::FailedKnown(KnownFailureReason::NotDispatched),
+        TerminalDetail::FailedKnown(KnownFailureReason::BrowserRejected),
+        TerminalDetail::FailedKnown(KnownFailureReason::PolicyDenied),
+        TerminalDetail::FailedKnown(KnownFailureReason::ApprovalDenied),
+        TerminalDetail::FailedKnown(KnownFailureReason::ApprovalTimedOut),
+        TerminalDetail::CancelledBeforeDispatch,
+        TerminalDetail::CancelledConfirmed,
+        TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::AmbiguousTransportLoss),
+        TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::WorkerLost),
+        TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::TimeoutAfterDispatch),
+    ];
+    let mut largest_payload = 0_usize;
+    for detail in candidates {
+        let mut terminal = entry.clone();
+        terminal.kind = JournalEntryKind::Terminal { detail };
+        let payload = serde_json::to_vec(&terminal).map_err(|error| {
+            JournalError::new(format!(
+                "action journal terminal reserve encoding failed: {error}"
+            ))
+        })?;
+        largest_payload = largest_payload.max(payload.len());
+    }
+    if largest_payload == 0 || largest_payload > limits.max_record_bytes {
+        return Err(JournalError::new(
+            "action journal cannot reserve a bounded terminal record",
+        ));
+    }
+    LENGTH_BYTES
+        .checked_add(largest_payload as u64)
+        .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+        .ok_or_else(|| JournalError::new("action journal terminal reserve length overflow"))
 }
 
 fn approval_decision(kind: &JournalEntryKind) -> Option<ApprovalDecision> {

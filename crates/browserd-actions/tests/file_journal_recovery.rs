@@ -224,7 +224,7 @@ fn configured_record_and_count_bounds_preserve_pre_append_state() {
     let directory = tempdir().expect("temporary journal directory should be created");
     let path = directory.path().join("bounded.wal");
     let session = session();
-    let bounded = ActionJournalLimits::new(512, 1, 4 * 1024);
+    let bounded = ActionJournalLimits::new(512, 2, 4 * 1024);
     let accepted_action_id = {
         let journal = Arc::new(
             FileActionJournal::open(&path, bounded).expect("bounded journal should be created"),
@@ -263,6 +263,50 @@ fn configured_record_and_count_bounds_preserve_pre_append_state() {
             .expect("accepted record should recover")
             .state(),
         ActionState::Accepted
+    );
+}
+
+#[test]
+fn count_bound_reserves_a_terminal_record_for_every_accepted_action() {
+    let directory = tempdir().expect("temporary journal directory should be created");
+    let path = directory.path().join("terminal-reserve.wal");
+    let session = session();
+    let bounded = ActionJournalLimits::new(4 * 1024, 4, 4 * 1024 * 1024);
+    let action_id = {
+        let journal = Arc::new(
+            FileActionJournal::open(&path, bounded).expect("bounded journal should be created"),
+        );
+        let ledger = ActionLedger::new(session.clone(), journal);
+        let accepted = ledger
+            .accept(FENCE, request("terminal-reserve", 17))
+            .expect("action and its terminal reserve should fit")
+            .snapshot()
+            .clone();
+        ledger
+            .enqueue(FENCE, accepted.action_id())
+            .expect("enqueue should fit before the terminal reserve");
+        ledger
+            .mark_ready(FENCE, accepted.action_id())
+            .expect("ready transition should fit before the terminal reserve");
+        assert!(matches!(
+            ledger.prepare_dispatch(FENCE, accepted.action_id()),
+            Err(ActionLedgerError::JournalUnavailable(_))
+        ));
+        ledger
+            .cancel_before_dispatch(FENCE, accepted.action_id())
+            .expect("the reserved terminal record must remain writable");
+        accepted.action_id().clone()
+    };
+
+    let journal =
+        Arc::new(FileActionJournal::open(&path, bounded).expect("bounded journal should reopen"));
+    let ledger = ActionLedger::recover(session, journal).expect("bounded journal should recover");
+    assert_eq!(
+        ledger
+            .snapshot(FENCE, &action_id)
+            .expect("cancelled action should recover")
+            .state(),
+        ActionState::CancelledBeforeDispatch
     );
 }
 
