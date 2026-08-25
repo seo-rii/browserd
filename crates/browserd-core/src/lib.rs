@@ -5,6 +5,7 @@ mod identifiers;
 mod isolation;
 mod placement;
 mod resources;
+mod safety;
 mod state;
 
 pub use error::{ErrorCode, ErrorSemantics, ResponseRepresentation, RetryClass};
@@ -20,6 +21,10 @@ pub use resources::{
     ActionLimits, ActionResourceClass, ArtifactLimits, MemoryLimits, MemoryThreshold,
     ResourceRequest, ResourceValidationError, RuntimeLimits, SessionLimits, SnapshotLimits,
     ViewerLimits,
+};
+pub use safety::{
+    SafetySwitchError, SafetySwitchMutation, SafetySwitchRegistry, SafetySwitchSnapshot,
+    SafetySwitchUpdate,
 };
 pub use state::{
     ActionEvent, ActionState, CreateOperationEvent, CreateOperationState, PlacementEvent,
