@@ -5,11 +5,11 @@ use browserd_core::{ActionId, ActionState, LeaseId, PlacementFence};
 
 use crate::{
     AcceptDecision, ActionLedgerError, ActionRequest, ActionSequence, ActionSnapshot,
-    BrowserResult, DispatchDecision, DispatchId, DispatchPermit, DurableActionJournal,
-    IdempotencyKey, JournalEntry, JournalEntryKind, JournalError, KnownFailureReason,
-    LedgerSession, OutcomeUnknownReason, RecordOutcome, ReplayableActionJournal,
-    ResolutionAnnotation, ResolutionKind, ResolutionOutcome, ResolutionPolicy, TerminalDetail,
-    TransportLoss,
+    ApprovalDecision, BrowserResult, DispatchDecision, DispatchId, DispatchPermit,
+    DurableActionJournal, IdempotencyKey, JournalEntry, JournalEntryKind, JournalError,
+    KnownFailureReason, LedgerSession, OutcomeUnknownReason, RecordOutcome,
+    ReplayableActionJournal, ResolutionAnnotation, ResolutionKind, ResolutionOutcome,
+    ResolutionPolicy, TerminalDetail, TransportLoss,
 };
 
 #[derive(Default)]
@@ -93,6 +93,7 @@ where
                         state: ActionState::Accepted,
                         dispatch_permit: None,
                         dispatch_acknowledged: false,
+                        approval_decision: None,
                         terminal_detail: None,
                         resolution: None,
                     };
@@ -114,6 +115,25 @@ where
                                 return Err(invalid("enqueue transition is not valid"));
                             }
                             snapshot.state = ActionState::Queued;
+                        }
+                        JournalEntryKind::ApprovalRequired => {
+                            if snapshot.state() != ActionState::Queued
+                                || snapshot.approval_decision().is_some()
+                            {
+                                return Err(invalid(
+                                    "approval requirement transition is not valid",
+                                ));
+                            }
+                            snapshot.state = ActionState::PendingApproval;
+                        }
+                        JournalEntryKind::ApprovalGranted => {
+                            if snapshot.state() != ActionState::PendingApproval
+                                || snapshot.approval_decision().is_some()
+                            {
+                                return Err(invalid("approval grant transition is not valid"));
+                            }
+                            snapshot.state = ActionState::ReadyToDispatch;
+                            snapshot.approval_decision = Some(ApprovalDecision::Granted);
                         }
                         JournalEntryKind::ReadyToDispatch => {
                             if snapshot.state() != ActionState::Queued {
@@ -152,6 +172,19 @@ where
                             if snapshot.terminal_detail().is_some() {
                                 return Err(invalid("action has more than one terminal record"));
                             }
+                            let attempted_approval = match detail {
+                                TerminalDetail::FailedKnown(KnownFailureReason::ApprovalDenied) => {
+                                    Some(ApprovalDecision::Denied)
+                                }
+                                TerminalDetail::FailedKnown(
+                                    KnownFailureReason::ApprovalTimedOut,
+                                ) => Some(ApprovalDecision::TimedOut),
+                                _ => None,
+                            };
+                            let approval_decision = (snapshot.state()
+                                == ActionState::PendingApproval)
+                                .then_some(attempted_approval)
+                                .flatten();
                             if detail == TerminalDetail::CancelledBeforeDispatch {
                                 if !matches!(
                                     snapshot.state(),
@@ -164,6 +197,16 @@ where
                                         "pre-dispatch cancellation follows a dispatch intent",
                                     ));
                                 }
+                            } else if approval_decision.is_some() {
+                                if snapshot.approval_decision().is_some() {
+                                    return Err(invalid(
+                                        "approval decision transition is not valid",
+                                    ));
+                                }
+                            } else if attempted_approval.is_some() {
+                                return Err(invalid(
+                                    "approval failure does not follow a pending approval",
+                                ));
                             } else if snapshot.state() != ActionState::MayHaveExecuted {
                                 return Err(invalid("terminal result has no dispatch intent"));
                             }
@@ -176,6 +219,9 @@ where
                                 ));
                             }
                             snapshot.state = detail.state();
+                            if approval_decision.is_some() {
+                                snapshot.approval_decision = approval_decision;
+                            }
                             snapshot.terminal_detail = Some(detail);
                         }
                         JournalEntryKind::Resolved { annotation } => {
@@ -263,6 +309,7 @@ where
             state: ActionState::Accepted,
             dispatch_permit: None,
             dispatch_acknowledged: false,
+            approval_decision: None,
             terminal_detail: None,
             resolution: None,
         };
@@ -297,6 +344,79 @@ where
             ActionState::Queued,
             JournalEntryKind::Enqueued,
         )
+    }
+
+    pub fn require_approval(
+        &self,
+        fence: PlacementFence,
+        action_id: &ActionId,
+    ) -> Result<ActionSnapshot, ActionLedgerError> {
+        self.transition_action(
+            fence,
+            action_id,
+            ActionState::Queued,
+            ActionState::PendingApproval,
+            JournalEntryKind::ApprovalRequired,
+        )
+    }
+
+    pub fn grant_approval(
+        &self,
+        fence: PlacementFence,
+        action_id: &ActionId,
+    ) -> Result<ActionSnapshot, ActionLedgerError> {
+        self.check_fence(fence)?;
+        let mut state = self.lock_state()?;
+        let snapshot = state
+            .actions
+            .get(action_id)
+            .cloned()
+            .ok_or(ActionLedgerError::ActionNotFound)?;
+        if let Some(current) = snapshot.approval_decision() {
+            return if current == ApprovalDecision::Granted {
+                Ok(snapshot)
+            } else {
+                Err(ActionLedgerError::ApprovalDecisionConflict {
+                    current,
+                    attempted: ApprovalDecision::Granted,
+                })
+            };
+        }
+        if snapshot.state() != ActionState::PendingApproval {
+            return Err(ActionLedgerError::InvalidTransition {
+                state: snapshot.state(),
+            });
+        }
+
+        self.append(JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            JournalEntryKind::ApprovalGranted,
+        ))?;
+        let stored = state
+            .actions
+            .get_mut(action_id)
+            .ok_or(ActionLedgerError::StateUnavailable)?;
+        stored.state = ActionState::ReadyToDispatch;
+        stored.approval_decision = Some(ApprovalDecision::Granted);
+        Ok(stored.clone())
+    }
+
+    pub fn deny_approval(
+        &self,
+        fence: PlacementFence,
+        action_id: &ActionId,
+    ) -> Result<RecordOutcome, ActionLedgerError> {
+        self.record_approval_failure(fence, action_id, ApprovalDecision::Denied)
+    }
+
+    pub fn expire_approval(
+        &self,
+        fence: PlacementFence,
+        action_id: &ActionId,
+    ) -> Result<RecordOutcome, ActionLedgerError> {
+        self.record_approval_failure(fence, action_id, ApprovalDecision::TimedOut)
     }
 
     pub fn mark_ready(
@@ -609,6 +729,16 @@ where
         self.check_fence(fence)?;
         let mut state = self.lock_state()?;
         let snapshot = self.correlated_snapshot(&state, permit)?;
+        if matches!(
+            attempted,
+            TerminalDetail::FailedKnown(
+                KnownFailureReason::ApprovalDenied | KnownFailureReason::ApprovalTimedOut
+            )
+        ) {
+            return Err(ActionLedgerError::InvalidTransition {
+                state: snapshot.state(),
+            });
+        }
         if attempted == TerminalDetail::FailedKnown(KnownFailureReason::NotDispatched)
             && snapshot.dispatch_acknowledged()
         {
@@ -639,6 +769,61 @@ where
             .ok_or(ActionLedgerError::StateUnavailable)?;
         stored.state = attempted.state();
         stored.terminal_detail = Some(attempted);
+        Ok(RecordOutcome::Recorded)
+    }
+
+    fn record_approval_failure(
+        &self,
+        fence: PlacementFence,
+        action_id: &ActionId,
+        attempted: ApprovalDecision,
+    ) -> Result<RecordOutcome, ActionLedgerError> {
+        self.check_fence(fence)?;
+        let mut state = self.lock_state()?;
+        let snapshot = state
+            .actions
+            .get(action_id)
+            .cloned()
+            .ok_or(ActionLedgerError::ActionNotFound)?;
+        if let Some(current) = snapshot.approval_decision() {
+            return if current == attempted {
+                Ok(RecordOutcome::AlreadyRecorded)
+            } else {
+                Err(ActionLedgerError::ApprovalDecisionConflict { current, attempted })
+            };
+        }
+        if snapshot.state() != ActionState::PendingApproval {
+            return Err(ActionLedgerError::InvalidTransition {
+                state: snapshot.state(),
+            });
+        }
+        let detail = match attempted {
+            ApprovalDecision::Denied => {
+                TerminalDetail::FailedKnown(KnownFailureReason::ApprovalDenied)
+            }
+            ApprovalDecision::TimedOut => {
+                TerminalDetail::FailedKnown(KnownFailureReason::ApprovalTimedOut)
+            }
+            ApprovalDecision::Granted => {
+                return Err(ActionLedgerError::InvalidTransition {
+                    state: snapshot.state(),
+                });
+            }
+        };
+
+        self.append(JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            JournalEntryKind::Terminal { detail },
+        ))?;
+        let stored = state
+            .actions
+            .get_mut(action_id)
+            .ok_or(ActionLedgerError::StateUnavailable)?;
+        stored.state = ActionState::FailedKnown;
+        stored.approval_decision = Some(attempted);
+        stored.terminal_detail = Some(detail);
         Ok(RecordOutcome::Recorded)
     }
 }

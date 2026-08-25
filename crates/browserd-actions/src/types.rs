@@ -198,6 +198,13 @@ pub enum TransportLoss {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ApprovalDecision {
+    Granted,
+    Denied,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TerminalDetail {
     Succeeded(ResultDigest),
     FailedKnown(KnownFailureReason),
@@ -296,6 +303,7 @@ pub struct ActionSnapshot {
     pub(crate) state: ActionState,
     pub(crate) dispatch_permit: Option<DispatchPermit>,
     pub(crate) dispatch_acknowledged: bool,
+    pub(crate) approval_decision: Option<ApprovalDecision>,
     pub(crate) terminal_detail: Option<TerminalDetail>,
     pub(crate) resolution: Option<ResolutionAnnotation>,
 }
@@ -329,6 +337,11 @@ impl ActionSnapshot {
     #[must_use]
     pub const fn dispatch_acknowledged(&self) -> bool {
         self.dispatch_acknowledged
+    }
+
+    #[must_use]
+    pub const fn approval_decision(&self) -> Option<ApprovalDecision> {
+        self.approval_decision
     }
 
     #[must_use]
@@ -390,6 +403,8 @@ pub enum ResolutionOutcome {
 pub enum JournalEntryType {
     Accepted,
     Enqueued,
+    ApprovalRequired,
+    ApprovalGranted,
     ReadyToDispatch,
     DispatchIntent,
     DispatchAcknowledged,
@@ -405,6 +420,8 @@ pub enum JournalEntryKind {
         action_kind: ActionKind,
     },
     Enqueued,
+    ApprovalRequired,
+    ApprovalGranted,
     ReadyToDispatch,
     DispatchIntent {
         dispatch_id: DispatchId,
@@ -426,6 +443,8 @@ impl JournalEntryKind {
         match self {
             Self::Accepted { .. } => JournalEntryType::Accepted,
             Self::Enqueued => JournalEntryType::Enqueued,
+            Self::ApprovalRequired => JournalEntryType::ApprovalRequired,
+            Self::ApprovalGranted => JournalEntryType::ApprovalGranted,
             Self::ReadyToDispatch => JournalEntryType::ReadyToDispatch,
             Self::DispatchIntent { .. } => JournalEntryType::DispatchIntent,
             Self::DispatchAcknowledged { .. } => JournalEntryType::DispatchAcknowledged,
@@ -567,6 +586,10 @@ pub enum ActionLedgerError {
     ActionNotFound,
     InvalidTransition {
         state: ActionState,
+    },
+    ApprovalDecisionConflict {
+        current: ApprovalDecision,
+        attempted: ApprovalDecision,
     },
     CorrelationMismatch,
     DeliveryEvidenceConflict,

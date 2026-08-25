@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -10,7 +10,8 @@ use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    DurableActionJournal, JournalEntry, JournalEntryKind, JournalError, ReplayableActionJournal,
+    ApprovalDecision, DurableActionJournal, JournalEntry, JournalEntryKind, JournalError,
+    KnownFailureReason, ReplayableActionJournal, TerminalDetail,
 };
 
 const FILE_HEADER: &[u8; 8] = b"BRACTJ01";
@@ -63,6 +64,7 @@ struct FileJournalState {
     file_bytes: u64,
     last_action_sequence: u64,
     dispatch_intents: HashSet<ActionId>,
+    approval_decisions: HashMap<ActionId, ApprovalDecision>,
     terminal_records: HashSet<ActionId>,
     poisoned: bool,
 }
@@ -217,6 +219,7 @@ impl FileActionJournal {
         let (entries, file_bytes) = scan(&mut file, limits)?;
         let mut last_action_sequence = 0_u64;
         let mut dispatch_intents = HashSet::new();
+        let mut approval_decisions = HashMap::new();
         let mut terminal_records = HashSet::new();
         for entry in &entries {
             if matches!(entry.kind(), JournalEntryKind::Accepted { .. }) {
@@ -237,6 +240,15 @@ impl FileActionJournal {
                     "action journal contains duplicate dispatch intents",
                 ));
             }
+            if let Some(decision) = approval_decision(entry.kind())
+                && approval_decisions
+                    .insert(entry.action_id().clone(), decision)
+                    .is_some()
+            {
+                return Err(JournalError::new(
+                    "action journal contains duplicate approval decisions",
+                ));
+            }
             if matches!(entry.kind(), JournalEntryKind::Terminal { .. })
                 && !terminal_records.insert(entry.action_id().clone())
             {
@@ -254,6 +266,7 @@ impl FileActionJournal {
                 file_bytes,
                 last_action_sequence,
                 dispatch_intents,
+                approval_decisions,
                 terminal_records,
                 poisoned: false,
             }),
@@ -331,6 +344,25 @@ impl DurableActionJournal for FileActionJournal {
         } else {
             None
         };
+        let approval_decision = approval_decision(entry.kind()).map(|decision| {
+            if decision == ApprovalDecision::Granted
+                && state.terminal_records.contains(entry.action_id())
+            {
+                return Err(JournalError::new(
+                    "action journal cannot grant approval after a terminal record",
+                ));
+            }
+            if state.approval_decisions.contains_key(entry.action_id()) {
+                return Err(JournalError::new(
+                    "action journal already contains an approval decision for this action",
+                ));
+            }
+            Ok((entry.action_id().clone(), decision))
+        });
+        let approval_decision = match approval_decision {
+            Some(decision) => Some(decision?),
+            None => None,
+        };
         let terminal_action_id = if matches!(entry.kind(), JournalEntryKind::Terminal { .. }) {
             if state.terminal_records.contains(entry.action_id()) {
                 return Err(JournalError::new(
@@ -372,10 +404,26 @@ impl DurableActionJournal for FileActionJournal {
         if let Some(action_id) = dispatch_action_id {
             state.dispatch_intents.insert(action_id);
         }
+        if let Some((action_id, decision)) = approval_decision {
+            state.approval_decisions.insert(action_id, decision);
+        }
         if let Some(action_id) = terminal_action_id {
             state.terminal_records.insert(action_id);
         }
         Ok(())
+    }
+}
+
+fn approval_decision(kind: &JournalEntryKind) -> Option<ApprovalDecision> {
+    match kind {
+        JournalEntryKind::ApprovalGranted => Some(ApprovalDecision::Granted),
+        JournalEntryKind::Terminal {
+            detail: TerminalDetail::FailedKnown(KnownFailureReason::ApprovalDenied),
+        } => Some(ApprovalDecision::Denied),
+        JournalEntryKind::Terminal {
+            detail: TerminalDetail::FailedKnown(KnownFailureReason::ApprovalTimedOut),
+        } => Some(ApprovalDecision::TimedOut),
+        _ => None,
     }
 }
 
