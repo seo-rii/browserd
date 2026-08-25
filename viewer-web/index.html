@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' blob:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    >
+    <title>browserd viewer</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body data-api-base="/">
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">browserd</p>
+          <h1>Live session viewer</h1>
+        </div>
+        <div class="connection" aria-live="polite">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status">Disconnected</span>
+        </div>
+      </header>
+
+      <form id="connect-form" class="toolbar">
+        <label>
+          Session ID
+          <input id="session-id" name="session_id" pattern="[A-Za-z0-9_-]+" autocomplete="off" required>
+        </label>
+        <button id="connect" type="submit">Connect</button>
+        <button id="disconnect" type="button" class="quiet" disabled>Disconnect</button>
+        <span class="divider" aria-hidden="true"></span>
+        <button id="control" type="button" disabled>Request control</button>
+        <button id="release" type="button" class="quiet" disabled>Release</button>
+      </form>
+
+      <section class="viewer-card" aria-label="Remote browser viewport">
+        <div id="viewport" class="viewport" tabindex="0">
+          <img id="frame" alt="Live browser page" draggable="false">
+          <div id="empty-state" class="empty-state">
+            <p>Connect to a session to begin observing.</p>
+            <small>Control requires an explicit lease.</small>
+          </div>
+        </div>
+        <footer class="viewer-footer">
+          <span id="frame-detail">No frame</span>
+          <label class="ime-label">
+            IME input
+            <input id="ime-input" autocomplete="off" disabled placeholder="한글・日本語・中文">
+          </label>
+        </footer>
+      </section>
+    </main>
+    <script type="module" src="./src/app.mjs"></script>
+  </body>
+</html>
