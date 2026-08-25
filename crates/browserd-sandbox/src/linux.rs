@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::ShardId;
+use browserd_core::{LeaseId, ShardId};
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -480,19 +480,29 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
     }
 
     async fn release_spawned(&self, identity: ChildIdentity) -> Result<(), SandboxError> {
-        let mut children = self
+        let child = self
             .children
             .lock()
-            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?;
-        let mut child = children
-            .remove(&identity.pid)
-            .ok_or_else(|| SandboxError::Backend("spawned child ownership missing".into()))?;
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+            .remove(&identity.pid);
+        let Some(mut child) = child else {
+            return if self.identity_matches(identity).await? {
+                Err(SandboxError::Backend(
+                    "live spawned child ownership missing".into(),
+                ))
+            } else {
+                Ok(())
+            };
+        };
         if child
             .try_wait()
             .map_err(|error| SandboxError::Backend(error.to_string()))?
             .is_none()
         {
-            children.insert(identity.pid, child);
+            self.children
+                .lock()
+                .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+                .insert(identity.pid, child);
             return Err(SandboxError::Backend(
                 "cannot release a live spawned child".into(),
             ));
@@ -544,16 +554,51 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
 
 #[async_trait]
 pub trait EgressRouteBackend: Send + Sync + 'static {
-    async fn prepare(&self, shard_id: &ShardId) -> Result<(), SandboxError>;
-    async fn revoke(&self, shard_id: &ShardId) -> Result<(), SandboxError>;
-    async fn is_active(&self, shard_id: &ShardId) -> Result<bool, SandboxError>;
+    async fn prepare(&self, fence: &ShardEgressFence) -> Result<(), SandboxError>;
+    async fn revoke(&self, fence: &ShardEgressFence) -> Result<(), SandboxError>;
+    async fn release(&self, fence: &ShardEgressFence) -> Result<(), SandboxError>;
+    async fn is_active(&self, fence: &ShardEgressFence) -> Result<bool, SandboxError>;
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ShardEgressFence {
+    shard_id: ShardId,
+    worker_epoch: u64,
+}
+
+impl ShardEgressFence {
+    #[must_use]
+    pub const fn new(shard_id: ShardId, worker_epoch: u64) -> Self {
+        Self {
+            shard_id,
+            worker_epoch,
+        }
+    }
+
+    #[must_use]
+    pub const fn shard_id(&self) -> &ShardId {
+        &self.shard_id
+    }
+
+    #[must_use]
+    pub const fn worker_epoch(&self) -> u64 {
+        self.worker_epoch
+    }
 }
 
 #[derive(Clone)]
 struct LinuxRuntime {
     identity: ChildIdentity,
+    backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
+    egress_fence: ShardEgressFence,
+    egress_revoked: bool,
+    egress_released: bool,
+    process_released: bool,
+    runtime_removed: bool,
+    cgroup_removed: bool,
+    namespaces_cleaned: bool,
 }
 
 pub struct LinuxSandboxBackend<F, P, E> {
@@ -578,6 +623,14 @@ where
             process,
             egress,
             runtimes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn validate_handle(runtime: &LinuxRuntime, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        if runtime.backend_token == handle.backend_token() {
+            Ok(())
+        } else {
+            Err(SandboxError::ShardNotFound)
         }
     }
 
@@ -730,6 +783,7 @@ where
         self.validate_host_paths()?;
         let cgroup_path = self.config.cgroup_root.join(spec.shard_id().to_string());
         let runtime_path = self.config.sandbox_root.join(spec.shard_id().to_string());
+        let egress_fence = ShardEgressFence::new(spec.shard_id().clone(), spec.worker_epoch());
         let mut cgroup_created = false;
         let mut runtime_created = false;
         let mut route_attempted = false;
@@ -778,7 +832,7 @@ where
                 .create_directory(&runtime_path.join("profile"))?;
 
             route_attempted = true;
-            self.egress.prepare(spec.shard_id()).await?;
+            self.egress.prepare(&egress_fence).await?;
             let identity = self
                 .process
                 .spawn(&self.planned_spawn_request(spec.shard_id()))
@@ -803,22 +857,50 @@ where
             Ok(identity) => identity,
             Err(cause) => {
                 let mut cleanup_errors = Vec::new();
-                if route_attempted && let Err(error) = self.egress.revoke(spec.shard_id()).await {
-                    cleanup_errors.push(format!("route: {error}"));
-                }
-                if let Some(identity) = spawned
-                    && let Err(error) = self.process.abort_spawned(identity).await
-                {
-                    cleanup_errors.push(format!("child: {error}"));
-                }
+                let route_revoked = if route_attempted {
+                    match self.egress.revoke(&egress_fence).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            cleanup_errors.push(format!("route: {error}"));
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                let child_cleaned = if let Some(identity) = spawned {
+                    match self.process.abort_spawned(identity).await {
+                        Ok(()) => true,
+                        Err(error) => {
+                            cleanup_errors.push(format!("child: {error}"));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
                 if runtime_created
                     && let Err(error) = self.filesystem.remove_directory(&runtime_path)
                 {
                     cleanup_errors.push(format!("runtime: {error}"));
                 }
-                if cgroup_created && let Err(error) = self.filesystem.remove_directory(&cgroup_path)
+                let cgroup_cleaned = if cgroup_created {
+                    match self.filesystem.remove_directory(&cgroup_path) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            cleanup_errors.push(format!("cgroup: {error}"));
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if route_revoked
+                    && child_cleaned
+                    && cgroup_cleaned
+                    && let Err(error) = self.egress.release(&egress_fence).await
                 {
-                    cleanup_errors.push(format!("cgroup: {error}"));
+                    cleanup_errors.push(format!("route release: {error}"));
                 }
                 if cleanup_errors.is_empty() {
                     return Err(cause);
@@ -829,18 +911,24 @@ where
                 )));
             }
         };
+        let backend_token = LeaseId::new().to_string();
         self.runtimes.lock().await.insert(
             spec.shard_id().clone(),
             LinuxRuntime {
                 identity,
+                backend_token: backend_token.clone(),
                 cgroup_path,
                 runtime_path,
+                egress_fence,
+                egress_revoked: false,
+                egress_released: false,
+                process_released: false,
+                runtime_removed: false,
+                cgroup_removed: false,
+                namespaces_cleaned: false,
             },
         );
-        Ok(SandboxHandle::new(
-            spec.shard_id().clone(),
-            spec.shard_id().to_string(),
-        ))
+        Ok(SandboxHandle::new(spec.shard_id().clone(), backend_token))
     }
 
     async fn revoke_egress(
@@ -848,7 +936,46 @@ where
         handle: &SandboxHandle,
         _reason: CleanupReason,
     ) -> Result<(), SandboxError> {
-        self.egress.revoke(handle.shard_id()).await
+        let state = self.runtimes.lock().await;
+        let runtime = state
+            .get(handle.shard_id())
+            .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
+        let fence = runtime.egress_fence.clone();
+        let already_revoked = runtime.egress_revoked;
+        drop(state);
+        if !already_revoked {
+            self.egress.revoke(&fence).await?;
+        }
+
+        let mut state = self.runtimes.lock().await;
+        let runtime = state
+            .get_mut(handle.shard_id())
+            .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
+        if runtime.egress_fence != fence {
+            return Err(SandboxError::ShardNotFound);
+        }
+        runtime.egress_revoked = true;
+        let release_after_cleanup = runtime.namespaces_cleaned && !runtime.egress_released;
+        drop(state);
+        if release_after_cleanup {
+            self.egress.release(&fence).await?;
+            let mut state = self.runtimes.lock().await;
+            let runtime = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            if runtime.egress_fence != fence {
+                return Err(SandboxError::ShardNotFound);
+            }
+            runtime.egress_released = true;
+            let remove_runtime = runtime.namespaces_cleaned;
+            if remove_runtime {
+                state.remove(handle.shard_id());
+            }
+        }
+        Ok(())
     }
 
     async fn kill_cgroup(
@@ -860,6 +987,7 @@ where
         let runtime = state
             .get(handle.shard_id())
             .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
         let identity = runtime.identity;
         let cgroup_path = runtime.cgroup_path.clone();
         drop(state);
@@ -908,18 +1036,86 @@ where
             .get(handle.shard_id())
             .cloned()
             .ok_or(SandboxError::ShardNotFound)?;
-        let events = self
-            .filesystem
-            .read_file(&runtime.cgroup_path.join("cgroup.events"))?;
-        if !events.lines().any(|line| line.trim() == "populated 0") {
-            return Err(SandboxError::Backend(
-                "refusing cleanup of populated cgroup".into(),
-            ));
+        Self::validate_handle(&runtime, handle)?;
+        if !runtime.process_released {
+            let events = self
+                .filesystem
+                .read_file(&runtime.cgroup_path.join("cgroup.events"))?;
+            if !events.lines().any(|line| line.trim() == "populated 0") {
+                return Err(SandboxError::Backend(
+                    "refusing cleanup of populated cgroup".into(),
+                ));
+            }
+            self.process.release_spawned(runtime.identity).await?;
+            let mut state = self.runtimes.lock().await;
+            let stored = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
+            if stored.egress_fence != runtime.egress_fence {
+                return Err(SandboxError::Backend(
+                    "sandbox runtime fence changed during cleanup".into(),
+                ));
+            }
+            stored.process_released = true;
         }
-        self.process.release_spawned(runtime.identity).await?;
-        self.filesystem.remove_directory(&runtime.runtime_path)?;
-        self.filesystem.remove_directory(&runtime.cgroup_path)?;
-        self.runtimes.lock().await.remove(handle.shard_id());
+
+        {
+            let mut state = self.runtimes.lock().await;
+            let stored = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
+            if stored.egress_fence != runtime.egress_fence {
+                return Err(SandboxError::Backend(
+                    "sandbox runtime fence changed during cleanup".into(),
+                ));
+            }
+            if !stored.runtime_removed {
+                self.filesystem.remove_directory(&stored.runtime_path)?;
+                stored.runtime_removed = true;
+            }
+            if !stored.cgroup_removed {
+                let events = self
+                    .filesystem
+                    .read_file(&stored.cgroup_path.join("cgroup.events"))?;
+                if !events.lines().any(|line| line.trim() == "populated 0") {
+                    return Err(SandboxError::Backend(
+                        "refusing cleanup of populated cgroup".into(),
+                    ));
+                }
+                self.filesystem.remove_directory(&stored.cgroup_path)?;
+                stored.cgroup_removed = true;
+            }
+            stored.namespaces_cleaned =
+                stored.process_released && stored.runtime_removed && stored.cgroup_removed;
+        }
+
+        let release_fence = {
+            let state = self.runtimes.lock().await;
+            let stored = state
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
+            (stored.namespaces_cleaned && stored.egress_revoked && !stored.egress_released)
+                .then(|| stored.egress_fence.clone())
+        };
+        if let Some(fence) = release_fence {
+            self.egress.release(&fence).await?;
+            let mut state = self.runtimes.lock().await;
+            let stored = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
+            if stored.egress_fence != fence {
+                return Err(SandboxError::ShardNotFound);
+            }
+            stored.egress_released = true;
+            let remove_runtime = stored.namespaces_cleaned;
+            if remove_runtime {
+                state.remove(handle.shard_id());
+            }
+        }
         Ok(())
     }
 
@@ -929,7 +1125,12 @@ where
         let runtime = state
             .get(handle.shard_id())
             .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
+        if runtime.namespaces_cleaned {
+            return Err(SandboxError::ShardNotFound);
+        }
         let cgroup_path = runtime.cgroup_path.clone();
+        let egress_fence = runtime.egress_fence.clone();
         drop(state);
         let memory_current_bytes = self
             .filesystem
@@ -955,7 +1156,7 @@ where
             memory_current_bytes,
             memory_peak_bytes,
             process_count,
-            egress_route_active: self.egress.is_active(handle.shard_id()).await?,
+            egress_route_active: self.egress.is_active(&egress_fence).await?,
         })
     }
 }

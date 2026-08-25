@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{ShardId, WorkerId};
+use browserd_core::{LeaseId, ShardId, WorkerId};
 use browserd_sandbox::{
     CgroupLimits, ChildIdentity, ChromiumRuntime, CleanupReason, EgressRouteBackend, LaunchSpec,
     LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig, ProcessSignal, ReadOnlyMount,
-    SandboxBackend, SandboxError, SandboxFilesystem, SpawnRequest, StdLinuxProcessBackend,
-    StdSandboxFilesystem,
+    SandboxBackend, SandboxError, SandboxFilesystem, ShardEgressFence, SpawnRequest,
+    StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 
 #[derive(Clone, Default)]
@@ -226,6 +226,10 @@ impl LinuxProcessBackend for FakeProcess {
     }
 
     async fn release_spawned(&self, _identity: ChildIdentity) -> Result<(), SandboxError> {
+        self.events
+            .lock()
+            .expect("process event lock should work")
+            .push("release".into());
         Ok(())
     }
 
@@ -333,53 +337,86 @@ impl LinuxProcessBackend for FaultProcess {
 #[derive(Clone, Default)]
 struct FakeEgress {
     events: Arc<Mutex<Vec<String>>>,
-    active: Arc<Mutex<HashSet<ShardId>>>,
+    calls: Arc<Mutex<Vec<EgressCall>>>,
+    active: Arc<Mutex<HashSet<ShardEgressFence>>>,
     fail_prepare: bool,
     fail_revoke: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EgressCall {
+    Prepare(ShardEgressFence),
+    Revoke(ShardEgressFence),
+    Release(ShardEgressFence),
+    IsActive(ShardEgressFence),
+}
+
 #[async_trait]
 impl EgressRouteBackend for FakeEgress {
-    async fn prepare(&self, shard_id: &ShardId) -> Result<(), SandboxError> {
+    async fn prepare(&self, fence: &ShardEgressFence) -> Result<(), SandboxError> {
         self.events
             .lock()
             .expect("egress lock should work")
             .push("route:prepare".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::Prepare(fence.clone()));
         if self.fail_prepare {
             self.active
                 .lock()
                 .expect("active lock should work")
-                .insert(shard_id.clone());
+                .insert(fence.clone());
             return Err(SandboxError::Backend("route unavailable".into()));
         }
         self.active
             .lock()
             .expect("active lock should work")
-            .insert(shard_id.clone());
+            .insert(fence.clone());
         Ok(())
     }
 
-    async fn revoke(&self, shard_id: &ShardId) -> Result<(), SandboxError> {
+    async fn revoke(&self, fence: &ShardEgressFence) -> Result<(), SandboxError> {
         self.events
             .lock()
             .expect("egress lock should work")
             .push("route:revoke".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::Revoke(fence.clone()));
         self.active
             .lock()
             .expect("active lock should work")
-            .remove(shard_id);
+            .remove(fence);
         if self.fail_revoke {
             return Err(SandboxError::Backend("route revoke failed".into()));
         }
         Ok(())
     }
 
-    async fn is_active(&self, shard_id: &ShardId) -> Result<bool, SandboxError> {
+    async fn release(&self, fence: &ShardEgressFence) -> Result<(), SandboxError> {
+        self.events
+            .lock()
+            .expect("egress lock should work")
+            .push("route:release".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::Release(fence.clone()));
+        Ok(())
+    }
+
+    async fn is_active(&self, fence: &ShardEgressFence) -> Result<bool, SandboxError> {
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::IsActive(fence.clone()));
         Ok(self
             .active
             .lock()
             .expect("active lock should work")
-            .contains(shard_id))
+            .contains(fence))
     }
 }
 
@@ -430,7 +467,8 @@ fn assert_no_provisioning_residue(
             .active
             .lock()
             .expect("active route lock should work")
-            .contains(shard_id)
+            .iter()
+            .any(|fence| fence.shard_id() == shard_id)
     );
     assert!(!*alive.lock().expect("alive lock should work"));
 }
@@ -1004,5 +1042,348 @@ async fn termination_validates_identity_then_terms_waits_kills_and_checks_popula
             .events()
             .iter()
             .any(|event| event.ends_with("cgroup.kill=1"))
+    );
+}
+
+#[tokio::test]
+async fn provisioning_rollback_revokes_the_exact_attempted_worker_epoch_fence() {
+    let filesystem = FakeFilesystem::production_tree();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let process = FaultProcess {
+        fault: SpawnFault::Spawn,
+        events: trace,
+        alive: Arc::new(Mutex::new(false)),
+    };
+    let egress = FakeEgress::default();
+    let egress_view = egress.clone();
+    let shard_id = ShardId::new();
+    let expected = ShardEgressFence::new(shard_id.clone(), 47);
+
+    LinuxSandboxBackend::new(config(), filesystem, process, egress)
+        .provision(&LaunchSpec::production(
+            shard_id,
+            WorkerId::new("worker-rollback").expect("worker should be valid"),
+            47,
+        ))
+        .await
+        .expect_err("spawn failure should roll provisioning back");
+
+    assert_eq!(
+        egress_view
+            .calls
+            .lock()
+            .expect("egress call lock should work")
+            .as_slice(),
+        [
+            EgressCall::Prepare(expected.clone()),
+            EgressCall::Revoke(expected.clone()),
+            EgressCall::Release(expected),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn concurrent_cleanup_and_inspect_use_each_runtimes_exact_egress_fence() {
+    let filesystem = FakeFilesystem::production_tree();
+    let process = FakeProcess {
+        events: Arc::new(Mutex::new(Vec::new())),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let egress = FakeEgress::default();
+    let egress_view = egress.clone();
+    let backend = Arc::new(backend(filesystem.clone(), process, egress));
+    let inspect_shard = ShardId::new();
+    let cleanup_shard = ShardId::new();
+    let inspect_fence = ShardEgressFence::new(inspect_shard.clone(), 101);
+    let cleanup_fence = ShardEgressFence::new(cleanup_shard.clone(), 202);
+    let inspect_handle = backend
+        .provision(&LaunchSpec::production(
+            inspect_shard.clone(),
+            WorkerId::new("worker-inspect").expect("worker should be valid"),
+            101,
+        ))
+        .await
+        .expect("inspect runtime should provision");
+    let cleanup_handle = backend
+        .provision(&LaunchSpec::production(
+            cleanup_shard,
+            WorkerId::new("worker-cleanup").expect("worker should be valid"),
+            202,
+        ))
+        .await
+        .expect("cleanup runtime should provision");
+    let inspect_cgroup = PathBuf::from("/sys/fs/cgroup/browserd").join(inspect_shard.to_string());
+    {
+        let mut files = filesystem.files.lock().expect("file lock should work");
+        files.insert(inspect_cgroup.join("memory.current"), "4096\n".into());
+        files.insert(inspect_cgroup.join("memory.peak"), "8192\n".into());
+    }
+
+    let (inspection, revocation) = tokio::join!(
+        backend.inspect(&inspect_handle),
+        backend.revoke_egress(&cleanup_handle, CleanupReason::Administrative),
+    );
+    assert!(
+        inspection
+            .expect("inspection should succeed")
+            .egress_route_active
+    );
+    revocation.expect("route revocation should succeed");
+
+    let calls = egress_view
+        .calls
+        .lock()
+        .expect("egress call lock should work");
+    assert!(calls.contains(&EgressCall::IsActive(inspect_fence)));
+    assert!(calls.contains(&EgressCall::Revoke(cleanup_fence)));
+}
+
+#[tokio::test]
+async fn failed_revoke_retains_the_exact_fence_after_namespace_cleanup_for_retry() {
+    let filesystem = FakeFilesystem::production_tree();
+    let process = FakeProcess {
+        events: Arc::new(Mutex::new(Vec::new())),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let egress = FakeEgress {
+        fail_revoke: true,
+        ..FakeEgress::default()
+    };
+    let egress_view = egress.clone();
+    let backend = backend(filesystem.clone(), process, egress);
+    let shard_id = ShardId::new();
+    let expected = ShardEgressFence::new(shard_id.clone(), 303);
+    let handle = backend
+        .provision(&LaunchSpec::production(
+            shard_id.clone(),
+            WorkerId::new("worker-retry").expect("worker should be valid"),
+            303,
+        ))
+        .await
+        .expect("runtime should provision");
+    filesystem
+        .files
+        .lock()
+        .expect("file lock should work")
+        .insert(
+            PathBuf::from("/sys/fs/cgroup/browserd")
+                .join(shard_id.to_string())
+                .join("cgroup.events"),
+            "populated 0\n".into(),
+        );
+
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect_err("first route revoke should fail");
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("namespace cleanup should still make progress");
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect_err("retry should reach the still-failing egress backend");
+
+    let calls = egress_view
+        .calls
+        .lock()
+        .expect("egress call lock should work");
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| **call == EgressCall::Revoke(expected.clone()))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn namespace_cleanup_releases_the_exact_fence_only_after_cgroup_is_empty() {
+    let filesystem = FakeFilesystem::production_tree();
+    let trace = filesystem.events.clone();
+    let process = FakeProcess {
+        events: trace.clone(),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let egress = FakeEgress {
+        events: trace.clone(),
+        ..FakeEgress::default()
+    };
+    let egress_view = egress.clone();
+    let backend = backend(filesystem.clone(), process, egress);
+    let shard_id = ShardId::new();
+    let expected = ShardEgressFence::new(shard_id.clone(), 7);
+    let handle = backend
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect("runtime should provision");
+    let cgroup_events = PathBuf::from("/sys/fs/cgroup/browserd")
+        .join(shard_id.to_string())
+        .join("cgroup.events");
+
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("route revoke should succeed");
+    assert!(
+        backend.cleanup_namespaces(&handle).await.is_err(),
+        "a populated or unverified cgroup must not release its shard"
+    );
+    assert!(
+        !egress_view
+            .calls
+            .lock()
+            .expect("egress call lock should work")
+            .contains(&EgressCall::Release(expected.clone()))
+    );
+
+    filesystem
+        .files
+        .lock()
+        .expect("file lock should work")
+        .insert(cgroup_events, "populated 0\n".into());
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("empty cgroup cleanup should release its shard");
+
+    let calls = egress_view
+        .calls
+        .lock()
+        .expect("egress call lock should work");
+    let revoke = calls
+        .iter()
+        .position(|call| *call == EgressCall::Revoke(expected.clone()))
+        .expect("route revoke should be recorded");
+    let release = calls
+        .iter()
+        .position(|call| *call == EgressCall::Release(expected.clone()))
+        .expect("shard release should be recorded");
+    assert!(revoke < release);
+    let trace = trace.lock().expect("cleanup trace lock should work");
+    let process_release = trace
+        .iter()
+        .position(|event| event == "release")
+        .expect("process handle should be released");
+    let runtime_remove = trace
+        .iter()
+        .position(|event| event.starts_with("remove:/var/lib/browserd/shards/"))
+        .expect("runtime directory should be removed");
+    let cgroup_remove = trace
+        .iter()
+        .position(|event| event.starts_with("remove:/sys/fs/cgroup/browserd/"))
+        .expect("cgroup should be removed");
+    let route_release = trace
+        .iter()
+        .position(|event| event == "route:release")
+        .expect("route shard should be released");
+    assert!(process_release < runtime_remove);
+    assert!(runtime_remove < cgroup_remove);
+    assert!(cgroup_remove < route_release);
+}
+
+#[tokio::test]
+async fn partial_namespace_cleanup_retries_only_unfinished_stages_before_release() {
+    let filesystem = FakeFilesystem::production_tree();
+    let trace = filesystem.events.clone();
+    let process = FakeProcess {
+        events: trace.clone(),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let egress = FakeEgress {
+        events: trace.clone(),
+        ..FakeEgress::default()
+    };
+    let backend = backend(filesystem.clone(), process, egress);
+    let shard_id = ShardId::new();
+    let handle = backend
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect("runtime should provision");
+    filesystem
+        .files
+        .lock()
+        .expect("file lock should work")
+        .insert(
+            PathBuf::from("/sys/fs/cgroup/browserd")
+                .join(shard_id.to_string())
+                .join("cgroup.events"),
+            "populated 0\n".into(),
+        );
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("route revoke should succeed");
+    filesystem
+        .failing_removes
+        .lock()
+        .expect("remove failpoint lock should work")
+        .insert(format!("browserd/{shard_id}"));
+
+    assert!(backend.cleanup_namespaces(&handle).await.is_err());
+    filesystem
+        .failing_removes
+        .lock()
+        .expect("remove failpoint lock should work")
+        .clear();
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("retry should finish only the remaining cleanup stages");
+
+    let trace = trace.lock().expect("cleanup trace lock should work");
+    assert_eq!(trace.iter().filter(|event| *event == "release").count(), 1);
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| event.starts_with("remove:/var/lib/browserd/shards/"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| *event == "route:release")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn forged_or_stale_backend_handle_cannot_target_the_current_runtime() {
+    let filesystem = FakeFilesystem::production_tree();
+    let process = FakeProcess {
+        events: Arc::new(Mutex::new(Vec::new())),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let egress = FakeEgress::default();
+    let egress_view = egress.clone();
+    let backend = backend(filesystem, process, egress);
+    let shard_id = ShardId::new();
+    backend
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect("runtime should provision");
+    let forged = browserd_sandbox::SandboxHandle::new(shard_id, LeaseId::new().to_string());
+
+    assert!(
+        backend
+            .revoke_egress(&forged, CleanupReason::Administrative)
+            .await
+            .is_err()
+    );
+    assert!(
+        !egress_view
+            .calls
+            .lock()
+            .expect("egress call lock should work")
+            .iter()
+            .any(|call| matches!(call, EgressCall::Revoke(_)))
     );
 }

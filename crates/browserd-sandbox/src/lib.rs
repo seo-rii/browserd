@@ -6,8 +6,8 @@ mod rpc;
 pub use linux::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
     EgressRouteBackend, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
-    ProcessSignal, ReadOnlyMount, SandboxFilesystem, SpawnRequest, StdLinuxProcessBackend,
-    StdSandboxFilesystem,
+    ProcessSignal, ReadOnlyMount, SandboxFilesystem, ShardEgressFence, SpawnRequest,
+    StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 pub use rpc::{
     RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer,
@@ -156,6 +156,10 @@ impl LaunchSpec {
 
     pub const fn shard_id(&self) -> &ShardId {
         &self.shard_id
+    }
+
+    pub const fn worker_epoch(&self) -> u64 {
+        self.worker_epoch
     }
 }
 
