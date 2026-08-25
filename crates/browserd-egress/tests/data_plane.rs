@@ -1023,6 +1023,64 @@ async fn websocket_rejection_does_not_enable_a_raw_tunnel() {
 }
 
 #[tokio::test]
+async fn websocket_response_header_uses_one_absolute_timeout() {
+    let (registry, endpoint, shard) = setup();
+    let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
+    let mut configured = data_limits();
+    configured.header_timeout = Duration::from_millis(15);
+    let service = DataPlane::new(
+        registry,
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(Some(proxy_upstream))),
+        },
+        configured,
+    )
+    .expect("limits should be valid");
+    let (mut client, server) = tokio::io::duplex(4_096);
+    client
+        .write_all(
+            b"GET ws://example.com/socket HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await
+        .expect("upgrade request should write");
+    let serve = tokio::spawn(async move {
+        service
+            .serve_connection(
+                VerifiedRouteSource::new(endpoint, shard),
+                server,
+                MonotonicMillis::new(1_001),
+            )
+            .await
+    });
+    let mut request = vec![0_u8; 1_024];
+    let read = origin.read(&mut request).await.expect("origin should read");
+    assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /socket HTTP/1.1"));
+    let dripper = tokio::spawn(async move {
+        for byte in b"HTTP/1.1 101 Switching Protocols\r\n" {
+            if origin.write_all(&[*byte]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    let result = tokio::time::timeout(Duration::from_millis(250), serve)
+        .await
+        .expect("absolute upstream header timeout should fire")
+        .expect("serve task should join");
+    assert!(matches!(
+        result,
+        Err(DataPlaneError::Timeout("upstream response header"))
+    ));
+    dripper.abort();
+}
+
+#[tokio::test]
 async fn revoke_or_expiry_immediately_closes_live_connect_tunnel() {
     for expire in [false, true] {
         let (registry, endpoint, shard) = setup();

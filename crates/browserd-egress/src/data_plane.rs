@@ -363,32 +363,36 @@ where
             }
         } else if websocket_upgrade_requested {
             let mut response = Vec::new();
-            let head_end = loop {
-                if let Some(position) = response.windows(4).position(|window| window == b"\r\n\r\n")
-                {
-                    break position;
-                }
-                let remaining = self
-                    .limits
-                    .protocol
-                    .max_header_bytes
-                    .saturating_add(1)
-                    .saturating_sub(response.len());
-                if remaining == 0 {
-                    return Err(DataPlaneError::UpstreamResponseHeaderTooLarge);
-                }
-                let mut chunk = vec![0_u8; remaining.min(self.limits.io_buffer_bytes)];
-                let read = tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
-                    result = timeout(self.limits.header_timeout, upstream.read(&mut chunk)) => {
-                        result.map_err(|_| DataPlaneError::Timeout("upstream response header"))??
+            let head_end = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+                result = timeout(self.limits.header_timeout, async {
+                    loop {
+                        if let Some(position) = response
+                            .windows(4)
+                            .position(|window| window == b"\r\n\r\n")
+                        {
+                            return Ok(position);
+                        }
+                        let remaining = self
+                            .limits
+                            .protocol
+                            .max_header_bytes
+                            .saturating_add(1)
+                            .saturating_sub(response.len());
+                        if remaining == 0 {
+                            return Err(DataPlaneError::UpstreamResponseHeaderTooLarge);
+                        }
+                        let mut chunk = vec![0_u8; remaining.min(self.limits.io_buffer_bytes)];
+                        let read = upstream.read(&mut chunk).await?;
+                        if read == 0 {
+                            return Err(DataPlaneError::UnexpectedEof);
+                        }
+                        response.extend_from_slice(&chunk[..read]);
                     }
-                };
-                if read == 0 {
-                    return Err(DataPlaneError::UnexpectedEof);
+                }) => {
+                    result.map_err(|_| DataPlaneError::Timeout("upstream response header"))??
                 }
-                response.extend_from_slice(&chunk[..read]);
             };
             let consumed_head = head_end
                 .checked_add(4)
