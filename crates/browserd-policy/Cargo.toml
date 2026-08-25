@@ -1,0 +1,15 @@
+[package]
+name = "browserd-policy"
+description = "Immutable policy snapshots, emergency denies, and exact-proposal approvals for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browserd-core = { path = "../browserd-core" }
+sha2.workspace = true
+url.workspace = true
