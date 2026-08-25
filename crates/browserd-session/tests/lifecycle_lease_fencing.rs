@@ -3,7 +3,7 @@ use std::time::Duration;
 use browserd_session::{
     ExpireDecision, LeasePolicy, LeaseRenewal, OwnershipFence, PlacementState, SessionError,
     SessionId, SessionLifecycle, SessionMachine, SessionOperation, SessionTime,
-    SessionTimeoutPolicy, WorkerId,
+    SessionTimeoutPolicy, TargetId, WorkerId,
 };
 
 fn machine(ttl_ms: u64, grace_ms: u64) -> Option<(SessionMachine, OwnershipFence)> {
@@ -259,4 +259,39 @@ fn ownership_lease_loss_is_failed_and_lost_not_a_graceful_session_close() {
     assert_eq!(snapshot.lifecycle, SessionLifecycle::Failed);
     assert_eq!(snapshot.placement, PlacementState::Lost);
     assert!(!snapshot.accepting_targets);
+}
+
+#[test]
+fn target_retirement_is_fenced_and_cannot_be_replayed() {
+    let Some((mut machine, fence)) = running_machine(100, 20) else {
+        return;
+    };
+    let first = TargetId::new("target-a");
+    let second = TargetId::new("target-b");
+    assert!(machine.register_target(&fence, first.clone()).is_ok());
+    assert!(machine.register_target(&fence, second).is_ok());
+    assert_eq!(machine.active_target_count(), 2);
+
+    assert_eq!(machine.unregister_target(&fence, &first), Ok(()));
+    assert_eq!(machine.active_target_count(), 1);
+    assert_eq!(
+        machine.unregister_target(&fence, &first),
+        Err(SessionError::UnknownTarget)
+    );
+    assert_eq!(machine.active_target_count(), 1);
+
+    let stale = OwnershipFence::new(
+        fence.worker_id().clone(),
+        fence.worker_epoch(),
+        fence.placement_version().saturating_add(1),
+        fence.session_incarnation(),
+    );
+    assert_eq!(
+        machine.unregister_target(&stale, &TargetId::new("target-b")),
+        Err(SessionError::PlacementVersionMismatch {
+            expected: fence.placement_version(),
+            received: stale.placement_version(),
+        })
+    );
+    assert_eq!(machine.active_target_count(), 1);
 }

@@ -94,6 +94,7 @@ pub enum SessionOperation {
     RenewLease,
     TransferOwner,
     RegisterTarget,
+    UnregisterTarget,
     RecordActivity,
     BeginAction,
     FinishAction,
@@ -145,6 +146,7 @@ pub enum SessionError {
     InvalidWorkerEpoch,
     TargetAdmissionClosed,
     DuplicateTarget,
+    UnknownTarget,
     ActionAlreadyRunning,
     ActionNotRunning,
     ActionIdentityMismatch,
@@ -733,6 +735,24 @@ impl SessionMachine {
         }
         if !self.active_targets.insert(target) {
             return Err(SessionError::DuplicateTarget);
+        }
+        Ok(())
+    }
+
+    pub fn unregister_target(
+        &mut self,
+        fence: &OwnershipFence,
+        target: &TargetId,
+    ) -> Result<(), SessionError> {
+        self.validate_fence(fence)?;
+        if self.lifecycle != SessionLifecycle::Ready {
+            return Err(SessionError::InvalidTransition {
+                from: self.lifecycle,
+                operation: SessionOperation::UnregisterTarget,
+            });
+        }
+        if !self.active_targets.remove(target) {
+            return Err(SessionError::UnknownTarget);
         }
         Ok(())
     }
