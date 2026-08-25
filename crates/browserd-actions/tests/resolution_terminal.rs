@@ -140,6 +140,42 @@ fn conflicting_or_disallowed_resolutions_are_rejected() {
 }
 
 #[test]
+fn same_resolution_kind_cannot_replace_its_audit_identity_or_basis() {
+    let fixture = ledger_fixture();
+    let permit = unknown_action(&fixture, "resolution-audit-conflict");
+    let original = ResolutionAnnotation::new(
+        ResolutionKind::ConfirmedExecuted,
+        PrincipalId::new(),
+        7,
+        "original evidence",
+    );
+    fixture
+        .ledger
+        .resolve(
+            fixture.fence,
+            permit.action_id(),
+            original,
+            ResolutionPolicy::new(false),
+        )
+        .expect("first resolution should succeed");
+
+    assert_eq!(
+        fixture.ledger.resolve(
+            fixture.fence,
+            permit.action_id(),
+            ResolutionAnnotation::new(
+                ResolutionKind::ConfirmedExecuted,
+                PrincipalId::new(),
+                8,
+                "replacement evidence",
+            ),
+            ResolutionPolicy::new(false),
+        ),
+        Err(ActionLedgerError::ResolutionConflict)
+    );
+}
+
+#[test]
 fn terminal_state_is_monotonic_and_conflicting_late_results_are_rejected() {
     let fixture = ledger_fixture();
     let ready = ready_action(&fixture.ledger, fixture.fence, request("terminal", 9));

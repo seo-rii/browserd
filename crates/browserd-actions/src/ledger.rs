@@ -621,7 +621,7 @@ where
             return Err(ActionLedgerError::ResolutionInvalid);
         }
         if let Some(existing) = snapshot.resolution() {
-            return if existing.kind() == annotation.kind() {
+            return if existing == &annotation {
                 Ok(ResolutionOutcome::AlreadyRecorded(snapshot))
             } else {
                 Err(ActionLedgerError::ResolutionConflict)
