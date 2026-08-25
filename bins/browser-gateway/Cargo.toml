@@ -1,0 +1,19 @@
+[package]
+name = "browser-gateway"
+description = "Public browserd API gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+browserd-api = { path = "../../crates/browserd-api" }
+browserd-auth = { path = "../../crates/browserd-auth" }
+browserd-core = { path = "../../crates/browserd-core" }
+browserd-http = { path = "../../crates/browserd-http" }
+tokio.workspace = true
