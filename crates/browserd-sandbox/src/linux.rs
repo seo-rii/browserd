@@ -803,13 +803,13 @@ where
             Ok(identity) => identity,
             Err(cause) => {
                 let mut cleanup_errors = Vec::new();
+                if route_attempted && let Err(error) = self.egress.revoke(spec.shard_id()).await {
+                    cleanup_errors.push(format!("route: {error}"));
+                }
                 if let Some(identity) = spawned
                     && let Err(error) = self.process.abort_spawned(identity).await
                 {
                     cleanup_errors.push(format!("child: {error}"));
-                }
-                if route_attempted && let Err(error) = self.egress.revoke(spec.shard_id()).await {
-                    cleanup_errors.push(format!("route: {error}"));
                 }
                 if runtime_created
                     && let Err(error) = self.filesystem.remove_directory(&runtime_path)

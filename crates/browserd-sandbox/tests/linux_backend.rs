@@ -743,7 +743,7 @@ async fn rollback_reports_cleanup_failures_and_continues_in_reverse_order() {
 }
 
 #[tokio::test]
-async fn invalid_or_mismatched_identity_still_terminates_owned_child_before_rollback() {
+async fn invalid_or_mismatched_identity_revokes_egress_before_terminating_owned_child() {
     for fault in [SpawnFault::InvalidIdentity, SpawnFault::MismatchedIdentity] {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let mut filesystem = FakeFilesystem::production_tree();
@@ -776,9 +776,9 @@ async fn invalid_or_mismatched_identity_still_terminates_owned_child_before_roll
             .iter()
             .position(|event| event == "route:revoke")
             .expect("route must be revoked");
-        assert!(kill < revoke);
-        assert!(events[revoke + 1].starts_with("remove:/var/lib/browserd/shards/"));
-        assert!(events[revoke + 2].starts_with("remove:/sys/fs/cgroup/browserd/"));
+        assert!(revoke < kill);
+        assert!(events[kill + 1].starts_with("remove:/var/lib/browserd/shards/"));
+        assert!(events[kill + 2].starts_with("remove:/sys/fs/cgroup/browserd/"));
     }
 }
 
@@ -820,9 +820,9 @@ async fn cgroup_attach_failure_revokes_route_and_terminates_spawned_child() {
         .iter()
         .position(|event| event == "route:revoke")
         .expect("route should be revoked");
-    assert!(kill < revoke);
-    assert!(events[revoke + 1].starts_with("remove:/var/lib/browserd/shards/"));
-    assert!(events[revoke + 2].starts_with("remove:/sys/fs/cgroup/browserd/"));
+    assert!(revoke < kill);
+    assert!(events[kill + 1].starts_with("remove:/var/lib/browserd/shards/"));
+    assert!(events[kill + 2].starts_with("remove:/sys/fs/cgroup/browserd/"));
 }
 
 #[tokio::test]

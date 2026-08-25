@@ -14,14 +14,16 @@ pub use rpc::{
 };
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{ShardId, WorkerId};
+use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Mutex;
-use tokio::time::Instant;
+use tokio::sync::{Mutex, watch};
+use tokio::time::{Instant, timeout};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SandboxCapabilities {
@@ -91,6 +93,7 @@ impl SandboxCapabilities {
 pub struct SupervisorConfig {
     supervisor_lease_ttl: Duration,
     directory_lease_ttl: Duration,
+    cleanup_stage_timeout: Duration,
 }
 
 impl SupervisorConfig {
@@ -107,7 +110,19 @@ impl SupervisorConfig {
         Ok(Self {
             supervisor_lease_ttl,
             directory_lease_ttl,
+            cleanup_stage_timeout: Duration::from_secs(2),
         })
+    }
+
+    pub fn with_cleanup_stage_timeout(
+        mut self,
+        cleanup_stage_timeout: Duration,
+    ) -> Result<Self, SandboxError> {
+        if cleanup_stage_timeout.is_zero() {
+            return Err(SandboxError::ZeroCleanupTimeout);
+        }
+        self.cleanup_stage_timeout = cleanup_stage_timeout;
+        Ok(self)
     }
 
     pub const fn supervisor_lease_ttl(self) -> Duration {
@@ -116,6 +131,10 @@ impl SupervisorConfig {
 
     pub const fn directory_lease_ttl(self) -> Duration {
         self.directory_lease_ttl
+    }
+
+    pub const fn cleanup_stage_timeout(self) -> Duration {
+        self.cleanup_stage_timeout
     }
 }
 
@@ -216,6 +235,7 @@ pub enum CreateShardOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum KillShardOutcome {
     Terminated(CleanupResult),
+    CleanupIncomplete(CleanupResult),
     AlreadyTerminated,
     CancellationRequested,
 }
@@ -255,18 +275,47 @@ struct ProvisioningShard {
     cancellation: Option<CleanupReason>,
 }
 
+#[derive(Debug)]
+struct CleaningShard {
+    worker_id: WorkerId,
+    worker_epoch: u64,
+    handle: SandboxHandle,
+    reason: CleanupReason,
+    progress: CleanupResult,
+    in_progress: bool,
+    notification_version: u64,
+    notifications: watch::Sender<u64>,
+}
+
+#[derive(Debug)]
+struct TerminatedShard {
+    worker_id: WorkerId,
+    worker_epoch: u64,
+}
+
 #[derive(Debug, Default)]
 struct SupervisorState {
     active: HashMap<ShardId, ActiveShard>,
     provisioning: HashMap<ShardId, ProvisioningShard>,
-    terminated: HashMap<ShardId, u64>,
+    cleaning: HashMap<ShardId, CleaningShard>,
+    terminated: HashMap<ShardId, TerminatedShard>,
 }
 
 #[derive(Debug)]
 pub struct SandboxSupervisor<B> {
     config: SupervisorConfig,
-    backend: B,
-    state: Mutex<SupervisorState>,
+    backend: Arc<B>,
+    state: Arc<Mutex<SupervisorState>>,
+}
+
+impl<B> Clone for SandboxSupervisor<B> {
+    fn clone(&self) -> Self {
+        Self {
+            config: self.config,
+            backend: Arc::clone(&self.backend),
+            state: Arc::clone(&self.state),
+        }
+    }
 }
 
 impl<B> SandboxSupervisor<B>
@@ -276,8 +325,8 @@ where
     pub fn new(config: SupervisorConfig, backend: B) -> Self {
         Self {
             config,
-            backend,
-            state: Mutex::new(SupervisorState::default()),
+            backend: Arc::new(backend),
+            state: Arc::new(Mutex::new(SupervisorState::default())),
         }
     }
 
@@ -334,6 +383,12 @@ where
                             provisioning.ownership.worker_epoch,
                         )
                     })
+                })
+                .or_else(|| {
+                    state
+                        .cleaning
+                        .get(&spec.shard_id)
+                        .map(|cleaning| (cleaning.worker_id.clone(), cleaning.worker_epoch))
                 });
             if let Some((existing_worker_id, existing_worker_epoch)) = existing_owner {
                 if existing_worker_id != spec.worker_id {
@@ -347,10 +402,13 @@ where
                 }
                 return Ok(CreateShardOutcome::AlreadyExists);
             }
-            if let Some(existing_worker_epoch) = state.terminated.get(&spec.shard_id) {
-                if *existing_worker_epoch != spec.worker_epoch {
+            if let Some(terminated) = state.terminated.get(&spec.shard_id) {
+                if terminated.worker_id != spec.worker_id {
+                    return Err(SandboxError::OwnershipMismatch);
+                }
+                if terminated.worker_epoch != spec.worker_epoch {
                     return Err(SandboxError::WorkerEpochMismatch {
-                        expected: *existing_worker_epoch,
+                        expected: terminated.worker_epoch,
                         actual: spec.worker_epoch,
                     });
                 }
@@ -374,16 +432,37 @@ where
         match provisioned {
             Ok(handle) => {
                 if let Some(reason) = provisioning.cancellation {
-                    state
-                        .terminated
-                        .insert(spec.shard_id.clone(), ownership.worker_epoch);
+                    let (notifications, _) = watch::channel(0);
+                    state.cleaning.insert(
+                        spec.shard_id.clone(),
+                        CleaningShard {
+                            worker_id: ownership.worker_id.clone(),
+                            worker_epoch: ownership.worker_epoch,
+                            handle,
+                            reason,
+                            progress: CleanupResult {
+                                route_revoked: false,
+                                cgroup_killed: false,
+                                namespaces_cleaned: false,
+                            },
+                            in_progress: false,
+                            notification_version: 0,
+                            notifications,
+                        },
+                    );
                     drop(state);
-                    let cleanup = self.cleanup(&handle, reason).await;
-                    if cleanup.route_revoked && cleanup.cgroup_killed && cleanup.namespaces_cleaned
+                    match self
+                        .continue_cleanup(&spec.shard_id, ownership.worker_epoch)
+                        .await?
                     {
-                        Ok(CreateShardOutcome::Cancelled)
-                    } else {
-                        Err(SandboxError::IncompleteCleanup { result: cleanup })
+                        KillShardOutcome::Terminated(_) => Ok(CreateShardOutcome::Cancelled),
+                        KillShardOutcome::CleanupIncomplete(result) => {
+                            Err(SandboxError::IncompleteCleanup { result })
+                        }
+                        KillShardOutcome::AlreadyTerminated => Ok(CreateShardOutcome::Cancelled),
+                        KillShardOutcome::CancellationRequested => Err(SandboxError::Backend(
+                            "cleanup did not acquire the provisioned shard".to_owned(),
+                        )),
                     }
                 } else {
                     state
@@ -433,11 +512,12 @@ where
     pub async fn expire_leases(&self, now: Instant) -> Vec<(ShardId, CleanupResult)> {
         let expired = {
             let mut state = self.state.lock().await;
-            let expired_ids = state
+            let expired = state
                 .active
                 .iter()
                 .filter_map(|(shard_id, active)| {
-                    (active.ownership.expires_at <= now).then_some(shard_id.clone())
+                    (active.ownership.expires_at <= now)
+                        .then_some((shard_id.clone(), active.ownership.worker_epoch))
                 })
                 .collect::<Vec<_>>();
             let expired_provisioning = state
@@ -446,36 +526,41 @@ where
                 .filter_map(|(shard_id, provisioning)| {
                     (provisioning.ownership.expires_at <= now
                         && provisioning.cancellation.is_none())
-                    .then_some((shard_id.clone(), provisioning.ownership.worker_epoch))
+                    .then_some(shard_id.clone())
                 })
                 .collect::<Vec<_>>();
-            for (shard_id, worker_epoch) in expired_provisioning {
+            for shard_id in expired_provisioning {
                 if let Some(provisioning) = state.provisioning.get_mut(&shard_id) {
                     provisioning.cancellation = Some(CleanupReason::WorkerLeaseExpired);
                 }
-                state.terminated.insert(shard_id, worker_epoch);
             }
-            expired_ids
-                .into_iter()
-                .filter_map(|shard_id| {
-                    state.active.remove(&shard_id).map(|active| {
-                        state
-                            .terminated
-                            .insert(shard_id.clone(), active.ownership.worker_epoch);
-                        (shard_id, active.handle)
-                    })
-                })
-                .collect::<Vec<_>>()
+            expired
         };
 
-        let mut results = Vec::with_capacity(expired.len());
-        for (shard_id, handle) in expired {
-            let result = self
-                .cleanup(&handle, CleanupReason::WorkerLeaseExpired)
-                .await;
-            results.push((shard_id, result));
-        }
-        results
+        join_all(
+            expired
+                .into_iter()
+                .map(|(shard_id, worker_epoch)| async move {
+                    let outcome = self
+                        .kill_shard(&shard_id, worker_epoch, CleanupReason::WorkerLeaseExpired)
+                        .await;
+                    match outcome {
+                        Ok(
+                            KillShardOutcome::Terminated(result)
+                            | KillShardOutcome::CleanupIncomplete(result),
+                        ) => Some((shard_id, result)),
+                        Ok(
+                            KillShardOutcome::AlreadyTerminated
+                            | KillShardOutcome::CancellationRequested,
+                        )
+                        | Err(_) => None,
+                    }
+                }),
+        )
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub async fn kill_shard(
@@ -484,12 +569,12 @@ where
         worker_epoch: u64,
         reason: CleanupReason,
     ) -> Result<KillShardOutcome, SandboxError> {
-        let handle = {
+        {
             let mut state = self.state.lock().await;
-            if let Some(terminated_epoch) = state.terminated.get(shard_id) {
-                if *terminated_epoch != worker_epoch {
+            if let Some(terminated) = state.terminated.get(shard_id) {
+                if terminated.worker_epoch != worker_epoch {
                     return Err(SandboxError::WorkerEpochMismatch {
-                        expected: *terminated_epoch,
+                        expected: terminated.worker_epoch,
                         actual: worker_epoch,
                     });
                 }
@@ -503,32 +588,175 @@ where
                     });
                 }
                 provisioning.cancellation = Some(reason);
-                state.terminated.insert(shard_id.clone(), worker_epoch);
                 return Ok(KillShardOutcome::CancellationRequested);
             }
-            let active = state
-                .active
-                .get(shard_id)
-                .ok_or(SandboxError::ShardNotFound)?;
-            if active.ownership.worker_epoch != worker_epoch {
-                return Err(SandboxError::WorkerEpochMismatch {
-                    expected: active.ownership.worker_epoch,
-                    actual: worker_epoch,
-                });
+            if !state.cleaning.contains_key(shard_id) {
+                let active = state
+                    .active
+                    .get(shard_id)
+                    .ok_or(SandboxError::ShardNotFound)?;
+                if active.ownership.worker_epoch != worker_epoch {
+                    return Err(SandboxError::WorkerEpochMismatch {
+                        expected: active.ownership.worker_epoch,
+                        actual: worker_epoch,
+                    });
+                }
+                let active = state
+                    .active
+                    .remove(shard_id)
+                    .ok_or(SandboxError::ShardNotFound)?;
+                let (notifications, _) = watch::channel(0);
+                state.cleaning.insert(
+                    shard_id.clone(),
+                    CleaningShard {
+                        worker_id: active.ownership.worker_id,
+                        worker_epoch: active.ownership.worker_epoch,
+                        handle: active.handle,
+                        reason,
+                        progress: CleanupResult {
+                            route_revoked: false,
+                            cgroup_killed: false,
+                            namespaces_cleaned: false,
+                        },
+                        in_progress: false,
+                        notification_version: 0,
+                        notifications,
+                    },
+                );
             }
-            let active = state
-                .active
-                .remove(shard_id)
-                .ok_or(SandboxError::ShardNotFound)?;
-            state
-                .terminated
-                .insert(shard_id.clone(), active.ownership.worker_epoch);
-            active.handle
-        };
+        }
 
-        Ok(KillShardOutcome::Terminated(
-            self.cleanup(&handle, reason).await,
-        ))
+        self.continue_cleanup(shard_id, worker_epoch).await
+    }
+
+    async fn continue_cleanup(
+        &self,
+        shard_id: &ShardId,
+        worker_epoch: u64,
+    ) -> Result<KillShardOutcome, SandboxError> {
+        enum CleanupStep {
+            Run {
+                handle: SandboxHandle,
+                reason: CleanupReason,
+                progress: CleanupResult,
+            },
+            Wait(watch::Receiver<u64>),
+            AlreadyTerminated,
+        }
+
+        loop {
+            let step = {
+                let mut state = self.state.lock().await;
+                if let Some(terminated) = state.terminated.get(shard_id) {
+                    if terminated.worker_epoch != worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: terminated.worker_epoch,
+                            actual: worker_epoch,
+                        });
+                    }
+                    CleanupStep::AlreadyTerminated
+                } else {
+                    let cleaning = state
+                        .cleaning
+                        .get_mut(shard_id)
+                        .ok_or(SandboxError::ShardNotFound)?;
+                    if cleaning.worker_epoch != worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: cleaning.worker_epoch,
+                            actual: worker_epoch,
+                        });
+                    }
+                    if cleaning.in_progress {
+                        CleanupStep::Wait(cleaning.notifications.subscribe())
+                    } else {
+                        cleaning.in_progress = true;
+                        CleanupStep::Run {
+                            handle: cleaning.handle.clone(),
+                            reason: cleaning.reason,
+                            progress: cleaning.progress,
+                        }
+                    }
+                }
+            };
+
+            match step {
+                CleanupStep::AlreadyTerminated => {
+                    return Ok(KillShardOutcome::AlreadyTerminated);
+                }
+                CleanupStep::Wait(mut notifications) => {
+                    notifications
+                        .changed()
+                        .await
+                        .map_err(|_| SandboxError::Backend("cleanup owner vanished".to_owned()))?;
+                }
+                CleanupStep::Run {
+                    handle,
+                    reason,
+                    progress,
+                } => {
+                    let supervisor = self.clone();
+                    let shard_id = shard_id.clone();
+                    let cleanup = tokio::spawn(async move {
+                        let mut result = progress;
+                        if !result.route_revoked {
+                            result.route_revoked = timeout(
+                                supervisor.config.cleanup_stage_timeout,
+                                supervisor.backend.revoke_egress(&handle, reason),
+                            )
+                            .await
+                            .is_ok_and(|stage| stage.is_ok());
+                        }
+                        if !result.cgroup_killed {
+                            result.cgroup_killed = timeout(
+                                supervisor.config.cleanup_stage_timeout,
+                                supervisor.backend.kill_cgroup(&handle, reason),
+                            )
+                            .await
+                            .is_ok_and(|stage| stage.is_ok());
+                        }
+                        if !result.namespaces_cleaned {
+                            result.namespaces_cleaned = timeout(
+                                supervisor.config.cleanup_stage_timeout,
+                                supervisor.backend.cleanup_namespaces(&handle),
+                            )
+                            .await
+                            .is_ok_and(|stage| stage.is_ok());
+                        }
+
+                        let mut state = supervisor.state.lock().await;
+                        let cleaning = state.cleaning.get_mut(&shard_id).ok_or_else(|| {
+                            SandboxError::Backend("cleanup state vanished".to_owned())
+                        })?;
+                        cleaning.progress = result;
+                        cleaning.in_progress = false;
+                        cleaning.notification_version =
+                            cleaning.notification_version.saturating_add(1);
+                        cleaning
+                            .notifications
+                            .send_replace(cleaning.notification_version);
+                        if result.route_revoked && result.cgroup_killed && result.namespaces_cleaned
+                        {
+                            let cleaning = state.cleaning.remove(&shard_id).ok_or_else(|| {
+                                SandboxError::Backend("cleanup state vanished".to_owned())
+                            })?;
+                            state.terminated.insert(
+                                shard_id,
+                                TerminatedShard {
+                                    worker_id: cleaning.worker_id,
+                                    worker_epoch: cleaning.worker_epoch,
+                                },
+                            );
+                            Ok(KillShardOutcome::Terminated(result))
+                        } else {
+                            Ok(KillShardOutcome::CleanupIncomplete(result))
+                        }
+                    });
+                    return cleanup.await.map_err(|error| {
+                        SandboxError::Backend(format!("cleanup task failed: {error}"))
+                    })?;
+                }
+            }
+        }
     }
 
     pub async fn inspect_resources(
@@ -552,17 +780,6 @@ where
         };
         self.backend.inspect(&handle).await
     }
-
-    async fn cleanup(&self, handle: &SandboxHandle, reason: CleanupReason) -> CleanupResult {
-        let route_revoked = self.backend.revoke_egress(handle, reason).await.is_ok();
-        let cgroup_killed = self.backend.kill_cgroup(handle, reason).await.is_ok();
-        let namespaces_cleaned = self.backend.cleanup_namespaces(handle).await.is_ok();
-        CleanupResult {
-            route_revoked,
-            cgroup_killed,
-            namespaces_cleaned,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -581,6 +798,8 @@ pub enum RenewLeaseError {
 pub enum SandboxError {
     #[error("supervisor and directory lease TTLs must be nonzero")]
     ZeroLeaseTtl,
+    #[error("sandbox cleanup stage timeout must be nonzero")]
+    ZeroCleanupTimeout,
     #[error("supervisor lease TTL cannot exceed directory lease TTL")]
     InvalidLeaseOrdering,
     #[error("production sandbox capability is missing: {name}")]

@@ -83,6 +83,7 @@ impl From<SandboxError> for RpcFailure {
     fn from(error: SandboxError) -> Self {
         let code = match error {
             SandboxError::ZeroLeaseTtl
+            | SandboxError::ZeroCleanupTimeout
             | SandboxError::InvalidLeaseOrdering
             | SandboxError::InvalidOwnerLease => RpcFailureCode::InvalidLease,
             SandboxError::MissingCapability { .. } => RpcFailureCode::MissingCapability,

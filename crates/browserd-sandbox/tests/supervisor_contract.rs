@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use browserd_sandbox::{
     LaunchSpec, RenewLeaseError, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
     SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 #[derive(Clone)]
@@ -269,7 +271,7 @@ async fn cleanup_continues_to_kill_when_route_revocation_reports_failure() {
             .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
             .await
             .expect("cleanup must return its partial result"),
-        KillShardOutcome::Terminated(CleanupResult {
+        KillShardOutcome::CleanupIncomplete(CleanupResult {
             route_revoked: false,
             cgroup_killed: true,
             namespaces_cleaned: true,
@@ -330,4 +332,296 @@ async fn explicit_kill_is_idempotent_and_resource_inspection_is_fenced() {
             .count(),
         1
     );
+}
+
+#[derive(Clone)]
+struct RetryCleanupBackend {
+    revoke_failures_remaining: Arc<AtomicUsize>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl SandboxBackend for RetryCleanupBackend {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::production_required()
+    }
+
+    async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        Ok(SandboxHandle::new(spec.shard_id().clone(), "retry"))
+    }
+
+    async fn revoke_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("revoke");
+        if self
+            .revoke_failures_remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            Err(SandboxError::Backend("first revoke fails".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn kill_cgroup(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("kill");
+        Ok(())
+    }
+
+    async fn cleanup_namespaces(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("namespaces");
+        Ok(())
+    }
+
+    async fn inspect(&self, _handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
+        Err(SandboxError::Backend("not used".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn partial_cleanup_retries_only_failed_stages_before_claiming_termination() {
+    let backend = RetryCleanupBackend {
+        revoke_failures_remaining: Arc::new(AtomicUsize::new(1)),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    assert_eq!(
+        supervisor
+            .create_shard(
+                launch_spec(shard_id.clone()),
+                WorkerOwnership::new(worker(), 17, now + Duration::from_secs(10)),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created)
+    );
+
+    assert_eq!(
+        supervisor
+            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .await,
+        Ok(KillShardOutcome::CleanupIncomplete(CleanupResult {
+            route_revoked: false,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
+    );
+    assert_eq!(
+        supervisor
+            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .await,
+        Ok(KillShardOutcome::Terminated(CleanupResult {
+            route_revoked: true,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
+    );
+    assert_eq!(
+        supervisor
+            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .await,
+        Ok(KillShardOutcome::AlreadyTerminated)
+    );
+    assert_eq!(
+        backend.events.lock().unwrap().as_slice(),
+        ["revoke", "kill", "namespaces", "revoke"]
+    );
+}
+
+#[derive(Clone)]
+struct HangingRevokeBackend {
+    never_revoke: Arc<Notify>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl SandboxBackend for HangingRevokeBackend {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::production_required()
+    }
+
+    async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        Ok(SandboxHandle::new(
+            spec.shard_id().clone(),
+            "hanging-revoke",
+        ))
+    }
+
+    async fn revoke_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("revoke-started");
+        self.never_revoke.notified().await;
+        Ok(())
+    }
+
+    async fn kill_cgroup(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("kill");
+        Ok(())
+    }
+
+    async fn cleanup_namespaces(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("namespaces");
+        Ok(())
+    }
+
+    async fn inspect(&self, _handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
+        Err(SandboxError::Backend("not used".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn hung_revoke_is_bounded_and_never_prevents_security_cgroup_kill() {
+    let backend = HangingRevokeBackend {
+        never_revoke: Arc::new(Notify::new()),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let supervisor_config = config()
+        .with_cleanup_stage_timeout(Duration::from_millis(20))
+        .expect("cleanup timeout should be valid");
+    let supervisor = SandboxSupervisor::new(supervisor_config, backend.clone());
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    assert!(
+        supervisor
+            .create_shard(
+                launch_spec(shard_id.clone()),
+                WorkerOwnership::new(worker(), 17, now + Duration::from_secs(10)),
+            )
+            .await
+            .is_ok()
+    );
+
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(200),
+        supervisor.kill_shard(&shard_id, 17, CleanupReason::SecurityViolation),
+    )
+    .await;
+    assert!(outcome.is_ok());
+    assert!(matches!(
+        outcome.ok().and_then(Result::ok),
+        Some(KillShardOutcome::CleanupIncomplete(CleanupResult {
+            route_revoked: false,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
+    ));
+    assert_eq!(
+        backend.events.lock().unwrap().as_slice(),
+        ["revoke-started", "kill", "namespaces"]
+    );
+}
+
+#[derive(Clone)]
+struct CancelSafeCleanupBackend {
+    revoke_started: Arc<Notify>,
+    release_revoke: Arc<Notify>,
+}
+
+#[async_trait]
+impl SandboxBackend for CancelSafeCleanupBackend {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::production_required()
+    }
+
+    async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        Ok(SandboxHandle::new(
+            spec.shard_id().clone(),
+            "cancel-safe-cleanup",
+        ))
+    }
+
+    async fn revoke_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.revoke_started.notify_one();
+        self.release_revoke.notified().await;
+        Ok(())
+    }
+
+    async fn kill_cgroup(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn cleanup_namespaces(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn inspect(&self, _handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
+        Err(SandboxError::Backend("not used".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn cancelling_cleanup_caller_never_strands_the_cleanup_owner() {
+    let backend = CancelSafeCleanupBackend {
+        revoke_started: Arc::new(Notify::new()),
+        release_revoke: Arc::new(Notify::new()),
+    };
+    let supervisor = Arc::new(SandboxSupervisor::new(config(), backend.clone()));
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    assert_eq!(
+        supervisor
+            .create_shard(
+                launch_spec(shard_id.clone()),
+                WorkerOwnership::new(worker(), 17, now + Duration::from_secs(10)),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created)
+    );
+
+    let cleanup_supervisor = Arc::clone(&supervisor);
+    let cleanup_shard_id = shard_id.clone();
+    let cleanup = tokio::spawn(async move {
+        cleanup_supervisor
+            .kill_shard(&cleanup_shard_id, 17, CleanupReason::SecurityViolation)
+            .await
+    });
+    backend.revoke_started.notified().await;
+    cleanup.abort();
+    assert!(
+        cleanup
+            .await
+            .expect_err("caller must be cancelled")
+            .is_cancelled()
+    );
+
+    backend.release_revoke.notify_waiters();
+    let retry = tokio::time::timeout(
+        Duration::from_millis(200),
+        supervisor.kill_shard(&shard_id, 17, CleanupReason::SecurityViolation),
+    )
+    .await;
+    assert!(
+        retry.is_ok(),
+        "cleanup ownership must survive caller cancellation"
+    );
+    assert!(matches!(
+        retry.expect("retry must be bounded"),
+        Ok(KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated)
+    ));
 }
