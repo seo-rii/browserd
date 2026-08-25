@@ -1,0 +1,28 @@
+[package]
+name = "browserd-worker"
+description = "Fenced browser worker control plane and fail-closed runtime contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browserd-actions = { path = "../browserd-actions" }
+browserd-artifacts = { path = "../browserd-artifacts" }
+browserd-core = { path = "../browserd-core" }
+browserd-features = { path = "../browserd-features" }
+browserd-fleet = { path = "../browserd-fleet" }
+browserd-operations = { path = "../browserd-operations" }
+browserd-policy = { path = "../browserd-policy" }
+browserd-sandbox = { path = "../browserd-sandbox" }
+browserd-session = { path = "../browserd-session" }
+browserd-targets = { path = "../browserd-targets" }
+browserd-viewer = { path = "../browserd-viewer" }
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
