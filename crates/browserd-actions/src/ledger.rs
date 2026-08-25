@@ -6,9 +6,10 @@ use browserd_core::{ActionId, ActionState, LeaseId, PlacementFence};
 use crate::{
     AcceptDecision, ActionLedgerError, ActionRequest, ActionSequence, ActionSnapshot,
     BrowserResult, DispatchDecision, DispatchId, DispatchPermit, DurableActionJournal,
-    IdempotencyKey, JournalEntry, JournalEntryKind, KnownFailureReason, LedgerSession,
-    RecordOutcome, ResolutionAnnotation, ResolutionKind, ResolutionOutcome, ResolutionPolicy,
-    TerminalDetail, TransportLoss,
+    IdempotencyKey, JournalEntry, JournalEntryKind, JournalError, KnownFailureReason,
+    LedgerSession, OutcomeUnknownReason, RecordOutcome, ReplayableActionJournal,
+    ResolutionAnnotation, ResolutionKind, ResolutionOutcome, ResolutionPolicy, TerminalDetail,
+    TransportLoss,
 };
 
 #[derive(Default)]
@@ -35,6 +36,193 @@ where
             journal,
             state: Mutex::new(LedgerState::default()),
         }
+    }
+
+    pub fn recover(session: LedgerSession, journal: Arc<J>) -> Result<Self, ActionLedgerError>
+    where
+        J: ReplayableActionJournal,
+    {
+        let entries = journal
+            .replay()
+            .map_err(ActionLedgerError::JournalUnavailable)?;
+        let mut state = LedgerState::default();
+
+        for (index, entry) in entries.into_iter().enumerate() {
+            let invalid = |reason: &str| {
+                ActionLedgerError::RecoveryInvalid(JournalError::new(format!(
+                    "invalid action journal record {}: {reason}",
+                    index + 1
+                )))
+            };
+            if entry.tenant_id() != session.tenant_id()
+                || entry.session_id() != session.session_id()
+                || entry.fence() != session.fence()
+            {
+                return Err(invalid("ledger session scope does not match"));
+            }
+
+            let action_id = entry.action_id().clone();
+            let action_sequence = entry.action_sequence();
+            match entry.kind().clone() {
+                JournalEntryKind::Accepted {
+                    idempotency_key,
+                    canonical_request_hash,
+                    action_kind,
+                } => {
+                    let expected_sequence = state
+                        .last_sequence
+                        .checked_add(1)
+                        .ok_or(ActionLedgerError::SequenceExhausted)?;
+                    if action_sequence.get() != expected_sequence {
+                        return Err(invalid("accepted action sequence is not contiguous"));
+                    }
+                    if state.actions.contains_key(&action_id)
+                        || state.idempotency.contains_key(&idempotency_key)
+                    {
+                        return Err(invalid("duplicate action or idempotency key"));
+                    }
+                    let request = ActionRequest::new(
+                        idempotency_key.clone(),
+                        canonical_request_hash,
+                        action_kind,
+                    );
+                    let snapshot = ActionSnapshot {
+                        action_id: action_id.clone(),
+                        action_sequence,
+                        request,
+                        state: ActionState::Accepted,
+                        dispatch_permit: None,
+                        dispatch_acknowledged: false,
+                        terminal_detail: None,
+                        resolution: None,
+                    };
+                    state.last_sequence = expected_sequence;
+                    state.idempotency.insert(idempotency_key, action_id.clone());
+                    state.actions.insert(action_id, snapshot);
+                }
+                kind => {
+                    let snapshot = state
+                        .actions
+                        .get_mut(&action_id)
+                        .ok_or_else(|| invalid("record references an unknown action"))?;
+                    if snapshot.action_sequence() != action_sequence {
+                        return Err(invalid("record action sequence does not match acceptance"));
+                    }
+                    match kind {
+                        JournalEntryKind::Enqueued => {
+                            if snapshot.state() != ActionState::Accepted {
+                                return Err(invalid("enqueue transition is not valid"));
+                            }
+                            snapshot.state = ActionState::Queued;
+                        }
+                        JournalEntryKind::ReadyToDispatch => {
+                            if snapshot.state() != ActionState::Queued {
+                                return Err(invalid("ready transition is not valid"));
+                            }
+                            snapshot.state = ActionState::ReadyToDispatch;
+                        }
+                        JournalEntryKind::DispatchIntent { dispatch_id } => {
+                            if snapshot.state() != ActionState::ReadyToDispatch
+                                || snapshot.dispatch_permit().is_some()
+                            {
+                                return Err(invalid("dispatch intent transition is not valid"));
+                            }
+                            snapshot.state = ActionState::MayHaveExecuted;
+                            snapshot.dispatch_permit = Some(DispatchPermit {
+                                action_id,
+                                action_sequence,
+                                dispatch_id,
+                            });
+                        }
+                        JournalEntryKind::DispatchAcknowledged { dispatch_id } => {
+                            let Some(permit) = snapshot.dispatch_permit() else {
+                                return Err(invalid("dispatch acknowledgement has no intent"));
+                            };
+                            if snapshot.state() != ActionState::MayHaveExecuted
+                                || snapshot.dispatch_acknowledged()
+                                || permit.dispatch_id() != &dispatch_id
+                            {
+                                return Err(invalid(
+                                    "dispatch acknowledgement does not match its intent",
+                                ));
+                            }
+                            snapshot.dispatch_acknowledged = true;
+                        }
+                        JournalEntryKind::Terminal { detail } => {
+                            if snapshot.terminal_detail().is_some() {
+                                return Err(invalid("action has more than one terminal record"));
+                            }
+                            if detail == TerminalDetail::CancelledBeforeDispatch {
+                                if !matches!(
+                                    snapshot.state(),
+                                    ActionState::Accepted
+                                        | ActionState::Queued
+                                        | ActionState::PendingApproval
+                                        | ActionState::ReadyToDispatch
+                                ) {
+                                    return Err(invalid(
+                                        "pre-dispatch cancellation follows a dispatch intent",
+                                    ));
+                                }
+                            } else if snapshot.state() != ActionState::MayHaveExecuted {
+                                return Err(invalid("terminal result has no dispatch intent"));
+                            }
+                            if detail
+                                == TerminalDetail::FailedKnown(KnownFailureReason::NotDispatched)
+                                && snapshot.dispatch_acknowledged()
+                            {
+                                return Err(invalid(
+                                    "not-dispatched result contradicts dispatch acknowledgement",
+                                ));
+                            }
+                            snapshot.state = detail.state();
+                            snapshot.terminal_detail = Some(detail);
+                        }
+                        JournalEntryKind::Resolved { annotation } => {
+                            if snapshot.state() != ActionState::OutcomeUnknown
+                                || snapshot.resolution().is_some()
+                            {
+                                return Err(invalid("resolution is not valid for action state"));
+                            }
+                            snapshot.resolution = Some(annotation);
+                        }
+                        JournalEntryKind::Accepted { .. } => {
+                            return Err(invalid("accepted record dispatch is inconsistent"));
+                        }
+                    }
+                }
+            }
+        }
+
+        let interrupted_dispatches = state
+            .actions
+            .values()
+            .filter(|snapshot| snapshot.state() == ActionState::MayHaveExecuted)
+            .map(|snapshot| (snapshot.action_id().clone(), snapshot.action_sequence()))
+            .collect::<Vec<_>>();
+        let detail = TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::WorkerLost);
+        for (action_id, action_sequence) in interrupted_dispatches {
+            journal
+                .append(&JournalEntry::new(
+                    &session,
+                    action_id.clone(),
+                    action_sequence,
+                    JournalEntryKind::Terminal { detail },
+                ))
+                .map_err(ActionLedgerError::JournalUnavailable)?;
+            let snapshot = state
+                .actions
+                .get_mut(&action_id)
+                .ok_or(ActionLedgerError::StateUnavailable)?;
+            snapshot.state = detail.state();
+            snapshot.terminal_detail = Some(detail);
+        }
+
+        Ok(Self {
+            session,
+            journal,
+            state: Mutex::new(state),
+        })
     }
 
     #[must_use]
@@ -78,16 +266,16 @@ where
             terminal_detail: None,
             resolution: None,
         };
-        self.append(JournalEntry {
-            session_id: self.session.session_id().clone(),
-            action_id: action_id.clone(),
-            action_sequence: snapshot.action_sequence(),
-            kind: JournalEntryKind::Accepted {
+        self.append(JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            JournalEntryKind::Accepted {
                 idempotency_key: request.idempotency_key().clone(),
                 canonical_request_hash: request.canonical_request_hash(),
                 action_kind: request.kind(),
             },
-        })?;
+        ))?;
 
         state.last_sequence = sequence;
         state
@@ -157,14 +345,14 @@ where
                 action_sequence: snapshot.action_sequence(),
                 dispatch_id: DispatchId(LeaseId::new()),
             };
-            self.append(JournalEntry {
-                session_id: self.session.session_id().clone(),
-                action_id: action_id.clone(),
-                action_sequence: snapshot.action_sequence(),
-                kind: JournalEntryKind::DispatchIntent {
+            self.append(JournalEntry::new(
+                &self.session,
+                action_id.clone(),
+                snapshot.action_sequence(),
+                JournalEntryKind::DispatchIntent {
                     dispatch_id: permit.dispatch_id().clone(),
                 },
-            })?;
+            ))?;
 
             let stored = state
                 .actions
@@ -201,14 +389,14 @@ where
             });
         }
 
-        self.append(JournalEntry {
-            session_id: self.session.session_id().clone(),
-            action_id: permit.action_id().clone(),
-            action_sequence: permit.action_sequence(),
-            kind: JournalEntryKind::DispatchAcknowledged {
+        self.append(JournalEntry::new(
+            &self.session,
+            permit.action_id().clone(),
+            permit.action_sequence(),
+            JournalEntryKind::DispatchAcknowledged {
                 dispatch_id: permit.dispatch_id().clone(),
             },
-        })?;
+        ))?;
         state
             .actions
             .get_mut(permit.action_id())
@@ -279,12 +467,12 @@ where
             });
         }
 
-        self.append(JournalEntry {
-            session_id: self.session.session_id().clone(),
-            action_id: action_id.clone(),
-            action_sequence: snapshot.action_sequence(),
-            kind: JournalEntryKind::Terminal { detail: attempted },
-        })?;
+        self.append(JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            JournalEntryKind::Terminal { detail: attempted },
+        ))?;
         let stored = state
             .actions
             .get_mut(action_id)
@@ -323,14 +511,14 @@ where
             return Err(ActionLedgerError::AbandonedResolutionDenied);
         }
 
-        self.append(JournalEntry {
-            session_id: self.session.session_id().clone(),
-            action_id: action_id.clone(),
-            action_sequence: snapshot.action_sequence(),
-            kind: JournalEntryKind::Resolved {
+        self.append(JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            JournalEntryKind::Resolved {
                 annotation: annotation.clone(),
             },
-        })?;
+        ))?;
         let stored = state
             .actions
             .get_mut(action_id)
@@ -383,12 +571,12 @@ where
                 state: snapshot.state(),
             });
         }
-        self.append(JournalEntry {
-            session_id: self.session.session_id().clone(),
-            action_id: action_id.clone(),
-            action_sequence: snapshot.action_sequence(),
-            kind: journal_kind,
-        })?;
+        self.append(JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            journal_kind,
+        ))?;
         let stored = state
             .actions
             .get_mut(action_id)
@@ -439,12 +627,12 @@ where
             });
         }
 
-        self.append(JournalEntry {
-            session_id: self.session.session_id().clone(),
-            action_id: permit.action_id().clone(),
-            action_sequence: permit.action_sequence(),
-            kind: JournalEntryKind::Terminal { detail: attempted },
-        })?;
+        self.append(JournalEntry::new(
+            &self.session,
+            permit.action_id().clone(),
+            permit.action_sequence(),
+            JournalEntryKind::Terminal { detail: attempted },
+        ))?;
         let stored = state
             .actions
             .get_mut(permit.action_id())

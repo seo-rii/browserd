@@ -3,8 +3,9 @@ use std::fmt;
 use browserd_core::{
     ActionId, ActionState, LeaseId, PlacementFence, PrincipalId, SessionId, TenantId,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct IdempotencyKey(String);
 
 impl IdempotencyKey {
@@ -19,7 +20,7 @@ impl IdempotencyKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CanonicalRequestHash([u8; 32]);
 
 impl CanonicalRequestHash {
@@ -34,7 +35,7 @@ impl CanonicalRequestHash {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ResultDigest([u8; 32]);
 
 impl ResultDigest {
@@ -49,7 +50,7 @@ impl ResultDigest {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ActionSequence(u64);
 
 impl ActionSequence {
@@ -64,7 +65,7 @@ impl ActionSequence {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ActionKind {
     ReadOnly,
     Mutating,
@@ -140,7 +141,7 @@ impl LedgerSession {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct DispatchId(pub(crate) LeaseId);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -167,7 +168,7 @@ impl DispatchPermit {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum KnownFailureReason {
     NotDispatched,
     BrowserRejected,
@@ -176,7 +177,7 @@ pub enum KnownFailureReason {
     ApprovalTimedOut,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum OutcomeUnknownReason {
     AmbiguousTransportLoss,
     WorkerLost,
@@ -196,7 +197,7 @@ pub enum TransportLoss {
     Ambiguous(OutcomeUnknownReason),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TerminalDetail {
     Succeeded(ResultDigest),
     FailedKnown(KnownFailureReason),
@@ -218,14 +219,14 @@ impl TerminalDetail {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ResolutionKind {
     ConfirmedExecuted,
     ConfirmedNotExecuted,
     Abandoned,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ResolutionAnnotation {
     kind: ResolutionKind,
     resolved_by: PrincipalId,
@@ -396,7 +397,7 @@ pub enum JournalEntryType {
     Resolved,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum JournalEntryKind {
     Accepted {
         idempotency_key: IdempotencyKey,
@@ -434,18 +435,73 @@ impl JournalEntryKind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct JournalFence {
+    worker_epoch: u64,
+    placement_version: u64,
+    session_incarnation: u64,
+}
+
+impl From<PlacementFence> for JournalFence {
+    fn from(value: PlacementFence) -> Self {
+        Self {
+            worker_epoch: value.worker_epoch,
+            placement_version: value.placement_version,
+            session_incarnation: value.session_incarnation,
+        }
+    }
+}
+
+impl From<JournalFence> for PlacementFence {
+    fn from(value: JournalFence) -> Self {
+        Self::new(
+            value.worker_epoch,
+            value.placement_version,
+            value.session_incarnation,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct JournalEntry {
+    tenant_id: TenantId,
     pub(crate) session_id: SessionId,
+    fence: JournalFence,
     pub(crate) action_id: ActionId,
     pub(crate) action_sequence: ActionSequence,
     pub(crate) kind: JournalEntryKind,
 }
 
 impl JournalEntry {
+    pub(crate) fn new(
+        session: &LedgerSession,
+        action_id: ActionId,
+        action_sequence: ActionSequence,
+        kind: JournalEntryKind,
+    ) -> Self {
+        Self {
+            tenant_id: session.tenant_id().clone(),
+            session_id: session.session_id().clone(),
+            fence: session.fence().into(),
+            action_id,
+            action_sequence,
+            kind,
+        }
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+
     #[must_use]
     pub const fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    #[must_use]
+    pub fn fence(&self) -> PlacementFence {
+        self.fence.into()
     }
 
     #[must_use]
@@ -491,9 +547,15 @@ pub trait DurableActionJournal: Send + Sync {
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError>;
 }
 
+pub trait ReplayableActionJournal: DurableActionJournal {
+    /// Returns the complete ordered durable prefix or fails without repairing it.
+    fn replay(&self) -> Result<Vec<JournalEntry>, JournalError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionLedgerError {
     JournalUnavailable(JournalError),
+    RecoveryInvalid(JournalError),
     StateUnavailable,
     StaleFence {
         expected: PlacementFence,
