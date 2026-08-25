@@ -195,33 +195,39 @@ where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let started_at = tokio::time::Instant::now();
-        let request = timeout(self.limits.header_timeout, async {
-            let mut buffered = Vec::new();
-            loop {
-                match ProxyRequest::parse(&buffered, self.limits.protocol) {
-                    Ok(request) => return Ok(request),
-                    Err(ProxyProtocolError::IncompleteHeader) => {}
-                    Err(error) => return Err(DataPlaneError::Request(error)),
+        let ingress = self
+            .registry
+            .begin_ingress(source.endpoint, &source.source_shard, now)?;
+        let cancellation = ingress.cancellation_token();
+        let request = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
+            result = timeout(self.limits.header_timeout, async {
+                let mut buffered = Vec::new();
+                loop {
+                    match ProxyRequest::parse(&buffered, self.limits.protocol) {
+                        Ok(request) => return Ok(request),
+                        Err(ProxyProtocolError::IncompleteHeader) => {}
+                        Err(error) => return Err(DataPlaneError::Request(error)),
+                    }
+                    let remaining = self
+                        .limits
+                        .protocol
+                        .max_header_bytes
+                        .saturating_add(1)
+                        .saturating_sub(buffered.len());
+                    if remaining == 0 {
+                        return Err(DataPlaneError::Request(ProxyProtocolError::HeaderTooLarge));
+                    }
+                    let mut chunk = vec![0_u8; remaining.min(self.limits.io_buffer_bytes)];
+                    let read = client.read(&mut chunk).await?;
+                    if read == 0 {
+                        return Err(DataPlaneError::UnexpectedEof);
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
                 }
-                let remaining = self
-                    .limits
-                    .protocol
-                    .max_header_bytes
-                    .saturating_add(1)
-                    .saturating_sub(buffered.len());
-                if remaining == 0 {
-                    return Err(DataPlaneError::Request(ProxyProtocolError::HeaderTooLarge));
-                }
-                let mut chunk = vec![0_u8; remaining.min(self.limits.io_buffer_bytes)];
-                let read = client.read(&mut chunk).await?;
-                if read == 0 {
-                    return Err(DataPlaneError::UnexpectedEof);
-                }
-                buffered.extend_from_slice(&chunk[..read]);
-            }
-        })
-        .await
-        .map_err(|_| DataPlaneError::Timeout("header"))??;
+            }) => result.map_err(|_| DataPlaneError::Timeout("header"))??,
+        };
         let websocket_upgrade_requested =
             request.kind() == ProxyRequestKind::ForwardHttp && request.url().scheme() == "ws" && {
                 let head = String::from_utf8_lossy(request.upstream_head());
@@ -242,11 +248,11 @@ where
                 connection_upgrade && websocket_upgrade
             };
 
-        let pre_dns = self.registry.authorize_dns(
-            source.endpoint,
-            &source.source_shard,
+        let pre_dns = ingress.authorize_dns(
             request.url(),
-            now,
+            MonotonicMillis::new(now.value().saturating_add(
+                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )),
         )?;
         let cancellation = pre_dns.cancellation_token();
         let resolution = tokio::select! {

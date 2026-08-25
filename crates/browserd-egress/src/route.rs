@@ -548,17 +548,22 @@ impl RouteRegistry {
         url: &CanonicalUrl,
         now: MonotonicMillis,
     ) -> Result<PreDnsPermit, RouteError> {
+        self.begin_ingress(endpoint, source_shard, now)?
+            .authorize_dns(url, now)
+    }
+
+    pub fn begin_ingress(
+        &self,
+        endpoint: RouteEndpoint,
+        source_shard: &ShardId,
+        now: MonotonicMillis,
+    ) -> Result<RouteIngressGuard, RouteError> {
         let mut state = self.lock_state();
         let (incarnation, shard_id, worker_epoch, cancellation) = {
             let entry = Self::active_entry(&mut state, endpoint, now)?;
             if &entry.shard_id != source_shard {
                 return Err(RouteError::SourceShardMismatch);
             }
-            entry.planner.authorize(url).map_err(RouteError::Plan)?;
-            entry
-                .quota
-                .record_dns_query(now)
-                .map_err(RouteError::Quota)?;
             (
                 entry.incarnation.clone(),
                 entry.shard_id.clone(),
@@ -577,11 +582,10 @@ impl RouteRegistry {
             .active_connections
             .checked_add(1)
             .ok_or(RouteError::InconsistentRegistryState)?;
-        Ok(PreDnsPermit {
+        Ok(RouteIngressGuard {
             registry: self.clone(),
             endpoint,
             incarnation,
-            url: url.clone(),
             cancellation,
             drain_guard: ShardDrainGuard::new(self.clone(), shard_id, worker_epoch),
         })
@@ -713,6 +717,55 @@ impl RouteRegistry {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug)]
+pub struct RouteIngressGuard {
+    registry: RouteRegistry,
+    endpoint: RouteEndpoint,
+    incarnation: LeaseId,
+    cancellation: CancellationToken,
+    drain_guard: ShardDrainGuard,
+}
+
+impl RouteIngressGuard {
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn authorize_dns(
+        self,
+        url: &CanonicalUrl,
+        now: MonotonicMillis,
+    ) -> Result<PreDnsPermit, RouteError> {
+        let Self {
+            registry,
+            endpoint,
+            incarnation,
+            cancellation,
+            drain_guard,
+        } = self;
+        let mut state = registry.lock_state();
+        let entry = RouteRegistry::active_entry(&mut state, endpoint, now)?;
+        if entry.incarnation != incarnation {
+            return Err(RouteError::RouteRevoked);
+        }
+        entry.planner.authorize(url).map_err(RouteError::Plan)?;
+        entry
+            .quota
+            .record_dns_query(now)
+            .map_err(RouteError::Quota)?;
+        drop(state);
+        Ok(PreDnsPermit {
+            registry,
+            endpoint,
+            incarnation,
+            url: url.clone(),
+            cancellation,
+            drain_guard,
+        })
     }
 }
 

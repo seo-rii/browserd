@@ -65,6 +65,45 @@ struct BlockingRelayClientIo {
     blocked: Arc<Notify>,
 }
 
+struct StalledHeaderIo {
+    read_polled: Arc<Notify>,
+}
+
+impl AsyncRead for StalledHeaderIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        _buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.read_polled.notify_one();
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for StalledHeaderIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 impl AsyncRead for BlockingRelayClientIo {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -494,6 +533,53 @@ async fn revoke_cancels_blocked_dns_before_connect() {
             .expect("target lock should work")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn shard_release_waits_for_a_header_stalled_connection_to_cancel() {
+    let (registry, endpoint, shard) = setup();
+    let read_polled = Arc::new(Notify::new());
+    let mut configured = data_limits();
+    configured.header_timeout = Duration::from_secs(30);
+    let service = DataPlane::new(
+        registry.clone(),
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        GatedConnector {
+            started: Arc::new(Notify::new()),
+            gate: Arc::new(Notify::new()),
+        },
+        configured,
+    )
+    .expect("limits should be valid");
+    let serving_shard = shard.clone();
+    let header_started = read_polled.clone();
+    let serve = tokio::spawn(async move {
+        service
+            .serve_connection(
+                VerifiedRouteSource::new(endpoint, serving_shard),
+                StalledHeaderIo {
+                    read_polled: header_started,
+                },
+                MonotonicMillis::new(1_001),
+            )
+            .await
+    });
+    read_polled.notified().await;
+
+    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    assert_eq!(
+        registry.release_shard(&shard, 7),
+        Err(browserd_egress::RouteError::ShardNotDrained)
+    );
+    let result = tokio::time::timeout(Duration::from_secs(1), serve)
+        .await
+        .expect("header read should cancel promptly")
+        .expect("serve task should join");
+    assert!(matches!(result, Err(DataPlaneError::RouteRevoked)));
+    assert_eq!(registry.release_shard(&shard, 7), Ok(()));
 }
 
 #[tokio::test]
