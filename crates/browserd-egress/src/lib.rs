@@ -4,6 +4,7 @@
 
 mod ip_policy;
 mod planner;
+mod proxy_protocol;
 mod quota;
 mod route;
 mod scheme;
@@ -15,6 +16,7 @@ pub use planner::{
     ConnectPlan, ConnectionPlanner, DnsResolution, EgressPolicy, EgressPolicyError,
     InspectedSocketAddr, PlanError,
 };
+pub use proxy_protocol::{ProxyProtocolError, ProxyProtocolLimits, ProxyRequest, ProxyRequestKind};
 pub use quota::{ConnectionId, MonotonicMillis, QuotaError, QuotaLedger, QuotaLimits, QuotaUsage};
 pub use route::{
     RouteBinding, RouteEndpoint, RouteError, RouteIdentity, RoutePermit, RouteRegistry,
