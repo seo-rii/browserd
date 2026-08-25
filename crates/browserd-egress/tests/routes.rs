@@ -325,6 +325,51 @@ fn pre_dns_permit_fences_route_identity_and_reserves_dns_quota() {
 }
 
 #[test]
+fn pending_ingress_reserves_connection_capacity_until_dropped() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let endpoint = RouteEndpoint::new(15).expect("endpoint should be valid");
+    let shard = ShardId::new();
+    prepare_shard(&registry, &shard, 7);
+    let mut quota_limits = limits();
+    quota_limits.max_concurrent_connections = 1;
+    registry
+        .bind(
+            endpoint,
+            RouteBinding::new(
+                TenantId::new(),
+                SessionId::new(),
+                shard.clone(),
+                7,
+                EgressPolicy::public_web_default(),
+                quota_limits,
+                MonotonicMillis::new(20_000),
+            ),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("route should bind");
+    let url = CanonicalUrl::parse("https://example.com/").expect("URL should be valid");
+
+    let first = registry
+        .authorize_dns(endpoint, &shard, &url, MonotonicMillis::new(1_001))
+        .expect("first pre-DNS permit should reserve capacity");
+    assert_eq!(registry.usage(endpoint).active_connections, 0);
+    assert_eq!(registry.usage(endpoint).connection_starts_in_window, 0);
+    assert!(matches!(
+        registry.begin_ingress(endpoint, &shard, MonotonicMillis::new(1_002)),
+        Err(RouteError::Quota(
+            browserd_egress::QuotaError::ConcurrentConnections
+        ))
+    ));
+
+    drop(first);
+    assert!(
+        registry
+            .begin_ingress(endpoint, &shard, MonotonicMillis::new(1_003))
+            .is_ok()
+    );
+}
+
+#[test]
 fn revocation_fences_existing_permits_and_wins_races_with_new_connections() {
     for iteration in 1..=100 {
         let registry = Arc::new(RouteRegistry::new(Duration::from_secs(30)));
@@ -893,10 +938,20 @@ fn release_waits_for_pre_dns_and_connection_permits_to_drain() {
     let shard = ShardId::new();
     let endpoint = RouteEndpoint::new(421).expect("endpoint should be valid");
     prepare_shard(&registry, &shard, 7);
+    let mut quota_limits = limits();
+    quota_limits.max_concurrent_connections = 3;
     registry
         .bind(
             endpoint,
-            binding(shard.clone(), 20_000),
+            RouteBinding::new(
+                TenantId::new(),
+                SessionId::new(),
+                shard.clone(),
+                7,
+                EgressPolicy::public_web_default(),
+                quota_limits,
+                MonotonicMillis::new(20_000),
+            ),
             MonotonicMillis::new(1_000),
         )
         .expect("route should bind");

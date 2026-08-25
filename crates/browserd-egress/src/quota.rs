@@ -76,6 +76,7 @@ pub struct QuotaLedger {
     window_egress_bytes: u64,
     total_egress_bytes: u64,
     next_connection_id: u64,
+    reserved_connections: u32,
     connections: BTreeMap<ConnectionId, ConnectionState>,
 }
 
@@ -106,14 +107,56 @@ impl QuotaLedger {
             window_egress_bytes: 0,
             total_egress_bytes: 0,
             next_connection_id: 1,
+            reserved_connections: 0,
             connections: BTreeMap::new(),
         }
     }
 
     pub fn open_connection(&mut self, now: MonotonicMillis) -> Result<ConnectionId, QuotaError> {
+        self.reserve_connection(now)?;
+        let result = self.open_reserved_connection(now);
+        if result.is_err() {
+            self.cancel_connection_reservation();
+        }
+        result
+    }
+
+    pub(crate) fn reserve_connection(&mut self, now: MonotonicMillis) -> Result<(), QuotaError> {
         self.advance_window(now)?;
-        if self.connections.len() >= self.limits.max_concurrent_connections as usize {
+        let reserved = usize::try_from(self.reserved_connections)
+            .map_err(|_| QuotaError::ArithmeticOverflow)?;
+        let occupied = self
+            .connections
+            .len()
+            .checked_add(reserved)
+            .ok_or(QuotaError::ArithmeticOverflow)?;
+        let maximum = usize::try_from(self.limits.max_concurrent_connections)
+            .map_err(|_| QuotaError::ArithmeticOverflow)?;
+        if occupied >= maximum {
             return Err(QuotaError::ConcurrentConnections);
+        }
+        self.reserved_connections = self
+            .reserved_connections
+            .checked_add(1)
+            .ok_or(QuotaError::ArithmeticOverflow)?;
+        Ok(())
+    }
+
+    pub(crate) fn cancel_connection_reservation(&mut self) -> bool {
+        let Some(remaining) = self.reserved_connections.checked_sub(1) else {
+            return false;
+        };
+        self.reserved_connections = remaining;
+        true
+    }
+
+    pub(crate) fn open_reserved_connection(
+        &mut self,
+        now: MonotonicMillis,
+    ) -> Result<ConnectionId, QuotaError> {
+        self.advance_window(now)?;
+        if self.reserved_connections == 0 {
+            return Err(QuotaError::UnknownConnection);
         }
         if self.connection_starts_in_window >= self.limits.max_connection_starts_per_window {
             return Err(QuotaError::ConnectionCreationRate);
@@ -128,6 +171,7 @@ impl QuotaLedger {
 
         self.next_connection_id = next_identifier;
         self.connection_starts_in_window = next_starts;
+        self.reserved_connections -= 1;
         self.connections.insert(
             identifier,
             ConnectionState {

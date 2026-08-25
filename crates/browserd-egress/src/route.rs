@@ -571,22 +571,44 @@ impl RouteRegistry {
                 entry.cancellation.clone(),
             )
         };
-        let shard = state
-            .shards
-            .get_mut(&shard_id)
-            .ok_or(RouteError::InconsistentRegistryState)?;
-        if shard.worker_epoch != worker_epoch || shard.lifecycle != ShardRouteLifecycle::Prepared {
-            return Err(RouteError::InconsistentRegistryState);
+        let next_active_connections = {
+            let shard = state
+                .shards
+                .get(&shard_id)
+                .ok_or(RouteError::InconsistentRegistryState)?;
+            if shard.worker_epoch != worker_epoch
+                || shard.lifecycle != ShardRouteLifecycle::Prepared
+            {
+                return Err(RouteError::InconsistentRegistryState);
+            }
+            shard
+                .active_connections
+                .checked_add(1)
+                .ok_or(RouteError::InconsistentRegistryState)?
+        };
+        let entry = Self::active_entry(&mut state, endpoint, now)?;
+        if entry.incarnation != incarnation {
+            return Err(RouteError::RouteRevoked);
         }
-        shard.active_connections = shard
-            .active_connections
-            .checked_add(1)
-            .ok_or(RouteError::InconsistentRegistryState)?;
+        entry
+            .quota
+            .reserve_connection(now)
+            .map_err(RouteError::Quota)?;
+        let Some(shard) = state.shards.get_mut(&shard_id) else {
+            if let Some(entry) = state.active.get_mut(&endpoint)
+                && entry.incarnation == incarnation
+            {
+                entry.quota.cancel_connection_reservation();
+            }
+            return Err(RouteError::InconsistentRegistryState);
+        };
+        shard.active_connections = next_active_connections;
         Ok(RouteIngressGuard {
             registry: self.clone(),
             endpoint,
-            incarnation,
+            incarnation: incarnation.clone(),
             cancellation,
+            reservation: ConnectionReservationGuard::new(self.clone(), endpoint, incarnation),
             drain_guard: ShardDrainGuard::new(self.clone(), shard_id, worker_epoch),
         })
     }
@@ -642,6 +664,32 @@ impl RouteRegistry {
             && &entry.incarnation == incarnation
         {
             entry.quota.close_connection(connection_id);
+        }
+    }
+
+    fn commit_connection_reservation(
+        &self,
+        endpoint: RouteEndpoint,
+        incarnation: &LeaseId,
+        now: MonotonicMillis,
+    ) -> Result<ConnectionId, RouteError> {
+        let mut state = self.lock_state();
+        let entry = Self::active_entry(&mut state, endpoint, now)?;
+        if &entry.incarnation != incarnation {
+            return Err(RouteError::RouteRevoked);
+        }
+        entry
+            .quota
+            .open_reserved_connection(now)
+            .map_err(RouteError::Quota)
+    }
+
+    fn cancel_connection_reservation(&self, endpoint: RouteEndpoint, incarnation: &LeaseId) {
+        let mut state = self.lock_state();
+        if let Some(entry) = state.active.get_mut(&endpoint)
+            && &entry.incarnation == incarnation
+        {
+            entry.quota.cancel_connection_reservation();
         }
     }
 
@@ -726,6 +774,7 @@ pub struct RouteIngressGuard {
     endpoint: RouteEndpoint,
     incarnation: LeaseId,
     cancellation: CancellationToken,
+    reservation: ConnectionReservationGuard,
     drain_guard: ShardDrainGuard,
 }
 
@@ -745,6 +794,7 @@ impl RouteIngressGuard {
             endpoint,
             incarnation,
             cancellation,
+            reservation,
             drain_guard,
         } = self;
         let mut state = registry.lock_state();
@@ -764,6 +814,7 @@ impl RouteIngressGuard {
             incarnation,
             url: url.clone(),
             cancellation,
+            reservation,
             drain_guard,
         })
     }
@@ -776,6 +827,7 @@ pub struct PreDnsPermit {
     incarnation: LeaseId,
     url: CanonicalUrl,
     cancellation: CancellationToken,
+    reservation: ConnectionReservationGuard,
     drain_guard: ShardDrainGuard,
 }
 
@@ -786,33 +838,83 @@ impl PreDnsPermit {
     }
 
     pub fn finish(
-        self,
+        mut self,
         resolution: DnsResolution,
         now: MonotonicMillis,
     ) -> Result<RoutePermit, RouteError> {
-        let mut state = self.registry.lock_state();
-        let entry = RouteRegistry::active_entry(&mut state, self.endpoint, now)?;
-        if entry.incarnation != self.incarnation {
-            return Err(RouteError::RouteRevoked);
-        }
-        let plan = entry
-            .planner
-            .plan(&self.url, resolution)
-            .map_err(RouteError::Plan)?;
-        let connection_id = entry
-            .quota
-            .open_connection(now)
-            .map_err(RouteError::Quota)?;
+        let plan = {
+            let mut state = self.registry.lock_state();
+            let entry = RouteRegistry::active_entry(&mut state, self.endpoint, now)?;
+            if entry.incarnation != self.incarnation {
+                return Err(RouteError::RouteRevoked);
+            }
+            entry
+                .planner
+                .plan(&self.url, resolution)
+                .map_err(RouteError::Plan)?
+        };
+        let connection_id = self.reservation.commit(now)?;
+        let Self {
+            registry,
+            endpoint,
+            incarnation,
+            url: _,
+            cancellation,
+            reservation: _,
+            drain_guard,
+        } = self;
         Ok(RoutePermit {
-            registry: self.registry.clone(),
-            endpoint: self.endpoint,
-            incarnation: entry.incarnation.clone(),
+            registry,
+            endpoint,
+            incarnation,
             connection_id,
             plan,
-            cancellation: entry.cancellation.clone(),
-            drain_guard: self.drain_guard,
+            cancellation,
+            drain_guard,
             open: true,
         })
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionReservationGuard {
+    registry: RouteRegistry,
+    endpoint: RouteEndpoint,
+    incarnation: LeaseId,
+    open: bool,
+}
+
+impl ConnectionReservationGuard {
+    fn new(registry: RouteRegistry, endpoint: RouteEndpoint, incarnation: LeaseId) -> Self {
+        Self {
+            registry,
+            endpoint,
+            incarnation,
+            open: true,
+        }
+    }
+
+    fn commit(&mut self, now: MonotonicMillis) -> Result<ConnectionId, RouteError> {
+        let connection_id =
+            self.registry
+                .commit_connection_reservation(self.endpoint, &self.incarnation, now)?;
+        self.open = false;
+        Ok(connection_id)
+    }
+
+    fn close(&mut self) {
+        if !self.open {
+            return;
+        }
+        self.registry
+            .cancel_connection_reservation(self.endpoint, &self.incarnation);
+        self.open = false;
+    }
+}
+
+impl Drop for ConnectionReservationGuard {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
