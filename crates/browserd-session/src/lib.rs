@@ -27,6 +27,10 @@ impl SessionTime {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,8 +97,11 @@ pub enum SessionOperation {
     RecordActivity,
     BeginAction,
     FinishAction,
+    MarkActionOutcomeUnknown,
+    ResolveAction,
     AcquireHumanControl,
     ReleaseHumanControl,
+    BeginClose,
     Cleanup,
 }
 
@@ -673,6 +680,35 @@ impl SessionMachine {
         Ok(self.owner_fence.clone())
     }
 
+    pub fn begin_close(
+        &mut self,
+        fence: &OwnershipFence,
+        now: SessionTime,
+    ) -> Result<SessionLifecycle, SessionError> {
+        self.validate_fence(fence)?;
+        if matches!(
+            self.lifecycle,
+            SessionLifecycle::Closing | SessionLifecycle::Closed
+        ) {
+            return Ok(self.lifecycle);
+        }
+        if !matches!(
+            self.lifecycle,
+            SessionLifecycle::Creating | SessionLifecycle::Ready
+        ) {
+            return Err(SessionError::InvalidTransition {
+                from: self.lifecycle,
+                operation: SessionOperation::BeginClose,
+            });
+        }
+        self.observe_time(now)?;
+        self.lifecycle = SessionLifecycle::Closing;
+        self.accepting_targets = false;
+        self.reconnect_grants.clear();
+        self.cleanup_drained_targets = self.active_targets.len();
+        Ok(self.lifecycle)
+    }
+
     pub fn register_target(
         &mut self,
         fence: &OwnershipFence,
@@ -767,6 +803,54 @@ impl SessionMachine {
             .clone()
             .transition(SessionExecutionEvent::KnownCompletion(action_id.clone()))
             .map_err(|_| SessionError::ActionIdentityMismatch)?;
+        self.observe_time(now)?;
+        self.execution = execution;
+        Ok(())
+    }
+
+    pub fn mark_action_outcome_unknown(
+        &mut self,
+        fence: &OwnershipFence,
+        action_id: &ActionId,
+        now: SessionTime,
+    ) -> Result<(), SessionError> {
+        self.validate_fence(fence)?;
+        if self.lifecycle != SessionLifecycle::Ready {
+            return Err(SessionError::InvalidTransition {
+                from: self.lifecycle,
+                operation: SessionOperation::MarkActionOutcomeUnknown,
+            });
+        }
+        let execution = self
+            .execution
+            .clone()
+            .transition(SessionExecutionEvent::OutcomeUnknown(action_id.clone()))
+            .map_err(|_| SessionError::ActionIdentityMismatch)?;
+        self.validate_active_deadlines(now)?;
+        self.observe_time(now)?;
+        self.execution = execution;
+        Ok(())
+    }
+
+    pub fn resolve_action(
+        &mut self,
+        fence: &OwnershipFence,
+        action_id: &ActionId,
+        now: SessionTime,
+    ) -> Result<(), SessionError> {
+        self.validate_fence(fence)?;
+        if self.lifecycle != SessionLifecycle::Ready {
+            return Err(SessionError::InvalidTransition {
+                from: self.lifecycle,
+                operation: SessionOperation::ResolveAction,
+            });
+        }
+        let execution = self
+            .execution
+            .clone()
+            .transition(SessionExecutionEvent::Resolve(action_id.clone()))
+            .map_err(|_| SessionError::ActionIdentityMismatch)?;
+        self.validate_active_deadlines(now)?;
         self.observe_time(now)?;
         self.execution = execution;
         Ok(())
