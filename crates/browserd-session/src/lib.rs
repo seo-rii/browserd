@@ -702,6 +702,19 @@ impl SessionMachine {
             });
         }
         self.observe_time(now)?;
+        if let SessionExecution::Running(action_id) = self.execution.clone() {
+            self.execution = self
+                .execution
+                .clone()
+                .transition(SessionExecutionEvent::OutcomeUnknown(action_id))
+                .map_err(|_| SessionError::ActionIdentityMismatch)?;
+        } else if let SessionExecution::PendingApproval(action_id) = self.execution.clone() {
+            self.execution = self
+                .execution
+                .clone()
+                .transition(SessionExecutionEvent::KnownCompletion(action_id))
+                .map_err(|_| SessionError::ActionIdentityMismatch)?;
+        }
         self.lifecycle = SessionLifecycle::Closing;
         self.accepting_targets = false;
         self.reconnect_grants.clear();

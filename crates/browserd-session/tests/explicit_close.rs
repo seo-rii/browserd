@@ -3,8 +3,9 @@ use std::thread;
 use std::time::Duration;
 
 use browserd_session::{
-    CleanupBackend, CleanupFailure, CleanupStage, LeasePolicy, OwnershipFence, SessionError,
-    SessionId, SessionLifecycle, SessionMachine, SessionTime, TargetId, WorkerId,
+    ActionId, CleanupBackend, CleanupFailure, CleanupStage, LeasePolicy, OwnershipFence,
+    SessionError, SessionExecution, SessionId, SessionLifecycle, SessionMachine, SessionTime,
+    TargetId, WorkerId,
 };
 
 fn ready_session() -> Option<(SessionMachine, OwnershipFence)> {
@@ -176,4 +177,24 @@ fn creating_session_can_close_before_becoming_ready() {
             ..
         })
     ));
+}
+
+#[test]
+fn explicit_close_marks_a_dispatched_action_for_reconciliation() {
+    let Some((mut machine, fence)) = ready_session() else {
+        return;
+    };
+    let action_id = ActionId::new();
+    assert_eq!(
+        machine.begin_action(&fence, action_id.clone(), SessionTime::new(2)),
+        Ok(())
+    );
+    assert_eq!(
+        machine.begin_close(&fence, SessionTime::new(3)),
+        Ok(SessionLifecycle::Closing)
+    );
+    assert_eq!(
+        machine.snapshot().execution,
+        SessionExecution::ReconciliationRequired(action_id)
+    );
 }
