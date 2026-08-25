@@ -4,6 +4,7 @@ mod error;
 mod identifiers;
 mod isolation;
 mod placement;
+mod prepared;
 mod resources;
 mod safety;
 mod state;
@@ -16,6 +17,11 @@ pub use identifiers::{
 pub use isolation::{IsolationDecision, IsolationEscalation, IsolationPolicy, IsolationProfile};
 pub use placement::{
     LeaseConfig, LeaseConfigError, Placement, PlacementFence, PlacementFenceError,
+};
+pub use prepared::{
+    EgressFence, LaunchGeneration, OwnerFence, PreparedShardLifecycle, PreparedShardState,
+    PreparedShardTransition, PreparedShardTransitionError, RouteGeneration, SessionIncarnation,
+    ShardFence, TransitionOutcome, WorkerEpoch,
 };
 pub use resources::{
     ActionLimits, ActionResourceClass, ArtifactLimits, MemoryLimits, MemoryThreshold,
