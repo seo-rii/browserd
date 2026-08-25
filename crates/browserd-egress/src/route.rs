@@ -147,6 +147,7 @@ struct RouteEntry {
 struct RetiredRoute {
     shard_id: ShardId,
     worker_epoch: u64,
+    final_usage: QuotaUsage,
 }
 
 #[derive(Debug)]
@@ -628,10 +629,13 @@ impl RouteRegistry {
 
     #[must_use]
     pub fn usage(&self, endpoint: RouteEndpoint) -> QuotaUsage {
-        self.lock_state()
+        let state = self.lock_state();
+        state
             .active
             .get(&endpoint)
-            .map_or_else(QuotaUsage::default, |entry| entry.quota.usage())
+            .map(|entry| entry.quota.usage())
+            .or_else(|| state.retired.get(&endpoint).map(|entry| entry.final_usage))
+            .unwrap_or_default()
     }
 
     fn record_egress_bytes(
@@ -744,6 +748,8 @@ impl RouteRegistry {
             return;
         };
         entry.cancellation.cancel();
+        let mut final_usage = entry.quota.usage();
+        final_usage.active_connections = 0;
         if let Some(shard) = state.shards.get_mut(&entry.shard_id)
             && shard.worker_epoch == entry.worker_epoch
         {
@@ -754,6 +760,7 @@ impl RouteRegistry {
             RetiredRoute {
                 shard_id: entry.shard_id,
                 worker_epoch: entry.worker_epoch,
+                final_usage,
             },
         );
     }

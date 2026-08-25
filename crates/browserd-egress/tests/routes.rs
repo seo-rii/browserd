@@ -237,6 +237,45 @@ fn connection_permit_uses_inspected_sockaddr_and_accounts_bytes() {
 }
 
 #[test]
+fn retired_routes_retain_final_quota_usage_for_audit() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let endpoint = RouteEndpoint::new(16).expect("endpoint should be valid");
+    let shard = ShardId::new();
+    prepare_shard(&registry, &shard, 7);
+    registry
+        .bind(
+            endpoint,
+            binding(shard.clone(), 20_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("route should bind");
+    let url = CanonicalUrl::parse("https://example.com/").expect("URL should be valid");
+    let mut permit = registry
+        .begin_connection(
+            endpoint,
+            &shard,
+            &url,
+            public_resolution("example.com"),
+            MonotonicMillis::new(1_001),
+        )
+        .expect("connection should open");
+    permit
+        .record_egress_bytes(123, MonotonicMillis::new(1_002))
+        .expect("usage should be recorded");
+
+    registry
+        .revoke(endpoint, &shard, 7)
+        .expect("route should revoke");
+
+    let usage = registry.usage(endpoint);
+    assert_eq!(usage.active_connections, 0);
+    assert_eq!(usage.connection_starts_in_window, 1);
+    assert_eq!(usage.dns_queries_in_window, 1);
+    assert_eq!(usage.total_egress_bytes, 123);
+    drop(permit);
+}
+
+#[test]
 fn denied_dns_answers_count_queries_but_never_consume_connection_capacity() {
     let registry = RouteRegistry::new(Duration::from_secs(30));
     let endpoint = RouteEndpoint::new(13);
