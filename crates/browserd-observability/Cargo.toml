@@ -1,0 +1,19 @@
+[package]
+name = "browserd-observability"
+description = "Redaction, bounded audit WAL, metrics policy, and usage aggregation for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+browserd-core = { path = "../browserd-core" }
+hex.workspace = true
+sha2.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
