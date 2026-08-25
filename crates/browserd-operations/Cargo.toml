@@ -1,0 +1,15 @@
+[package]
+name = "browserd-operations"
+description = "Operation state, idempotency, fair queueing, and uncertainty semantics for browserd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+browserd-core = { path = "../browserd-core" }
+serde_json.workspace = true
+sha2.workspace = true
