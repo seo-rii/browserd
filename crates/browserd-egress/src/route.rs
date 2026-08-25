@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use browserd_core::{LeaseId, SessionId, ShardId, TenantId};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     CanonicalUrl, ConnectPlan, ConnectionId, ConnectionPlanner, DnsResolution, EgressPolicy,
@@ -139,6 +140,7 @@ struct RouteEntry {
     expires_at: MonotonicMillis,
     planner: ConnectionPlanner,
     quota: QuotaLedger,
+    cancellation: CancellationToken,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +199,7 @@ impl RouteRegistry {
             expires_at: binding.expires_at,
             planner: ConnectionPlanner::new(binding.policy),
             quota: QuotaLedger::new(binding.quota_limits),
+            cancellation: CancellationToken::new(),
         };
         let identity = RouteIdentity::from(&entry);
         state.active.insert(endpoint, entry);
@@ -277,6 +280,7 @@ impl RouteRegistry {
             shard_id: entry.shard_id.clone(),
             worker_epoch: entry.worker_epoch,
         };
+        entry.cancellation.cancel();
         state.active.remove(&endpoint);
         state.retired.insert(endpoint, retired);
         Ok(())
@@ -290,31 +294,56 @@ impl RouteRegistry {
         resolution: DnsResolution,
         now: MonotonicMillis,
     ) -> Result<RoutePermit, RouteError> {
+        self.authorize_dns(endpoint, source_shard, url, now)?
+            .finish(resolution, now)
+    }
+
+    pub fn authorize_dns(
+        &self,
+        endpoint: RouteEndpoint,
+        source_shard: &ShardId,
+        url: &CanonicalUrl,
+        now: MonotonicMillis,
+    ) -> Result<PreDnsPermit, RouteError> {
         let mut state = self.lock_state();
         let entry = Self::active_entry(&mut state, endpoint, now)?;
         if &entry.shard_id != source_shard {
             return Err(RouteError::SourceShardMismatch);
         }
+        entry.planner.authorize(url).map_err(RouteError::Plan)?;
         entry
             .quota
             .record_dns_query(now)
             .map_err(RouteError::Quota)?;
-        let plan = entry
-            .planner
-            .plan(url, resolution)
-            .map_err(RouteError::Plan)?;
-        let connection_id = entry
-            .quota
-            .open_connection(now)
-            .map_err(RouteError::Quota)?;
-        Ok(RoutePermit {
+        Ok(PreDnsPermit {
             registry: self.clone(),
             endpoint,
             incarnation: entry.incarnation.clone(),
-            connection_id,
-            plan,
-            open: true,
+            url: url.clone(),
+            cancellation: entry.cancellation.clone(),
         })
+    }
+
+    pub fn expire_routes(&self, now: MonotonicMillis) -> usize {
+        let mut state = self.lock_state();
+        let expired = state
+            .active
+            .iter()
+            .filter_map(|(endpoint, entry)| (entry.expires_at <= now).then_some(*endpoint))
+            .collect::<Vec<_>>();
+        for endpoint in &expired {
+            if let Some(entry) = state.active.remove(endpoint) {
+                entry.cancellation.cancel();
+                state.retired.insert(
+                    *endpoint,
+                    RetiredRoute {
+                        shard_id: entry.shard_id,
+                        worker_epoch: entry.worker_epoch,
+                    },
+                );
+            }
+        }
+        expired.len()
     }
 
     #[must_use]
@@ -386,6 +415,7 @@ impl RouteRegistry {
                 shard_id: entry.shard_id.clone(),
                 worker_epoch: entry.worker_epoch,
             };
+            entry.cancellation.cancel();
             state.active.remove(&endpoint);
             state.retired.insert(endpoint, retired);
             return Err(RouteError::RouteExpired);
@@ -407,12 +437,58 @@ impl RouteRegistry {
 }
 
 #[derive(Debug)]
+pub struct PreDnsPermit {
+    registry: RouteRegistry,
+    endpoint: RouteEndpoint,
+    incarnation: LeaseId,
+    url: CanonicalUrl,
+    cancellation: CancellationToken,
+}
+
+impl PreDnsPermit {
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    pub fn finish(
+        self,
+        resolution: DnsResolution,
+        now: MonotonicMillis,
+    ) -> Result<RoutePermit, RouteError> {
+        let mut state = self.registry.lock_state();
+        let entry = RouteRegistry::active_entry(&mut state, self.endpoint, now)?;
+        if entry.incarnation != self.incarnation {
+            return Err(RouteError::RouteRevoked);
+        }
+        let plan = entry
+            .planner
+            .plan(&self.url, resolution)
+            .map_err(RouteError::Plan)?;
+        let connection_id = entry
+            .quota
+            .open_connection(now)
+            .map_err(RouteError::Quota)?;
+        Ok(RoutePermit {
+            registry: self.registry.clone(),
+            endpoint: self.endpoint,
+            incarnation: entry.incarnation.clone(),
+            connection_id,
+            plan,
+            cancellation: entry.cancellation.clone(),
+            open: true,
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct RoutePermit {
     registry: RouteRegistry,
     endpoint: RouteEndpoint,
     incarnation: LeaseId,
     connection_id: ConnectionId,
     plan: ConnectPlan,
+    cancellation: CancellationToken,
     open: bool,
 }
 
@@ -420,6 +496,11 @@ impl RoutePermit {
     #[must_use]
     pub const fn plan(&self) -> &ConnectPlan {
         &self.plan
+    }
+
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 
     pub fn record_egress_bytes(

@@ -214,28 +214,7 @@ impl ConnectionPlanner {
         url: &CanonicalUrl,
         resolution: DnsResolution,
     ) -> Result<ConnectPlan, PlanError> {
-        if self
-            .policy
-            .scheme_policy
-            .classify(NavigationScope::PageRequest, url.scheme())
-            != SchemeDecision::AllowEgress
-        {
-            return Err(PlanError::SchemeDenied {
-                scheme: url.scheme().to_owned(),
-            });
-        }
-        let host_is_allowed = match &self.policy.host_policy {
-            HostPolicy::AnyPublic => true,
-            HostPolicy::ExactAuthorities(entries) => {
-                entries.contains(&(url.host().to_owned(), url.port()))
-            }
-        };
-        if !host_is_allowed {
-            return Err(PlanError::HostNotAllowed {
-                host: url.host().to_owned(),
-                port: url.port(),
-            });
-        }
+        self.authorize(url)?;
         if resolution.canonical_host.as_deref() != Some(url.host()) {
             return Err(PlanError::DnsHostMismatch {
                 declared: url.host().to_owned(),
@@ -296,6 +275,32 @@ impl ConnectionPlanner {
             http_host_header: host_header,
             tls_server_name,
         })
+    }
+
+    pub fn authorize(&self, url: &CanonicalUrl) -> Result<(), PlanError> {
+        if self
+            .policy
+            .scheme_policy
+            .classify(NavigationScope::PageRequest, url.scheme())
+            != SchemeDecision::AllowEgress
+        {
+            return Err(PlanError::SchemeDenied {
+                scheme: url.scheme().to_owned(),
+            });
+        }
+        let host_is_allowed = match &self.policy.host_policy {
+            HostPolicy::AnyPublic => true,
+            HostPolicy::ExactAuthorities(entries) => {
+                entries.contains(&(url.host().to_owned(), url.port()))
+            }
+        };
+        if !host_is_allowed {
+            return Err(PlanError::HostNotAllowed {
+                host: url.host().to_owned(),
+                port: url.port(),
+            });
+        }
+        Ok(())
     }
 
     pub fn revalidate_redirect(

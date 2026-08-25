@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod data_plane;
 mod ip_policy;
 mod planner;
 mod proxy_protocol;
@@ -11,6 +12,10 @@ mod scheme;
 mod upstream_proxy;
 mod url;
 
+pub use data_plane::{
+    BoxedEgressIo, Connector, DataPlane, DataPlaneError, DataPlaneLimits, EgressIo, Resolver,
+    TcpConnector, TokioResolver, VerifiedRouteSource,
+};
 pub use ip_policy::{IpDenyReason, IpPolicy};
 pub use planner::{
     ConnectPlan, ConnectionPlanner, DnsResolution, EgressPolicy, EgressPolicyError,
@@ -19,7 +24,8 @@ pub use planner::{
 pub use proxy_protocol::{ProxyProtocolError, ProxyProtocolLimits, ProxyRequest, ProxyRequestKind};
 pub use quota::{ConnectionId, MonotonicMillis, QuotaError, QuotaLedger, QuotaLimits, QuotaUsage};
 pub use route::{
-    RouteBinding, RouteEndpoint, RouteError, RouteIdentity, RoutePermit, RouteRegistry,
+    PreDnsPermit, RouteBinding, RouteEndpoint, RouteError, RouteIdentity, RoutePermit,
+    RouteRegistry,
 };
 pub use scheme::{NavigationScope, SchemeDecision, SchemePolicy};
 pub use upstream_proxy::{NetworkClass, UpstreamProxy, UpstreamProxyError, UpstreamProxyPolicy};

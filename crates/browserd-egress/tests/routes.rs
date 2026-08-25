@@ -264,6 +264,51 @@ fn denied_dns_answers_count_queries_but_never_consume_connection_capacity() {
 }
 
 #[test]
+fn pre_dns_permit_fences_route_identity_and_reserves_dns_quota() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let endpoint = RouteEndpoint::new(14);
+    assert!(endpoint.is_ok());
+    let Ok(endpoint) = endpoint else {
+        return;
+    };
+    let shard = ShardId::new();
+    let other_shard = ShardId::new();
+    assert!(
+        registry
+            .bind(
+                endpoint,
+                binding(shard.clone(), 20_000),
+                MonotonicMillis::new(1_000),
+            )
+            .is_ok()
+    );
+    let url = CanonicalUrl::parse("https://example.com/");
+    assert!(url.is_ok());
+    let Ok(url) = url else {
+        return;
+    };
+
+    assert!(matches!(
+        registry.authorize_dns(endpoint, &other_shard, &url, MonotonicMillis::new(1_001)),
+        Err(RouteError::SourceShardMismatch)
+    ));
+    assert_eq!(registry.usage(endpoint).dns_queries_in_window, 0);
+    let permit = registry.authorize_dns(endpoint, &shard, &url, MonotonicMillis::new(1_001));
+    assert!(permit.is_ok());
+    assert_eq!(registry.usage(endpoint).dns_queries_in_window, 1);
+    assert_eq!(registry.usage(endpoint).connection_starts_in_window, 0);
+    let Ok(permit) = permit else {
+        return;
+    };
+    let connection = permit.finish(
+        public_resolution("example.com"),
+        MonotonicMillis::new(1_002),
+    );
+    assert!(connection.is_ok());
+    assert_eq!(registry.usage(endpoint).connection_starts_in_window, 1);
+}
+
+#[test]
 fn revocation_fences_existing_permits_and_wins_races_with_new_connections() {
     for iteration in 1..=100 {
         let registry = Arc::new(RouteRegistry::new(Duration::from_secs(30)));

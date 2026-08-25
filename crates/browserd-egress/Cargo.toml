@@ -6,7 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 browserd-core = { path = "../browserd-core" }
+tokio.workspace = true
+tokio-util.workspace = true
 url.workspace = true
 
 [lints]
