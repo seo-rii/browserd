@@ -36,6 +36,7 @@ generation_type!(RouteGeneration);
 generation_type!(SessionIncarnation);
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnerFence {
     worker_id: WorkerId,
     worker_epoch: WorkerEpoch,
@@ -62,6 +63,7 @@ impl OwnerFence {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShardFence {
     owner: OwnerFence,
     shard_id: ShardId,
@@ -99,6 +101,7 @@ impl ShardFence {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EgressFence {
     shard: ShardFence,
     route_generation: RouteGeneration,
@@ -190,6 +193,7 @@ pub enum TransitionOutcome {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedShardLifecycle {
     fence: ShardFence,
     state: PreparedShardState,

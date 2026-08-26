@@ -24,7 +24,7 @@ http-body-util = "0.1"
 ipnet = { version = "2.11", features = ["serde"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 lru = "0.16"
-nix = { version = "0.30", features = ["fs", "mount", "process", "resource", "sched", "signal", "socket", "user"] }
+nix = { version = "0.30", features = ["dir", "fs", "mount", "process", "resource", "sched", "signal", "socket", "user"] }
 parking_lot = "0.12"
 prometheus-client = "0.25"
 rand = "0.9"

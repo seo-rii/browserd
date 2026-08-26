@@ -1,8 +1,18 @@
 //! Shard sandbox supervisor contract, ownership leases, and cleanup ordering.
 
+mod journal;
 mod linux;
 mod rpc;
 
+pub use journal::{
+    FilePreparedShardJournal, JournalSequence, PreparedShardCleanupFailure,
+    PreparedShardCleanupPermit, PreparedShardCleanupProgress, PreparedShardCleanupStage,
+    PreparedShardCleanupStageStatus, PreparedShardEffect, PreparedShardEffectPermit,
+    PreparedShardJournalError, PreparedShardJournalLimits, PreparedShardJournalRecord,
+    PreparedShardRecoveryBackend, PreparedShardRecoveryDisposition, PreparedShardRecoveryError,
+    PreparedShardRecoveryLocators, PreparedShardRecoveryRoots, StartupPreparedShardReconciler,
+    StartupReconciliationHandle, StartupReconciliationReport,
+};
 pub use linux::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
     EgressRouteBackend, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
