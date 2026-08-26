@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::{DelayQueue, delay_queue};
 
@@ -138,6 +138,19 @@ impl CdpTransport {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let (reader, writer) = tokio::io::split(io);
+        Self::spawn_split(reader, writer, config)
+    }
+
+    pub fn spawn_split<R, W>(
+        reader: R,
+        writer: W,
+        config: CdpTransportConfig,
+    ) -> (CdpClient, mpsc::Receiver<CdpIncoming>, CdpDriver)
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (request_tx, request_rx) =
             mpsc::channel::<CommandRequest>(config.command_queue_capacity.max(1));
         let (event_tx, event_rx) = mpsc::channel::<CdpIncoming>(config.event_queue_capacity.max(1));
@@ -156,7 +169,8 @@ impl CdpTransport {
                 return Err(CdpTransportError::InvalidConfig);
             }
 
-            let mut framed = Framed::new(io, CdpFrameCodec::new(config.max_frame_bytes));
+            let mut incoming = FramedRead::new(reader, CdpFrameCodec::new(config.max_frame_bytes));
+            let mut outgoing = FramedWrite::new(writer, CdpFrameCodec::new(config.max_frame_bytes));
             let mut pending = PendingRegistry::new(config.max_pending_commands);
             let mut responders =
                 HashMap::<u64, oneshot::Sender<Result<Value, CdpCommandError>>>::new();
@@ -174,8 +188,8 @@ impl CdpTransport {
                             let _sent = response.send(Err(CdpCommandError::TimedOut));
                         }
                     }
-                    incoming = framed.next() => {
-                        match incoming {
+                    message = incoming.next() => {
+                        match message {
                             Some(Ok(CdpIncoming::Response { id, result, .. })) => {
                                 if matches!(pending.resolve(id), ResolveOutcome::Matched { .. }) {
                                     if let Some(key) = deadline_keys.remove(&id) {
@@ -235,7 +249,11 @@ impl CdpTransport {
                         if let Some(session_id) = request.session_id {
                             command = command.with_session_id(session_id);
                         }
-                        let written = tokio::time::timeout(config.write_timeout, framed.send(command)).await;
+                        let written = tokio::time::timeout(
+                            config.write_timeout,
+                            outgoing.send(command),
+                        )
+                        .await;
                         match written {
                             Ok(Ok(())) => {
                                 responders.insert(id, request.response);

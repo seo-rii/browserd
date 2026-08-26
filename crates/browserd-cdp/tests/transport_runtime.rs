@@ -44,6 +44,55 @@ fn config() -> CdpTransportConfig {
 }
 
 #[tokio::test]
+async fn split_chromium_pipes_dispatch_commands_and_receive_messages() {
+    let (driver_event_io, mut chromium_event_io) = tokio::io::duplex(16 * 1024);
+    let (mut chromium_command_io, driver_command_io) = tokio::io::duplex(16 * 1024);
+    let (event_reader, unused_event_writer) = tokio::io::split(driver_event_io);
+    let (unused_command_reader, command_writer) = tokio::io::split(driver_command_io);
+    drop(unused_event_writer);
+    drop(unused_command_reader);
+
+    let (client, mut events, driver) =
+        CdpTransport::spawn_split(event_reader, command_writer, config());
+    let command = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            client
+                .command("Browser.getVersion", json!({}), None, None)
+                .await
+        })
+    };
+
+    let dispatched = read_command(&mut chromium_command_io).await;
+    let id = dispatched["id"].as_u64();
+    assert!(id.is_some());
+    write_message(
+        &mut chromium_event_io,
+        json!({"method": "Target.targetCreated", "params": {"targetInfo": {"targetId": "page"}}}),
+    )
+    .await;
+    if let Some(id) = id {
+        write_message(
+            &mut chromium_event_io,
+            json!({"id": id, "result": {"product": "Chromium"}}),
+        )
+        .await;
+    }
+
+    assert!(matches!(
+        events.recv().await,
+        Some(browserd_cdp::CdpIncoming::Event { method, .. })
+            if method == "Target.targetCreated"
+    ));
+    let command = command.await;
+    assert!(matches!(command, Ok(Ok(_))));
+    if let Ok(Ok(result)) = command {
+        assert_eq!(result, json!({"product": "Chromium"}));
+    }
+    driver.shutdown().await;
+}
+
+#[tokio::test]
 async fn concurrent_commands_correlate_out_of_order_responses_exactly_once() {
     let (client_io, mut chromium_io) = tokio::io::duplex(64 * 1024);
     let (client, mut events, driver) = CdpTransport::spawn(client_io, config());
