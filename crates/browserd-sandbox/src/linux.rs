@@ -13,7 +13,8 @@ use browserd_core::{LeaseId, ShardId};
 use browserd_launch_gate::APPROVAL_FRAME;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open, openat};
 use nix::sys::signal::Signal;
-use nix::sys::stat::Mode;
+use nix::sys::stat::{Mode, fstat};
+use nix::sys::statfs::fstatfs;
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 use nix::unistd::{pipe2, write as write_fd};
 use tokio::io::AsyncReadExt;
@@ -33,6 +34,7 @@ pub const CHROMIUM_CDP_WRITE_FD: i32 = 4;
 const BWRAP_INFO_TIMEOUT: Duration = Duration::from_secs(1);
 const PREPARED_CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PREPARED_CHILD_EXIT_POLL: Duration = Duration::from_millis(5);
+const PIPEFS_MAGIC: u64 = 0x5049_5045;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CgroupLimits {
@@ -502,6 +504,66 @@ pub struct ChromiumCdpPipes {
 }
 
 impl ChromiumCdpPipes {
+    /// Reconstructs a received capability pair after validating descriptor type, direction,
+    /// close-on-exec state, and that the two ends belong to distinct anonymous pipes.
+    pub fn from_owned_fds(
+        command_writer: OwnedFd,
+        event_reader: OwnedFd,
+    ) -> Result<Self, SandboxError> {
+        let mut command_pipe_identity = None;
+        for (descriptor, required_access, description) in [
+            (&command_writer, nix::libc::O_WRONLY, "CDP command writer"),
+            (&event_reader, nix::libc::O_RDONLY, "CDP event reader"),
+        ] {
+            let metadata = fstat(descriptor).map_err(|error| {
+                SandboxError::Backend(format!("{description} metadata: {error}"))
+            })?;
+            if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFIFO {
+                return Err(SandboxError::Backend(format!(
+                    "{description} is not a pipe"
+                )));
+            }
+            let status = fcntl(descriptor, FcntlArg::F_GETFL).map_err(|error| {
+                SandboxError::Backend(format!("{description} status flags: {error}"))
+            })?;
+            if status & nix::libc::O_PATH != 0 {
+                return Err(SandboxError::Backend(format!("{description} is path-only")));
+            }
+            if status & nix::libc::O_ACCMODE != required_access {
+                return Err(SandboxError::Backend(format!(
+                    "{description} has the wrong access direction"
+                )));
+            }
+            let filesystem = fstatfs(descriptor).map_err(|error| {
+                SandboxError::Backend(format!("{description} filesystem type: {error}"))
+            })?;
+            if filesystem.filesystem_type().0 as u64 != PIPEFS_MAGIC {
+                return Err(SandboxError::Backend(format!(
+                    "{description} is not an anonymous pipe"
+                )));
+            }
+            let descriptor_flags = fcntl(descriptor, FcntlArg::F_GETFD).map_err(|error| {
+                SandboxError::Backend(format!("{description} descriptor flags: {error}"))
+            })?;
+            if !FdFlag::from_bits_truncate(descriptor_flags).contains(FdFlag::FD_CLOEXEC) {
+                return Err(SandboxError::Backend(format!(
+                    "{description} is not close-on-exec"
+                )));
+            }
+            let identity = (metadata.st_dev, metadata.st_ino);
+            if command_pipe_identity == Some(identity) {
+                return Err(SandboxError::Backend(
+                    "CDP command and event capabilities alias one pipe".into(),
+                ));
+            }
+            command_pipe_identity = Some(identity);
+        }
+        Ok(Self {
+            command_writer,
+            event_reader,
+        })
+    }
+
     #[must_use]
     pub fn command_writer(&self) -> BorrowedFd<'_> {
         self.command_writer.as_fd()
@@ -2187,6 +2249,26 @@ where
                 }
             }
         }
+    }
+
+    async fn claim_cdp_pipes(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<ChromiumCdpPipes, SandboxError> {
+        let operation = self.runtime_process_operation(handle)?;
+        let _operation_guard = operation.lock().await;
+        let (backend_token, identity) = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            (runtime.backend_token.clone(), runtime.identity)
+        };
+        self.process.claim_cdp_pipes(&backend_token, identity).await
     }
 
     async fn revoke_egress(

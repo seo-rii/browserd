@@ -306,6 +306,20 @@ impl LinuxProcessBackend for FakeProcess {
         Ok(ChildIdentity::new(4242, 991))
     }
 
+    async fn claim_cdp_pipes(
+        &self,
+        _backend_token: &str,
+        _identity: ChildIdentity,
+    ) -> Result<browserd_sandbox::ChromiumCdpPipes, SandboxError> {
+        let (command_reader, command_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .map_err(|error| SandboxError::Backend(error.to_string()))?;
+        let (event_reader, event_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .map_err(|error| SandboxError::Backend(error.to_string()))?;
+        drop(command_reader);
+        drop(event_writer);
+        browserd_sandbox::ChromiumCdpPipes::from_owned_fds(command_writer, event_reader)
+    }
+
     async fn release_prepared(
         &self,
         _backend_token: &str,
@@ -2968,6 +2982,84 @@ async fn production_cdp_claim_rejects_missing_backend_ownership() {
 }
 
 #[test]
+fn received_cdp_capabilities_fail_closed_on_wrong_or_aliased_descriptors() {
+    let (command_reader, command_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("command pipe should be created");
+    let (event_reader, event_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("event pipe should be created");
+    let wrong_direction =
+        browserd_sandbox::ChromiumCdpPipes::from_owned_fds(command_reader, event_writer);
+    assert!(
+        matches!(wrong_direction, Err(error) if error.to_string().contains("wrong access direction"))
+    );
+    drop(command_writer);
+    drop(event_reader);
+
+    let (alias_reader, alias_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("alias pipe should be created");
+    let aliased = browserd_sandbox::ChromiumCdpPipes::from_owned_fds(alias_writer, alias_reader);
+    assert!(matches!(aliased, Err(error) if error.to_string().contains("alias one pipe")));
+
+    let (unused_command_reader, command_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("command pipe should be created");
+    let (event_reader, unused_event_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("event pipe should be created");
+    nix::fcntl::fcntl(
+        &command_writer,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+    )
+    .expect("test should clear close-on-exec");
+    let inheritable =
+        browserd_sandbox::ChromiumCdpPipes::from_owned_fds(command_writer, event_reader);
+    assert!(matches!(inheritable, Err(error) if error.to_string().contains("not close-on-exec")));
+    drop(unused_command_reader);
+    drop(unused_event_writer);
+}
+
+#[test]
+fn received_cdp_capabilities_reject_path_only_and_named_fifo_descriptors() {
+    let directory = tempfile::tempdir().expect("FIFO tempdir should be created");
+    let fifo = directory.path().join("events.fifo");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("named FIFO should be created");
+
+    let (unused_command_reader, command_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("command pipe should be created");
+    let path_only_event_reader = nix::fcntl::open(
+        &fifo,
+        nix::fcntl::OFlag::O_PATH | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .expect("path-only FIFO should open without blocking");
+    let path_only =
+        browserd_sandbox::ChromiumCdpPipes::from_owned_fds(command_writer, path_only_event_reader);
+    assert!(matches!(
+        path_only,
+        Err(error) if error.to_string().contains("path-only")
+    ));
+    drop(unused_command_reader);
+
+    let (unused_command_reader, command_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("command pipe should be created");
+    let named_event_reader = nix::fcntl::open(
+        &fifo,
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC,
+        nix::sys::stat::Mode::empty(),
+    )
+    .expect("nonblocking named FIFO reader should open");
+    let named =
+        browserd_sandbox::ChromiumCdpPipes::from_owned_fds(command_writer, named_event_reader);
+    assert!(matches!(
+        named,
+        Err(error) if error.to_string().contains("anonymous pipe")
+    ));
+    drop(unused_command_reader);
+}
+
+#[test]
 fn production_process_signals_through_pidfds_instead_of_rechecking_proc_then_killing_pid() {
     let implementation = include_str!("../src/linux.rs");
     assert!(
@@ -4855,4 +4947,24 @@ async fn forged_or_stale_backend_handle_cannot_target_the_current_runtime() {
             .iter()
             .any(|call| matches!(call, EgressCall::Revoke(_)))
     );
+}
+
+#[tokio::test]
+async fn runtime_handle_fences_the_cdp_capability_claim() {
+    let filesystem = FakeFilesystem::production_tree();
+    let process = FakeProcess {
+        events: Arc::new(Mutex::new(Vec::new())),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let backend = backend(filesystem, process, FakeEgress::default());
+    let shard_id = ShardId::new();
+    let handle = backend
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect("runtime should provision");
+    let forged = browserd_sandbox::SandboxHandle::new(shard_id, LeaseId::new().to_string());
+
+    assert!(backend.claim_cdp_pipes(&forged).await.is_err());
+    assert!(backend.claim_cdp_pipes(&handle).await.is_ok());
 }

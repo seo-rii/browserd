@@ -24,15 +24,16 @@ pub use rpc::{
 };
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{ShardId, WorkerId};
-use futures::future::join_all;
+use futures::{FutureExt, future::join_all};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, oneshot, watch};
 use tokio::time::{Instant, timeout};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,6 +261,20 @@ pub trait SandboxBackend: Send + Sync + 'static {
 
     async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError>;
 
+    /// Transfers the exact runtime's parent-side CDP capabilities at most once.
+    /// Returning `Err` must not newly consume the capabilities during that call. The supervisor
+    /// may cancel this future after its bounded claim interval; any uncertain effect must remain
+    /// owned by `handle` so the ordinary revoke/kill/namespace cleanup path can close it
+    /// fail-closed.
+    async fn claim_cdp_pipes(
+        &self,
+        _handle: &SandboxHandle,
+    ) -> Result<ChromiumCdpPipes, SandboxError> {
+        Err(SandboxError::Backend(
+            "CDP pipe claim is unsupported by this sandbox backend".into(),
+        ))
+    }
+
     async fn revoke_egress(
         &self,
         handle: &SandboxHandle,
@@ -281,6 +296,21 @@ pub trait SandboxBackend: Send + Sync + 'static {
 struct ActiveShard {
     ownership: WorkerOwnership,
     handle: SandboxHandle,
+    cdp_claim: CdpClaimState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CdpClaimState {
+    Available,
+    InProgress,
+    Claimed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CdpClaimReceipt {
+    Accepted,
+    Reject(CleanupReason),
+    AlreadyInactive,
 }
 
 #[derive(Debug)]
@@ -479,9 +509,14 @@ where
                         )),
                     }
                 } else {
-                    state
-                        .active
-                        .insert(spec.shard_id, ActiveShard { ownership, handle });
+                    state.active.insert(
+                        spec.shard_id,
+                        ActiveShard {
+                            ownership,
+                            handle,
+                            cdp_claim: CdpClaimState::Available,
+                        },
+                    );
                     Ok(CreateShardOutcome::Created)
                 }
             }
@@ -794,6 +829,231 @@ where
         };
         self.backend.inspect(&handle).await
     }
+
+    pub async fn claim_cdp_pipes(
+        &self,
+        shard_id: &ShardId,
+        worker_id: &WorkerId,
+        worker_epoch: u64,
+    ) -> Result<ChromiumCdpPipes, SandboxError> {
+        let handle = {
+            let mut state = self.state.lock().await;
+            let active = state
+                .active
+                .get_mut(shard_id)
+                .ok_or(SandboxError::ShardNotFound)?;
+            if active.ownership.worker_id != *worker_id {
+                return Err(SandboxError::OwnershipMismatch);
+            }
+            if active.ownership.worker_epoch != worker_epoch {
+                return Err(SandboxError::WorkerEpochMismatch {
+                    expected: active.ownership.worker_epoch,
+                    actual: worker_epoch,
+                });
+            }
+            if active.ownership.expires_at <= Instant::now() {
+                return Err(SandboxError::InvalidOwnerLease);
+            }
+            match active.cdp_claim {
+                CdpClaimState::Available => {
+                    active.cdp_claim = CdpClaimState::InProgress;
+                }
+                CdpClaimState::InProgress => return Err(SandboxError::CdpClaimInProgress),
+                CdpClaimState::Claimed => return Err(SandboxError::CdpPipesAlreadyClaimed),
+            }
+            active.handle.clone()
+        };
+
+        let supervisor = self.clone();
+        let claim_shard_id = shard_id.clone();
+        let claim_worker_id = worker_id.clone();
+        let (response_sender, response_receiver) = oneshot::channel();
+        let (receipt_sender, receipt_receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            if response_sender.is_closed() {
+                let mut state = supervisor.state.lock().await;
+                if let Some(active) = state.active.get_mut(&claim_shard_id)
+                    && active.ownership.worker_id == claim_worker_id
+                    && active.ownership.worker_epoch == worker_epoch
+                    && active.cdp_claim == CdpClaimState::InProgress
+                {
+                    active.cdp_claim = CdpClaimState::Available;
+                }
+                return;
+            }
+
+            let (backend_result, uncertain_backend_effect) = match timeout(
+                supervisor.config.cleanup_stage_timeout,
+                AssertUnwindSafe(supervisor.backend.claim_cdp_pipes(&handle)).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => (result, false),
+                Ok(Err(_)) => (
+                    Err(SandboxError::Backend(
+                        "CDP capability backend panicked during claim".to_owned(),
+                    )),
+                    true,
+                ),
+                Err(_) => (
+                    Err(SandboxError::Backend(
+                        "CDP capability backend claim timed out".to_owned(),
+                    )),
+                    true,
+                ),
+            };
+            let mut cleanup_reason = None;
+            let response = {
+                let mut state = supervisor.state.lock().await;
+                match state.active.get_mut(&claim_shard_id) {
+                    None => Err(SandboxError::ShardNotFound),
+                    Some(active) if active.ownership.worker_id != claim_worker_id => {
+                        Err(SandboxError::OwnershipMismatch)
+                    }
+                    Some(active) if active.ownership.worker_epoch != worker_epoch => {
+                        Err(SandboxError::WorkerEpochMismatch {
+                            expected: active.ownership.worker_epoch,
+                            actual: worker_epoch,
+                        })
+                    }
+                    Some(active) if active.cdp_claim != CdpClaimState::InProgress => {
+                        cleanup_reason = Some(CleanupReason::BrowserFailure);
+                        Err(SandboxError::Backend(
+                            "CDP claim reservation changed during backend handoff".to_owned(),
+                        ))
+                    }
+                    Some(active) if active.ownership.expires_at <= Instant::now() => {
+                        active.cdp_claim = CdpClaimState::Claimed;
+                        cleanup_reason = Some(CleanupReason::WorkerLeaseExpired);
+                        Err(SandboxError::InvalidOwnerLease)
+                    }
+                    Some(active) if uncertain_backend_effect => {
+                        active.cdp_claim = CdpClaimState::Claimed;
+                        cleanup_reason = Some(CleanupReason::BrowserFailure);
+                        backend_result
+                    }
+                    Some(active) => match backend_result {
+                        Ok(pipes) => Ok(pipes),
+                        Err(error) => {
+                            active.cdp_claim = CdpClaimState::Available;
+                            Err(error)
+                        }
+                    },
+                }
+            };
+
+            if let Some(reason) = cleanup_reason {
+                let _ = supervisor
+                    .kill_shard(&claim_shard_id, worker_epoch, reason)
+                    .await;
+            }
+            let response_contains_capability = response.is_ok();
+            match response_sender.send(response) {
+                Ok(()) if response_contains_capability => {
+                    match timeout(supervisor.config.cleanup_stage_timeout, receipt_receiver).await {
+                        Ok(Ok(CdpClaimReceipt::Accepted | CdpClaimReceipt::AlreadyInactive)) => {}
+                        Ok(Ok(CdpClaimReceipt::Reject(reason))) => {
+                            let _ = supervisor
+                                .kill_shard(&claim_shard_id, worker_epoch, reason)
+                                .await;
+                        }
+                        Ok(Err(_)) | Err(_) => {
+                            let cleanup_reason = {
+                                let mut state = supervisor.state.lock().await;
+                                state.active.get_mut(&claim_shard_id).and_then(|active| {
+                                    (active.ownership.worker_id == claim_worker_id
+                                        && active.ownership.worker_epoch == worker_epoch
+                                        && active.cdp_claim == CdpClaimState::InProgress)
+                                        .then(|| {
+                                            active.cdp_claim = CdpClaimState::Claimed;
+                                            if active.ownership.expires_at <= Instant::now() {
+                                                CleanupReason::WorkerLeaseExpired
+                                            } else {
+                                                CleanupReason::BrowserFailure
+                                            }
+                                        })
+                                })
+                            };
+                            if let Some(reason) = cleanup_reason {
+                                let _ = supervisor
+                                    .kill_shard(&claim_shard_id, worker_epoch, reason)
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                Err(Ok(pipes)) => {
+                    drop(pipes);
+                    let _ = supervisor
+                        .kill_shard(&claim_shard_id, worker_epoch, CleanupReason::BrowserFailure)
+                        .await;
+                }
+                Ok(()) | Err(Err(_)) => {}
+            }
+        });
+
+        let response = response_receiver.await.map_err(|error| {
+            SandboxError::Backend(format!("CDP claim task failed before responding: {error}"))
+        })?;
+        match response {
+            Ok(pipes) => {
+                let (validation, receipt) = {
+                    let mut state = self.state.lock().await;
+                    match state.active.get_mut(shard_id) {
+                        None => (
+                            Err(SandboxError::ShardNotFound),
+                            CdpClaimReceipt::AlreadyInactive,
+                        ),
+                        Some(active) if active.ownership.worker_id != *worker_id => (
+                            Err(SandboxError::OwnershipMismatch),
+                            CdpClaimReceipt::AlreadyInactive,
+                        ),
+                        Some(active) if active.ownership.worker_epoch != worker_epoch => (
+                            Err(SandboxError::WorkerEpochMismatch {
+                                expected: active.ownership.worker_epoch,
+                                actual: worker_epoch,
+                            }),
+                            CdpClaimReceipt::AlreadyInactive,
+                        ),
+                        Some(active) if active.cdp_claim != CdpClaimState::InProgress => (
+                            Err(SandboxError::Backend(
+                                "CDP claim reservation changed before caller receipt".to_owned(),
+                            )),
+                            CdpClaimReceipt::Reject(CleanupReason::BrowserFailure),
+                        ),
+                        Some(active) if active.ownership.expires_at <= Instant::now() => {
+                            active.cdp_claim = CdpClaimState::Claimed;
+                            (
+                                Err(SandboxError::InvalidOwnerLease),
+                                CdpClaimReceipt::Reject(CleanupReason::WorkerLeaseExpired),
+                            )
+                        }
+                        Some(active) => {
+                            active.cdp_claim = CdpClaimState::Claimed;
+                            (Ok(()), CdpClaimReceipt::Accepted)
+                        }
+                    }
+                };
+                if let Err(error) = validation {
+                    drop(pipes);
+                    let _ = receipt_sender.send(receipt);
+                    return Err(error);
+                }
+                if receipt_sender.send(receipt).is_err() {
+                    drop(pipes);
+                    let _ = self
+                        .kill_shard(shard_id, worker_epoch, CleanupReason::BrowserFailure)
+                        .await;
+                    Err(SandboxError::Backend(
+                        "CDP claim task failed before acknowledging receipt".to_owned(),
+                    ))
+                } else {
+                    Ok(pipes)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -826,6 +1086,10 @@ pub enum SandboxError {
     ShardNotFound,
     #[error("worker epoch mismatch: expected {expected}, received {actual}")]
     WorkerEpochMismatch { expected: u64, actual: u64 },
+    #[error("a CDP capability claim is already in progress")]
+    CdpClaimInProgress,
+    #[error("the CDP capabilities have already been claimed")]
+    CdpPipesAlreadyClaimed,
     #[error("sandbox has incomplete cleanup: {result:?}")]
     IncompleteCleanup { result: CleanupResult },
     #[error("sandbox backend failed: {0}")]

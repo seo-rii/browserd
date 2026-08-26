@@ -1,5 +1,6 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,9 +8,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use browserd_core::{ShardId, WorkerId};
 use browserd_sandbox::{
-    CleanupReason, CleanupResult, CreateShardOutcome, InspectResources, KillShardOutcome,
-    LaunchSpec, RenewLeaseError, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
-    SandboxSupervisor, SupervisorConfig, WorkerOwnership,
+    ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome, InspectResources,
+    KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxCapabilities,
+    SandboxError, SandboxHandle, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -101,6 +102,474 @@ fn config() -> SupervisorConfig {
 
 fn launch_spec(shard_id: ShardId) -> LaunchSpec {
     LaunchSpec::production(shard_id, worker(), 17)
+}
+
+#[derive(Clone)]
+struct ClaimingBackend {
+    pipes: Arc<Mutex<Option<ChromiumCdpPipes>>>,
+    claim_calls: Arc<AtomicUsize>,
+    claim_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    kill_reasons: Arc<Mutex<Vec<CleanupReason>>>,
+    kill_called: Arc<Notify>,
+    claim_completed: Arc<Notify>,
+    panic_on_claim: bool,
+}
+
+impl ClaimingBackend {
+    fn new() -> Self {
+        let (backend, command_reader) = Self::with_gate(None);
+        drop(command_reader);
+        backend
+    }
+
+    fn blocked() -> (Self, Arc<Notify>, Arc<Notify>, OwnedFd) {
+        let entered = Arc::new(Notify::new());
+        let proceed = Arc::new(Notify::new());
+        let (backend, command_reader) =
+            Self::with_gate(Some((Arc::clone(&entered), Arc::clone(&proceed))));
+        (backend, entered, proceed, command_reader)
+    }
+
+    fn panicking() -> Self {
+        let mut backend = Self::new();
+        backend.panic_on_claim = true;
+        backend
+    }
+
+    fn with_gate(gate: Option<(Arc<Notify>, Arc<Notify>)>) -> (Self, OwnedFd) {
+        let (command_reader, command_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .expect("command pipe should be created");
+        let (event_reader, event_writer) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("event pipe should be created");
+        drop(event_writer);
+        (
+            Self {
+                pipes: Arc::new(Mutex::new(Some(
+                    ChromiumCdpPipes::from_owned_fds(command_writer, event_reader)
+                        .expect("directional CDP capabilities should be valid"),
+                ))),
+                claim_calls: Arc::new(AtomicUsize::new(0)),
+                claim_gate: gate,
+                kill_reasons: Arc::new(Mutex::new(Vec::new())),
+                kill_called: Arc::new(Notify::new()),
+                claim_completed: Arc::new(Notify::new()),
+                panic_on_claim: false,
+            },
+            command_reader,
+        )
+    }
+}
+
+#[async_trait]
+impl SandboxBackend for ClaimingBackend {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::production_required()
+    }
+
+    async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        Ok(SandboxHandle::new(spec.shard_id().clone(), "claiming"))
+    }
+
+    async fn claim_cdp_pipes(
+        &self,
+        _handle: &SandboxHandle,
+    ) -> Result<ChromiumCdpPipes, SandboxError> {
+        self.claim_calls.fetch_add(1, Ordering::AcqRel);
+        if let Some((entered, proceed)) = &self.claim_gate {
+            entered.notify_one();
+            proceed.notified().await;
+        }
+        if self.panic_on_claim {
+            panic!("simulated CDP claim panic");
+        }
+        let result = self
+            .pipes
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| SandboxError::Backend("CDP pipes already claimed".to_owned()));
+        if result.is_ok() {
+            self.claim_completed.notify_one();
+        }
+        result
+    }
+
+    async fn revoke_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn kill_cgroup(
+        &self,
+        _handle: &SandboxHandle,
+        reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.kill_reasons.lock().unwrap().push(reason);
+        self.kill_called.notify_one();
+        Ok(())
+    }
+
+    async fn cleanup_namespaces(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn inspect(&self, _handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
+        Err(SandboxError::Backend("not used".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn cdp_capability_claim_is_epoch_fenced_and_one_shot() {
+    let backend = ClaimingBackend::new();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    assert!(matches!(
+        supervisor.claim_cdp_pipes(&shard_id, &worker(), 16).await,
+        Err(SandboxError::WorkerEpochMismatch {
+            expected: 17,
+            actual: 16,
+        })
+    ));
+    assert_eq!(backend.claim_calls.load(Ordering::Acquire), 0);
+    let other_worker = WorkerId::new("worker-apne2-a-002").expect("test worker ID must be valid");
+    assert!(matches!(
+        supervisor
+            .claim_cdp_pipes(&shard_id, &other_worker, 17)
+            .await,
+        Err(SandboxError::OwnershipMismatch)
+    ));
+    assert_eq!(backend.claim_calls.load(Ordering::Acquire), 0);
+    let claimed = supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await;
+    assert!(claimed.is_ok());
+    assert_eq!(backend.claim_calls.load(Ordering::Acquire), 1);
+    let duplicate = supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await;
+    assert!(matches!(
+        duplicate,
+        Err(SandboxError::CdpPipesAlreadyClaimed)
+    ));
+}
+
+#[tokio::test]
+async fn expired_owner_cannot_claim_cdp_capabilities_before_the_sweeper_runs() {
+    let backend = ClaimingBackend::new();
+    let short_config =
+        SupervisorConfig::new(Duration::from_millis(100), Duration::from_millis(300))
+            .expect("short lease ordering should be valid");
+    let supervisor = SandboxSupervisor::new(short_config, backend.clone());
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_millis(50)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+    tokio::time::sleep(Duration::from_millis(75)).await;
+
+    assert!(matches!(
+        supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await,
+        Err(SandboxError::InvalidOwnerLease)
+    ));
+    assert_eq!(backend.claim_calls.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn concurrent_cdp_claim_is_rejected_before_a_second_backend_effect() {
+    let (backend, claim_entered, release_claim, _command_reader) = ClaimingBackend::blocked();
+    let supervisor = Arc::new(SandboxSupervisor::new(config(), backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let first_supervisor = Arc::clone(&supervisor);
+    let first_shard_id = shard_id.clone();
+    let first = tokio::spawn(async move {
+        first_supervisor
+            .claim_cdp_pipes(&first_shard_id, &worker(), 17)
+            .await
+    });
+    claim_entered.notified().await;
+
+    let concurrent = tokio::time::timeout(
+        Duration::from_millis(100),
+        supervisor.claim_cdp_pipes(&shard_id, &worker(), 17),
+    )
+    .await;
+    release_claim.notify_one();
+    let first_result = first.await.expect("first claim task should finish");
+
+    assert!(matches!(
+        concurrent,
+        Ok(Err(SandboxError::CdpClaimInProgress))
+    ));
+    assert!(first_result.is_ok());
+    assert_eq!(backend.claim_calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn kill_linearized_during_cdp_claim_prevents_stale_capability_handoff() {
+    let (backend, claim_entered, release_claim, _command_reader) = ClaimingBackend::blocked();
+    let supervisor = Arc::new(SandboxSupervisor::new(config(), backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let claim_supervisor = Arc::clone(&supervisor);
+    let claim_shard_id = shard_id.clone();
+    let claim = tokio::spawn(async move {
+        claim_supervisor
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .await
+    });
+    claim_entered.notified().await;
+    let killed = supervisor
+        .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+        .await;
+    assert!(matches!(killed, Ok(KillShardOutcome::Terminated(_))));
+
+    release_claim.notify_one();
+    assert!(matches!(
+        claim.await.expect("claim task should finish"),
+        Err(SandboxError::ShardNotFound)
+    ));
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::SecurityViolation]
+    );
+}
+
+#[tokio::test]
+async fn lease_expiry_during_cdp_claim_drops_capabilities_and_starts_cleanup() {
+    let (backend, claim_entered, release_claim, _command_reader) = ClaimingBackend::blocked();
+    let short_config =
+        SupervisorConfig::new(Duration::from_millis(100), Duration::from_millis(300))
+            .expect("short lease ordering should be valid");
+    let supervisor = Arc::new(SandboxSupervisor::new(short_config, backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_millis(50)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let claim_supervisor = Arc::clone(&supervisor);
+    let claim_shard_id = shard_id.clone();
+    let claim = tokio::spawn(async move {
+        claim_supervisor
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .await
+    });
+    claim_entered.notified().await;
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    release_claim.notify_one();
+
+    assert!(matches!(
+        claim.await.expect("claim task should finish"),
+        Err(SandboxError::InvalidOwnerLease)
+    ));
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::WorkerLeaseExpired]
+    );
+}
+
+#[tokio::test]
+async fn cancelling_cdp_claim_caller_drops_returned_fds_and_fails_closed() {
+    let (backend, claim_entered, release_claim, command_reader) = ClaimingBackend::blocked();
+    nix::fcntl::fcntl(
+        &command_reader,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .expect("test command reader should become nonblocking");
+    let supervisor = Arc::new(SandboxSupervisor::new(config(), backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let claim_supervisor = Arc::clone(&supervisor);
+    let claim_shard_id = shard_id.clone();
+    let claim = tokio::spawn(async move {
+        claim_supervisor
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .await
+    });
+    claim_entered.notified().await;
+    claim.abort();
+    assert!(
+        claim
+            .await
+            .expect_err("claim caller should be cancelled")
+            .is_cancelled()
+    );
+    release_claim.notify_one();
+
+    tokio::time::timeout(Duration::from_millis(200), backend.kill_called.notified())
+        .await
+        .expect("cancelled handoff should start cleanup");
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::BrowserFailure]
+    );
+    let mut byte = [0_u8; 1];
+    assert_eq!(nix::unistd::read(&command_reader, &mut byte), Ok(0));
+}
+
+#[tokio::test]
+async fn dropping_cdp_claim_after_delivery_but_before_receipt_fails_closed() {
+    let (backend, claim_entered, release_claim, command_reader) = ClaimingBackend::blocked();
+    nix::fcntl::fcntl(
+        &command_reader,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .expect("test command reader should become nonblocking");
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let owner = worker();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(owner.clone(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let mut claim = Box::pin(supervisor.claim_cdp_pipes(&shard_id, &owner, 17));
+    assert!(futures::poll!(claim.as_mut()).is_pending());
+    claim_entered.notified().await;
+    release_claim.notify_one();
+    backend.claim_completed.notified().await;
+    tokio::task::yield_now().await;
+    drop(claim);
+
+    tokio::time::timeout(Duration::from_millis(200), backend.kill_called.notified())
+        .await
+        .expect("an unacknowledged delivered capability should start cleanup");
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::BrowserFailure]
+    );
+    let mut byte = [0_u8; 1];
+    assert_eq!(nix::unistd::read(&command_reader, &mut byte), Ok(0));
+}
+
+#[tokio::test]
+async fn kill_after_backend_delivery_is_revalidated_before_caller_receipt() {
+    let (backend, claim_entered, release_claim, _command_reader) = ClaimingBackend::blocked();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let owner = worker();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(owner.clone(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let mut claim = Box::pin(supervisor.claim_cdp_pipes(&shard_id, &owner, 17));
+    assert!(futures::poll!(claim.as_mut()).is_pending());
+    claim_entered.notified().await;
+    release_claim.notify_one();
+    backend.claim_completed.notified().await;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        supervisor
+            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .await,
+        Ok(KillShardOutcome::Terminated(_))
+    ));
+
+    assert!(matches!(claim.await, Err(SandboxError::ShardNotFound)));
+}
+
+#[tokio::test]
+async fn hung_cdp_backend_claim_is_bounded_and_fails_closed() {
+    let (backend, claim_entered, release_claim, _command_reader) = ClaimingBackend::blocked();
+    let bounded_config = config()
+        .with_cleanup_stage_timeout(Duration::from_millis(20))
+        .expect("claim timeout should be valid");
+    let supervisor = Arc::new(SandboxSupervisor::new(bounded_config, backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let claim_supervisor = Arc::clone(&supervisor);
+    let claim_shard_id = shard_id.clone();
+    let claim = tokio::spawn(async move {
+        claim_supervisor
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .await
+    });
+    claim_entered.notified().await;
+    let bounded = tokio::time::timeout(Duration::from_millis(200), claim).await;
+    release_claim.notify_one();
+
+    assert!(matches!(
+        bounded,
+        Ok(Ok(Err(SandboxError::Backend(message)))) if message.contains("timed out")
+    ));
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::BrowserFailure]
+    );
+}
+
+#[tokio::test]
+async fn panicking_cdp_backend_claim_is_caught_and_fails_closed() {
+    let backend = ClaimingBackend::panicking();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let result = supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await;
+
+    assert!(matches!(
+        result,
+        Err(SandboxError::Backend(message)) if message.contains("panicked")
+    ));
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::BrowserFailure]
+    );
 }
 
 #[test]

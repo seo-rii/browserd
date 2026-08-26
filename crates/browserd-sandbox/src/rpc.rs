@@ -91,7 +91,9 @@ impl From<SandboxError> for RpcFailure {
             SandboxError::ShardNotFound => RpcFailureCode::ShardNotFound,
             SandboxError::WorkerEpochMismatch { .. } => RpcFailureCode::WorkerEpochMismatch,
             SandboxError::IncompleteCleanup { .. } => RpcFailureCode::IncompleteCleanup,
-            SandboxError::Backend(_) => RpcFailureCode::Backend,
+            SandboxError::CdpClaimInProgress
+            | SandboxError::CdpPipesAlreadyClaimed
+            | SandboxError::Backend(_) => RpcFailureCode::Backend,
         };
         Self {
             code,
