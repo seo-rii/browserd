@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 browserd-core = { path = "../browserd-core" }
+browserd-launch-gate = { path = "../browserd-launch-gate" }
 bytes.workspace = true
 futures.workspace = true
 nix.workspace = true

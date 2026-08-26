@@ -15,9 +15,9 @@ pub use journal::{
 };
 pub use linux::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
-    EgressRouteBackend, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
-    ProcessSignal, ReadOnlyMount, SandboxFilesystem, ShardEgressFence, SpawnRequest,
-    StdLinuxProcessBackend, StdSandboxFilesystem,
+    EgressRouteBackend, LaunchGateRuntime, LinuxProcessBackend, LinuxSandboxBackend,
+    LinuxSandboxConfig, ProcessSignal, ReadOnlyMount, SandboxFilesystem, ShardEgressFence,
+    SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 pub use rpc::{
     RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer,

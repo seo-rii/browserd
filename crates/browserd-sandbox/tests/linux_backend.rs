@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use browserd_core::{LeaseId, ShardId, WorkerId};
 use browserd_sandbox::{
-    CgroupLimits, ChildIdentity, ChromiumRuntime, CleanupReason, EgressRouteBackend, LaunchSpec,
-    LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig, ProcessSignal, ReadOnlyMount,
-    SandboxBackend, SandboxError, SandboxFilesystem, ShardEgressFence, SpawnRequest,
-    StdLinuxProcessBackend, StdSandboxFilesystem,
+    CgroupLimits, ChildIdentity, ChromiumRuntime, CleanupReason, EgressRouteBackend,
+    LaunchGateRuntime, LaunchSpec, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
+    ProcessSignal, ReadOnlyMount, SandboxBackend, SandboxError, SandboxFilesystem,
+    ShardEgressFence, SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 
 #[derive(Clone)]
@@ -66,13 +66,22 @@ impl FakeFilesystem {
                 .expect("directory lock should work")
                 .insert(PathBuf::from(directory));
         }
-        for file in ["/opt/chromium/chrome", "/usr/bin/bwrap"] {
+        for file in [
+            "/opt/chromium/chrome",
+            "/usr/bin/bwrap",
+            "/usr/libexec/browserd-launch-gate",
+        ] {
             filesystem
                 .files
                 .lock()
                 .expect("file lock should work")
                 .insert(PathBuf::from(file), String::new());
         }
+        filesystem
+            .unwritable
+            .lock()
+            .expect("unwritable lock should work")
+            .insert(PathBuf::from("/usr/libexec/browserd-launch-gate"));
         filesystem
             .files
             .lock()
@@ -1033,6 +1042,10 @@ fn config() -> LinuxSandboxConfig {
         "/var/lib/browserd/shards",
         "/usr/bin/bwrap",
         ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+        LaunchGateRuntime::new(
+            "/usr/libexec/browserd-launch-gate",
+            "/opt/browser/browserd-launch-gate",
+        ),
         [
             ReadOnlyMount::new("/opt/runtime", "/opt/runtime"),
             ReadOnlyMount::new("/usr/share/fonts", "/usr/share/fonts"),
@@ -1044,6 +1057,52 @@ fn config() -> LinuxSandboxConfig {
         Duration::from_millis(10),
     )
     .expect("configuration should be valid")
+}
+
+#[test]
+fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
+    let backend = backend(
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let request = backend.planned_spawn_request(&ShardId::new());
+    let arguments = request.arguments();
+
+    assert_eq!(
+        arguments.first().and_then(|value| value.to_str()),
+        Some("--die-with-parent")
+    );
+    assert!(arguments.windows(3).any(|window| {
+        window
+            == [
+                "--ro-bind",
+                "/usr/libexec/browserd-launch-gate",
+                "/opt/browser/browserd-launch-gate",
+            ]
+    }));
+    assert_eq!(
+        arguments
+            .iter()
+            .rev()
+            .take(6)
+            .rev()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        [
+            "/opt/browser/browserd-launch-gate",
+            "--",
+            "/opt/browser/chrome",
+            "--remote-debugging-pipe",
+            "--user-data-dir=/profile",
+            "--disable-features=BackForwardCache",
+        ]
+    );
+    assert!(!arguments.iter().any(|argument| argument == "--block-fd"));
 }
 
 fn launch_spec(shard_id: ShardId) -> LaunchSpec {
@@ -1140,6 +1199,10 @@ fn process_request_for(bwrap: &Path) -> (tempfile::TempDir, SpawnRequest) {
             "/var/lib/browserd/shards",
             bwrap,
             ChromiumRuntime::new("/opt/chromium/chrome", "/opt/chromium/chrome"),
+            LaunchGateRuntime::new(
+                "/usr/libexec/browserd-launch-gate",
+                "/opt/browser/browserd-launch-gate",
+            ),
             [],
             CgroupLimits::new(512, 256, 4, 10, 100).expect("limits should be valid"),
             9,
@@ -2680,6 +2743,10 @@ async fn unsafe_or_symlinked_roots_fail_closed_before_mutation() {
                 "/var/lib/browserd/shards",
                 "/usr/bin/bwrap",
                 ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+                LaunchGateRuntime::new(
+                    "/usr/libexec/browserd-launch-gate",
+                    "/opt/browser/browserd-launch-gate",
+                ),
                 [],
                 CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
                 9,
@@ -2696,6 +2763,10 @@ async fn unsafe_or_symlinked_roots_fail_closed_before_mutation() {
                 "/var/lib/browserd/shards",
                 "/usr/bin/bwrap",
                 ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+                LaunchGateRuntime::new(
+                    "/usr/libexec/browserd-launch-gate",
+                    "/opt/browser/browserd-launch-gate",
+                ),
                 [],
                 CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
                 conflicting_seccomp_fd,
@@ -2724,6 +2795,91 @@ async fn unsafe_or_symlinked_roots_fail_closed_before_mutation() {
             .await
             .is_err()
     );
+    assert!(filesystem.events().is_empty());
+}
+
+#[test]
+fn launch_gate_path_cannot_be_shadowed_by_a_later_runtime_mount() {
+    let configuration = LinuxSandboxConfig::new(
+        "/sys/fs/cgroup/browserd",
+        "/var/lib/browserd/shards",
+        "/usr/bin/bwrap",
+        ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+        LaunchGateRuntime::new(
+            "/usr/libexec/browserd-launch-gate",
+            "/opt/browser/browserd-launch-gate",
+        ),
+        [ReadOnlyMount::new("/opt/runtime", "/opt/browser")],
+        CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
+        9,
+        Duration::from_millis(10),
+        Duration::from_millis(1),
+    );
+
+    assert!(configuration.is_err());
+}
+
+#[test]
+fn launch_gate_paths_cannot_alias_a_runtime_or_virtual_filesystem() {
+    for launch_gate in [
+        LaunchGateRuntime::new("/opt/chromium/chrome", "/opt/browser/launch-gate"),
+        LaunchGateRuntime::new("/usr/bin/bwrap", "/opt/browser/launch-gate"),
+        LaunchGateRuntime::new("/usr/libexec/browserd-launch-gate", "/opt/browser"),
+        LaunchGateRuntime::new(
+            "/usr/libexec/browserd-launch-gate",
+            "/sys/browserd-launch-gate",
+        ),
+        LaunchGateRuntime::new("/tmp/browserd-launch-gate", "/opt/browser/launch-gate"),
+        LaunchGateRuntime::new("/var/tmp/browserd-launch-gate", "/opt/browser/launch-gate"),
+        LaunchGateRuntime::new("/dev/shm/browserd-launch-gate", "/opt/browser/launch-gate"),
+        LaunchGateRuntime::new(
+            "/run/user/1000/browserd-launch-gate",
+            "/opt/browser/launch-gate",
+        ),
+        LaunchGateRuntime::new(
+            "/var/lib/browserd/shards/browserd-launch-gate",
+            "/opt/browser/launch-gate",
+        ),
+    ] {
+        assert!(
+            LinuxSandboxConfig::new(
+                "/sys/fs/cgroup/browserd",
+                "/var/lib/browserd/shards",
+                "/usr/bin/bwrap",
+                ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+                launch_gate,
+                [],
+                CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
+                9,
+                Duration::from_millis(10),
+                Duration::from_millis(1),
+            )
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn writable_launch_gate_fails_closed_before_any_sandbox_mutation() {
+    let filesystem = FakeFilesystem::production_tree();
+    filesystem
+        .unwritable
+        .lock()
+        .expect("unwritable lock should work")
+        .remove(Path::new("/usr/libexec/browserd-launch-gate"));
+    let result = backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    )
+    .provision(&launch_spec(ShardId::new()))
+    .await;
+
+    assert!(result.is_err());
     assert!(filesystem.events().is_empty());
 }
 
@@ -2766,6 +2922,10 @@ async fn production_process_rejects_missing_required_launch_descriptors_before_e
             "/var/lib/browserd/shards",
             "/definitely/missing/bwrap",
             ChromiumRuntime::new("/opt/chromium/chrome", "/opt/chromium/chrome"),
+            LaunchGateRuntime::new(
+                "/usr/libexec/browserd-launch-gate",
+                "/opt/browser/browserd-launch-gate",
+            ),
             [],
             CgroupLimits::new(512, 256, 4, 10, 100).expect("limits should be valid"),
             i32::MAX,
@@ -2845,12 +3005,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -2859,12 +3018,17 @@ if sandbox_pid == 0:
     os.setsid()
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
-    os.read(gate_fd, 1)
+    sys.stdin.buffer.read()
     os._exit(0)
 
-open("__BOOTSTRAP_PID__", "w").write(str(os.getpid()))
+bootstrap_pid_marker = "__BOOTSTRAP_PID__"
+bootstrap_pid_temporary = bootstrap_pid_marker + ".tmp"
+with open(bootstrap_pid_temporary, "w") as marker:
+    marker.write(str(os.getpid()))
+    marker.flush()
+    os.fsync(marker.fileno())
+os.replace(bootstrap_pid_temporary, bootstrap_pid_marker)
 os.close(info_fd)
-os.close(gate_fd)
 while not os.path.exists("__BOOTSTRAP_EXIT__"):
     time.sleep(0.005)
 os._exit(0)
@@ -3042,12 +3206,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3056,12 +3219,17 @@ if sandbox_pid == 0:
     os.setsid()
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
-    os.read(gate_fd, 1)
+    sys.stdin.buffer.read()
     os._exit(0)
 
-open("__BOOTSTRAP_PID__", "w").write(str(os.getpid()))
+bootstrap_pid_marker = "__BOOTSTRAP_PID__"
+bootstrap_pid_temporary = bootstrap_pid_marker + ".tmp"
+with open(bootstrap_pid_temporary, "w") as marker:
+    marker.write(str(os.getpid()))
+    marker.flush()
+    os.fsync(marker.fileno())
+os.replace(bootstrap_pid_temporary, bootstrap_pid_marker)
 os.close(info_fd)
-os.close(gate_fd)
 while not os.path.exists("__BOOTSTRAP_EXIT__"):
     time.sleep(0.005)
 os._exit(0)
@@ -3237,12 +3405,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3250,13 +3417,12 @@ unrelated_pid = os.getppid()
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
+    if sys.stdin.buffer.read() == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
     os._exit(0)
 
 os.write(info_fd, json.dumps({"child-pid": unrelated_pid}).encode() + b"\n")
 os.close(info_fd)
-os.close(gate_fd)
 time.sleep(30)
 "#
     .replace(
@@ -3329,12 +3495,11 @@ import signal
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3346,11 +3511,10 @@ cgroup_events_path = os.path.join(os.path.dirname(cgroup_kill_path), "cgroup.eve
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
+    if sys.stdin.buffer.read() == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
     os._exit(0)
 
-os.close(gate_fd)
 os.write(info_fd, b"not-json\n")
 os.close(info_fd)
 while True:
@@ -3436,12 +3600,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3450,12 +3613,11 @@ if sandbox_pid == 0:
     os.setsid()
     os.write(info_fd, b"not-json\n")
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
+    if sys.stdin.buffer.read() == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
     os._exit(0)
 
 os.close(info_fd)
-os.close(gate_fd)
 time.sleep(30)
 "#
     .replace(
@@ -3525,12 +3687,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3540,12 +3701,11 @@ if sandbox_pid == 0:
     time.sleep(1.2)
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
+    if sys.stdin.buffer.read() == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
     os._exit(0)
 
 os.close(info_fd)
-os.close(gate_fd)
 time.sleep(30)
 "#
     .replace(
@@ -3605,12 +3765,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3621,12 +3780,11 @@ if sandbox_pid == 0:
     time.sleep(0.3)
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
+    if sys.stdin.buffer.read() == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
     os._exit(0)
 
 os.close(info_fd)
-os.close(gate_fd)
 time.sleep(30)
 "#
     .replace(
@@ -3704,12 +3862,13 @@ import json
 import os
 import sys
 
-gate_fd = None
 info_fd = None
+block_fd_seen = False
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        block_fd_seen = True
+        next(arguments)
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3721,11 +3880,11 @@ cgroup_events_path = os.path.join(os.path.dirname(cgroup_kill_path), "cgroup.eve
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
+    approval = sys.stdin.buffer.read()
+    if not block_fd_seen and approval == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
     os._exit(0)
 
-os.close(gate_fd)
 os.write(info_fd, json.dumps({"child-pid": sandbox_pid}).encode() + b"\n")
 os.close(info_fd)
 os.waitpid(sandbox_pid, 0)
@@ -3818,12 +3977,11 @@ import os
 import sys
 import time
 
-gate_fd = None
 info_fd = None
 arguments = iter(sys.argv[1:])
 for argument in arguments:
     if argument == "--block-fd":
-        gate_fd = int(next(arguments))
+        raise RuntimeError("legacy block-fd must not be used")
     elif argument == "--info-fd":
         info_fd = int(next(arguments))
 
@@ -3832,12 +3990,12 @@ if sandbox_pid == 0:
     os.setsid()
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
-    os.read(gate_fd, 1)
-    open("__EXEC_MARKER__", "w").close()
-    os.execl("/bin/sleep", "sleep", "30")
+    if sys.stdin.buffer.read() == b"browserd-launch-gate/v1 approve\n":
+        open("__EXEC_MARKER__", "w").close()
+        os.execl("/bin/sleep", "sleep", "30")
+    os._exit(77)
 
 os.close(info_fd)
-os.close(gate_fd)
 time.sleep(30)
 "#
     .replace(

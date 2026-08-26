@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{LeaseId, ShardId};
+use browserd_launch_gate::APPROVAL_FRAME;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open, openat};
 use nix::sys::signal::Signal;
 use nix::sys::stat::Mode;
@@ -89,6 +90,25 @@ impl ChromiumRuntime {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchGateRuntime {
+    host_executable: PathBuf,
+    sandbox_executable: PathBuf,
+}
+
+impl LaunchGateRuntime {
+    #[must_use]
+    pub fn new(
+        host_executable: impl Into<PathBuf>,
+        sandbox_executable: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            host_executable: host_executable.into(),
+            sandbox_executable: sandbox_executable.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadOnlyMount {
     source: PathBuf,
     destination: PathBuf,
@@ -110,6 +130,7 @@ pub struct LinuxSandboxConfig {
     sandbox_root: PathBuf,
     bwrap_executable: PathBuf,
     chromium: ChromiumRuntime,
+    launch_gate: LaunchGateRuntime,
     read_only_mounts: Vec<ReadOnlyMount>,
     limits: CgroupLimits,
     seccomp_fd: i32,
@@ -124,6 +145,7 @@ impl LinuxSandboxConfig {
         sandbox_root: impl Into<PathBuf>,
         bwrap_executable: impl Into<PathBuf>,
         chromium: ChromiumRuntime,
+        launch_gate: LaunchGateRuntime,
         read_only_mounts: I,
         limits: CgroupLimits,
         seccomp_fd: i32,
@@ -141,6 +163,8 @@ impl LinuxSandboxConfig {
         validate_absolute_path(&bwrap_executable)?;
         validate_absolute_path(&chromium.host_executable)?;
         validate_absolute_path(&chromium.sandbox_executable)?;
+        validate_absolute_path(&launch_gate.host_executable)?;
+        validate_absolute_path(&launch_gate.sandbox_executable)?;
         if cgroup_root == Path::new("/sys/fs/cgroup")
             || cgroup_root == Path::new("/")
             || sandbox_root == Path::new("/")
@@ -151,6 +175,31 @@ impl LinuxSandboxConfig {
             || termination_grace.is_zero()
             || poll_interval.is_zero()
             || poll_interval > termination_grace
+            || [
+                "/home",
+                "/root",
+                "/tmp",
+                "/var/tmp",
+                "/dev/shm",
+                "/run/user",
+                "/proc",
+                "/sys",
+            ]
+            .into_iter()
+            .any(|mutable| launch_gate.host_executable.starts_with(mutable))
+            || launch_gate.host_executable.starts_with(&cgroup_root)
+            || launch_gate.host_executable.starts_with(&sandbox_root)
+            || launch_gate.host_executable == bwrap_executable
+            || launch_gate.host_executable == chromium.host_executable
+            || ["/proc", "/dev", "/sys", "/tmp", "/profile"]
+                .into_iter()
+                .any(|protected| launch_gate.sandbox_executable.starts_with(protected))
+            || launch_gate
+                .sandbox_executable
+                .starts_with(&chromium.sandbox_executable)
+            || chromium
+                .sandbox_executable
+                .starts_with(&launch_gate.sandbox_executable)
         {
             return Err(SandboxError::Backend(
                 "unsafe Linux sandbox configuration".into(),
@@ -171,12 +220,24 @@ impl LinuxSandboxConfig {
                     "unsafe read-only runtime mount".into(),
                 ));
             }
+            if mount
+                .destination
+                .starts_with(&launch_gate.sandbox_executable)
+                || launch_gate
+                    .sandbox_executable
+                    .starts_with(&mount.destination)
+            {
+                return Err(SandboxError::Backend(
+                    "runtime mount overlaps launch gate".into(),
+                ));
+            }
         }
         Ok(Self {
             cgroup_root,
             sandbox_root,
             bwrap_executable,
             chromium,
+            launch_gate,
             read_only_mounts,
             limits,
             seccomp_fd,
@@ -472,9 +533,9 @@ pub trait LinuxProcessBackend: Send + Sync + 'static {
     /// succeeds for that exact identity. Before returning `Err`, implementations must either prove
     /// that every child they started exited or retain the gate so execution remains impossible.
     ///
-    /// `StdLinuxProcessBackend` retains that tombstone for cancellation and ordinary error recovery,
-    /// but bubblewrap treats writer EOF as release. A supervisor-process crash therefore still
-    /// requires a separate fail-closed launch helper; this primitive alone is not crash-safe.
+    /// `StdLinuxProcessBackend` retains that tombstone for cancellation and ordinary error recovery.
+    /// Its control pipe terminates at the fail-closed launch helper, which rejects supervisor EOF;
+    /// bubblewrap itself must never interpret the pipe as an execution gate.
     /// Implementations must also place the bootstrap process in `request.cgroup_procs_path()`
     /// before exec so every descendant inherits containment; callers must never attach a returned
     /// numeric PID after userspace identity checks.
@@ -484,7 +545,10 @@ pub trait LinuxProcessBackend: Send + Sync + 'static {
         request: &SpawnRequest,
     ) -> Result<ChildIdentity, SandboxError>;
     /// Releases the execution gate for exactly this prepared PID/start-time identity.
-    /// Returning `Err` must leave the child gated so `abort_spawned` can fail closed.
+    /// The caller must durably record its fenced release intent before entering this one-shot
+    /// boundary. `StdLinuxProcessBackend` writes the complete approval frame and closes its writer
+    /// without suspension. Returning `Err` must leave Chromium unable to execute so
+    /// `abort_spawned` can fail closed.
     async fn release_prepared(
         &self,
         backend_token: &str,
@@ -612,9 +676,9 @@ struct StdLinuxProcessRegistry {
 }
 
 // Process-global ownership is intentional: dropping a backend value or cancelling a future must
-// not close a quarantined writer (bubblewrap treats gate EOF as a successful release). Any fresh
-// backend handle can retry cleanup by the stable launch token. Supervisor process death remains the
-// separate fail-open limitation documented on `spawn_prepared`.
+// not close a quarantined writer during ordinary in-process recovery. Any fresh backend handle can
+// retry cleanup by the stable launch token. If the supervisor process dies, writer EOF reaches the
+// fail-closed launch helper and can never release Chromium.
 static STD_LINUX_PROCESS_REGISTRY: OnceLock<StdLinuxProcessRegistry> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug)]
@@ -807,11 +871,9 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             .map_err(|error| SandboxError::Backend(format!("execution gate: {error}")))?;
         let (info_read, info_write) = pipe2(OFlag::O_CLOEXEC)
             .map_err(|error| SandboxError::Backend(format!("sandbox PID pipe: {error}")))?;
-        for descriptor in [&gate_read, &info_write] {
-            fcntl(descriptor, FcntlArg::F_SETFD(FdFlag::empty())).map_err(|error| {
-                SandboxError::Backend(format!("sandbox bootstrap descriptor: {error}"))
-            })?;
-        }
+        fcntl(&info_write, FcntlArg::F_SETFD(FdFlag::empty())).map_err(|error| {
+            SandboxError::Backend(format!("sandbox bootstrap descriptor: {error}"))
+        })?;
         let mut command = Command::new(request.program());
         let cgroup_procs_fd = cgroup_procs.as_raw_fd();
         // SAFETY: this callback runs after fork and before exec. It performs only one libc write
@@ -837,13 +899,11 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             });
         }
         command
-            .arg("--block-fd")
-            .arg(gate_read.as_raw_fd().to_string())
             .arg("--info-fd")
             .arg(info_write.as_raw_fd().to_string())
             .args(request.arguments())
             .env_clear()
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(fs::File::from(gate_read)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let slot = Arc::new(StdMutex::new(None));
@@ -880,7 +940,6 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             Ok(pidfd) => (Some(pidfd), None),
             Err(error) => (None, Some(error)),
         };
-        drop(gate_read);
         drop(info_write);
         let owned = OwnedLinuxChild {
             _monitor: monitor,
@@ -948,9 +1007,9 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             .execution_gate
             .as_ref()
             .ok_or_else(|| SandboxError::Backend("prepared child already released".into()))?;
-        let written = write_fd(gate, b"1")
+        let written = write_fd(gate, APPROVAL_FRAME)
             .map_err(|error| SandboxError::Backend(format!("execution gate release: {error}")))?;
-        if written != 1 {
+        if written != APPROVAL_FRAME.len() {
             return Err(SandboxError::Backend(
                 "execution gate release was incomplete".into(),
             ));
@@ -1423,6 +1482,7 @@ where
         for executable in [
             &self.config.bwrap_executable,
             &self.config.chromium.host_executable,
+            &self.config.launch_gate.host_executable,
         ] {
             if !self.filesystem.is_file(executable)?
                 || self.filesystem.contains_symlink(executable)?
@@ -1432,6 +1492,14 @@ where
                     executable.display()
                 )));
             }
+        }
+        if self
+            .filesystem
+            .is_writable(&self.config.launch_gate.host_executable)?
+        {
+            return Err(SandboxError::Backend(
+                "launch gate executable is writable".into(),
+            ));
         }
         for mount in &self.config.read_only_mounts {
             if (!self.filesystem.is_directory(&mount.source)?
@@ -1688,6 +1756,19 @@ where
                 .clone()
                 .into_os_string(),
         ]);
+        arguments.extend([
+            OsString::from("--ro-bind"),
+            self.config
+                .launch_gate
+                .host_executable
+                .clone()
+                .into_os_string(),
+            self.config
+                .launch_gate
+                .sandbox_executable
+                .clone()
+                .into_os_string(),
+        ]);
         for mount in &self.config.read_only_mounts {
             arguments.extend([
                 OsString::from("--ro-bind"),
@@ -1700,6 +1781,12 @@ where
             OsString::from("2"),
             OsString::from("--seccomp"),
             OsString::from(self.config.seccomp_fd.to_string()),
+            OsString::from("--"),
+            self.config
+                .launch_gate
+                .sandbox_executable
+                .clone()
+                .into_os_string(),
             OsString::from("--"),
             self.config
                 .chromium
