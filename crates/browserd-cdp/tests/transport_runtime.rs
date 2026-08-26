@@ -342,6 +342,152 @@ async fn explicit_shutdown_fails_pending_work_and_completes_once() {
     assert!(matches!(pending, Ok(Err(CdpCommandError::TransportClosed))));
 }
 
+#[tokio::test]
+async fn dropping_driver_closes_both_split_chromium_capabilities() {
+    let (driver_event_io, mut chromium_event_io) = tokio::io::duplex(16 * 1024);
+    let (mut chromium_command_io, driver_command_io) = tokio::io::duplex(16 * 1024);
+    let (event_reader, unused_event_writer) = tokio::io::split(driver_event_io);
+    let (unused_command_reader, command_writer) = tokio::io::split(driver_command_io);
+    drop(unused_event_writer);
+    drop(unused_command_reader);
+    let (client, events, driver) =
+        CdpTransport::spawn_split(event_reader, command_writer, config());
+
+    drop(client);
+    drop(events);
+    drop(driver);
+
+    let mut byte = [0_u8; 1];
+    let command_eof = tokio::time::timeout(
+        Duration::from_millis(100),
+        chromium_command_io.read(&mut byte),
+    )
+    .await;
+    assert!(matches!(command_eof, Ok(Ok(0))));
+    let event_closed = tokio::time::timeout(
+        Duration::from_millis(100),
+        chromium_event_io.write_all(b"{}\0"),
+    )
+    .await;
+    assert!(matches!(event_closed, Ok(Err(_))));
+}
+
+#[tokio::test]
+async fn dropping_driver_fails_pending_commands_without_waiting_for_their_deadline() {
+    let (client_io, mut chromium_io) = tokio::io::duplex(16 * 1024);
+    let (client, events, driver) = CdpTransport::spawn(client_io, config());
+    let pending =
+        tokio::spawn(async move { client.command("Page.enable", json!({}), None, None).await });
+    let _command = read_command(&mut chromium_io).await;
+
+    drop(events);
+    drop(driver);
+
+    let outcome = tokio::time::timeout(Duration::from_millis(100), pending).await;
+    assert!(matches!(
+        outcome,
+        Ok(Ok(Err(CdpCommandError::TransportClosed)))
+    ));
+}
+
+#[tokio::test]
+async fn dropping_driver_marks_surviving_clients_closed_synchronously() {
+    let (client_io, _chromium_io) = tokio::io::duplex(16 * 1024);
+    let (client, events, driver) = CdpTransport::spawn(client_io, config());
+    assert!(!client.is_closed());
+
+    drop(events);
+    drop(driver);
+
+    assert!(client.is_closed());
+    assert_eq!(
+        client
+            .command("Browser.getVersion", json!({}), None, None)
+            .await,
+        Err(CdpCommandError::TransportClosed)
+    );
+}
+
+#[tokio::test]
+async fn dropping_driver_aborts_a_blocked_write_instead_of_waiting_for_write_timeout() {
+    let (client_io, mut chromium_io) = tokio::io::duplex(1);
+    let (client, events, driver) = CdpTransport::spawn(client_io, config());
+    let pending = tokio::spawn(async move {
+        client
+            .command(
+                "Runtime.evaluate",
+                json!({"expression": "x".repeat(8 * 1024)}),
+                None,
+                None,
+            )
+            .await
+    });
+    let mut first_byte = [0_u8; 1];
+    let write_entered = tokio::time::timeout(
+        Duration::from_millis(100),
+        chromium_io.read_exact(&mut first_byte),
+    )
+    .await;
+    assert!(matches!(write_entered, Ok(Ok(_))));
+
+    drop(events);
+    drop(driver);
+
+    let outcome = tokio::time::timeout(Duration::from_millis(100), pending).await;
+    assert!(matches!(
+        outcome,
+        Ok(Ok(Err(CdpCommandError::TransportClosed)))
+    ));
+    let mut remaining = Vec::new();
+    let command_eof = tokio::time::timeout(
+        Duration::from_millis(100),
+        chromium_io.read_to_end(&mut remaining),
+    )
+    .await;
+    assert!(matches!(command_eof, Ok(Ok(_))));
+}
+
+#[tokio::test]
+async fn cancelling_driver_wait_still_aborts_blocked_io_and_pending_commands() {
+    let (client_io, mut chromium_io) = tokio::io::duplex(1);
+    let (client, events, driver) = CdpTransport::spawn(client_io, config());
+    let pending = tokio::spawn(async move {
+        client
+            .command(
+                "Runtime.evaluate",
+                json!({"expression": "x".repeat(8 * 1024)}),
+                None,
+                None,
+            )
+            .await
+    });
+    let mut first_byte = [0_u8; 1];
+    let write_entered = tokio::time::timeout(
+        Duration::from_millis(100),
+        chromium_io.read_exact(&mut first_byte),
+    )
+    .await;
+    assert!(matches!(write_entered, Ok(Ok(_))));
+
+    drop(events);
+    let wait = tokio::spawn(driver.wait());
+    wait.abort();
+    assert!(matches!(wait.await, Err(error) if error.is_cancelled()));
+
+    let outcome = tokio::time::timeout(Duration::from_millis(100), pending).await;
+    assert!(matches!(
+        outcome,
+        Ok(Ok(Err(CdpCommandError::TransportClosed)))
+    ));
+    let mut remaining = Vec::new();
+    let command_eof = tokio::time::timeout(
+        Duration::from_millis(100),
+        chromium_io.read_to_end(&mut remaining),
+    )
+    .await;
+    assert!(matches!(command_eof, Ok(Ok(_))));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn dropping_all_command_clients_does_not_starve_events_or_shutdown() {
     let (client_io, mut chromium_io) = tokio::io::duplex(16 * 1024);

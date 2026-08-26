@@ -111,19 +111,28 @@ struct CommandRequest {
 pub struct CdpDriver {
     shutdown: CancellationToken,
     task: JoinHandle<Result<(), CdpTransportError>>,
+    closed: Arc<AtomicBool>,
 }
 
 impl CdpDriver {
-    pub async fn wait(self) -> Result<(), CdpTransportError> {
-        match self.task.await {
+    pub async fn wait(mut self) -> Result<(), CdpTransportError> {
+        match (&mut self.task).await {
             Ok(result) => result,
             Err(_) => Err(CdpTransportError::DriverTaskFailed),
         }
     }
 
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.shutdown.cancel();
-        let _result = self.task.await;
+        let _result = (&mut self.task).await;
+    }
+}
+
+impl Drop for CdpDriver {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+        self.shutdown.cancel();
+        self.task.abort();
     }
 }
 
@@ -157,6 +166,7 @@ impl CdpTransport {
         let closed = Arc::new(AtomicBool::new(false));
         let shutdown = CancellationToken::new();
         let task_closed = Arc::clone(&closed);
+        let driver_closed = Arc::clone(&closed);
         let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             let mut requests = request_rx;
@@ -287,7 +297,11 @@ impl CdpTransport {
                 closed,
             },
             event_rx,
-            CdpDriver { shutdown, task },
+            CdpDriver {
+                shutdown,
+                task,
+                closed: driver_closed,
+            },
         )
     }
 }
