@@ -6,27 +6,50 @@ use std::thread;
 use std::time::Duration;
 
 use browserd_actions::{ActionJournalLimits, ActionKind, ResolutionKind};
-use browserd_core::{LeaseId, PageId, PrincipalId, TenantId, WorkerId};
+use browserd_core::{IsolationProfile, LeaseId, PageId, PrincipalId, TenantId, WorkerId};
 use browserd_features::BuiltinFeature;
-use browserd_policy::ApprovalDecision;
+use browserd_policy::{
+    ActionArgumentsHash, ActionType, ApprovalDecision, CanonicalActionProposal, CredentialRefsHash,
+    Origin,
+};
 use browserd_session::{LeasePolicy, SessionLifecycle, SessionTime, SessionTimeoutPolicy};
 use browserd_viewer::ViewerScopes;
 use browserd_worker::{
-    ActionExecutionResult, ActionJournalConfig, ActionStatus, ArtifactUpload, AuthenticatedPeer,
-    ChromiumDriver, CreateSessionCommand, DependencyError, InternalEndpoint, SandboxClient,
-    WorkerConfig, WorkerControlPlane, WorkerError,
+    ActionApprovalRequirement, ActionExecutionResult, ActionJournalConfig, ActionStatus,
+    ApprovedActionError, ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand,
+    CreateSessionOutcome, DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient,
+    WorkerClock, WorkerConfig, WorkerControlPlane, WorkerError,
 };
+
+struct TestClock;
+
+impl WorkerClock for TestClock {
+    fn now(&self) -> Result<SessionTime, WorkerError> {
+        Ok(SessionTime::new(0))
+    }
+}
 
 #[derive(Default)]
 struct FakeDriver {
     qualified: bool,
     executions: Mutex<VecDeque<ActionExecutionResult>>,
     cleanup_count: Mutex<usize>,
+    qualification_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     execution_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    approved_effect_gate: Mutex<()>,
 }
 
 impl ChromiumDriver for FakeDriver {
     fn qualify(&self) -> Result<(), DependencyError> {
+        let barriers = self
+            .qualification_barriers
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?
+            .clone();
+        if let Some((started, release)) = barriers {
+            started.wait();
+            release.wait();
+        }
         if self.qualified {
             Ok(())
         } else {
@@ -42,6 +65,10 @@ impl ChromiumDriver for FakeDriver {
     }
 
     fn close_context(&self, _session_id: &browserd_core::SessionId) -> Result<(), DependencyError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         let Ok(mut count) = self.cleanup_count.lock() else {
             return Err(DependencyError::Unavailable);
         };
@@ -61,6 +88,10 @@ impl ChromiumDriver for FakeDriver {
         _session_id: &browserd_core::SessionId,
         _page_id: &PageId,
     ) -> Result<(), DependencyError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         Ok(())
     }
 
@@ -94,11 +125,61 @@ impl ChromiumDriver for FakeDriver {
             .unwrap_or(ActionExecutionResult::Succeeded(Vec::new()))
     }
 
+    fn inspect_approval_context(
+        &self,
+        _session_id: &browserd_core::SessionId,
+        _page_id: &PageId,
+        _proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        Ok(LiveApprovalContext {
+            target_incarnation: 1,
+            frame_document_epoch: 1,
+            current_origin: Origin::parse("https://example.test/")
+                .map_err(|_| DependencyError::Rejected)?,
+            url_revision: 1,
+            node_ref: None,
+            node_valid: true,
+            resolved_ips: vec![],
+            credential_refs: vec![],
+            chromium_build: "sha256:test".to_owned(),
+            effective_isolation: IsolationProfile::SharedContext,
+        })
+    }
+
+    fn execute_approved_action(
+        &self,
+        session_id: &browserd_core::SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        let observed = self
+            .inspect_approval_context(session_id, page_id, proposal)
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        if let Some(reason) = inspected.stale_reason(&observed) {
+            return Err(ApprovedActionError::ApprovalStale(reason));
+        }
+        authorize_and_commit(&observed)?;
+        Ok(self.execute_action(session_id, Some(page_id), payload))
+    }
+
     fn cancel_action(
         &self,
         _session_id: &browserd_core::SessionId,
         _action_id: &browserd_core::ActionId,
     ) -> Result<bool, DependencyError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         Ok(true)
     }
 }
@@ -107,8 +188,11 @@ impl ChromiumDriver for FakeDriver {
 struct FakeSandbox {
     qualified: bool,
     fail_provision: bool,
+    fail_cleanup: bool,
     provision_count: Mutex<usize>,
     cleanup_count: Mutex<usize>,
+    provision_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    artifact_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
 }
 
 impl SandboxClient for FakeSandbox {
@@ -125,10 +209,24 @@ impl SandboxClient for FakeSandbox {
         _session_id: &browserd_core::SessionId,
         _fence: &browserd_session::OwnershipFence,
     ) -> Result<(), DependencyError> {
-        let Ok(mut count) = self.provision_count.lock() else {
-            return Err(DependencyError::Unavailable);
+        let invocation = {
+            let Ok(mut count) = self.provision_count.lock() else {
+                return Err(DependencyError::Unavailable);
+            };
+            *count += 1;
+            *count
         };
-        *count += 1;
+        if invocation == 1 {
+            let barriers = self
+                .provision_barriers
+                .lock()
+                .map_err(|_| DependencyError::Unavailable)?
+                .clone();
+            if let Some((started, release)) = barriers {
+                started.wait();
+                release.wait();
+            }
+        }
         if self.fail_provision {
             Err(DependencyError::Unavailable)
         } else {
@@ -145,7 +243,11 @@ impl SandboxClient for FakeSandbox {
             return Err(DependencyError::Unavailable);
         };
         *count += 1;
-        Ok(())
+        if self.fail_cleanup {
+            Err(DependencyError::Unavailable)
+        } else {
+            Ok(())
+        }
     }
 
     fn heartbeat(&self, _worker_id: &WorkerId, _worker_epoch: u64) -> Result<(), DependencyError> {
@@ -157,6 +259,15 @@ impl SandboxClient for FakeSandbox {
         _session_id: &browserd_core::SessionId,
         _upload: &ArtifactUpload,
     ) -> Result<(), DependencyError> {
+        let barriers = self
+            .artifact_barriers
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?
+            .clone();
+        if let Some((started, release)) = barriers {
+            started.wait();
+            release.wait();
+        }
         Ok(())
     }
 }
@@ -214,7 +325,12 @@ fn ready_worker(queue_capacity: usize) -> Option<ReadyWorker> {
         ..FakeSandbox::default()
     });
     let peer = AuthenticatedPeer::new("gateway-internal").ok()?;
-    let worker = WorkerControlPlane::new(config(queue_capacity)?, driver.clone(), sandbox.clone());
+    let worker = WorkerControlPlane::new_with_clock(
+        config(queue_capacity)?,
+        driver.clone(),
+        sandbox.clone(),
+        Arc::new(TestClock),
+    );
     Some((worker, peer, driver, sandbox))
 }
 
@@ -226,6 +342,35 @@ fn create_command(tenant_id: TenantId, key: &str, hash_byte: u8) -> CreateSessio
         placement_version: 1,
         session_incarnation: 1,
     }
+}
+
+fn approval_requirement(
+    tenant_id: &TenantId,
+    requester: &PrincipalId,
+    session: &CreateSessionOutcome,
+    payload: &[u8],
+    submitted_at: SessionTime,
+) -> Option<ActionApprovalRequirement> {
+    Some(ActionApprovalRequirement::new(
+        CanonicalActionProposal::new(
+            tenant_id.clone(),
+            requester.clone(),
+            session.session_id.clone(),
+            session.fence.session_incarnation(),
+            session.primary_page_id.clone(),
+            1,
+            1,
+            Origin::parse("https://example.test/").ok()?,
+            1,
+            ActionType::Click,
+            ActionArgumentsHash::digest(payload),
+            None,
+            CredentialRefsHash::digest(std::iter::empty()),
+            submitted_at.get() + 100,
+        ),
+        ActionType::Click,
+        true,
+    ))
 }
 
 #[test]
@@ -240,7 +385,7 @@ fn readiness_and_internal_transport_fail_closed() {
     };
     let driver = Arc::new(FakeDriver::default());
     let sandbox = Arc::new(FakeSandbox::default());
-    let worker = WorkerControlPlane::new(config, driver, sandbox);
+    let worker = WorkerControlPlane::new_with_clock(config, driver, sandbox, Arc::new(TestClock));
     assert!(!worker.is_ready());
     let peer = AuthenticatedPeer::new("gateway-internal");
     assert!(peer.is_ok());
@@ -350,6 +495,387 @@ fn create_is_idempotent_fenced_and_page_lifecycle_is_serialized() {
 }
 
 #[test]
+fn blocked_session_provisioning_does_not_hold_the_global_worker_mutex() {
+    let Some((worker, peer, _driver, sandbox)) = ready_worker(4) else {
+        return;
+    };
+    let worker = Arc::new(worker);
+    let provision_started = Arc::new(Barrier::new(2));
+    let release_provision = Arc::new(Barrier::new(2));
+    let Ok(mut provision_barriers) = sandbox.provision_barriers.lock() else {
+        return;
+    };
+    *provision_barriers = Some((
+        Arc::clone(&provision_started),
+        Arc::clone(&release_provision),
+    ));
+    drop(provision_barriers);
+
+    let create_worker = Arc::clone(&worker);
+    let create_peer = peer.clone();
+    let create_handle = thread::spawn(move || {
+        create_worker.create_session(
+            &create_peer,
+            create_command(TenantId::new(), "blocked-create", 41),
+            SessionTime::new(0),
+        )
+    });
+    provision_started.wait();
+
+    let readiness_worker = Arc::clone(&worker);
+    let (readiness_tx, readiness_rx) = std::sync::mpsc::channel();
+    let readiness_handle = thread::spawn(move || {
+        let _ = readiness_tx.send(readiness_worker.is_ready());
+    });
+    let readiness_completed = readiness_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+
+    release_provision.wait();
+    assert!(create_handle.join().is_ok_and(|result| result.is_ok()));
+    assert!(readiness_handle.join().is_ok());
+    assert!(
+        readiness_completed,
+        "readiness must not wait for an unrelated external provision call"
+    );
+}
+
+#[test]
+fn concurrent_identical_create_waits_for_and_reuses_the_single_inflight_operation() {
+    let Some((worker, peer, _driver, sandbox)) = ready_worker(4) else {
+        return;
+    };
+    let worker = Arc::new(worker);
+    let provision_started = Arc::new(Barrier::new(2));
+    let release_provision = Arc::new(Barrier::new(2));
+    let Ok(mut provision_barriers) = sandbox.provision_barriers.lock() else {
+        return;
+    };
+    *provision_barriers = Some((
+        Arc::clone(&provision_started),
+        Arc::clone(&release_provision),
+    ));
+    drop(provision_barriers);
+    let command = create_command(TenantId::new(), "concurrent-identical-create", 52);
+
+    let first_worker = Arc::clone(&worker);
+    let first_peer = peer.clone();
+    let first_command = command.clone();
+    let first_handle = thread::spawn(move || {
+        first_worker.create_session(&first_peer, first_command, SessionTime::new(0))
+    });
+    provision_started.wait();
+
+    let second_worker = Arc::clone(&worker);
+    let second_peer = peer.clone();
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second_handle = thread::spawn(move || {
+        let _ = second_tx.send(second_worker.create_session(
+            &second_peer,
+            command,
+            SessionTime::new(0),
+        ));
+    });
+    let retry_completed_before_original = second_rx.recv_timeout(Duration::from_millis(50)).is_ok();
+
+    release_provision.wait();
+    let first = first_handle.join();
+    let second = second_rx.recv_timeout(Duration::from_secs(1));
+    assert!(second_handle.join().is_ok());
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    let (Ok(Ok(first)), Ok(Ok(second))) = (first, second) else {
+        return;
+    };
+    assert!(
+        !retry_completed_before_original,
+        "an identical retry must not observe a partial create result"
+    );
+    assert_eq!(first.operation_id, second.operation_id);
+    assert_eq!(first.session_id, second.session_id);
+    assert!(!first.existing);
+    assert!(second.existing);
+    assert_eq!(
+        sandbox.provision_count.lock().ok().map(|count| *count),
+        Some(1)
+    );
+}
+
+#[test]
+fn graceful_shutdown_waits_for_an_inflight_create_to_rollback() {
+    let Some((worker, peer, driver, sandbox)) = ready_worker(4) else {
+        return;
+    };
+    let worker = Arc::new(worker);
+    let provision_started = Arc::new(Barrier::new(2));
+    let release_provision = Arc::new(Barrier::new(2));
+    let Ok(mut provision_barriers) = sandbox.provision_barriers.lock() else {
+        return;
+    };
+    *provision_barriers = Some((
+        Arc::clone(&provision_started),
+        Arc::clone(&release_provision),
+    ));
+    drop(provision_barriers);
+
+    let create_worker = Arc::clone(&worker);
+    let create_peer = peer.clone();
+    let create_handle = thread::spawn(move || {
+        create_worker.create_session(
+            &create_peer,
+            create_command(TenantId::new(), "shutdown-inflight-create", 53),
+            SessionTime::new(0),
+        )
+    });
+    provision_started.wait();
+    assert_eq!(worker.begin_drain(&peer), Ok(()));
+
+    let shutdown_entered = Arc::new(Barrier::new(2));
+    let shutdown_entered_thread = Arc::clone(&shutdown_entered);
+    let shutdown_worker = Arc::clone(&worker);
+    let shutdown_peer = peer.clone();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let shutdown_handle = thread::spawn(move || {
+        shutdown_entered_thread.wait();
+        let _ = shutdown_tx
+            .send(shutdown_worker.graceful_shutdown(&shutdown_peer, SessionTime::new(1)));
+    });
+    shutdown_entered.wait();
+    let shutdown_before_create_rollback = shutdown_rx.recv_timeout(Duration::from_millis(100));
+
+    release_provision.wait();
+    let create_result = create_handle.join();
+    let shutdown_completed_early = shutdown_before_create_rollback.is_ok();
+    let shutdown_result = match shutdown_before_create_rollback {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            shutdown_rx.recv_timeout(Duration::from_secs(1)).ok()
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+    };
+    let shutdown_join = shutdown_handle.join();
+
+    assert!(
+        !shutdown_completed_early,
+        "graceful shutdown must not report success while a provisioned create is still live"
+    );
+    assert!(create_result.is_ok(), "create thread must not panic");
+    let Ok(create_result) = create_result else {
+        return;
+    };
+    assert!(matches!(
+        create_result,
+        Err(WorkerError::Draining | WorkerError::Stopped)
+    ));
+    assert!(shutdown_join.is_ok(), "shutdown thread must not panic");
+    assert!(
+        shutdown_result.is_some(),
+        "shutdown must finish after create rollback"
+    );
+    let Some(shutdown_result) = shutdown_result else {
+        return;
+    };
+    assert_eq!(shutdown_result, Ok(()));
+    assert_eq!(
+        sandbox.cleanup_count.lock().ok().map(|count| *count),
+        Some(1),
+        "the rejected create must roll back its sandbox before shutdown returns"
+    );
+    assert_eq!(
+        driver.cleanup_count.lock().ok().map(|count| *count),
+        Some(1),
+        "the rejected create must close its browser context before shutdown returns"
+    );
+}
+
+#[test]
+fn graceful_shutdown_reports_an_inflight_create_rollback_failure() {
+    let driver = Arc::new(FakeDriver {
+        qualified: true,
+        ..FakeDriver::default()
+    });
+    let sandbox = Arc::new(FakeSandbox {
+        qualified: true,
+        fail_cleanup: true,
+        ..FakeSandbox::default()
+    });
+    let Some(config) = config(4) else {
+        return;
+    };
+    let Ok(peer) = AuthenticatedPeer::new("gateway-internal") else {
+        return;
+    };
+    let worker = Arc::new(WorkerControlPlane::new_with_clock(
+        config,
+        Arc::clone(&driver),
+        Arc::clone(&sandbox),
+        Arc::new(TestClock),
+    ));
+    let provision_started = Arc::new(Barrier::new(2));
+    let release_provision = Arc::new(Barrier::new(2));
+    let Ok(mut provision_barriers) = sandbox.provision_barriers.lock() else {
+        return;
+    };
+    *provision_barriers = Some((
+        Arc::clone(&provision_started),
+        Arc::clone(&release_provision),
+    ));
+    drop(provision_barriers);
+
+    let create_worker = Arc::clone(&worker);
+    let create_peer = peer.clone();
+    let create_handle = thread::spawn(move || {
+        create_worker.create_session(
+            &create_peer,
+            create_command(TenantId::new(), "shutdown-failed-create-rollback", 54),
+            SessionTime::new(0),
+        )
+    });
+    provision_started.wait();
+    assert_eq!(worker.begin_drain(&peer), Ok(()));
+
+    let shutdown_worker = Arc::clone(&worker);
+    let shutdown_peer = peer.clone();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let shutdown_handle = thread::spawn(move || {
+        let _ = shutdown_tx
+            .send(shutdown_worker.graceful_shutdown(&shutdown_peer, SessionTime::new(1)));
+    });
+    assert!(
+        shutdown_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "shutdown must wait for the in-flight rollback attempt"
+    );
+
+    release_provision.wait();
+    let create_result = create_handle.join();
+    let shutdown_result = shutdown_rx.recv_timeout(Duration::from_secs(1));
+    let shutdown_join = shutdown_handle.join();
+
+    assert!(matches!(create_result, Ok(Err(WorkerError::CleanupFailed))));
+    assert_eq!(shutdown_result, Ok(Err(WorkerError::CleanupFailed)));
+    assert!(shutdown_join.is_ok(), "shutdown thread must not panic");
+    assert_eq!(
+        sandbox.cleanup_count.lock().ok().map(|count| *count),
+        Some(1),
+        "shutdown must observe the failed rollback attempt"
+    );
+    assert_eq!(
+        driver.cleanup_count.lock().ok().map(|count| *count),
+        Some(1)
+    );
+}
+
+#[test]
+fn blocked_readiness_probe_does_not_hold_the_global_worker_mutex() {
+    let Some((worker, peer, driver, _sandbox)) = ready_worker(4) else {
+        return;
+    };
+    let worker = Arc::new(worker);
+    let session = worker.create_session(
+        &peer,
+        create_command(TenantId::new(), "readiness-session", 42),
+        SessionTime::new(0),
+    );
+    assert!(session.is_ok());
+    let Ok(session) = session else {
+        return;
+    };
+    let qualify_started = Arc::new(Barrier::new(2));
+    let release_qualify = Arc::new(Barrier::new(2));
+    let Ok(mut qualification_barriers) = driver.qualification_barriers.lock() else {
+        return;
+    };
+    *qualification_barriers = Some((Arc::clone(&qualify_started), Arc::clone(&release_qualify)));
+    drop(qualification_barriers);
+
+    let readiness_worker = Arc::clone(&worker);
+    let readiness_handle = thread::spawn(move || readiness_worker.is_ready());
+    qualify_started.wait();
+
+    let query_worker = Arc::clone(&worker);
+    let query_peer = peer.clone();
+    let query_session_id = session.session_id.clone();
+    let query_fence = session.fence.clone();
+    let (query_tx, query_rx) = std::sync::mpsc::channel();
+    let query_handle = thread::spawn(move || {
+        let _ =
+            query_tx.send(query_worker.get_session(&query_peer, &query_session_id, &query_fence));
+    });
+    let query_completed = query_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+
+    release_qualify.wait();
+    assert!(readiness_handle.join().is_ok_and(|ready| ready));
+    assert!(query_handle.join().is_ok());
+    assert!(
+        query_completed,
+        "session lookup must not wait for an external readiness probe"
+    );
+}
+
+#[test]
+fn blocked_artifact_storage_does_not_hold_the_session_state_mutex() {
+    let Some((worker, peer, _driver, sandbox)) = ready_worker(4) else {
+        return;
+    };
+    let worker = Arc::new(worker);
+    let session = worker.create_session(
+        &peer,
+        create_command(TenantId::new(), "artifact-session", 43),
+        SessionTime::new(0),
+    );
+    assert!(session.is_ok());
+    let Ok(session) = session else {
+        return;
+    };
+    let storage_started = Arc::new(Barrier::new(2));
+    let release_storage = Arc::new(Barrier::new(2));
+    let Ok(mut artifact_barriers) = sandbox.artifact_barriers.lock() else {
+        return;
+    };
+    *artifact_barriers = Some((Arc::clone(&storage_started), Arc::clone(&release_storage)));
+    drop(artifact_barriers);
+
+    let upload_worker = Arc::clone(&worker);
+    let upload_peer = peer.clone();
+    let upload_session_id = session.session_id.clone();
+    let upload_fence = session.fence.clone();
+    let upload_handle = thread::spawn(move || {
+        upload_worker.upload_artifact(
+            &upload_peer,
+            &upload_session_id,
+            &upload_fence,
+            ArtifactUpload {
+                bytes: vec![1, 2, 3],
+                content_type: "application/octet-stream".to_owned(),
+            },
+            SessionTime::new(2),
+        )
+    });
+    storage_started.wait();
+
+    let query_worker = Arc::clone(&worker);
+    let query_peer = peer.clone();
+    let query_session_id = session.session_id.clone();
+    let query_fence = session.fence.clone();
+    let (query_tx, query_rx) = std::sync::mpsc::channel();
+    let query_handle = thread::spawn(move || {
+        let _ =
+            query_tx.send(query_worker.get_session(&query_peer, &query_session_id, &query_fence));
+    });
+    let query_completed = query_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+
+    release_storage.wait();
+    assert!(upload_handle.join().is_ok_and(|result| result.is_ok()));
+    assert!(query_handle.join().is_ok());
+    assert!(
+        query_completed,
+        "session query must not wait for external artifact storage"
+    );
+}
+
+#[test]
 fn action_queue_is_bounded_idempotent_and_unknown_requires_explicit_resolution() {
     let Some((worker, peer, driver, _sandbox)) = ready_worker(1) else {
         return;
@@ -364,8 +890,10 @@ fn action_queue_is_bounded_idempotent_and_unknown_requires_explicit_resolution()
         return;
     };
     let page = created.primary_page_id.clone();
+    let requester = PrincipalId::new();
     let first = worker.submit_action(
         &peer,
+        requester.clone(),
         &created.session_id,
         &created.fence,
         "action-key",
@@ -374,7 +902,7 @@ fn action_queue_is_bounded_idempotent_and_unknown_requires_explicit_resolution()
         Some(BuiltinFeature::CoreInput),
         Some(page),
         b"click".to_vec(),
-        false,
+        None,
         SessionTime::new(2),
     );
     assert!(first.is_ok());
@@ -383,6 +911,7 @@ fn action_queue_is_bounded_idempotent_and_unknown_requires_explicit_resolution()
     };
     let duplicate = worker.submit_action(
         &peer,
+        requester,
         &created.session_id,
         &created.fence,
         "action-key",
@@ -391,13 +920,14 @@ fn action_queue_is_bounded_idempotent_and_unknown_requires_explicit_resolution()
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(2),
     );
     assert_eq!(duplicate.ok(), Some(first.clone()));
     assert_eq!(
         worker.submit_action(
             &peer,
+            PrincipalId::new(),
             &created.session_id,
             &created.fence,
             "second",
@@ -406,7 +936,7 @@ fn action_queue_is_bounded_idempotent_and_unknown_requires_explicit_resolution()
             None,
             None,
             Vec::new(),
-            false,
+            None,
             SessionTime::new(2),
         ),
         Err(WorkerError::QueueFull)
@@ -478,9 +1008,10 @@ fn artifact_approval_viewer_and_cleanup_commands_remain_fenced() {
     let Some((worker, peer, _driver, sandbox)) = ready_worker(2) else {
         return;
     };
+    let tenant_id = TenantId::new();
     let created = worker.create_session(
         &peer,
-        create_command(TenantId::new(), "create", 1),
+        create_command(tenant_id.clone(), "create", 1),
         SessionTime::new(0),
     );
     assert!(created.is_ok());
@@ -519,17 +1050,19 @@ fn artifact_approval_viewer_and_cleanup_commands_remain_fenced() {
             .is_ok()
     );
 
+    let requester = PrincipalId::new();
     let action = worker.submit_action(
         &peer,
+        requester.clone(),
         &created.session_id,
         &created.fence,
         "approval",
         [8; 32],
         ActionKind::Mutating,
         None,
-        None,
+        Some(created.primary_page_id.clone()),
         Vec::new(),
-        true,
+        approval_requirement(&tenant_id, &requester, &created, &[], SessionTime::new(3)),
         SessionTime::new(3),
     );
     assert!(action.is_ok());
@@ -675,6 +1208,7 @@ fn worker_loss_racing_dispatched_action_derives_outcome_unknown() {
     };
     let action_id = worker.submit_action(
         &peer,
+        PrincipalId::new(),
         &created.session_id,
         &created.fence,
         "running",
@@ -683,7 +1217,7 @@ fn worker_loss_racing_dispatched_action_derives_outcome_unknown() {
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(1),
     );
     assert!(action_id.is_ok());
@@ -741,6 +1275,7 @@ fn explicit_close_racing_dispatched_action_never_leaves_it_running() {
     };
     let action_id = worker.submit_action(
         &peer,
+        PrincipalId::new(),
         &created.session_id,
         &created.fence,
         "running-close",
@@ -749,7 +1284,7 @@ fn explicit_close_racing_dispatched_action_never_leaves_it_running() {
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(1),
     );
     assert!(action_id.is_ok());
@@ -805,6 +1340,7 @@ fn failed_pre_dispatch_validation_keeps_action_available_for_close_cancellation(
     };
     let action_id = worker.submit_action(
         &peer,
+        PrincipalId::new(),
         &created.session_id,
         &created.fence,
         "queued-at-expiry",
@@ -813,7 +1349,7 @@ fn failed_pre_dispatch_validation_keeps_action_available_for_close_cancellation(
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(1),
     );
     assert!(action_id.is_ok());
@@ -855,9 +1391,10 @@ fn explicit_close_resolves_all_actions_that_never_dispatched() {
     let Some((worker, peer, _driver, _sandbox)) = ready_worker(3) else {
         return;
     };
+    let tenant_id = TenantId::new();
     let created = worker.create_session(
         &peer,
-        create_command(TenantId::new(), "close-pending", 1),
+        create_command(tenant_id.clone(), "close-pending", 1),
         SessionTime::new(0),
     );
     assert!(created.is_ok());
@@ -866,6 +1403,7 @@ fn explicit_close_resolves_all_actions_that_never_dispatched() {
     };
     let queued = worker.submit_action(
         &peer,
+        PrincipalId::new(),
         &created.session_id,
         &created.fence,
         "queued",
@@ -874,20 +1412,28 @@ fn explicit_close_resolves_all_actions_that_never_dispatched() {
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(1),
     );
+    let pending_requester = PrincipalId::new();
     let pending = worker.submit_action(
         &peer,
+        pending_requester.clone(),
         &created.session_id,
         &created.fence,
         "pending",
         [13; 32],
         ActionKind::Mutating,
         None,
-        None,
+        Some(created.primary_page_id.clone()),
         Vec::new(),
-        true,
+        approval_requirement(
+            &tenant_id,
+            &pending_requester,
+            &created,
+            &[],
+            SessionTime::new(2),
+        ),
         SessionTime::new(2),
     );
     assert!(queued.is_ok());
@@ -944,7 +1490,8 @@ fn failed_create_result_is_stable_for_identical_retries() {
     let Some(config) = config(1) else {
         return;
     };
-    let worker = WorkerControlPlane::new(config, driver, sandbox.clone());
+    let worker =
+        WorkerControlPlane::new_with_clock(config, driver, sandbox.clone(), Arc::new(TestClock));
     let tenant_id = TenantId::new();
 
     assert_eq!(
@@ -985,7 +1532,7 @@ fn terminal_sessions_release_worker_capacity_without_losing_query_state() {
     let Some(config) = config_with_max_sessions(1, 1) else {
         return;
     };
-    let worker = WorkerControlPlane::new(config, driver, sandbox);
+    let worker = WorkerControlPlane::new_with_clock(config, driver, sandbox, Arc::new(TestClock));
     let peer = AuthenticatedPeer::new("gateway-internal");
     assert!(peer.is_ok());
     let Some(peer) = peer.ok() else {
@@ -1030,9 +1577,10 @@ fn timeout_expiry_terminalizes_dispatched_queued_and_pending_actions() {
         return;
     };
     let worker = Arc::new(worker);
+    let tenant_id = TenantId::new();
     let created = worker.create_session(
         &peer,
-        create_command(TenantId::new(), "timeout-actions", 1),
+        create_command(tenant_id.clone(), "timeout-actions", 1),
         SessionTime::new(0),
     );
     assert!(created.is_ok());
@@ -1041,6 +1589,7 @@ fn timeout_expiry_terminalizes_dispatched_queued_and_pending_actions() {
     };
     let running = worker.submit_action(
         &peer,
+        PrincipalId::new(),
         &created.session_id,
         &created.fence,
         "timeout-running",
@@ -1049,11 +1598,12 @@ fn timeout_expiry_terminalizes_dispatched_queued_and_pending_actions() {
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(1),
     );
     let queued = worker.submit_action(
         &peer,
+        PrincipalId::new(),
         &created.session_id,
         &created.fence,
         "timeout-queued",
@@ -1062,20 +1612,28 @@ fn timeout_expiry_terminalizes_dispatched_queued_and_pending_actions() {
         None,
         None,
         Vec::new(),
-        false,
+        None,
         SessionTime::new(1),
     );
+    let pending_requester = PrincipalId::new();
     let pending = worker.submit_action(
         &peer,
+        pending_requester.clone(),
         &created.session_id,
         &created.fence,
         "timeout-pending",
         [16; 32],
         ActionKind::Mutating,
         None,
-        None,
+        Some(created.primary_page_id.clone()),
         Vec::new(),
-        true,
+        approval_requirement(
+            &tenant_id,
+            &pending_requester,
+            &created,
+            &[],
+            SessionTime::new(1),
+        ),
         SessionTime::new(1),
     );
     assert!(running.is_ok());
@@ -1177,6 +1735,7 @@ fn page_close_cannot_invalidate_an_admitted_action_target() {
         worker
             .submit_action(
                 &peer,
+                PrincipalId::new(),
                 &created.session_id,
                 &created.fence,
                 "page-bound-action",
@@ -1185,7 +1744,7 @@ fn page_close_cannot_invalidate_an_admitted_action_target() {
                 None,
                 Some(created.primary_page_id.clone()),
                 Vec::new(),
-                false,
+                None,
                 SessionTime::new(1),
             )
             .is_ok()

@@ -12,14 +12,20 @@ use std::time::Duration;
 use browserd_actions::{
     ActionJournalLimits, ActionKind, ActionLedger, FileActionJournal, LedgerSession,
 };
-use browserd_core::{ActionId, ActionState, PageId, PrincipalId, SessionId, TenantId, WorkerId};
-use browserd_policy::ApprovalDecision;
+use browserd_core::{
+    ActionId, ActionState, IsolationProfile, PageId, PrincipalId, SessionId, TenantId, WorkerId,
+};
+use browserd_policy::{
+    ActionArgumentsHash, ActionType, ApprovalDecision, ApprovalError, CanonicalActionProposal,
+    CredentialRefsHash, Origin,
+};
 use browserd_session::{
     LeasePolicy, OwnershipFence, SessionExecution, SessionTime, SessionTimeoutPolicy,
 };
 use browserd_worker::{
-    ActionExecutionResult, ActionJournalConfig, ArtifactUpload, AuthenticatedPeer, ChromiumDriver,
-    CreateSessionCommand, CreateSessionOutcome, DependencyError, InternalEndpoint, SandboxClient,
+    ActionApprovalRequirement, ActionExecutionResult, ActionJournalConfig, ApprovedActionError,
+    ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand, CreateSessionOutcome,
+    DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient, WorkerClock,
     WorkerConfig, WorkerControlPlane, WorkerError,
 };
 use tempfile::TempDir;
@@ -30,6 +36,7 @@ struct RecordingDriver {
     payloads: Mutex<Vec<Vec<u8>>>,
     results: Mutex<VecDeque<ActionExecutionResult>>,
     execution_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    approved_effect_gate: Mutex<()>,
 }
 
 impl ChromiumDriver for RecordingDriver {
@@ -42,6 +49,10 @@ impl ChromiumDriver for RecordingDriver {
     }
 
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         Ok(())
     }
 
@@ -54,6 +65,10 @@ impl ChromiumDriver for RecordingDriver {
         _session_id: &SessionId,
         _page_id: &PageId,
     ) -> Result<(), DependencyError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         Ok(())
     }
 
@@ -92,11 +107,60 @@ impl ChromiumDriver for RecordingDriver {
             .unwrap_or_else(|| ActionExecutionResult::Succeeded(payload.to_vec()))
     }
 
+    fn inspect_approval_context(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        Ok(LiveApprovalContext {
+            target_incarnation: 1,
+            frame_document_epoch: 1,
+            current_origin: Origin::parse("https://example.test/").expect("origin should be valid"),
+            url_revision: 1,
+            node_ref: None,
+            node_valid: true,
+            resolved_ips: vec![],
+            credential_refs: vec![],
+            chromium_build: "sha256:test".to_owned(),
+            effective_isolation: IsolationProfile::SharedContext,
+        })
+    }
+
+    fn execute_approved_action(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        let observed = self
+            .inspect_approval_context(session_id, page_id, proposal)
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        if let Some(reason) = inspected.stale_reason(&observed) {
+            return Err(ApprovedActionError::ApprovalStale(reason));
+        }
+        authorize_and_commit(&observed)?;
+        Ok(self.execute_action(session_id, Some(page_id), payload))
+    }
+
     fn cancel_action(
         &self,
         _session_id: &SessionId,
         _action_id: &ActionId,
     ) -> Result<bool, DependencyError> {
+        let _gate = self
+            .approved_effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         Ok(true)
     }
 }
@@ -151,6 +215,14 @@ impl SandboxClient for JournalCheckingSandbox {
 
 type TestWorker = WorkerControlPlane<RecordingDriver, JournalCheckingSandbox>;
 
+struct TestClock;
+
+impl WorkerClock for TestClock {
+    fn now(&self) -> Result<SessionTime, WorkerError> {
+        Ok(SessionTime::new(0))
+    }
+}
+
 fn worker(
     max_records: usize,
     queue_capacity: usize,
@@ -190,20 +262,36 @@ fn worker(
         saw_journal_before_provision: AtomicBool::new(false),
         fail_provision: AtomicBool::new(false),
     });
-    let worker = Arc::new(WorkerControlPlane::new(
+    let worker = Arc::new(WorkerControlPlane::new_with_clock(
         config,
         Arc::clone(&driver),
         Arc::clone(&sandbox),
+        Arc::new(TestClock),
     ));
     (worker, peer, driver, sandbox, journal_root)
 }
 
-fn create_session(worker: &TestWorker, peer: &AuthenticatedPeer) -> CreateSessionOutcome {
-    worker
+struct TestSession {
+    outcome: CreateSessionOutcome,
+    tenant_id: TenantId,
+    requester: PrincipalId,
+}
+
+impl std::ops::Deref for TestSession {
+    type Target = CreateSessionOutcome;
+
+    fn deref(&self) -> &Self::Target {
+        &self.outcome
+    }
+}
+
+fn create_session(worker: &TestWorker, peer: &AuthenticatedPeer) -> TestSession {
+    let tenant_id = TenantId::new();
+    let outcome = worker
         .create_session(
             peer,
             CreateSessionCommand {
-                tenant_id: TenantId::new(),
+                tenant_id: tenant_id.clone(),
                 idempotency_key: "create".to_owned(),
                 canonical_request_hash: [1; 32],
                 placement_version: 1,
@@ -211,29 +299,57 @@ fn create_session(worker: &TestWorker, peer: &AuthenticatedPeer) -> CreateSessio
             },
             SessionTime::new(0),
         )
-        .expect("session should be created")
+        .expect("session should be created");
+    TestSession {
+        outcome,
+        tenant_id,
+        requester: PrincipalId::new(),
+    }
 }
 
 fn submit(
     worker: &TestWorker,
     peer: &AuthenticatedPeer,
-    session: &CreateSessionOutcome,
+    session: &TestSession,
     key: &str,
     payload: &[u8],
     requires_approval: bool,
 ) -> ActionId {
+    let approval = requires_approval.then(|| {
+        ActionApprovalRequirement::new(
+            CanonicalActionProposal::new(
+                session.tenant_id.clone(),
+                session.requester.clone(),
+                session.session_id.clone(),
+                session.fence.session_incarnation(),
+                session.primary_page_id.clone(),
+                1,
+                1,
+                Origin::parse("https://example.test/").expect("origin should be valid"),
+                1,
+                ActionType::Click,
+                ActionArgumentsHash::digest(payload),
+                None,
+                CredentialRefsHash::digest(std::iter::empty()),
+                6,
+            ),
+            ActionType::Click,
+            true,
+        )
+    });
     worker
         .submit_action(
             peer,
+            session.requester.clone(),
             &session.session_id,
             &session.fence,
             key,
             [payload.len() as u8; 32],
             ActionKind::Mutating,
             None,
-            None,
+            requires_approval.then(|| session.primary_page_id.clone()),
             payload.to_vec(),
-            requires_approval,
+            approval,
             SessionTime::new(1),
         )
         .expect("action should be submitted")
@@ -342,6 +458,7 @@ fn partial_submission_is_compensated_and_remains_idempotently_queryable() {
     let submit = || {
         worker.submit_action(
             &peer,
+            session.requester.clone(),
             &session.session_id,
             &session.fence,
             "partial",
@@ -350,7 +467,7 @@ fn partial_submission_is_compensated_and_remains_idempotently_queryable() {
             None,
             None,
             b"partial".to_vec(),
-            false,
+            None,
             SessionTime::new(1),
         )
     };
@@ -476,7 +593,7 @@ fn pending_approval_expires_on_its_own_deadline_without_dispatch() {
             PrincipalId::new(),
             SessionTime::new(7),
         ),
-        Err(WorkerError::InvalidApprovalTransition)
+        Err(WorkerError::ApprovalPolicy(ApprovalError::ApprovalExpired))
     );
 }
 
@@ -668,7 +785,7 @@ fn driver_result_after_newer_heartbeat_commits_consistently() {
 fn stale_cancel_time_is_rejected_before_durable_mutation() {
     let (worker, peer, _driver, _sandbox, journal_root) = worker(64, 8);
     let tenant_id = TenantId::new();
-    let session = worker
+    let outcome = worker
         .create_session(
             &peer,
             CreateSessionCommand {
@@ -681,6 +798,11 @@ fn stale_cancel_time_is_rejected_before_durable_mutation() {
             SessionTime::new(0),
         )
         .expect("session should be created");
+    let session = TestSession {
+        outcome,
+        tenant_id: tenant_id.clone(),
+        requester: PrincipalId::new(),
+    };
     let action_id = submit(&worker, &peer, &session, "stale-cancel", b"click", false);
     worker
         .heartbeat(&peer, SessionTime::new(90))
@@ -709,7 +831,7 @@ fn stale_cancel_time_is_rejected_before_durable_mutation() {
     let ledger = ActionLedger::recover(
         LedgerSession::new(
             tenant_id,
-            session.session_id,
+            session.session_id.clone(),
             session.fence.as_placement_fence(),
         ),
         Arc::new(journal),
@@ -728,7 +850,7 @@ fn stale_cancel_time_is_rejected_before_durable_mutation() {
 fn stale_resolution_time_cannot_replace_durable_audit_evidence() {
     let (worker, peer, driver, _sandbox, journal_root) = worker(64, 8);
     let tenant_id = TenantId::new();
-    let session = worker
+    let outcome = worker
         .create_session(
             &peer,
             CreateSessionCommand {
@@ -741,6 +863,11 @@ fn stale_resolution_time_cannot_replace_durable_audit_evidence() {
             SessionTime::new(0),
         )
         .expect("session should be created");
+    let session = TestSession {
+        outcome,
+        tenant_id: tenant_id.clone(),
+        requester: PrincipalId::new(),
+    };
     driver
         .results
         .lock()
@@ -813,7 +940,7 @@ fn stale_resolution_time_cannot_replace_durable_audit_evidence() {
     let ledger = ActionLedger::recover(
         LedgerSession::new(
             tenant_id,
-            session.session_id,
+            session.session_id.clone(),
             session.fence.as_placement_fence(),
         ),
         Arc::new(journal),
@@ -894,7 +1021,7 @@ fn browser_mutations_cannot_bypass_the_running_action_owner() {
 fn close_durably_terminalizes_every_action_that_never_dispatched() {
     let (worker, peer, _driver, _sandbox, journal_root) = worker(64, 8);
     let tenant_id = TenantId::new();
-    let session = worker
+    let outcome = worker
         .create_session(
             &peer,
             CreateSessionCommand {
@@ -907,6 +1034,11 @@ fn close_durably_terminalizes_every_action_that_never_dispatched() {
             SessionTime::new(0),
         )
         .expect("session should be created");
+    let session = TestSession {
+        outcome,
+        tenant_id: tenant_id.clone(),
+        requester: PrincipalId::new(),
+    };
     let queued = submit(&worker, &peer, &session, "queued", b"queued", false);
     let pending = submit(&worker, &peer, &session, "pending", b"pending", true);
 
@@ -930,7 +1062,7 @@ fn close_durably_terminalizes_every_action_that_never_dispatched() {
     let ledger = ActionLedger::recover(
         LedgerSession::new(
             tenant_id,
-            session.session_id,
+            session.session_id.clone(),
             session.fence.as_placement_fence(),
         ),
         Arc::new(journal),

@@ -3,8 +3,10 @@
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
+use std::time::Duration;
 
 use browserd_core::{IsolationProfile, PageId, PrincipalId, SessionId, TenantId};
 use browserd_policy::{
@@ -357,6 +359,70 @@ fn approval_token_is_consumed_once_even_under_dispatch_race() -> Result<(), Box<
             .count(),
         CALLERS - 1
     );
+    Ok(())
+}
+
+#[test]
+fn admitted_dispatch_does_not_block_unrelated_emergency_policy_updates()
+-> Result<(), Box<dyn Error>> {
+    let proposal = proposal(
+        TenantId::new(),
+        PrincipalId::new(),
+        SessionId::new(),
+        PageId::new(),
+    );
+    let context = execution_context(&proposal);
+    let request = Arc::new(approved_request(proposal, PrincipalId::new())?);
+    let emergency = Arc::new(EmergencyPolicy::default());
+    let release_dispatch = Arc::new(Barrier::new(2));
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let (dispatch_started_tx, dispatch_started_rx) = mpsc::channel();
+
+    let dispatch_handle = {
+        let request = Arc::clone(&request);
+        let emergency = Arc::clone(&emergency);
+        let context = context.clone();
+        let release_dispatch = Arc::clone(&release_dispatch);
+        let dispatches = Arc::clone(&dispatches);
+        thread::spawn(move || {
+            request.authorize_and_dispatch(&emergency, &context, 200, || {
+                dispatch_started_tx.send(()).expect("test receiver remains");
+                release_dispatch.wait();
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+    };
+    dispatch_started_rx.recv()?;
+
+    let other_session = SessionId::new();
+    let (policy_updated_tx, policy_updated_rx) = mpsc::channel();
+    let policy_handle = {
+        let emergency = Arc::clone(&emergency);
+        thread::spawn(move || {
+            let revision = emergency.disable_session(other_session);
+            policy_updated_tx
+                .send(revision)
+                .expect("test receiver remains");
+        })
+    };
+    let updated_while_dispatch_blocked = policy_updated_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_ok();
+
+    release_dispatch.wait();
+    let dispatch_result = dispatch_handle
+        .join()
+        .map_err(|_| std::io::Error::other("dispatch panic"))?;
+    policy_handle
+        .join()
+        .map_err(|_| std::io::Error::other("policy update panic"))?;
+
+    assert!(
+        updated_while_dispatch_blocked,
+        "emergency updates must not wait for an already-admitted browser effect"
+    );
+    assert_eq!(dispatch_result, Ok(()));
+    assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
