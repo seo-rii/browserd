@@ -1,20 +1,23 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::fd::BorrowedFd;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{LeaseId, ShardId};
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use nix::sys::signal::{Signal, kill};
-use nix::unistd::Pid;
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open, openat};
+use nix::sys::signal::Signal;
+use nix::sys::stat::Mode;
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+use nix::unistd::{pipe2, write as write_fd};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     CleanupReason, InspectResources, LaunchSpec, SandboxBackend, SandboxCapabilities, SandboxError,
@@ -25,6 +28,10 @@ use crate::{
 pub const CHROMIUM_CDP_READ_FD: i32 = 3;
 /// Chromium's fixed event/output descriptor for `--remote-debugging-pipe`.
 pub const CHROMIUM_CDP_WRITE_FD: i32 = 4;
+
+const BWRAP_INFO_TIMEOUT: Duration = Duration::from_secs(1);
+const PREPARED_CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
+const PREPARED_CHILD_EXIT_POLL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CgroupLimits {
@@ -338,6 +345,88 @@ impl ChildIdentity {
     }
 }
 
+fn open_pidfd(pid: u32) -> Result<OwnedFd, SandboxError> {
+    let pid =
+        i32::try_from(pid).map_err(|_| SandboxError::Backend("child PID exceeds i32".into()))?;
+    // SAFETY: pidfd_open takes a numeric PID and flags=0 and returns a new owned descriptor.
+    let descriptor = unsafe { nix::libc::syscall(nix::libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        return Err(SandboxError::Backend(format!(
+            "pidfd_open: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let descriptor = i32::try_from(descriptor)
+        .map_err(|_| SandboxError::Backend("pidfd descriptor exceeds i32".into()))?;
+    // SAFETY: the successful pidfd_open call returned a new descriptor owned by this function.
+    Ok(unsafe { OwnedFd::from_raw_fd(descriptor) })
+}
+
+fn signal_pidfd(descriptor: &OwnedFd, signal: Signal) -> Result<(), SandboxError> {
+    // SAFETY: the descriptor remains owned for the call, siginfo=NULL is supported, and flags=0.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_pidfd_send_signal,
+            descriptor.as_raw_fd(),
+            signal as i32,
+            std::ptr::null::<nix::libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(nix::libc::ESRCH) {
+            return Err(SandboxError::Backend(format!("pidfd_send_signal: {error}")));
+        }
+    }
+    Ok(())
+}
+
+fn pidfd_has_exited(descriptor: &OwnedFd) -> Result<bool, SandboxError> {
+    let mut descriptor = nix::libc::pollfd {
+        fd: descriptor.as_raw_fd(),
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one valid pollfd for a nonblocking readiness query.
+    let result = unsafe { nix::libc::poll(&raw mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(SandboxError::Backend(format!(
+            "pidfd poll: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(result == 1
+        && descriptor.revents & (nix::libc::POLLIN | nix::libc::POLLHUP | nix::libc::POLLERR) != 0)
+}
+
+async fn wait_for_pidfd_exit(descriptor: &OwnedFd, description: &str) -> Result<(), SandboxError> {
+    tokio::time::timeout(PREPARED_CHILD_EXIT_TIMEOUT, async {
+        while !pidfd_has_exited(descriptor)? {
+            tokio::time::sleep(PREPARED_CHILD_EXIT_POLL).await;
+        }
+        Ok::<(), SandboxError>(())
+    })
+    .await
+    .map_err(|_| SandboxError::Backend(format!("{description} exit timed out")))??;
+    Ok(())
+}
+
+fn reap_pidfd(descriptor: &OwnedFd, description: &str) -> Result<(), SandboxError> {
+    match waitid(
+        Id::PIDFd(descriptor.as_fd()),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG,
+    ) {
+        Ok(WaitStatus::StillAlive) => Err(SandboxError::Backend(format!(
+            "{description} was not reapable after its exact pidfd reported exit"
+        ))),
+        Ok(_) | Err(nix::errno::Errno::ECHILD) => Ok(()),
+        Err(error) => Err(SandboxError::Backend(format!(
+            "{description} pidfd reap: {error}"
+        ))),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcessSignal {
     Terminate,
@@ -349,6 +438,7 @@ pub struct SpawnRequest {
     program: PathBuf,
     arguments: Vec<OsString>,
     inherited_fds: Vec<i32>,
+    cgroup_procs_path: PathBuf,
 }
 
 impl SpawnRequest {
@@ -368,35 +458,298 @@ impl SpawnRequest {
         // The sandbox backend only requires bwrap to preserve those fixed child descriptors.
         &self.inherited_fds
     }
+
+    #[must_use]
+    pub fn cgroup_procs_path(&self) -> &Path {
+        &self.cgroup_procs_path
+    }
 }
 
 #[async_trait]
 pub trait LinuxProcessBackend: Send + Sync + 'static {
-    /// Spawns the child and returns only after it has captured a stable PID/start-time identity.
-    /// Implementations must terminate and reap any child they started before returning `Err`.
-    async fn spawn(&self, request: &SpawnRequest) -> Result<ChildIdentity, SandboxError>;
-    /// Terminates a child still owned by this backend without trusting its reported identity.
-    async fn abort_spawned(&self, identity: ChildIdentity) -> Result<(), SandboxError>;
+    /// Prepares the child behind an execution gate and captures its stable PID/start-time identity.
+    /// The requested browser runtime must remain unable to execute until `release_prepared`
+    /// succeeds for that exact identity. Before returning `Err`, implementations must either prove
+    /// that every child they started exited or retain the gate so execution remains impossible.
+    ///
+    /// `StdLinuxProcessBackend` retains that tombstone for cancellation and ordinary error recovery,
+    /// but bubblewrap treats writer EOF as release. A supervisor-process crash therefore still
+    /// requires a separate fail-closed launch helper; this primitive alone is not crash-safe.
+    /// Implementations must also place the bootstrap process in `request.cgroup_procs_path()`
+    /// before exec so every descendant inherits containment; callers must never attach a returned
+    /// numeric PID after userspace identity checks.
+    async fn spawn_prepared(
+        &self,
+        backend_token: &str,
+        request: &SpawnRequest,
+    ) -> Result<ChildIdentity, SandboxError>;
+    /// Releases the execution gate for exactly this prepared PID/start-time identity.
+    /// Returning `Err` must leave the child gated so `abort_spawned` can fail closed.
+    async fn release_prepared(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<(), SandboxError>;
+    /// Terminates a child still owned by this backend. `None` means identity capture was interrupted;
+    /// the stable backend token must still resolve the retained reader, gate, and bootstrap handle.
+    /// Implementations must make successful cleanup idempotent for cancellation retries.
+    async fn abort_spawned(
+        &self,
+        backend_token: &str,
+        identity: Option<ChildIdentity>,
+    ) -> Result<(), SandboxError>;
     /// Releases the retained process handle after cgroup emptiness has proven process exit.
-    async fn release_spawned(&self, identity: ChildIdentity) -> Result<(), SandboxError>;
-    async fn identity_matches(&self, identity: ChildIdentity) -> Result<bool, SandboxError>;
+    async fn release_spawned(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<(), SandboxError>;
+    async fn identity_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<bool, SandboxError>;
     async fn signal(
         &self,
+        backend_token: &str,
         identity: ChildIdentity,
         signal: ProcessSignal,
     ) -> Result<(), SandboxError>;
-    async fn is_alive(&self, identity: ChildIdentity) -> Result<bool, SandboxError>;
+    async fn is_alive(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<bool, SandboxError>;
     async fn wait(&self, duration: Duration);
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
+struct OwnedLinuxChild {
+    _monitor: std::process::Child,
+    bootstrap_pid: Option<u32>,
+    bootstrap_pidfd: Option<OwnedFd>,
+    cgroup_events: fs::File,
+    cgroup_kill: fs::File,
+    cgroup_kill_requested: bool,
+    cgroup_empty: bool,
+    identity: Option<ChildIdentity>,
+    sandbox_pidfd: Option<OwnedFd>,
+    execution_gate: Option<OwnedFd>,
+    info_reader: Option<tokio::fs::File>,
+    info_bytes: Vec<u8>,
+    info_eof: bool,
+    bootstrap_process_signalled: bool,
+    bootstrap_monitor_reaped: bool,
+}
+
+static EMERGENCY_GATE_QUARANTINE: OnceLock<StdMutex<HashMap<String, Vec<OwnedLinuxChild>>>> =
+    OnceLock::new();
+
+type OwnedLinuxChildSlot = Arc<StdMutex<Option<OwnedLinuxChild>>>;
+
+struct CheckedOutLinuxChild {
+    backend_token: String,
+    slot: OwnedLinuxChildSlot,
+    child: Option<OwnedLinuxChild>,
+}
+
+impl CheckedOutLinuxChild {
+    fn new(backend_token: &str, slot: OwnedLinuxChildSlot) -> Result<Self, SandboxError> {
+        let mut state = slot
+            .lock()
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))?;
+        let child = state
+            .take()
+            .ok_or_else(|| SandboxError::Backend("child operation already in progress".into()))?;
+        drop(state);
+        Ok(Self {
+            backend_token: backend_token.to_owned(),
+            slot,
+            child: Some(child),
+        })
+    }
+
+    fn child_mut(&mut self) -> Result<&mut OwnedLinuxChild, SandboxError> {
+        self.child
+            .as_mut()
+            .ok_or_else(|| SandboxError::Backend("checked-out child ownership missing".into()))
+    }
+
+    fn finish(mut self) {
+        self.child.take();
+    }
+}
+
+impl Drop for CheckedOutLinuxChild {
+    fn drop(&mut self) {
+        let Some(child) = self.child.take() else {
+            return;
+        };
+        let mut state = match self.slot.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.is_none() {
+            *state = Some(child);
+            return;
+        }
+        drop(state);
+        let quarantine = EMERGENCY_GATE_QUARANTINE.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut quarantine = match quarantine.lock() {
+            Ok(quarantine) => quarantine,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        quarantine
+            .entry(self.backend_token.clone())
+            .or_default()
+            .push(child);
+    }
+}
+
+#[derive(Debug, Default)]
+struct StdLinuxProcessRegistry {
+    children: StdMutex<HashMap<String, OwnedLinuxChildSlot>>,
+}
+
+// Process-global ownership is intentional: dropping a backend value or cancelling a future must
+// not close a quarantined writer (bubblewrap treats gate EOF as a successful release). Any fresh
+// backend handle can retry cleanup by the stable launch token. Supervisor process death remains the
+// separate fail-open limitation documented on `spawn_prepared`.
+static STD_LINUX_PROCESS_REGISTRY: OnceLock<StdLinuxProcessRegistry> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
 pub struct StdLinuxProcessBackend {
-    children: Arc<StdMutex<HashMap<u32, tokio::process::Child>>>,
+    registry: &'static StdLinuxProcessRegistry,
+}
+
+impl Default for StdLinuxProcessBackend {
+    fn default() -> Self {
+        Self {
+            registry: STD_LINUX_PROCESS_REGISTRY.get_or_init(StdLinuxProcessRegistry::default),
+        }
+    }
+}
+
+async fn capture_sandbox_identity(
+    child: &mut OwnedLinuxChild,
+) -> Result<ChildIdentity, SandboxError> {
+    if let Some(identity) = child.identity {
+        return Ok(identity);
+    }
+    if child.info_bytes.len() > 16_384 {
+        return Err(SandboxError::Backend(
+            "sandbox PID response exceeded its bound".into(),
+        ));
+    }
+    if !child.info_eof {
+        let deadline = tokio::time::Instant::now() + BWRAP_INFO_TIMEOUT;
+        tokio::time::timeout_at(deadline, async {
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let reader = child
+                    .info_reader
+                    .as_mut()
+                    .ok_or_else(|| SandboxError::Backend("sandbox PID reader missing".into()))?;
+                let read = reader.read(&mut chunk).await.map_err(|error| {
+                    SandboxError::Backend(format!("failed to read sandbox PID: {error}"))
+                })?;
+                if read == 0 {
+                    child.info_eof = true;
+                    break;
+                }
+                child.info_bytes.extend_from_slice(&chunk[..read]);
+                if child.info_bytes.len() > 16_384 {
+                    return Err(SandboxError::Backend(
+                        "sandbox PID response exceeded its bound".into(),
+                    ));
+                }
+            }
+            Ok::<(), SandboxError>(())
+        })
+        .await
+        .map_err(|_| SandboxError::Backend("sandbox PID response timed out".into()))??;
+    }
+    let info: serde_json::Value = serde_json::from_slice(&child.info_bytes)
+        .map_err(|error| SandboxError::Backend(format!("invalid sandbox PID response: {error}")))?;
+    let pid = info
+        .get("child-pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| SandboxError::Backend("invalid sandbox child PID".into()))?;
+    let bootstrap_pid = child
+        .bootstrap_pid
+        .ok_or_else(|| SandboxError::Backend("bootstrap process PID missing".into()))?;
+    let bootstrap_pidfd = child
+        .bootstrap_pidfd
+        .as_ref()
+        .ok_or_else(|| SandboxError::Backend("bootstrap process pidfd missing".into()))?;
+    if pidfd_has_exited(bootstrap_pidfd)? {
+        return Err(SandboxError::Backend(
+            "sandbox bootstrap exited before identity capture".into(),
+        ));
+    }
+    let read_proc_identity = |pid: u32| -> Result<Option<(u32, u64)>, SandboxError> {
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(SandboxError::Backend(error.to_string())),
+        };
+        let fields = stat
+            .rsplit_once(") ")
+            .map(|(_, fields)| fields)
+            .ok_or_else(|| SandboxError::Backend("invalid child proc stat".into()))?;
+        let mut fields = fields.split_whitespace();
+        let parent_pid = fields
+            .nth(1)
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|parent_pid| *parent_pid != 0)
+            .ok_or_else(|| SandboxError::Backend("invalid child parent PID".into()))?;
+        let start_time_ticks = fields
+            .nth(17)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|start_time_ticks| *start_time_ticks != 0)
+            .ok_or_else(|| SandboxError::Backend("invalid child start time".into()))?;
+        Ok(Some((parent_pid, start_time_ticks)))
+    };
+    let identity_before_pidfd = read_proc_identity(pid)?.ok_or_else(|| {
+        SandboxError::Backend("sandbox child exited before identity capture".into())
+    })?;
+    if identity_before_pidfd.0 != bootstrap_pid {
+        return Err(SandboxError::Backend(
+            "sandbox child does not have the exact bootstrap parent".into(),
+        ));
+    }
+    let pidfd = open_pidfd(pid)?;
+    let identity_after_pidfd = read_proc_identity(pid)?.ok_or_else(|| {
+        SandboxError::Backend("sandbox child exited during identity capture".into())
+    })?;
+    if identity_after_pidfd != identity_before_pidfd {
+        return Err(SandboxError::Backend(
+            "sandbox child identity changed around pidfd capture".into(),
+        ));
+    }
+    if identity_after_pidfd.0 != bootstrap_pid
+        || pidfd_has_exited(&pidfd)?
+        || pidfd_has_exited(bootstrap_pidfd)?
+    {
+        return Err(SandboxError::Backend(
+            "sandbox child exited during identity capture".into(),
+        ));
+    }
+    let identity = ChildIdentity::new(pid, identity_after_pidfd.1);
+    child.identity = Some(identity);
+    child.sandbox_pidfd = Some(pidfd);
+    Ok(identity)
 }
 
 #[async_trait]
 impl LinuxProcessBackend for StdLinuxProcessBackend {
-    async fn spawn(&self, request: &SpawnRequest) -> Result<ChildIdentity, SandboxError> {
+    async fn spawn_prepared(
+        &self,
+        backend_token: &str,
+        request: &SpawnRequest,
+    ) -> Result<ChildIdentity, SandboxError> {
         for descriptor in request.inherited_fds() {
             // SAFETY: this only borrows the caller-owned descriptor for the duration of fcntl.
             let descriptor = unsafe { BorrowedFd::borrow_raw(*descriptor) };
@@ -411,140 +764,521 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                 ));
             }
         }
+        let cgroup_path = request
+            .cgroup_procs_path()
+            .parent()
+            .ok_or_else(|| SandboxError::Backend("sandbox cgroup path has no parent".into()))?;
+        let cgroup_directory = open(
+            cgroup_path,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Backend(format!("sandbox cgroup directory: {error}")))?;
+        let cgroup_procs = fs::File::from(
+            openat(
+                &cgroup_directory,
+                "cgroup.procs",
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| {
+                SandboxError::Backend(format!("sandbox cgroup attachment: {error}"))
+            })?,
+        );
+        let cgroup_kill = fs::File::from(
+            openat(
+                &cgroup_directory,
+                "cgroup.kill",
+                OFlag::O_WRONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| SandboxError::Backend(format!("sandbox cgroup kill: {error}")))?,
+        );
+        let cgroup_events = fs::File::from(
+            openat(
+                &cgroup_directory,
+                "cgroup.events",
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(|error| SandboxError::Backend(format!("sandbox cgroup events: {error}")))?,
+        );
+        let (gate_read, gate_write) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|error| SandboxError::Backend(format!("execution gate: {error}")))?;
+        let (info_read, info_write) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|error| SandboxError::Backend(format!("sandbox PID pipe: {error}")))?;
+        for descriptor in [&gate_read, &info_write] {
+            fcntl(descriptor, FcntlArg::F_SETFD(FdFlag::empty())).map_err(|error| {
+                SandboxError::Backend(format!("sandbox bootstrap descriptor: {error}"))
+            })?;
+        }
         let mut command = Command::new(request.program());
+        let cgroup_procs_fd = cgroup_procs.as_raw_fd();
+        // SAFETY: this callback runs after fork and before exec. It performs only one libc write
+        // through a descriptor opened by the parent; writing 0 attaches the calling bootstrap
+        // process itself, so no reusable numeric PID is resolved by the supervisor.
+        unsafe {
+            command.pre_exec(move || {
+                let membership = b"0\n";
+                let written = nix::libc::write(
+                    cgroup_procs_fd,
+                    membership.as_ptr().cast(),
+                    membership.len(),
+                );
+                if written == membership.len() as isize {
+                    Ok(())
+                } else if written < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Err(std::io::Error::other(
+                        "sandbox cgroup attachment was incomplete",
+                    ))
+                }
+            });
+        }
         command
+            .arg("--block-fd")
+            .arg(gate_read.as_raw_fd().to_string())
+            .arg("--info-fd")
+            .arg(info_write.as_raw_fd().to_string())
             .args(request.arguments())
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = command
-            .spawn()
-            .map_err(|error| SandboxError::Backend(error.to_string()))?;
-        let pid = child
-            .id()
-            .ok_or_else(|| SandboxError::Backend("spawned child has no PID".into()))?;
-        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) => {
-                child.kill().await.map_err(|cleanup_error| {
-                    SandboxError::Backend(format!(
-                        "failed to read child identity ({error}); child cleanup failed: {cleanup_error}"
-                    ))
-                })?;
-                return Err(SandboxError::Backend(format!(
-                    "failed to read child identity: {error}"
-                )));
-            }
-        };
-        let start_time_ticks = match stat
-            .rsplit_once(") ")
-            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-            .and_then(|value| value.parse::<u64>().ok())
+        let slot = Arc::new(StdMutex::new(None));
         {
-            Some(start_time_ticks) if start_time_ticks != 0 => start_time_ticks,
-            _ => {
-                child.kill().await.map_err(|cleanup_error| {
-                    SandboxError::Backend(format!(
-                        "invalid child proc stat; child cleanup failed: {cleanup_error}"
-                    ))
-                })?;
-                return Err(SandboxError::Backend("invalid child proc stat".into()));
+            let mut children = self
+                .registry
+                .children
+                .lock()
+                .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?;
+            if children.contains_key(backend_token) {
+                return Err(SandboxError::Backend(
+                    "prepared child token is already owned".into(),
+                ));
+            }
+            children.insert(backend_token.to_owned(), slot.clone());
+        }
+        let monitor = command
+            .into_std()
+            .spawn()
+            .map_err(|error| SandboxError::Backend(error.to_string()));
+        let monitor = match monitor {
+            Ok(monitor) => monitor,
+            Err(error) => {
+                self.registry
+                    .children
+                    .lock()
+                    .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+                    .remove(backend_token);
+                return Err(error);
             }
         };
-        self.children
+        let bootstrap_pid = monitor.id();
+        let (bootstrap_pidfd, bootstrap_pidfd_error) = match open_pidfd(bootstrap_pid) {
+            Ok(pidfd) => (Some(pidfd), None),
+            Err(error) => (None, Some(error)),
+        };
+        drop(gate_read);
+        drop(info_write);
+        let owned = OwnedLinuxChild {
+            _monitor: monitor,
+            bootstrap_pid: Some(bootstrap_pid),
+            bootstrap_pidfd,
+            cgroup_events,
+            cgroup_kill,
+            cgroup_kill_requested: false,
+            cgroup_empty: false,
+            identity: None,
+            sandbox_pidfd: None,
+            execution_gate: Some(gate_write),
+            info_reader: Some(tokio::fs::File::from_std(fs::File::from(info_read))),
+            info_bytes: Vec::new(),
+            info_eof: false,
+            bootstrap_process_signalled: false,
+            bootstrap_monitor_reaped: false,
+        };
+        *slot
             .lock()
-            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
-            .insert(pid, child);
-        Ok(ChildIdentity::new(pid, start_time_ticks))
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))? = Some(owned);
+        if let Some(error) = bootstrap_pidfd_error {
+            return Err(SandboxError::Backend(format!(
+                "bootstrap process pidfd unavailable; child quarantined: {error}"
+            )));
+        }
+        let mut checked_out = CheckedOutLinuxChild::new(backend_token, slot)?;
+        capture_sandbox_identity(checked_out.child_mut()?).await
     }
 
-    async fn abort_spawned(&self, identity: ChildIdentity) -> Result<(), SandboxError> {
-        let mut child = self
+    async fn release_prepared(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<(), SandboxError> {
+        let slot = self
+            .registry
             .children
             .lock()
             .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
-            .remove(&identity.pid)
-            .ok_or_else(|| SandboxError::Backend("spawned child ownership missing".into()))?;
-        if child
-            .try_wait()
-            .map_err(|error| SandboxError::Backend(error.to_string()))?
-            .is_none()
-        {
-            child
-                .kill()
-                .await
-                .map_err(|error| SandboxError::Backend(error.to_string()))?;
+            .get(backend_token)
+            .cloned()
+            .ok_or_else(|| SandboxError::Backend("prepared child ownership missing".into()))?;
+        let mut state = slot
+            .lock()
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))?;
+        let child = state
+            .as_mut()
+            .ok_or_else(|| SandboxError::Backend("child operation already in progress".into()))?;
+        if child.identity != Some(identity) {
+            return Err(SandboxError::Backend(
+                "prepared child PID identity changed".into(),
+            ));
         }
+        let pidfd = child
+            .sandbox_pidfd
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("sandbox child pidfd missing".into()))?;
+        if pidfd_has_exited(pidfd)? {
+            return Err(SandboxError::Backend(
+                "prepared child exited before gate release".into(),
+            ));
+        }
+        let gate = child
+            .execution_gate
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("prepared child already released".into()))?;
+        let written = write_fd(gate, b"1")
+            .map_err(|error| SandboxError::Backend(format!("execution gate release: {error}")))?;
+        if written != 1 {
+            return Err(SandboxError::Backend(
+                "execution gate release was incomplete".into(),
+            ));
+        }
+        child.execution_gate = None;
         Ok(())
     }
 
-    async fn release_spawned(&self, identity: ChildIdentity) -> Result<(), SandboxError> {
-        let child = self
+    async fn abort_spawned(
+        &self,
+        backend_token: &str,
+        identity: Option<ChildIdentity>,
+    ) -> Result<(), SandboxError> {
+        let slot = self
+            .registry
             .children
             .lock()
             .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
-            .remove(&identity.pid);
-        let Some(mut child) = child else {
-            return if self.identity_matches(identity).await? {
-                Err(SandboxError::Backend(
-                    "live spawned child ownership missing".into(),
-                ))
-            } else {
-                Ok(())
-            };
+            .get(backend_token)
+            .cloned();
+        let Some(slot) = slot else {
+            return Ok(());
         };
-        if child
-            .try_wait()
-            .map_err(|error| SandboxError::Backend(error.to_string()))?
-            .is_none()
+        let mut checked_out = CheckedOutLinuxChild::new(backend_token, slot.clone())?;
+        if let Some(expected) = identity
+            && checked_out.child_mut()?.identity != Some(expected)
         {
-            self.children
-                .lock()
-                .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
-                .insert(identity.pid, child);
+            return Err(SandboxError::Backend(
+                "spawned child PID identity changed".into(),
+            ));
+        }
+        if checked_out.child_mut()?.identity.is_none() && !checked_out.child_mut()?.info_eof {
+            let _ = capture_sandbox_identity(checked_out.child_mut()?).await;
+        }
+
+        let mut cleanup_errors = Vec::new();
+        let sandbox_dead = if let Some(pidfd) = checked_out.child_mut()?.sandbox_pidfd.as_ref() {
+            if !pidfd_has_exited(pidfd)?
+                && let Err(error) = signal_pidfd(pidfd, Signal::SIGKILL)
+            {
+                cleanup_errors.push(format!("sandbox signal: {error}"));
+            }
+            match wait_for_pidfd_exit(pidfd, "sandbox child").await {
+                Ok(()) => true,
+                Err(error) => {
+                    cleanup_errors.push(error.to_string());
+                    false
+                }
+            }
+        } else {
+            let cgroup_cleanup = async {
+                if !checked_out.child_mut()?.cgroup_kill_requested {
+                    checked_out
+                        .child_mut()?
+                        .cgroup_kill
+                        .write_all(b"1")
+                        .map_err(|error| {
+                            SandboxError::Backend(format!("exact cgroup kill: {error}"))
+                        })?;
+                    checked_out.child_mut()?.cgroup_kill_requested = true;
+                }
+                if checked_out.child_mut()?.cgroup_empty {
+                    return Ok(());
+                }
+                tokio::time::timeout(PREPARED_CHILD_EXIT_TIMEOUT, async {
+                    loop {
+                        let empty = {
+                            let child = checked_out.child_mut()?;
+                            child
+                                .cgroup_events
+                                .seek(SeekFrom::Start(0))
+                                .map_err(|error| {
+                                    SandboxError::Backend(format!(
+                                        "exact cgroup events seek: {error}"
+                                    ))
+                                })?;
+                            let mut events = String::new();
+                            child
+                                .cgroup_events
+                                .read_to_string(&mut events)
+                                .map_err(|error| {
+                                    SandboxError::Backend(format!(
+                                        "exact cgroup events read: {error}"
+                                    ))
+                                })?;
+                            events.lines().any(|line| line.trim() == "populated 0")
+                        };
+                        if empty {
+                            checked_out.child_mut()?.cgroup_empty = true;
+                            return Ok::<(), SandboxError>(());
+                        }
+                        tokio::time::sleep(PREPARED_CHILD_EXIT_POLL).await;
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    SandboxError::Backend(
+                        "exact cgroup remained populated after cgroup.kill".into(),
+                    )
+                })??;
+                Ok::<(), SandboxError>(())
+            }
+            .await;
+            match cgroup_cleanup {
+                Ok(()) => true,
+                Err(error) => {
+                    cleanup_errors.push(error.to_string());
+                    false
+                }
+            }
+        };
+
+        if !checked_out.child_mut()?.bootstrap_monitor_reaped
+            && !checked_out.child_mut()?.bootstrap_process_signalled
+        {
+            let bootstrap_signal =
+                if let Some(pidfd) = checked_out.child_mut()?.bootstrap_pidfd.as_ref() {
+                    signal_pidfd(pidfd, Signal::SIGKILL)
+                } else {
+                    Err(SandboxError::Backend(
+                        "bootstrap process pidfd unavailable".into(),
+                    ))
+                };
+            match bootstrap_signal {
+                Ok(()) => checked_out.child_mut()?.bootstrap_process_signalled = true,
+                Err(error) => cleanup_errors.push(format!("bootstrap signal: {error}")),
+            }
+        }
+        if !checked_out.child_mut()?.bootstrap_monitor_reaped {
+            let pidfd_ready = if let Some(pidfd) = checked_out.child_mut()?.bootstrap_pidfd.as_ref()
+            {
+                match wait_for_pidfd_exit(pidfd, "bootstrap process").await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        cleanup_errors.push(error.to_string());
+                        false
+                    }
+                }
+            } else {
+                cleanup_errors.push("bootstrap process pidfd unavailable".into());
+                false
+            };
+            if pidfd_ready {
+                let reap = checked_out
+                    .child_mut()?
+                    .bootstrap_pidfd
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SandboxError::Backend("bootstrap process pidfd unavailable".into())
+                    })
+                    .and_then(|pidfd| reap_pidfd(pidfd, "bootstrap process"));
+                match reap {
+                    Ok(()) => checked_out.child_mut()?.bootstrap_monitor_reaped = true,
+                    Err(error) => cleanup_errors.push(error.to_string()),
+                }
+            }
+        }
+
+        if !sandbox_dead || !checked_out.child_mut()?.bootstrap_monitor_reaped {
+            return Err(SandboxError::Backend(format!(
+                "prepared child cleanup incomplete; execution gate quarantined: {}",
+                cleanup_errors.join("; ")
+            )));
+        }
+        checked_out.child_mut()?.execution_gate.take();
+        let mut children = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?;
+        if !children
+            .get(backend_token)
+            .is_some_and(|current| Arc::ptr_eq(current, &slot))
+        {
+            return Err(SandboxError::Backend(
+                "spawned child ownership changed during abort".into(),
+            ));
+        }
+        children.remove(backend_token);
+        drop(children);
+        checked_out.finish();
+        Ok(())
+    }
+
+    async fn release_spawned(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<(), SandboxError> {
+        let slot = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+            .get(backend_token)
+            .cloned();
+        let Some(slot) = slot else {
+            return Err(SandboxError::Backend(
+                "spawned child ownership missing".into(),
+            ));
+        };
+        let mut checked_out = CheckedOutLinuxChild::new(backend_token, slot.clone())?;
+        if checked_out.child_mut()?.identity != Some(identity) {
+            return Err(SandboxError::Backend(
+                "spawned child PID identity changed".into(),
+            ));
+        }
+        let pidfd = checked_out
+            .child_mut()?
+            .sandbox_pidfd
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("sandbox child pidfd missing".into()))?;
+        if !pidfd_has_exited(pidfd)? {
             return Err(SandboxError::Backend(
                 "cannot release a live spawned child".into(),
             ));
         }
+        if checked_out.child_mut()?.execution_gate.is_some() {
+            return Err(SandboxError::Backend(
+                "cannot release a still-gated spawned child".into(),
+            ));
+        }
+        let bootstrap_pidfd = checked_out
+            .child_mut()?
+            .bootstrap_pidfd
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("bootstrap process pidfd missing".into()))?;
+        if !pidfd_has_exited(bootstrap_pidfd)? {
+            return Err(SandboxError::Backend(
+                "cannot release a live spawned child".into(),
+            ));
+        }
+        reap_pidfd(bootstrap_pidfd, "bootstrap process")?;
+        checked_out.child_mut()?.bootstrap_monitor_reaped = true;
+        let mut children = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?;
+        if !children
+            .get(backend_token)
+            .is_some_and(|current| Arc::ptr_eq(current, &slot))
+        {
+            return Err(SandboxError::Backend(
+                "spawned child ownership changed during release".into(),
+            ));
+        }
+        children.remove(backend_token);
+        drop(children);
+        checked_out.finish();
         Ok(())
     }
 
-    async fn identity_matches(&self, identity: ChildIdentity) -> Result<bool, SandboxError> {
-        let stat = match fs::read_to_string(format!("/proc/{}/stat", identity.pid)) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(SandboxError::Backend(error.to_string())),
+    async fn identity_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<bool, SandboxError> {
+        let slot = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+            .get(backend_token)
+            .cloned();
+        let Some(slot) = slot else {
+            return Ok(false);
         };
-        Ok(stat
-            .rsplit_once(") ")
-            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-            .and_then(|value| value.parse::<u64>().ok())
-            == Some(identity.start_time_ticks))
+        let state = slot
+            .lock()
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))?;
+        let Some(child) = state.as_ref() else {
+            return Err(SandboxError::Backend(
+                "child operation already in progress".into(),
+            ));
+        };
+        if child.identity != Some(identity) {
+            return Ok(false);
+        }
+        let pidfd = child
+            .sandbox_pidfd
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("sandbox child pidfd missing".into()))?;
+        Ok(!pidfd_has_exited(pidfd)?)
     }
 
     async fn signal(
         &self,
+        backend_token: &str,
         identity: ChildIdentity,
         signal: ProcessSignal,
     ) -> Result<(), SandboxError> {
-        if !self.identity_matches(identity).await? {
+        let slot = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+            .get(backend_token)
+            .cloned()
+            .ok_or_else(|| SandboxError::Backend("spawned child ownership missing".into()))?;
+        let state = slot
+            .lock()
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))?;
+        let child = state
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("child operation already in progress".into()))?;
+        if child.identity != Some(identity) {
             return Err(SandboxError::Backend("child PID identity changed".into()));
         }
-        let pid = i32::try_from(identity.pid)
-            .map_err(|_| SandboxError::Backend("child PID exceeds i32".into()))?;
-        kill(
-            Pid::from_raw(pid),
+        let pidfd = child
+            .sandbox_pidfd
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("sandbox child pidfd missing".into()))?;
+        signal_pidfd(
+            pidfd,
             match signal {
                 ProcessSignal::Terminate => Signal::SIGTERM,
                 ProcessSignal::Kill => Signal::SIGKILL,
             },
         )
-        .map_err(|error| SandboxError::Backend(error.to_string()))
     }
 
-    async fn is_alive(&self, identity: ChildIdentity) -> Result<bool, SandboxError> {
-        self.identity_matches(identity).await
+    async fn is_alive(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<bool, SandboxError> {
+        self.identity_matches(backend_token, identity).await
     }
 
     async fn wait(&self, duration: Duration) {
@@ -599,6 +1333,44 @@ struct LinuxRuntime {
     runtime_removed: bool,
     cgroup_removed: bool,
     namespaces_cleaned: bool,
+    cleanup_operation: Arc<AsyncMutex<()>>,
+    process_operation: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Clone)]
+struct ProvisionCleanup {
+    backend_token: String,
+    cgroup_path: PathBuf,
+    runtime_path: PathBuf,
+    egress_fence: ShardEgressFence,
+    owner_active: bool,
+    cgroup_created: bool,
+    runtime_created: bool,
+    route_may_exist: bool,
+    child_may_exist: bool,
+    identity: Option<ChildIdentity>,
+    route_revoked: bool,
+    child_aborted: bool,
+    runtime_removed: bool,
+    cgroup_removed: bool,
+    route_released: bool,
+}
+
+struct ProvisionAttempt<'a> {
+    provisions: &'a StdMutex<HashMap<ShardId, ProvisionCleanup>>,
+    shard_id: ShardId,
+    backend_token: String,
+}
+
+impl Drop for ProvisionAttempt<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut provisions) = self.provisions.lock()
+            && let Some(provision) = provisions.get_mut(&self.shard_id)
+            && provision.backend_token == self.backend_token
+        {
+            provision.owner_active = false;
+        }
+    }
 }
 
 pub struct LinuxSandboxBackend<F, P, E> {
@@ -606,7 +1378,8 @@ pub struct LinuxSandboxBackend<F, P, E> {
     filesystem: F,
     process: P,
     egress: E,
-    runtimes: Mutex<HashMap<ShardId, LinuxRuntime>>,
+    provisioning: StdMutex<HashMap<ShardId, ProvisionCleanup>>,
+    runtimes: StdMutex<HashMap<ShardId, LinuxRuntime>>,
 }
 
 impl<F, P, E> LinuxSandboxBackend<F, P, E>
@@ -622,7 +1395,8 @@ where
             filesystem,
             process,
             egress,
-            runtimes: Mutex::new(HashMap::new()),
+            provisioning: StdMutex::new(HashMap::new()),
+            runtimes: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -682,6 +1456,186 @@ where
                 "required cgroup v2 controllers unavailable".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn provision_snapshot(
+        &self,
+        shard_id: &ShardId,
+        backend_token: &str,
+    ) -> Result<ProvisionCleanup, SandboxError> {
+        let provisions = self
+            .provisioning
+            .lock()
+            .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+        let provision = provisions
+            .get(shard_id)
+            .ok_or_else(|| SandboxError::Backend("provision cleanup ownership missing".into()))?;
+        if provision.backend_token != backend_token {
+            return Err(SandboxError::Backend(
+                "provision cleanup ownership changed".into(),
+            ));
+        }
+        Ok(provision.clone())
+    }
+
+    fn update_provision(
+        &self,
+        shard_id: &ShardId,
+        backend_token: &str,
+        update: impl FnOnce(&mut ProvisionCleanup),
+    ) -> Result<(), SandboxError> {
+        let mut provisions = self
+            .provisioning
+            .lock()
+            .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+        let provision = provisions
+            .get_mut(shard_id)
+            .ok_or_else(|| SandboxError::Backend("provision cleanup ownership missing".into()))?;
+        if provision.backend_token != backend_token {
+            return Err(SandboxError::Backend(
+                "provision cleanup ownership changed".into(),
+            ));
+        }
+        update(provision);
+        Ok(())
+    }
+
+    fn runtime_cleanup_operation(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<Arc<AsyncMutex<()>>, SandboxError> {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+        let runtime = runtimes
+            .get(handle.shard_id())
+            .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
+        Ok(runtime.cleanup_operation.clone())
+    }
+
+    fn runtime_process_operation(
+        &self,
+        handle: &SandboxHandle,
+    ) -> Result<Arc<AsyncMutex<()>>, SandboxError> {
+        let runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+        let runtime = runtimes
+            .get(handle.shard_id())
+            .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
+        Ok(runtime.process_operation.clone())
+    }
+
+    async fn cleanup_provision(
+        &self,
+        shard_id: &ShardId,
+        backend_token: &str,
+    ) -> Result<(), SandboxError> {
+        let state = self.provision_snapshot(shard_id, backend_token)?;
+        let revoke_needed = state.route_may_exist && !state.route_revoked;
+        let abort_needed = state.child_may_exist && !state.child_aborted;
+        let revoke = async {
+            if !revoke_needed {
+                return Ok(());
+            }
+            self.egress.revoke(&state.egress_fence).await?;
+            self.update_provision(shard_id, backend_token, |provision| {
+                provision.route_revoked = true;
+            })
+        };
+        let abort = async {
+            if !abort_needed {
+                return Ok(());
+            }
+            self.process
+                .abort_spawned(backend_token, state.identity)
+                .await?;
+            self.update_provision(shard_id, backend_token, |provision| {
+                provision.child_aborted = true;
+            })
+        };
+        let (revoke_result, abort_result) = tokio::join!(revoke, abort);
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = revoke_result {
+            cleanup_errors.push(format!("route revoke: {error}"));
+        }
+        if let Err(error) = abort_result {
+            cleanup_errors.push(format!("child abort: {error}"));
+        }
+
+        let mut state = self.provision_snapshot(shard_id, backend_token)?;
+        let child_is_dead = !state.child_may_exist || state.child_aborted;
+        if child_is_dead && state.runtime_created && !state.runtime_removed {
+            match self.filesystem.remove_directory(&state.runtime_path) {
+                Ok(()) => {
+                    self.update_provision(shard_id, backend_token, |provision| {
+                        provision.runtime_removed = true;
+                    })?;
+                    state.runtime_removed = true;
+                }
+                Err(error) => cleanup_errors.push(format!("runtime removal: {error}")),
+            }
+        }
+        if child_is_dead && state.cgroup_created && !state.cgroup_removed {
+            match self.filesystem.remove_directory(&state.cgroup_path) {
+                Ok(()) => {
+                    self.update_provision(shard_id, backend_token, |provision| {
+                        provision.cgroup_removed = true;
+                    })?;
+                    state.cgroup_removed = true;
+                }
+                Err(error) => cleanup_errors.push(format!("cgroup removal: {error}")),
+            }
+        }
+        let resources_removed = (!state.runtime_created || state.runtime_removed)
+            && (!state.cgroup_created || state.cgroup_removed);
+        if state.route_may_exist
+            && state.route_revoked
+            && child_is_dead
+            && resources_removed
+            && !state.route_released
+        {
+            match self.egress.release(&state.egress_fence).await {
+                Ok(()) => {
+                    self.update_provision(shard_id, backend_token, |provision| {
+                        provision.route_released = true;
+                    })?;
+                    state.route_released = true;
+                }
+                Err(error) => cleanup_errors.push(format!("route release: {error}")),
+            }
+        }
+        let complete = (!state.route_may_exist || (state.route_revoked && state.route_released))
+            && (!state.child_may_exist || state.child_aborted)
+            && (!state.runtime_created || state.runtime_removed)
+            && (!state.cgroup_created || state.cgroup_removed);
+        if !complete {
+            if cleanup_errors.is_empty() {
+                cleanup_errors.push("cleanup did not complete all stages".into());
+            }
+            return Err(SandboxError::Backend(format!(
+                "provision cleanup incomplete: {}",
+                cleanup_errors.join("; ")
+            )));
+        }
+        let mut provisions = self
+            .provisioning
+            .lock()
+            .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+        if provisions
+            .get(shard_id)
+            .is_none_or(|provision| provision.backend_token != backend_token)
+        {
+            return Err(SandboxError::Backend(
+                "provision cleanup ownership changed before completion".into(),
+            ));
+        }
+        provisions.remove(shard_id);
         Ok(())
     }
 
@@ -764,6 +1718,11 @@ where
                 CHROMIUM_CDP_WRITE_FD,
                 self.config.seccomp_fd,
             ],
+            cgroup_procs_path: self
+                .config
+                .cgroup_root
+                .join(shard_id.to_string())
+                .join("cgroup.procs"),
         }
     }
 }
@@ -780,17 +1739,91 @@ where
     }
 
     async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
-        self.validate_host_paths()?;
         let cgroup_path = self.config.cgroup_root.join(spec.shard_id().to_string());
         let runtime_path = self.config.sandbox_root.join(spec.shard_id().to_string());
         let egress_fence = ShardEgressFence::new(spec.shard_id().clone(), spec.worker_epoch());
-        let mut cgroup_created = false;
-        let mut runtime_created = false;
-        let mut route_attempted = false;
-        let mut spawned = None;
+        let backend_token = LeaseId::new().to_string();
+        let cleanup_retry = {
+            let mut provisions = self
+                .provisioning
+                .lock()
+                .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+            if let Some(existing) = provisions.get_mut(spec.shard_id()) {
+                if existing.owner_active {
+                    return Err(SandboxError::Backend(
+                        "sandbox shard provisioning is already in progress".into(),
+                    ));
+                }
+                existing.owner_active = true;
+                Some(existing.backend_token.clone())
+            } else {
+                if self
+                    .runtimes
+                    .lock()
+                    .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?
+                    .contains_key(spec.shard_id())
+                {
+                    return Err(SandboxError::Backend("sandbox shard already exists".into()));
+                }
+                provisions.insert(
+                    spec.shard_id().clone(),
+                    ProvisionCleanup {
+                        backend_token: backend_token.clone(),
+                        cgroup_path: cgroup_path.clone(),
+                        runtime_path: runtime_path.clone(),
+                        egress_fence: egress_fence.clone(),
+                        owner_active: true,
+                        cgroup_created: false,
+                        runtime_created: false,
+                        route_may_exist: false,
+                        child_may_exist: false,
+                        identity: None,
+                        route_revoked: false,
+                        child_aborted: false,
+                        runtime_removed: false,
+                        cgroup_removed: false,
+                        route_released: false,
+                    },
+                );
+                None
+            }
+        };
+        let owned_token = cleanup_retry
+            .as_deref()
+            .unwrap_or(backend_token.as_str())
+            .to_owned();
+        let _attempt = ProvisionAttempt {
+            provisions: &self.provisioning,
+            shard_id: spec.shard_id().clone(),
+            backend_token: owned_token.clone(),
+        };
+        if cleanup_retry.is_some() {
+            let cleanup = self.cleanup_provision(spec.shard_id(), &owned_token).await;
+            return match cleanup {
+                Ok(()) => Err(SandboxError::Backend(
+                    "abandoned sandbox provisioning was cleaned; retry provisioning".into(),
+                )),
+                Err(error) => Err(SandboxError::Backend(format!(
+                    "abandoned sandbox provisioning cleanup incomplete: {error}"
+                ))),
+            };
+        }
+        if let Err(cause) = self.validate_host_paths() {
+            return match self
+                .cleanup_provision(spec.shard_id(), &backend_token)
+                .await
+            {
+                Ok(()) => Err(cause),
+                Err(cleanup_error) => Err(SandboxError::Backend(format!(
+                    "{cause}; empty provisioning rollback incomplete: {cleanup_error}"
+                ))),
+            };
+        }
         let provisioned = async {
             self.filesystem.create_directory(&cgroup_path)?;
-            cgroup_created = true;
+            self.update_provision(spec.shard_id(), &backend_token, |provision| {
+                provision.cgroup_created = true;
+            })?;
             if self.filesystem.contains_symlink(&cgroup_path)? {
                 return Err(SandboxError::Backend(
                     "created cgroup path resolved through a symlink".into(),
@@ -822,7 +1855,9 @@ where
             self.filesystem
                 .write_file(&cgroup_path.join("cpu.weight"), "100")?;
             self.filesystem.create_directory(&runtime_path)?;
-            runtime_created = true;
+            self.update_provision(spec.shard_id(), &backend_token, |provision| {
+                provision.runtime_created = true;
+            })?;
             if self.filesystem.contains_symlink(&runtime_path)? {
                 return Err(SandboxError::Backend(
                     "created runtime path resolved through a symlink".into(),
@@ -831,104 +1866,122 @@ where
             self.filesystem
                 .create_directory(&runtime_path.join("profile"))?;
 
-            route_attempted = true;
+            self.update_provision(spec.shard_id(), &backend_token, |provision| {
+                provision.route_may_exist = true;
+            })?;
             self.egress.prepare(&egress_fence).await?;
+            self.update_provision(spec.shard_id(), &backend_token, |provision| {
+                provision.child_may_exist = true;
+            })?;
             let identity = self
                 .process
-                .spawn(&self.planned_spawn_request(spec.shard_id()))
+                .spawn_prepared(&backend_token, &self.planned_spawn_request(spec.shard_id()))
                 .await?;
-            spawned = Some(identity);
+            self.update_provision(spec.shard_id(), &backend_token, |provision| {
+                provision.identity = Some(identity);
+            })?;
             if identity.pid == 0 || identity.start_time_ticks == 0 {
                 return Err(SandboxError::Backend("invalid child PID identity".into()));
             }
-            if !self.process.identity_matches(identity).await? {
+            if !self
+                .process
+                .identity_matches(&backend_token, identity)
+                .await?
+            {
                 return Err(SandboxError::Backend(
                     "spawned child PID identity mismatch".into(),
                 ));
             }
-            self.filesystem.write_file(
-                &cgroup_path.join("cgroup.procs"),
-                &identity.pid().to_string(),
-            )?;
-            Ok(identity)
+            let cgroup_members = self
+                .filesystem
+                .read_file(&cgroup_path.join("cgroup.procs"))?
+                .split_whitespace()
+                .map(|member| {
+                    member.parse::<u32>().map_err(|_| {
+                        SandboxError::Backend("invalid cgroup.procs membership".into())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !cgroup_members.contains(&identity.pid()) {
+                return Err(SandboxError::Backend(
+                    "sandbox child was not attached to its cgroup".into(),
+                ));
+            }
+            if !self
+                .process
+                .identity_matches(&backend_token, identity)
+                .await?
+            {
+                return Err(SandboxError::Backend(
+                    "sandbox child PID identity changed during cgroup attachment".into(),
+                ));
+            }
+            if !self.egress.is_active(&egress_fence).await? {
+                return Err(SandboxError::Backend(
+                    "sandbox egress fence became inactive before launch".into(),
+                ));
+            }
+            self.process
+                .release_prepared(&backend_token, identity)
+                .await?;
+            let mut provisions = self
+                .provisioning
+                .lock()
+                .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+            if provisions
+                .get(spec.shard_id())
+                .is_none_or(|provision| provision.backend_token != backend_token)
+            {
+                return Err(SandboxError::Backend(
+                    "provision ownership changed before commit".into(),
+                ));
+            }
+            let mut runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            if runtimes.contains_key(spec.shard_id()) {
+                return Err(SandboxError::Backend("sandbox shard already exists".into()));
+            }
+            runtimes.insert(
+                spec.shard_id().clone(),
+                LinuxRuntime {
+                    identity,
+                    backend_token: backend_token.clone(),
+                    cgroup_path: cgroup_path.clone(),
+                    runtime_path: runtime_path.clone(),
+                    egress_fence: egress_fence.clone(),
+                    egress_revoked: false,
+                    egress_released: false,
+                    process_released: false,
+                    runtime_removed: false,
+                    cgroup_removed: false,
+                    namespaces_cleaned: false,
+                    cleanup_operation: Arc::new(AsyncMutex::new(())),
+                    process_operation: Arc::new(AsyncMutex::new(())),
+                },
+            );
+            provisions.remove(spec.shard_id());
+            Ok(SandboxHandle::new(
+                spec.shard_id().clone(),
+                backend_token.clone(),
+            ))
         }
         .await;
-        let identity = match provisioned {
-            Ok(identity) => identity,
+        match provisioned {
+            Ok(handle) => Ok(handle),
             Err(cause) => {
-                let mut cleanup_errors = Vec::new();
-                let route_revoked = if route_attempted {
-                    match self.egress.revoke(&egress_fence).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            cleanup_errors.push(format!("route: {error}"));
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                let child_cleaned = if let Some(identity) = spawned {
-                    match self.process.abort_spawned(identity).await {
-                        Ok(()) => true,
-                        Err(error) => {
-                            cleanup_errors.push(format!("child: {error}"));
-                            false
-                        }
-                    }
-                } else {
-                    true
-                };
-                if runtime_created
-                    && let Err(error) = self.filesystem.remove_directory(&runtime_path)
+                match self
+                    .cleanup_provision(spec.shard_id(), &backend_token)
+                    .await
                 {
-                    cleanup_errors.push(format!("runtime: {error}"));
+                    Ok(()) => Err(cause),
+                    Err(cleanup_error) => Err(SandboxError::Backend(format!(
+                        "{cause}; provisioning rollback incomplete: {cleanup_error}"
+                    ))),
                 }
-                let cgroup_cleaned = if cgroup_created {
-                    match self.filesystem.remove_directory(&cgroup_path) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            cleanup_errors.push(format!("cgroup: {error}"));
-                            false
-                        }
-                    }
-                } else {
-                    true
-                };
-                if route_revoked
-                    && child_cleaned
-                    && cgroup_cleaned
-                    && let Err(error) = self.egress.release(&egress_fence).await
-                {
-                    cleanup_errors.push(format!("route release: {error}"));
-                }
-                if cleanup_errors.is_empty() {
-                    return Err(cause);
-                }
-                return Err(SandboxError::Backend(format!(
-                    "{cause}; provisioning rollback incomplete: {}",
-                    cleanup_errors.join("; ")
-                )));
             }
-        };
-        let backend_token = LeaseId::new().to_string();
-        self.runtimes.lock().await.insert(
-            spec.shard_id().clone(),
-            LinuxRuntime {
-                identity,
-                backend_token: backend_token.clone(),
-                cgroup_path,
-                runtime_path,
-                egress_fence,
-                egress_revoked: false,
-                egress_released: false,
-                process_released: false,
-                runtime_removed: false,
-                cgroup_removed: false,
-                namespaces_cleaned: false,
-            },
-        );
-        Ok(SandboxHandle::new(spec.shard_id().clone(), backend_token))
+        }
     }
 
     async fn revoke_egress(
@@ -936,32 +1989,44 @@ where
         handle: &SandboxHandle,
         _reason: CleanupReason,
     ) -> Result<(), SandboxError> {
-        let state = self.runtimes.lock().await;
-        let runtime = state
-            .get(handle.shard_id())
-            .ok_or(SandboxError::ShardNotFound)?;
-        Self::validate_handle(runtime, handle)?;
-        let fence = runtime.egress_fence.clone();
-        let already_revoked = runtime.egress_revoked;
-        drop(state);
+        let operation = self.runtime_cleanup_operation(handle)?;
+        let _operation_guard = operation.lock().await;
+        let (fence, already_revoked) = {
+            let state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = state
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            (runtime.egress_fence.clone(), runtime.egress_revoked)
+        };
         if !already_revoked {
             self.egress.revoke(&fence).await?;
         }
 
-        let mut state = self.runtimes.lock().await;
-        let runtime = state
-            .get_mut(handle.shard_id())
-            .ok_or(SandboxError::ShardNotFound)?;
-        Self::validate_handle(runtime, handle)?;
-        if runtime.egress_fence != fence {
-            return Err(SandboxError::ShardNotFound);
-        }
-        runtime.egress_revoked = true;
-        let release_after_cleanup = runtime.namespaces_cleaned && !runtime.egress_released;
-        drop(state);
+        let release_after_cleanup = {
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            if runtime.egress_fence != fence {
+                return Err(SandboxError::ShardNotFound);
+            }
+            runtime.egress_revoked = true;
+            runtime.namespaces_cleaned && !runtime.egress_released
+        };
         if release_after_cleanup {
             self.egress.release(&fence).await?;
-            let mut state = self.runtimes.lock().await;
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
             let runtime = state
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
@@ -983,29 +2048,48 @@ where
         handle: &SandboxHandle,
         _reason: CleanupReason,
     ) -> Result<(), SandboxError> {
-        let state = self.runtimes.lock().await;
-        let runtime = state
-            .get(handle.shard_id())
-            .ok_or(SandboxError::ShardNotFound)?;
-        Self::validate_handle(runtime, handle)?;
-        let identity = runtime.identity;
-        let cgroup_path = runtime.cgroup_path.clone();
-        drop(state);
+        let process_operation = self.runtime_process_operation(handle)?;
+        let _process_operation_guard = process_operation.lock().await;
+        let (identity, backend_token, cgroup_path) = {
+            let state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = state
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            (
+                runtime.identity,
+                runtime.backend_token.clone(),
+                runtime.cgroup_path.clone(),
+            )
+        };
 
-        if self.process.identity_matches(identity).await? {
+        if self
+            .process
+            .identity_matches(&backend_token, identity)
+            .await?
+        {
             self.process
-                .signal(identity, ProcessSignal::Terminate)
+                .signal(&backend_token, identity, ProcessSignal::Terminate)
                 .await?;
             let mut elapsed = Duration::ZERO;
-            while elapsed < self.config.termination_grace && self.process.is_alive(identity).await?
+            while elapsed < self.config.termination_grace
+                && self.process.is_alive(&backend_token, identity).await?
             {
                 self.process.wait(self.config.poll_interval).await;
                 elapsed = elapsed.saturating_add(self.config.poll_interval);
             }
-            if self.process.is_alive(identity).await?
-                && self.process.identity_matches(identity).await?
+            if self.process.is_alive(&backend_token, identity).await?
+                && self
+                    .process
+                    .identity_matches(&backend_token, identity)
+                    .await?
             {
-                self.process.signal(identity, ProcessSignal::Kill).await?;
+                self.process
+                    .signal(&backend_token, identity, ProcessSignal::Kill)
+                    .await?;
             }
         }
         self.filesystem
@@ -1029,10 +2113,14 @@ where
     }
 
     async fn cleanup_namespaces(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        let operation = self.runtime_cleanup_operation(handle)?;
+        let _operation_guard = operation.lock().await;
+        let process_operation = self.runtime_process_operation(handle)?;
+        let _process_operation_guard = process_operation.lock().await;
         let runtime = self
             .runtimes
             .lock()
-            .await
+            .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?
             .get(handle.shard_id())
             .cloned()
             .ok_or(SandboxError::ShardNotFound)?;
@@ -1046,8 +2134,13 @@ where
                     "refusing cleanup of populated cgroup".into(),
                 ));
             }
-            self.process.release_spawned(runtime.identity).await?;
-            let mut state = self.runtimes.lock().await;
+            self.process
+                .release_spawned(&runtime.backend_token, runtime.identity)
+                .await?;
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
             let stored = state
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
@@ -1060,10 +2153,13 @@ where
             stored.process_released = true;
         }
 
-        {
-            let mut state = self.runtimes.lock().await;
+        let cleanup = {
+            let state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
             let stored = state
-                .get_mut(handle.shard_id())
+                .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
             if stored.egress_fence != runtime.egress_fence {
@@ -1071,28 +2167,68 @@ where
                     "sandbox runtime fence changed during cleanup".into(),
                 ));
             }
-            if !stored.runtime_removed {
-                self.filesystem.remove_directory(&stored.runtime_path)?;
-                stored.runtime_removed = true;
+            stored.clone()
+        };
+        if !cleanup.runtime_removed {
+            self.filesystem.remove_directory(&cleanup.runtime_path)?;
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let stored = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
+            if stored.egress_fence != cleanup.egress_fence {
+                return Err(SandboxError::Backend(
+                    "sandbox runtime fence changed during cleanup".into(),
+                ));
             }
-            if !stored.cgroup_removed {
-                let events = self
-                    .filesystem
-                    .read_file(&stored.cgroup_path.join("cgroup.events"))?;
-                if !events.lines().any(|line| line.trim() == "populated 0") {
-                    return Err(SandboxError::Backend(
-                        "refusing cleanup of populated cgroup".into(),
-                    ));
-                }
-                self.filesystem.remove_directory(&stored.cgroup_path)?;
-                stored.cgroup_removed = true;
+            stored.runtime_removed = true;
+        }
+        if !cleanup.cgroup_removed {
+            let events = self
+                .filesystem
+                .read_file(&cleanup.cgroup_path.join("cgroup.events"))?;
+            if !events.lines().any(|line| line.trim() == "populated 0") {
+                return Err(SandboxError::Backend(
+                    "refusing cleanup of populated cgroup".into(),
+                ));
             }
+            self.filesystem.remove_directory(&cleanup.cgroup_path)?;
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let stored = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
+            if stored.egress_fence != cleanup.egress_fence {
+                return Err(SandboxError::Backend(
+                    "sandbox runtime fence changed during cleanup".into(),
+                ));
+            }
+            stored.cgroup_removed = true;
+        }
+        {
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let stored = state
+                .get_mut(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(stored, handle)?;
             stored.namespaces_cleaned =
                 stored.process_released && stored.runtime_removed && stored.cgroup_removed;
         }
 
         let release_fence = {
-            let state = self.runtimes.lock().await;
+            let state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
             let stored = state
                 .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
@@ -1102,7 +2238,10 @@ where
         };
         if let Some(fence) = release_fence {
             self.egress.release(&fence).await?;
-            let mut state = self.runtimes.lock().await;
+            let mut state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
             let stored = state
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
@@ -1121,17 +2260,20 @@ where
 
     async fn inspect(&self, handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
         self.validate_host_paths()?;
-        let state = self.runtimes.lock().await;
-        let runtime = state
-            .get(handle.shard_id())
-            .ok_or(SandboxError::ShardNotFound)?;
-        Self::validate_handle(runtime, handle)?;
-        if runtime.namespaces_cleaned {
-            return Err(SandboxError::ShardNotFound);
-        }
-        let cgroup_path = runtime.cgroup_path.clone();
-        let egress_fence = runtime.egress_fence.clone();
-        drop(state);
+        let (cgroup_path, egress_fence) = {
+            let state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = state
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            if runtime.namespaces_cleaned {
+                return Err(SandboxError::ShardNotFound);
+            }
+            (runtime.cgroup_path.clone(), runtime.egress_fence.clone())
+        };
         let memory_current_bytes = self
             .filesystem
             .read_file(&cgroup_path.join("memory.current"))?
