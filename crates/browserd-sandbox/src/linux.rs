@@ -494,6 +494,30 @@ pub enum ProcessSignal {
     Kill,
 }
 
+/// Parent-side capabilities for Chromium's fixed remote-debugging pipes.
+#[derive(Debug)]
+pub struct ChromiumCdpPipes {
+    command_writer: OwnedFd,
+    event_reader: OwnedFd,
+}
+
+impl ChromiumCdpPipes {
+    #[must_use]
+    pub fn command_writer(&self) -> BorrowedFd<'_> {
+        self.command_writer.as_fd()
+    }
+
+    #[must_use]
+    pub fn event_reader(&self) -> BorrowedFd<'_> {
+        self.event_reader.as_fd()
+    }
+
+    #[must_use]
+    pub fn into_owned_fds(self) -> (OwnedFd, OwnedFd) {
+        (self.command_writer, self.event_reader)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnRequest {
     program: PathBuf,
@@ -515,8 +539,8 @@ impl SpawnRequest {
 
     #[must_use]
     pub fn inherited_fds(&self) -> &[i32] {
-        // The process backend owns mapping the per-launch CDP pipe ends to child FDs 3/4.
-        // The sandbox backend only requires bwrap to preserve those fixed child descriptors.
+        // The process backend creates and maps per-launch CDP pipe ends to child FDs 3/4.
+        // Only caller-supplied descriptors, such as the seccomp program, are listed here.
         &self.inherited_fds
     }
 
@@ -544,6 +568,18 @@ pub trait LinuxProcessBackend: Send + Sync + 'static {
         backend_token: &str,
         request: &SpawnRequest,
     ) -> Result<ChildIdentity, SandboxError>;
+    /// Claims the parent command-write and event-read capabilities exactly once for the owned
+    /// child identified by `backend_token` and `identity`. The capabilities remain registry-owned
+    /// before the claim, including after a successful gate release.
+    async fn claim_cdp_pipes(
+        &self,
+        _backend_token: &str,
+        _identity: ChildIdentity,
+    ) -> Result<ChromiumCdpPipes, SandboxError> {
+        Err(SandboxError::Backend(
+            "CDP pipe claim is unsupported by this process backend".into(),
+        ))
+    }
     /// Releases the execution gate for exactly this prepared PID/start-time identity.
     /// The caller must durably record its fenced release intent before entering this one-shot
     /// boundary. `StdLinuxProcessBackend` writes the complete approval frame and closes its writer
@@ -596,6 +632,8 @@ struct OwnedLinuxChild {
     cgroup_kill: fs::File,
     cgroup_kill_requested: bool,
     cgroup_empty: bool,
+    unclaimed_cdp_pipes: Option<ChromiumCdpPipes>,
+    cdp_pipes_claimed: bool,
     identity: Option<ChildIdentity>,
     sandbox_pidfd: Option<OwnedFd>,
     execution_gate: Option<OwnedFd>,
@@ -828,6 +866,25 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                 ));
             }
         }
+        let (cdp_command_reader, cdp_command_writer) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|error| SandboxError::Backend(format!("CDP command pipe: {error}")))?;
+        let (cdp_event_reader, cdp_event_writer) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|error| SandboxError::Backend(format!("CDP event pipe: {error}")))?;
+        let relocate_child_end = |descriptor: OwnedFd,
+                                  description: &str|
+         -> Result<OwnedFd, SandboxError> {
+            if ![CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD].contains(&descriptor.as_raw_fd()) {
+                return Ok(descriptor);
+            }
+            let duplicated = fcntl(&descriptor, FcntlArg::F_DUPFD_CLOEXEC(5)).map_err(|error| {
+                SandboxError::Backend(format!("{description} relocation: {error}"))
+            })?;
+            // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor on success.
+            Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
+        };
+        let cdp_command_reader =
+            relocate_child_end(cdp_command_reader, "CDP child command descriptor")?;
+        let cdp_event_writer = relocate_child_end(cdp_event_writer, "CDP child event descriptor")?;
         let cgroup_path = request
             .cgroup_procs_path()
             .parent()
@@ -876,9 +933,13 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         })?;
         let mut command = Command::new(request.program());
         let cgroup_procs_fd = cgroup_procs.as_raw_fd();
+        let cdp_command_reader_fd = cdp_command_reader.as_raw_fd();
+        let cdp_event_writer_fd = cdp_event_writer.as_raw_fd();
         // SAFETY: this callback runs after fork and before exec. It performs only one libc write
-        // through a descriptor opened by the parent; writing 0 attaches the calling bootstrap
-        // process itself, so no reusable numeric PID is resolved by the supervisor.
+        // through a descriptor opened by the parent, followed by async-signal-safe dup2 calls.
+        // Writing 0 attaches the calling bootstrap itself, so the supervisor never resolves a
+        // reusable numeric PID. The CDP sources were relocated away from targets 3/4 in the parent,
+        // preventing either dup2 from clobbering the other source.
         unsafe {
             command.pre_exec(move || {
                 let membership = b"0\n";
@@ -887,15 +948,25 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                     membership.as_ptr().cast(),
                     membership.len(),
                 );
-                if written == membership.len() as isize {
-                    Ok(())
-                } else if written < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Err(std::io::Error::other(
-                        "sandbox cgroup attachment was incomplete",
-                    ))
+                if written < 0 {
+                    return Err(std::io::Error::last_os_error());
                 }
+                if written != membership.len() as isize {
+                    return Err(std::io::Error::other(
+                        "sandbox cgroup attachment was incomplete",
+                    ));
+                }
+                if nix::libc::dup2(cdp_command_reader_fd, CHROMIUM_CDP_READ_FD)
+                    != CHROMIUM_CDP_READ_FD
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if nix::libc::dup2(cdp_event_writer_fd, CHROMIUM_CDP_WRITE_FD)
+                    != CHROMIUM_CDP_WRITE_FD
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
             });
         }
         command
@@ -924,6 +995,8 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             .into_std()
             .spawn()
             .map_err(|error| SandboxError::Backend(error.to_string()));
+        drop(cdp_command_reader);
+        drop(cdp_event_writer);
         let monitor = match monitor {
             Ok(monitor) => monitor,
             Err(error) => {
@@ -949,6 +1022,11 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             cgroup_kill,
             cgroup_kill_requested: false,
             cgroup_empty: false,
+            unclaimed_cdp_pipes: Some(ChromiumCdpPipes {
+                command_writer: cdp_command_writer,
+                event_reader: cdp_event_reader,
+            }),
+            cdp_pipes_claimed: false,
             identity: None,
             sandbox_pidfd: None,
             execution_gate: Some(gate_write),
@@ -968,6 +1046,52 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         }
         let mut checked_out = CheckedOutLinuxChild::new(backend_token, slot)?;
         capture_sandbox_identity(checked_out.child_mut()?).await
+    }
+
+    async fn claim_cdp_pipes(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+    ) -> Result<ChromiumCdpPipes, SandboxError> {
+        let slot = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+            .get(backend_token)
+            .cloned()
+            .ok_or_else(|| SandboxError::Backend("prepared child ownership missing".into()))?;
+        let mut state = slot
+            .lock()
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))?;
+        let child = state
+            .as_mut()
+            .ok_or_else(|| SandboxError::Backend("child operation already in progress".into()))?;
+        if child.identity != Some(identity) {
+            return Err(SandboxError::Backend(
+                "prepared child PID identity changed".into(),
+            ));
+        }
+        let pidfd = child
+            .sandbox_pidfd
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("sandbox child pidfd missing".into()))?;
+        if pidfd_has_exited(pidfd)? {
+            return Err(SandboxError::Backend(
+                "prepared child exited before CDP claim".into(),
+            ));
+        }
+        if child.cdp_pipes_claimed {
+            return Err(SandboxError::Backend(
+                "prepared child CDP pipes already claimed".into(),
+            ));
+        }
+        let pipes = child
+            .unclaimed_cdp_pipes
+            .take()
+            .ok_or_else(|| SandboxError::Backend("prepared child CDP pipes missing".into()))?;
+        child.cdp_pipes_claimed = true;
+        Ok(pipes)
     }
 
     async fn release_prepared(
@@ -1777,8 +1901,6 @@ where
             ]);
         }
         arguments.extend([
-            OsString::from("--preserve-fds"),
-            OsString::from("2"),
             OsString::from("--seccomp"),
             OsString::from(self.config.seccomp_fd.to_string()),
             OsString::from("--"),
@@ -1800,11 +1922,7 @@ where
         SpawnRequest {
             program: self.config.bwrap_executable.clone(),
             arguments,
-            inherited_fds: vec![
-                CHROMIUM_CDP_READ_FD,
-                CHROMIUM_CDP_WRITE_FD,
-                self.config.seccomp_fd,
-            ],
+            inherited_fds: vec![self.config.seccomp_fd],
             cgroup_procs_path: self
                 .config
                 .cgroup_root

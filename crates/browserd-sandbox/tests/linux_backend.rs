@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::os::fd::AsRawFd;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -14,10 +15,11 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use browserd_core::{LeaseId, ShardId, WorkerId};
 use browserd_sandbox::{
-    CgroupLimits, ChildIdentity, ChromiumRuntime, CleanupReason, EgressRouteBackend,
-    LaunchGateRuntime, LaunchSpec, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
-    ProcessSignal, ReadOnlyMount, SandboxBackend, SandboxError, SandboxFilesystem,
-    ShardEgressFence, SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
+    CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
+    CleanupReason, EgressRouteBackend, LaunchGateRuntime, LaunchSpec, LinuxProcessBackend,
+    LinuxSandboxBackend, LinuxSandboxConfig, ProcessSignal, ReadOnlyMount, SandboxBackend,
+    SandboxError, SandboxFilesystem, ShardEgressFence, SpawnRequest, StdLinuxProcessBackend,
+    StdSandboxFilesystem,
 };
 
 #[derive(Clone)]
@@ -1156,25 +1158,27 @@ fn run_process_helper(test_name: &str) {
     );
 }
 
-fn install_required_launch_descriptors() -> File {
+fn install_required_launch_descriptors() -> OwnedFd {
     let null = File::options()
         .read(true)
         .write(true)
         .open("/dev/null")
         .expect("null device should open");
-    for target in [3, 4, 9] {
-        // SAFETY: the helper runs in an isolated subprocess and duplicates one live descriptor
-        // only onto the three fixed launch descriptor numbers used by this test.
-        let duplicated = unsafe { nix::libc::dup2(null.as_raw_fd(), target) };
-        assert_eq!(
-            duplicated, target,
-            "required descriptor should be installed"
-        );
-        // SAFETY: `target` was just installed above and F_SETFD with zero only clears CLOEXEC.
-        let result = unsafe { nix::libc::fcntl(target, nix::libc::F_SETFD, 0) };
-        assert_eq!(result, 0, "required descriptor should be inheritable");
+    let source = null.as_raw_fd();
+    // SAFETY: the helper runs in an isolated subprocess and duplicates one live descriptor only
+    // onto the fixed seccomp descriptor used by its SpawnRequest.
+    let duplicated = unsafe { nix::libc::dup2(source, 9) };
+    assert_eq!(duplicated, 9, "seccomp descriptor should be installed");
+    // SAFETY: descriptor 9 was just installed above and F_SETFD with zero only clears CLOEXEC.
+    let result = unsafe { nix::libc::fcntl(9, nix::libc::F_SETFD, 0) };
+    assert_eq!(result, 0, "seccomp descriptor should be inheritable");
+    if source == 9 {
+        OwnedFd::from(null)
+    } else {
+        drop(null);
+        // SAFETY: dup2 created descriptor 9 above and ownership has not been transferred elsewhere.
+        unsafe { OwnedFd::from_raw_fd(9) }
     }
-    null
 }
 
 fn executable_script(contents: &str) -> (tempfile::TempDir, PathBuf) {
@@ -1305,13 +1309,16 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
         "/dev/shm",
         "--ro-bind",
         "--seccomp",
-        "--preserve-fds",
     ] {
         assert!(process_events.contains(argument), "missing {argument}");
     }
+    assert!(
+        !process_events.contains("--preserve-fds"),
+        "the pinned bubblewrap CLI has no preserve-fds option"
+    );
     assert!(!process_events.contains("--no-sandbox"));
     assert!(!process_events.contains("/home"));
-    assert!(process_events.contains("fds:[3, 4, 9]"));
+    assert!(process_events.contains("fds:[9]"));
 }
 
 #[tokio::test]
@@ -2950,6 +2957,16 @@ async fn production_process_rejects_missing_required_launch_descriptors_before_e
     assert!(error.to_string().contains("required inherited descriptor"));
 }
 
+#[tokio::test]
+async fn production_cdp_claim_rejects_missing_backend_ownership() {
+    let error = StdLinuxProcessBackend::default()
+        .claim_cdp_pipes(&LeaseId::new().to_string(), ChildIdentity::new(123, 456))
+        .await
+        .expect_err("a missing backend token must not mint CDP capabilities");
+
+    assert!(error.to_string().contains("ownership missing"));
+}
+
 #[test]
 fn production_process_signals_through_pidfds_instead_of_rechecking_proc_then_killing_pid() {
     let implementation = include_str!("../src/linux.rs");
@@ -3846,6 +3863,372 @@ fn production_abort_confirms_the_exact_sandbox_child_exited_before_forgetting_ow
 #[test]
 fn production_release_reaps_the_naturally_exited_bootstrap_before_forgetting_ownership() {
     run_process_helper("std_process_natural_release_helper");
+}
+
+#[test]
+fn production_cdp_pipes_are_mapped_claimed_and_released_exactly_once() {
+    run_process_helper("std_process_cdp_round_trip_helper");
+}
+
+#[test]
+fn pinned_bubblewrap_preserves_inheritable_chromium_descriptors() {
+    run_process_helper("real_bwrap_cdp_inheritance_helper");
+}
+
+#[test]
+#[ignore = "runs only in an isolated descriptor-owning subprocess"]
+fn real_bwrap_cdp_inheritance_helper() {
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    let (command_reader, command_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .expect("CDP command pipe should be created");
+    let (event_reader, event_writer) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("CDP event pipe should be created");
+    let command_reader_source =
+        nix::fcntl::fcntl(&command_reader, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(10))
+            .expect("CDP command child end should be relocated");
+    let event_writer_source =
+        nix::fcntl::fcntl(&event_writer, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(10))
+            .expect("CDP event child end should be relocated");
+    // SAFETY: both fcntl calls returned fresh owned descriptors.
+    let command_reader_source = unsafe { OwnedFd::from_raw_fd(command_reader_source) };
+    // SAFETY: both fcntl calls returned fresh owned descriptors.
+    let event_writer_source = unsafe { OwnedFd::from_raw_fd(event_writer_source) };
+    drop(command_reader);
+    drop(event_writer);
+
+    let executable = std::env::current_exe().expect("test executable should be known");
+    let command_reader_fd = command_reader_source.as_raw_fd();
+    let event_writer_fd = event_writer_source.as_raw_fd();
+    let mut command = Command::new("/usr/bin/bwrap");
+    // SAFETY: the callback runs after fork and uses only async-signal-safe dup2 calls. Both source
+    // descriptors were moved above Chromium's fixed targets, so neither mapping clobbers a source.
+    unsafe {
+        command.pre_exec(move || {
+            if nix::libc::dup2(command_reader_fd, CHROMIUM_CDP_READ_FD) != CHROMIUM_CDP_READ_FD {
+                return Err(std::io::Error::last_os_error());
+            }
+            if nix::libc::dup2(event_writer_fd, CHROMIUM_CDP_WRITE_FD) != CHROMIUM_CDP_WRITE_FD {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .args(["--ro-bind", "/", "/", "--"])
+        .arg(executable)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("real_bwrap_cdp_endpoint_helper")
+        .arg("--nocapture")
+        .env("BROWSERD_BWRAP_CDP_ENDPOINT", "1")
+        .spawn()
+        .expect("pinned bubblewrap should accept its production-compatible arguments");
+    drop(command_reader_source);
+    drop(event_writer_source);
+
+    let mut command_writer = File::from(command_writer);
+    command_writer
+        .write_all(b"ping")
+        .expect("parent command end should reach bubblewrap child FD 3");
+    drop(command_writer);
+    let event_flags = nix::fcntl::fcntl(&event_reader, nix::fcntl::FcntlArg::F_GETFL)
+        .expect("event descriptor flags should be readable");
+    nix::fcntl::fcntl(
+        &event_reader,
+        nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_truncate(event_flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        ),
+    )
+    .expect("event descriptor should become nonblocking for a bounded test");
+    let mut event_reader = File::from(event_reader);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut response = Vec::new();
+    let mut read_error = None;
+    while Instant::now() < deadline && response.len() < 4 {
+        let mut chunk = [0_u8; 4];
+        match event_reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
+    }
+    assert!(
+        read_error.is_none(),
+        "bubblewrap CDP event read should succeed"
+    );
+    assert_eq!(response, b"pong");
+    let status = child.wait().expect("bubblewrap child should be waitable");
+    assert!(
+        status.success(),
+        "bubblewrap CDP endpoint should exit cleanly"
+    );
+}
+
+#[test]
+#[ignore = "runs only inside the real bubblewrap inheritance helper"]
+fn real_bwrap_cdp_endpoint_helper() {
+    if std::env::var_os("BROWSERD_BWRAP_CDP_ENDPOINT").is_none() {
+        return;
+    }
+    // SAFETY: the isolated bubblewrap subprocess owns the two fixed Chromium descriptors.
+    let mut command_reader = unsafe { File::from_raw_fd(CHROMIUM_CDP_READ_FD) };
+    // SAFETY: the isolated bubblewrap subprocess owns the two fixed Chromium descriptors.
+    let mut event_writer = unsafe { File::from_raw_fd(CHROMIUM_CDP_WRITE_FD) };
+    let mut command = [0_u8; 4];
+    command_reader
+        .read_exact(&mut command)
+        .expect("bubblewrap child should read its command from FD 3");
+    assert_eq!(command, *b"ping");
+    event_writer
+        .write_all(b"pong")
+        .expect("bubblewrap child should write its event to FD 4");
+}
+
+#[test]
+#[ignore = "runs only in an isolated descriptor-owning subprocess"]
+fn std_process_cdp_round_trip_helper() {
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    for descriptor in [3, 4] {
+        // SAFETY: this ignored helper runs in its own subprocess and intentionally frees the two
+        // Chromium descriptor targets before the production backend allocates its pipes.
+        unsafe {
+            nix::libc::close(descriptor);
+        }
+    }
+    let cdp_target_reservation = File::open("/dev/null")
+        .expect("the isolated helper should reserve Chromium descriptor targets");
+    assert_eq!(
+        cdp_target_reservation.as_raw_fd(),
+        CHROMIUM_CDP_READ_FD,
+        "closing low descriptors must make the first CDP source collide with target FD 3"
+    );
+    // SAFETY: FD 3 is the live reservation above; this isolated helper reserves FD 4 until its
+    // Tokio runtime has allocated all process-lifetime descriptors away from the CDP targets.
+    let reserved =
+        unsafe { nix::libc::dup2(cdp_target_reservation.as_raw_fd(), CHROMIUM_CDP_WRITE_FD) };
+    assert_eq!(reserved, CHROMIUM_CDP_WRITE_FD);
+    let _seccomp_descriptor = install_required_launch_descriptors();
+    let script = r#"#!/usr/bin/python3
+import json
+import os
+import sys
+
+info_fd = None
+arguments = iter(sys.argv[1:])
+for argument in arguments:
+    if argument == "--block-fd":
+        raise RuntimeError("legacy block-fd must not be used")
+    elif argument == "--info-fd":
+        info_fd = int(next(arguments))
+
+control_path = os.path.join(os.path.dirname(__file__), "cgroup-kill-path")
+with open(control_path) as control:
+    cgroup_kill_path = control.read()
+cgroup_events_path = os.path.join(os.path.dirname(cgroup_kill_path), "cgroup.events")
+
+sandbox_pid = os.fork()
+if sandbox_pid == 0:
+    os.close(info_fd)
+    approval = sys.stdin.buffer.read()
+    if approval != b"browserd-launch-gate/v1 approve\n":
+        os._exit(77)
+    if os.read(3, 4) != b"ping":
+        os._exit(78)
+    os.write(4, b"pong")
+    os._exit(0)
+
+os.write(info_fd, json.dumps({"child-pid": sandbox_pid}).encode() + b"\n")
+os.close(info_fd)
+os.waitpid(sandbox_pid, 0)
+with open(cgroup_events_path, "w") as cgroup_events:
+    cgroup_events.write("populated 0\n")
+os._exit(0)
+"#;
+    let (directory, bwrap) = executable_script(script);
+    let (_cgroup_directory, request) = process_request_for(&bwrap);
+    let cgroup_kill_path = request.cgroup_procs_path().with_file_name("cgroup.kill");
+    std::fs::write(
+        directory.path().join("cgroup-kill-path"),
+        cgroup_kill_path.as_os_str().as_encoded_bytes(),
+    )
+    .expect("fake cgroup kill locator should be written");
+
+    let process = StdLinuxProcessBackend::default();
+    let backend_token = LeaseId::new().to_string();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("helper runtime should build");
+    drop(cdp_target_reservation);
+    // SAFETY: FD 4 is the helper-owned duplicate installed above and has no Rust owner.
+    let closed = unsafe { nix::libc::close(CHROMIUM_CDP_WRITE_FD) };
+    assert_eq!(closed, 0, "reserved CDP write target should close");
+    for descriptor in [CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD] {
+        // SAFETY: the isolated helper intentionally verifies these raw target numbers are free.
+        let result = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+        assert_eq!(result, -1, "CDP target must be free before pipe creation");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(nix::libc::EBADF)
+        );
+    }
+    runtime.block_on(async {
+        let identity = process
+            .spawn_prepared(&backend_token, &request)
+            .await
+            .expect("fake sandbox child should be prepared");
+        process
+            .claim_cdp_pipes(&backend_token, ChildIdentity::new(identity.pid(), 1))
+            .await
+            .expect_err("a stale PID identity must not claim CDP capabilities");
+        let claim_barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let first_claim = {
+            let claim_barrier = Arc::clone(&claim_barrier);
+            let backend_token = backend_token.clone();
+            tokio::spawn(async move {
+                claim_barrier.wait().await;
+                process.claim_cdp_pipes(&backend_token, identity).await
+            })
+        };
+        let second_claim = {
+            let claim_barrier = Arc::clone(&claim_barrier);
+            let backend_token = backend_token.clone();
+            tokio::spawn(async move {
+                claim_barrier.wait().await;
+                process.claim_cdp_pipes(&backend_token, identity).await
+            })
+        };
+        claim_barrier.wait().await;
+        let first_claim = first_claim.await.expect("first claim task should join");
+        let second_claim = second_claim.await.expect("second claim task should join");
+        let claimed = match (first_claim, second_claim) {
+            (Ok(claimed), Err(error)) | (Err(error), Ok(claimed)) => {
+                assert!(error.to_string().contains("already claimed"));
+                Some(claimed)
+            }
+            _ => None,
+        };
+        assert!(claimed.is_some(), "exactly one concurrent claim must win");
+        let Some(claimed) = claimed else {
+            return;
+        };
+
+        let (command_writer, event_reader) = claimed.into_owned_fds();
+        for descriptor in [&command_writer, &event_reader] {
+            let flags = nix::fcntl::fcntl(descriptor, nix::fcntl::FcntlArg::F_GETFD)
+                .expect("parent CDP descriptor flags should be readable");
+            assert!(
+                nix::fcntl::FdFlag::from_bits_truncate(flags)
+                    .contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+                "parent CDP capabilities must not leak through unrelated exec"
+            );
+        }
+        let event_flags = nix::fcntl::fcntl(&event_reader, nix::fcntl::FcntlArg::F_GETFL)
+            .expect("event descriptor flags should be readable");
+        nix::fcntl::fcntl(
+            &event_reader,
+            nix::fcntl::FcntlArg::F_SETFL(
+                nix::fcntl::OFlag::from_bits_truncate(event_flags)
+                    | nix::fcntl::OFlag::O_NONBLOCK,
+            ),
+        )
+        .expect("event descriptor should become nonblocking for the bounded test");
+        let mut command_writer = File::from(command_writer);
+        let mut event_reader = File::from(event_reader);
+        command_writer
+            .write_all(b"ping")
+            .expect("parent command end should write to child FD 3");
+        process
+            .release_prepared(&backend_token, identity)
+            .await
+            .expect("a claimed prepared child should be released");
+
+        let mut response = Vec::new();
+        let event_result = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut chunk = [0_u8; 16];
+            loop {
+                match event_reader.read(&mut chunk) {
+                    Ok(0) => break Ok(()),
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await;
+        assert!(matches!(event_result, Ok(Ok(()))));
+        assert_eq!(response, b"pong");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match process.release_spawned(&backend_token, identity).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        assert!(error.to_string().contains("live spawned child"));
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("exited child ownership should become releasable");
+        nix::fcntl::fcntl(&command_writer, nix::fcntl::FcntlArg::F_GETFD)
+            .expect("registry release must not double-close a claimed command end");
+        nix::fcntl::fcntl(&event_reader, nix::fcntl::FcntlArg::F_GETFD)
+            .expect("registry release must not double-close a claimed event end");
+
+        let second_token = LeaseId::new().to_string();
+        let second_identity = process
+            .spawn_prepared(&second_token, &request)
+            .await
+            .expect("second fake sandbox child should be prepared");
+        process
+            .release_prepared(&second_token, second_identity)
+            .await
+            .expect("release-before-claim must preserve registry-owned parent CDP ends");
+        let late_claim = process
+            .claim_cdp_pipes(&second_token, second_identity)
+            .await
+            .expect("the exact live identity may claim registry-owned pipes after release");
+        process
+            .abort_spawned(&second_token, Some(second_identity))
+            .await
+            .expect("released child should still abort through exact pidfds");
+        nix::fcntl::fcntl(
+            late_claim.command_writer(),
+            nix::fcntl::FcntlArg::F_GETFD,
+        )
+        .expect("abort must not double-close a claimed command end");
+        nix::fcntl::fcntl(late_claim.event_reader(), nix::fcntl::FcntlArg::F_GETFD)
+            .expect("abort must not double-close a claimed event end");
+
+        let unclaimed_token = LeaseId::new().to_string();
+        let unclaimed_identity = process
+            .spawn_prepared(&unclaimed_token, &request)
+            .await
+            .expect("unclaimed fake sandbox child should be prepared");
+        process
+            .abort_spawned(&unclaimed_token, Some(unclaimed_identity))
+            .await
+            .expect("abort should close registry-owned unclaimed CDP capabilities");
+        let claim_after_abort = process
+            .claim_cdp_pipes(&unclaimed_token, unclaimed_identity)
+            .await;
+        assert!(matches!(claim_after_abort, Err(error) if error.to_string().contains("ownership missing")));
+    });
 }
 
 #[test]

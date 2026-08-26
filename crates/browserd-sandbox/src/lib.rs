@@ -14,10 +14,10 @@ pub use journal::{
     StartupReconciliationHandle, StartupReconciliationReport,
 };
 pub use linux::{
-    CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
-    EgressRouteBackend, LaunchGateRuntime, LinuxProcessBackend, LinuxSandboxBackend,
-    LinuxSandboxConfig, ProcessSignal, ReadOnlyMount, SandboxFilesystem, ShardEgressFence,
-    SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
+    CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumCdpPipes,
+    ChromiumRuntime, EgressRouteBackend, LaunchGateRuntime, LinuxProcessBackend,
+    LinuxSandboxBackend, LinuxSandboxConfig, ProcessSignal, ReadOnlyMount, SandboxFilesystem,
+    ShardEgressFence, SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 pub use rpc::{
     RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer,
