@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use browserd_core::ActionId;
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat, openat2};
+use nix::sys::stat::{Mode, fstat};
 use nix::unistd::Uid;
 use sha2::{Digest, Sha256};
 
@@ -102,6 +106,15 @@ impl FileActionJournal {
         limits: ActionJournalLimits,
         mode: FileOpenMode,
     ) -> Result<Self, JournalError> {
+        Self::open_with_mode_after_parent_validation(path, limits, mode, || {})
+    }
+
+    fn open_with_mode_after_parent_validation(
+        path: &Path,
+        limits: ActionJournalLimits,
+        mode: FileOpenMode,
+        after_parent_validation: impl FnOnce(),
+    ) -> Result<Self, JournalError> {
         if limits.max_record_bytes == 0
             || limits.max_records == 0
             || limits.max_file_bytes < FILE_HEADER.len()
@@ -116,83 +129,113 @@ impl FileActionJournal {
             .filter(|candidate| !candidate.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let effective_uid = Uid::effective().as_raw();
-        let mut inspected_parent = PathBuf::new();
+        let mut parent_components: Vec<&OsStr> = Vec::new();
         for component in parent.components() {
             match component {
-                Component::Prefix(_) | Component::RootDir => {
-                    inspected_parent.push(component.as_os_str());
+                Component::RootDir | Component::CurDir => {}
+                Component::Prefix(_) => {
+                    return Err(JournalError::new(
+                        "action journal parent prefix is unsupported",
+                    ));
                 }
-                Component::CurDir => continue,
                 Component::ParentDir => {
                     return Err(JournalError::new(
                         "action journal parent must not contain parent traversal",
                     ));
                 }
-                Component::Normal(component) => {
-                    inspected_parent.push(component);
-                }
+                Component::Normal(component) => parent_components.push(component),
             }
-            let component_metadata = fs::symlink_metadata(&inspected_parent).map_err(|error| {
+        }
+        let directory_flags =
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
+        let mut parent_fd = open(
+            if path.is_absolute() {
+                Path::new("/")
+            } else {
+                Path::new(".")
+            },
+            directory_flags,
+            Mode::empty(),
+        )
+        .map_err(|error| {
+            JournalError::new(format!("action journal parent is unavailable: {error}"))
+        })?;
+        let validate_directory = |directory: &OwnedFd, final_parent: bool| {
+            let metadata = fstat(directory).map_err(|error| {
                 JournalError::new(format!(
-                    "action journal parent component is unavailable: {error}"
+                    "action journal parent metadata is unavailable: {error}"
                 ))
             })?;
-            if component_metadata.file_type().is_symlink() {
+            if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFDIR || metadata.st_nlink == 0
+            {
                 return Err(JournalError::new(
-                    "action journal parent must not contain symbolic links",
+                    "action journal parent component is not a linked directory",
                 ));
             }
-            if !component_metadata.is_dir() {
-                return Err(JournalError::new(
-                    "action journal parent component is not a directory",
-                ));
-            }
-            if component_metadata.uid() != 0 && component_metadata.uid() != effective_uid {
+            if metadata.st_uid != 0 && metadata.st_uid != effective_uid {
                 return Err(JournalError::new(
                     "action journal parent component has an untrusted owner",
                 ));
             }
-            if component_metadata.mode() & 0o022 != 0 && component_metadata.mode() & 0o1000 == 0 {
+            let writable_by_others = metadata.st_mode & 0o022 != 0;
+            let sticky = metadata.st_mode & 0o1000 != 0;
+            if writable_by_others && (final_parent || !sticky) {
                 return Err(JournalError::new(
                     "action journal parent permissions allow path replacement",
                 ));
             }
-        }
-        let parent_metadata = fs::metadata(parent).map_err(|error| {
-            JournalError::new(format!("action journal parent is unavailable: {error}"))
-        })?;
-        if !parent_metadata.is_dir() {
-            return Err(JournalError::new(
-                "action journal parent is not a directory",
-            ));
-        }
-        if parent_metadata.uid() != 0 && parent_metadata.uid() != effective_uid {
-            return Err(JournalError::new(
-                "action journal parent has an untrusted owner",
-            ));
-        }
-        if parent_metadata.mode() & 0o022 != 0 {
-            return Err(JournalError::new(
-                "action journal parent permissions allow path replacement",
-            ));
-        }
-
-        let open_file = |create_new: bool| {
-            let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .append(true)
-                .create_new(create_new)
-                .mode(0o600)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC);
-            options.open(path)
+            Ok(())
         };
-        let (mut file, created) = match open_file(true) {
+        validate_directory(&parent_fd, parent_components.is_empty())?;
+        for (index, component) in parent_components.iter().enumerate() {
+            let next = openat2(
+                &parent_fd,
+                Path::new(component),
+                OpenHow::new().flags(directory_flags).resolve(
+                    ResolveFlag::RESOLVE_BENEATH
+                        | ResolveFlag::RESOLVE_NO_SYMLINKS
+                        | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+                ),
+            )
+            .map_err(|error| {
+                JournalError::new(format!(
+                    "action journal parent component is unavailable: {error}"
+                ))
+            })?;
+            validate_directory(&next, index + 1 == parent_components.len())?;
+            parent_fd = next;
+        }
+        after_parent_validation();
+        validate_directory(&parent_fd, true)?;
+
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| JournalError::new("action journal path has no file name"))?;
+        let file_flags = OFlag::O_RDWR
+            | OFlag::O_APPEND
+            | OFlag::O_CLOEXEC
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_NONBLOCK;
+        let open_file = |create_new: bool| {
+            let creation_flags = if create_new {
+                OFlag::O_CREAT | OFlag::O_EXCL
+            } else {
+                OFlag::empty()
+            };
+            openat(
+                &parent_fd,
+                file_name,
+                file_flags | creation_flags,
+                Mode::from_bits_truncate(0o600),
+            )
+        };
+        let (file_fd, created) = match open_file(true) {
             Ok(file) => (file, true),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(Errno::EEXIST) => {
                 if mode == FileOpenMode::CreateNew {
                     return Err(JournalError::new(format!(
-                        "action journal already exists: {error}"
+                        "action journal already exists: {}",
+                        Errno::EEXIST
                     )));
                 }
                 let file = open_file(false).map_err(|open_error| {
@@ -208,23 +251,26 @@ impl FileActionJournal {
                 )));
             }
         };
-        file.try_lock().map_err(|error| {
-            JournalError::new(format!("action journal already has a writer: {error}"))
-        })?;
-
-        let metadata = file.metadata().map_err(|error| {
+        let metadata = fstat(&file_fd).map_err(|error| {
             JournalError::new(format!("action journal metadata is unavailable: {error}"))
         })?;
-        if !metadata.is_file() || metadata.nlink() != 1 {
+        if metadata.st_mode & nix::libc::S_IFMT != nix::libc::S_IFREG || metadata.st_nlink != 1 {
             return Err(JournalError::new(
                 "action journal must be a regular, singly linked file",
             ));
         }
-        if metadata.mode() & 0o077 != 0 {
+        if metadata.st_uid != 0 && metadata.st_uid != effective_uid {
+            return Err(JournalError::new("action journal has an untrusted owner"));
+        }
+        if metadata.st_mode & 0o077 != 0 {
             return Err(JournalError::new(
                 "action journal permissions must not grant group or other access",
             ));
         }
+        let mut file = File::from(file_fd);
+        file.try_lock().map_err(|error| {
+            JournalError::new(format!("action journal already has a writer: {error}"))
+        })?;
 
         if created {
             file.write_all(FILE_HEADER).map_err(|error| {
@@ -236,9 +282,7 @@ impl FileActionJournal {
             file.sync_all().map_err(|error| {
                 JournalError::new(format!("action journal header sync failed: {error}"))
             })?;
-            let parent_file = File::open(parent).map_err(|error| {
-                JournalError::new(format!("action journal parent cannot be opened: {error}"))
-            })?;
+            let parent_file = File::from(parent_fd);
             parent_file.sync_all().map_err(|error| {
                 JournalError::new(format!("action journal parent sync failed: {error}"))
             })?;
@@ -676,4 +720,84 @@ fn scan(
     file.seek(SeekFrom::End(0))
         .map_err(|error| JournalError::new(format!("action journal seek failed: {error}")))?;
     Ok((entries, file_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use super::{ActionJournalLimits, FILE_HEADER, FileActionJournal, FileOpenMode};
+
+    #[test]
+    fn concurrent_parent_swap_cannot_redirect_wal_creation() {
+        let directory = tempfile::tempdir().expect("temporary root should be created");
+        let original_parent = directory.path().join("journal-parent");
+        let moved_parent = directory.path().join("pinned-parent");
+        let outside_parent = directory.path().join("outside-parent");
+        fs::create_dir(&original_parent).expect("original parent should be created");
+        fs::create_dir(&outside_parent).expect("outside parent should be created");
+        let requested_path = original_parent.join("actions.wal");
+
+        let journal = FileActionJournal::open_with_mode_after_parent_validation(
+            &requested_path,
+            ActionJournalLimits::default(),
+            FileOpenMode::OpenOrCreate,
+            || {
+                fs::rename(&original_parent, &moved_parent)
+                    .expect("validated parent should be moved");
+                symlink(&outside_parent, &original_parent)
+                    .expect("requested parent name should be replaced by a symlink");
+            },
+        )
+        .expect("the pinned original parent should remain usable");
+        drop(journal);
+
+        assert!(moved_parent.join("actions.wal").exists());
+        assert!(!outside_parent.join("actions.wal").exists());
+    }
+
+    #[test]
+    fn concurrent_parent_swap_cannot_redirect_existing_wal_open() {
+        let directory = tempfile::tempdir().expect("temporary root should be created");
+        let original_parent = directory.path().join("journal-parent");
+        let moved_parent = directory.path().join("pinned-parent");
+        let outside_parent = directory.path().join("outside-parent");
+        fs::create_dir(&original_parent).expect("original parent should be created");
+        fs::create_dir(&outside_parent).expect("outside parent should be created");
+        let requested_path = original_parent.join("actions.wal");
+        drop(
+            FileActionJournal::create_new(&requested_path, ActionJournalLimits::default())
+                .expect("original WAL should be initialized"),
+        );
+        fs::write(outside_parent.join("actions.wal"), b"attacker-controlled")
+            .expect("outside decoy should be created");
+
+        let journal = FileActionJournal::open_with_mode_after_parent_validation(
+            &requested_path,
+            ActionJournalLimits::default(),
+            FileOpenMode::OpenOrCreate,
+            || {
+                fs::rename(&original_parent, &moved_parent)
+                    .expect("validated parent should be moved");
+                symlink(&outside_parent, &original_parent)
+                    .expect("requested parent name should be replaced by a symlink");
+            },
+        )
+        .expect("recovery must use the WAL below the pinned original parent");
+        drop(journal);
+
+        assert_eq!(
+            fs::read(moved_parent.join("actions.wal"))
+                .expect("original WAL should remain readable"),
+            FILE_HEADER
+        );
+        assert_eq!(
+            fs::read(outside_parent.join("actions.wal"))
+                .expect("outside decoy should remain readable"),
+            b"attacker-controlled"
+        );
+    }
 }
