@@ -258,13 +258,17 @@ dependencies = [
 name = "browserd-chromium"
 version = "0.1.0"
 dependencies = [
+ "browserd-cdp",
+ "browserd-sandbox",
  "chrono",
  "hex",
+ "nix",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

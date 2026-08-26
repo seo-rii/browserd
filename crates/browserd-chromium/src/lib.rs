@@ -1,5 +1,11 @@
 //! Immutable Chromium compatibility artifacts and launch qualification gates.
 
+mod connection;
+
+pub use connection::{
+    ChromiumConnection, ChromiumConnectionConfig, ChromiumConnectionError, ChromiumVersion,
+};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
