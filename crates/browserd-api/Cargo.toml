@@ -14,6 +14,7 @@ browserd-actions = { path = "../browserd-actions" }
 browserd-artifacts = { path = "../browserd-artifacts" }
 browserd-auth = { path = "../browserd-auth" }
 browserd-core = { path = "../browserd-core" }
+browserd-coordination = { path = "../browserd-coordination" }
 browserd-operations = { path = "../browserd-operations" }
 browserd-policy = { path = "../browserd-policy" }
 browserd-session = { path = "../browserd-session" }
@@ -27,4 +28,5 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 jsonwebtoken.workspace = true

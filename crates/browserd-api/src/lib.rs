@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -15,6 +16,12 @@ use browserd_actions::{
 };
 use browserd_artifacts::{ArtifactKey, ArtifactState, DownloadToken};
 use browserd_auth::AuthenticatedPrincipal;
+use browserd_coordination::{
+    CanonicalRequestHash as DurableRequestHash, ClaimCreateOperation, ClaimOutcome,
+    CoordinationBlockingClient, CoordinationError, CreateOperationError, CreateOperationResult,
+    CreateOperationSnapshot as DurableOperationSnapshot, DispatchLeaseToken, DownstreamDedupeKey,
+    OperationMutation, RecoverableCreateIntent,
+};
 use browserd_core::{
     ActionId, ArtifactId, CreateOperationState, ErrorCode, IsolationProfile, OperationId, PageId,
     SessionId, SessionLifecycle, TenantId, WorkerId,
@@ -158,9 +165,12 @@ pub struct SessionCreateRequest {
 #[derive(Clone, Debug)]
 pub struct SessionCreateDispatch {
     operation_id: OperationId,
-    idempotency_key: String,
+    downstream_dedupe_key: DownstreamDedupeKey,
     canonical_request_hash: [u8; 32],
-    received_at: Instant,
+    accepted_at: DateTime<Utc>,
+    admission_deadline: DateTime<Utc>,
+    dispatch_generation: u64,
+    runtime_timeout: StdDuration,
 }
 
 impl SessionCreateDispatch {
@@ -170,8 +180,8 @@ impl SessionCreateDispatch {
     }
 
     #[must_use]
-    pub fn idempotency_key(&self) -> &str {
-        &self.idempotency_key
+    pub const fn downstream_dedupe_key(&self) -> DownstreamDedupeKey {
+        self.downstream_dedupe_key
     }
 
     #[must_use]
@@ -180,8 +190,39 @@ impl SessionCreateDispatch {
     }
 
     #[must_use]
-    pub const fn received_at(&self) -> Instant {
-        self.received_at
+    pub const fn accepted_at(&self) -> DateTime<Utc> {
+        self.accepted_at
+    }
+
+    #[must_use]
+    pub const fn admission_deadline(&self) -> DateTime<Utc> {
+        self.admission_deadline
+    }
+
+    #[must_use]
+    pub const fn dispatch_generation(&self) -> u64 {
+        self.dispatch_generation
+    }
+    #[must_use]
+    pub const fn runtime_timeout(&self) -> StdDuration {
+        self.runtime_timeout
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateAuthority {
+    tenant_id: TenantId,
+    principal_id: browserd_core::PrincipalId,
+}
+
+impl CreateAuthority {
+    #[must_use]
+    pub const fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+    #[must_use]
+    pub const fn principal_id(&self) -> &browserd_core::PrincipalId {
+        &self.principal_id
     }
 }
 
@@ -677,16 +718,27 @@ pub struct ApiError {
     code: ErrorCode,
     message: String,
     details: BTreeMap<String, String>,
+    retryable: bool,
     trace_id: Uuid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OperationFailure {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub details: BTreeMap<String, String>,
 }
 
 impl ApiError {
     #[must_use]
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        let retryable = code.semantics().retry_class() != RetryClass::Never;
         Self {
             code,
             message: message.into(),
             details: BTreeMap::new(),
+            retryable,
             trace_id: Uuid::now_v7(),
         }
     }
@@ -709,6 +761,22 @@ impl ApiError {
     #[must_use]
     pub const fn details(&self) -> &BTreeMap<String, String> {
         &self.details
+    }
+
+    #[must_use]
+    pub fn with_failure_metadata(
+        mut self,
+        retryable: bool,
+        details: BTreeMap<String, String>,
+    ) -> Self {
+        self.retryable = retryable;
+        self.details = details;
+        self
+    }
+
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.retryable
     }
 
     #[must_use]
@@ -762,6 +830,7 @@ pub struct OperationEnvelope {
     state: CreateOperationState,
     poll_url: String,
     session: Option<SessionResource>,
+    failure: Option<OperationFailure>,
 }
 
 impl OperationEnvelope {
@@ -784,6 +853,46 @@ impl OperationEnvelope {
     pub const fn session(&self) -> Option<&SessionResource> {
         self.session.as_ref()
     }
+
+    #[must_use]
+    pub const fn failure(&self) -> Option<&OperationFailure> {
+        self.failure.as_ref()
+    }
+
+    #[must_use]
+    pub fn public_value(&self) -> serde_json::Value {
+        let state = match self.state {
+            CreateOperationState::Accepted => "accepted",
+            CreateOperationState::Queued => "queued",
+            CreateOperationState::Reserving => "reserving",
+            CreateOperationState::Creating => "creating",
+            CreateOperationState::Succeeded => "succeeded",
+            CreateOperationState::TimedOut => "timed_out",
+            CreateOperationState::Cancelled => "cancelled",
+            CreateOperationState::Failed => "failed",
+        };
+        let session = self.session.as_ref().map(|session| {
+            serde_json::json!({
+                "id": session.id,
+                "lifecycle": format!("{:?}", session.lifecycle).to_ascii_lowercase(),
+                "incarnation": session.incarnation,
+                "requested_isolation": match session.requested_isolation {
+                    IsolationProfile::SharedContext => "shared_context",
+                    IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
+                    IsolationProfile::DedicatedProcess => "dedicated_process",
+                    IsolationProfile::DedicatedWorker => "dedicated_worker",
+                },
+                "effective_isolation": match session.effective_isolation {
+                    IsolationProfile::SharedContext => "shared_context",
+                    IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
+                    IsolationProfile::DedicatedProcess => "dedicated_process",
+                    IsolationProfile::DedicatedWorker => "dedicated_worker",
+                },
+                "metadata": session.metadata,
+            })
+        });
+        serde_json::json!({ "id": self.id, "state": state, "poll_url": self.poll_url, "session": session, "failure": self.failure })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -798,7 +907,7 @@ impl SessionCreateResponse {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionResource {
     pub id: SessionId,
     pub lifecycle: SessionLifecycle,
@@ -1785,16 +1894,23 @@ pub trait ApiService: Send + Sync {
 pub trait RuntimeApiBackend: Send + Sync {
     fn create_session(
         &self,
-        principal: &AuthenticatedPrincipal,
+        authority: &CreateAuthority,
         dispatch: &SessionCreateDispatch,
         request: &SessionCreateRequest,
-    ) -> Result<SessionResource, ApiError>;
+    ) -> RuntimeCreateResult;
 
     fn execute_runtime(
         &self,
         principal: &AuthenticatedPrincipal,
         request: ApiRequest,
     ) -> Result<ApiResponse, ApiError>;
+}
+
+#[derive(Clone, Debug)]
+pub enum RuntimeCreateResult {
+    Succeeded(SessionResource),
+    ConfirmedFailure(ApiError),
+    OutcomeUnknown(ApiError),
 }
 
 pub struct ApiRouter<B> {
@@ -1845,7 +1961,18 @@ where
                     body,
                     &idempotency_key,
                     received_at,
-                    |dispatch, request| self.runtime.create_session(principal, dispatch, request),
+                    |dispatch, request| match self.runtime.create_session(
+                        &CreateAuthority {
+                            tenant_id: principal.tenant_id().clone(),
+                            principal_id: principal.principal_id().clone(),
+                        },
+                        dispatch,
+                        request,
+                    ) {
+                        RuntimeCreateResult::Succeeded(session) => Ok(session),
+                        RuntimeCreateResult::ConfirmedFailure(error)
+                        | RuntimeCreateResult::OutcomeUnknown(error) => Err(error),
+                    },
                 )
                 .map(ApiResponse::SessionCreate),
             coordination_request @ (ApiRequest::GetOperation(_)
@@ -1853,6 +1980,671 @@ where
             | ApiRequest::ResumeEvents { .. }) => {
                 self.coordination.execute(principal, coordination_request)
             }
+            runtime_request => self.runtime.execute_runtime(principal, runtime_request),
+        }
+    }
+}
+
+pub struct DurableApiRouter<B> {
+    coordination: CoordinationBlockingClient,
+    runtime: Arc<B>,
+    auxiliary: InMemoryApiService,
+    dispatch_lease_duration: StdDuration,
+    runtime_create_timeout: StdDuration,
+    dispatch_slots: Arc<AtomicUsize>,
+}
+
+struct DispatchSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for DispatchSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl<B> DurableApiRouter<B>
+where
+    B: RuntimeApiBackend + 'static,
+{
+    #[must_use]
+    pub fn new(runtime: Arc<B>, coordination: CoordinationBlockingClient) -> Self {
+        Self {
+            coordination,
+            runtime,
+            auxiliary: InMemoryApiService::default(),
+            dispatch_lease_duration: StdDuration::from_secs(30),
+            runtime_create_timeout: StdDuration::from_secs(25),
+            dispatch_slots: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn with_dispatch_lease_duration(
+        runtime: Arc<B>,
+        coordination: CoordinationBlockingClient,
+        duration: StdDuration,
+    ) -> Result<Self, ApiError> {
+        if duration < StdDuration::from_millis(1) || duration > StdDuration::from_secs(5 * 60) {
+            return Err(ApiError::invalid_request(
+                "dispatch lease duration must be 1ms..=5m",
+            ));
+        }
+        let runtime_create_timeout = duration
+            .checked_sub(StdDuration::from_millis(1))
+            .ok_or_else(|| {
+                ApiError::invalid_request("dispatch lease must exceed runtime deadline")
+            })?;
+        Ok(Self {
+            coordination,
+            runtime,
+            auxiliary: InMemoryApiService::default(),
+            dispatch_lease_duration: duration,
+            runtime_create_timeout,
+            dispatch_slots: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub fn create_session_for_principal(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        body: SessionCreateRequest,
+        idempotency_key: &str,
+        _received_at: Instant,
+    ) -> Result<ApiEnvelope<SessionCreateResponse>, ApiError> {
+        body.validate()?;
+        let parsed_key = validate_idempotency_key(idempotency_key)?;
+        let request_json = serde_json::to_value(&body)
+            .map_err(|_| ApiError::new(ErrorCode::Internal, "request canonicalization failed"))?;
+        let request_hash = CanonicalRequestHash::from_json(&request_json);
+        let now = Utc::now();
+        let deadline = now
+            .checked_add_signed(ChronoDuration::seconds(30))
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "admission deadline overflow"))?;
+        let operation_id = OperationId::new();
+        let intent = RecoverableCreateIntent::new(
+            &operation_id,
+            request_json,
+            now,
+            deadline,
+            serde_json::json!({}),
+        )
+        .map_err(Self::map_coordination_error)?;
+        let claim = ClaimCreateOperation::new(
+            principal.tenant_id().clone(),
+            principal.principal_id().clone(),
+            operation_id.clone(),
+            parsed_key.to_string(),
+            DurableRequestHash::new(*request_hash.as_bytes()),
+            intent,
+        )
+        .map_err(Self::map_coordination_error)?;
+        let claimed = match self.coordination.claim_create(claim, now) {
+            Ok(outcome) => outcome,
+            Err(CoordinationError::ActorMutationTimeout | CoordinationError::ActorTimeout) => {
+                let snapshot = self
+                    .coordination
+                    .get(principal.tenant_id(), &operation_id)
+                    .map_err(Self::map_coordination_error)?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ErrorCode::WorkerUnavailable,
+                            "create admission outcome unknown",
+                        )
+                    })?;
+                ClaimOutcome::Existing(snapshot)
+            }
+            Err(error) => return Err(Self::map_coordination_error(error)),
+        };
+        let mut snapshot = match claimed {
+            ClaimOutcome::Created(snapshot) | ClaimOutcome::Existing(snapshot) => snapshot,
+        };
+        snapshot = self.drive_pending(snapshot)?;
+        let operation = self.operation_envelope(snapshot)?;
+        Ok(ApiEnvelope::new(SessionCreateResponse { operation }))
+    }
+
+    fn drive_pending(
+        &self,
+        mut snapshot: DurableOperationSnapshot,
+    ) -> Result<DurableOperationSnapshot, ApiError> {
+        loop {
+            let transition_now = Utc::now();
+            if transition_now >= snapshot.intent().admission_deadline()
+                && matches!(
+                    snapshot.state(),
+                    CreateOperationState::Accepted
+                        | CreateOperationState::Queued
+                        | CreateOperationState::Reserving
+                )
+            {
+                let error = CreateOperationError::new(
+                    "admission_timeout",
+                    "create admission deadline elapsed",
+                    false,
+                    serde_json::json!({}),
+                );
+                match self.coordination.compare_and_set(
+                    snapshot.tenant_id(),
+                    snapshot.operation_id(),
+                    snapshot.revision(),
+                    snapshot.state(),
+                    OperationMutation::timeout(error),
+                    transition_now,
+                ) {
+                    Ok(updated) => return Ok(updated),
+                    Err(CoordinationError::StaleWrite(current)) => {
+                        snapshot = *current;
+                        continue;
+                    }
+                    Err(error) => return Err(Self::map_coordination_error(error)),
+                }
+            }
+            let mutation = match snapshot.state() {
+                CreateOperationState::Accepted => {
+                    OperationMutation::transition(CreateOperationState::Queued)
+                }
+                CreateOperationState::Queued => {
+                    OperationMutation::transition(CreateOperationState::Reserving)
+                }
+                CreateOperationState::Reserving | CreateOperationState::Creating => {
+                    let token = DispatchLeaseToken::new();
+                    match self.coordination.acquire_dispatch_lease(
+                        snapshot.tenant_id(),
+                        snapshot.operation_id(),
+                        snapshot.revision(),
+                        token.clone(),
+                        self.dispatch_lease_duration,
+                        transition_now,
+                    ) {
+                        Ok(leased) => return self.dispatch_owned(leased, token),
+                        Err(CoordinationError::DispatchLeaseActive(current)) => {
+                            return Ok(*current);
+                        }
+                        Err(CoordinationError::StaleWrite(current)) => {
+                            snapshot = *current;
+                            continue;
+                        }
+                        Err(CoordinationError::ActorMutationTimeout) => {
+                            snapshot = self
+                                .coordination
+                                .get(snapshot.tenant_id(), snapshot.operation_id())
+                                .map_err(Self::map_coordination_error)?
+                                .ok_or_else(|| {
+                                    ApiError::new(
+                                        ErrorCode::WorkerUnavailable,
+                                        "lease acquisition outcome unknown",
+                                    )
+                                })?;
+                            if snapshot
+                                .dispatch_lease()
+                                .is_some_and(|lease| lease.token() == &token)
+                            {
+                                return self.dispatch_owned(snapshot, token);
+                            }
+                            return Ok(snapshot);
+                        }
+                        Err(error) => return Err(Self::map_coordination_error(error)),
+                    }
+                }
+                CreateOperationState::Succeeded
+                | CreateOperationState::TimedOut
+                | CreateOperationState::Cancelled
+                | CreateOperationState::Failed => break,
+            };
+            match self.coordination.compare_and_set(
+                snapshot.tenant_id(),
+                snapshot.operation_id(),
+                snapshot.revision(),
+                snapshot.state(),
+                mutation,
+                transition_now,
+            ) {
+                Ok(updated) => {
+                    snapshot = updated;
+                }
+                Err(CoordinationError::StaleWrite(current)) => snapshot = *current,
+                Err(error) => return Err(Self::map_coordination_error(error)),
+            }
+        }
+        Ok(snapshot)
+    }
+
+    fn dispatch_owned(
+        &self,
+        snapshot: DurableOperationSnapshot,
+        dispatch_token: DispatchLeaseToken,
+    ) -> Result<DurableOperationSnapshot, ApiError> {
+        let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        dispatch_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < 64).then_some(current + 1)
+            })
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorCode::WorkerUnavailable,
+                    "runtime create capacity exhausted",
+                )
+            })?;
+        let _slot = DispatchSlotGuard(dispatch_slots);
+        if Utc::now() >= snapshot.intent().admission_deadline() {
+            return self
+                .coordination
+                .compare_and_set(
+                    snapshot.tenant_id(),
+                    snapshot.operation_id(),
+                    snapshot.revision(),
+                    CreateOperationState::Creating,
+                    OperationMutation::timeout_with_lease(
+                        dispatch_token,
+                        CreateOperationError::new(
+                            "admission_timeout",
+                            "create admission deadline elapsed",
+                            false,
+                            serde_json::json!({}),
+                        ),
+                    ),
+                    Utc::now(),
+                )
+                .map_err(Self::map_coordination_error);
+        }
+        let body: SessionCreateRequest = serde_json::from_value(
+            snapshot.intent().canonical_request().clone(),
+        )
+        .map_err(|_| ApiError::new(ErrorCode::Internal, "stored create intent is invalid"))?;
+        let authority = CreateAuthority {
+            tenant_id: snapshot.tenant_id().clone(),
+            principal_id: snapshot.principal_id().clone(),
+        };
+        let dispatch = SessionCreateDispatch {
+            operation_id: snapshot.operation_id().clone(),
+            downstream_dedupe_key: snapshot.intent().downstream_dedupe_key(),
+            canonical_request_hash: snapshot.request_hash().as_bytes(),
+            accepted_at: snapshot.intent().accepted_at(),
+            admission_deadline: snapshot.intent().admission_deadline(),
+            dispatch_generation: snapshot.dispatch_generation(),
+            runtime_timeout: self.runtime_create_timeout,
+        };
+        let coordination = self.coordination.clone();
+        let tenant_id = snapshot.tenant_id().clone();
+        let operation_id = snapshot.operation_id().clone();
+        let renewal_token = dispatch_token.clone();
+        let lease_ttl = self.dispatch_lease_duration;
+        let renewal_interval = std::cmp::max(StdDuration::from_millis(1), lease_ttl / 3);
+        let initial_revision = snapshot.revision();
+        let (stop_sender, stop_receiver) = std::sync::mpsc::sync_channel(1);
+        let renewer = std::thread::Builder::new()
+            .name("browserd-dispatch-lease".to_owned())
+            .spawn(move || {
+                let mut revision = initial_revision;
+                while matches!(
+                    stop_receiver.recv_timeout(renewal_interval),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    match coordination.renew_dispatch_lease(
+                        &tenant_id,
+                        &operation_id,
+                        revision,
+                        renewal_token.clone(),
+                        lease_ttl,
+                        Utc::now(),
+                    ) {
+                        Ok(updated) => revision = updated.revision(),
+                        Err(CoordinationError::ActorMutationTimeout) => {
+                            match coordination.get(&tenant_id, &operation_id) {
+                                Ok(Some(current))
+                                    if current
+                                        .dispatch_lease()
+                                        .is_some_and(|lease| lease.token() == &renewal_token) =>
+                                {
+                                    revision = current.revision()
+                                }
+                                _ => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorCode::WorkerUnavailable,
+                    "dispatch lease renewer unavailable",
+                )
+            })?;
+        let runtime_result = self.runtime.create_session(&authority, &dispatch, &body);
+        let _ = stop_sender.send(());
+        let _ = renewer.join();
+        let snapshot = self
+            .coordination
+            .get(snapshot.tenant_id(), snapshot.operation_id())
+            .map_err(Self::map_coordination_error)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::WorkerUnavailable,
+                    "operation disappeared during dispatch",
+                )
+            })?;
+        if snapshot
+            .dispatch_lease()
+            .is_none_or(|lease| lease.token() != &dispatch_token)
+        {
+            return Err(ApiError::new(
+                ErrorCode::WorkerUnavailable,
+                "dispatch ownership changed before completion",
+            ));
+        }
+        match runtime_result {
+            RuntimeCreateResult::Succeeded(session) => {
+                let lifecycle = match session.lifecycle {
+                    SessionLifecycle::Creating => "creating",
+                    SessionLifecycle::Ready => "ready",
+                    SessionLifecycle::Closing => "closing",
+                    SessionLifecycle::Closed => "closed",
+                    SessionLifecycle::Failed => "failed",
+                };
+                let requested_isolation = match session.requested_isolation {
+                    IsolationProfile::SharedContext => "shared_context",
+                    IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
+                    IsolationProfile::DedicatedProcess => "dedicated_process",
+                    IsolationProfile::DedicatedWorker => "dedicated_worker",
+                };
+                let effective_isolation = match session.effective_isolation {
+                    IsolationProfile::SharedContext => "shared_context",
+                    IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
+                    IsolationProfile::DedicatedProcess => "dedicated_process",
+                    IsolationProfile::DedicatedWorker => "dedicated_worker",
+                };
+                let value = serde_json::json!({
+                    "id": session.id,
+                    "lifecycle": lifecycle,
+                    "incarnation": session.incarnation,
+                    "requested_isolation": requested_isolation,
+                    "effective_isolation": effective_isolation,
+                    "metadata": session.metadata,
+                });
+                self.coordination
+                    .compare_and_set(
+                        snapshot.tenant_id(),
+                        snapshot.operation_id(),
+                        snapshot.revision(),
+                        CreateOperationState::Creating,
+                        OperationMutation::succeed_with_lease(
+                            dispatch_token,
+                            CreateOperationResult::new(session.id, value),
+                        ),
+                        Utc::now(),
+                    )
+                    .or_else(|error| {
+                        self.reconcile_completion(
+                            snapshot.tenant_id(),
+                            snapshot.operation_id(),
+                            error,
+                        )
+                    })
+                    .map_err(Self::map_coordination_error)
+            }
+            RuntimeCreateResult::OutcomeUnknown(error) => Err(error),
+            RuntimeCreateResult::ConfirmedFailure(error) => self
+                .coordination
+                .compare_and_set(
+                    snapshot.tenant_id(),
+                    snapshot.operation_id(),
+                    snapshot.revision(),
+                    CreateOperationState::Creating,
+                    OperationMutation::fail_with_lease(
+                        dispatch_token,
+                        CreateOperationError::new(
+                            error.code().to_string(),
+                            error.message(),
+                            error.retryable(),
+                            serde_json::to_value(error.details())
+                                .unwrap_or_else(|_| serde_json::json!({})),
+                        ),
+                    ),
+                    Utc::now(),
+                )
+                .or_else(|store_error| {
+                    self.reconcile_completion(
+                        snapshot.tenant_id(),
+                        snapshot.operation_id(),
+                        store_error,
+                    )
+                })
+                .map_err(Self::map_coordination_error),
+        }
+    }
+
+    fn reconcile_completion(
+        &self,
+        tenant: &TenantId,
+        operation: &OperationId,
+        error: CoordinationError,
+    ) -> Result<DurableOperationSnapshot, CoordinationError> {
+        if matches!(
+            error,
+            CoordinationError::ActorMutationTimeout | CoordinationError::StaleWrite(_)
+        ) {
+            self.coordination
+                .get(tenant, operation)?
+                .ok_or(CoordinationError::NotFound)
+        } else {
+            Err(error)
+        }
+    }
+
+    pub fn get_operation_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        operation_id: &OperationId,
+    ) -> Result<ApiEnvelope<OperationEnvelope>, ApiError> {
+        let snapshot = self
+            .coordination
+            .get(tenant_id, operation_id)
+            .map_err(Self::map_coordination_error)?
+            .ok_or_else(|| ApiError::new(ErrorCode::OperationNotFound, "operation not found"))?;
+        self.drive_pending(snapshot)
+            .and_then(|snapshot| self.operation_envelope(snapshot))
+            .map(ApiEnvelope::new)
+    }
+
+    pub fn reconcile_pending(&self, limit: usize) -> Result<Vec<OperationEnvelope>, ApiError> {
+        self.coordination
+            .scan_reconcilable(limit, Utc::now())
+            .map_err(Self::map_coordination_error)?
+            .into_iter()
+            .map(|snapshot| {
+                self.drive_pending(snapshot)
+                    .and_then(|snapshot| self.operation_envelope(snapshot))
+            })
+            .collect()
+    }
+
+    pub fn cancel_operation_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        operation_id: &OperationId,
+    ) -> Result<ApiEnvelope<OperationEnvelope>, ApiError> {
+        let mut snapshot = self
+            .coordination
+            .get(tenant_id, operation_id)
+            .map_err(Self::map_coordination_error)?
+            .ok_or_else(|| ApiError::new(ErrorCode::OperationNotFound, "operation not found"))?;
+        while let CreateOperationState::Accepted
+        | CreateOperationState::Queued
+        | CreateOperationState::Reserving = snapshot.state()
+        {
+            match self.coordination.compare_and_set(
+                tenant_id,
+                operation_id,
+                snapshot.revision(),
+                snapshot.state(),
+                OperationMutation::transition(CreateOperationState::Cancelled),
+                Utc::now(),
+            ) {
+                Ok(updated) => {
+                    snapshot = updated;
+                    break;
+                }
+                Err(CoordinationError::StaleWrite(current)) => snapshot = *current,
+                Err(error) => return Err(Self::map_coordination_error(error)),
+            }
+        }
+        self.operation_envelope(snapshot).map(ApiEnvelope::new)
+    }
+
+    fn operation_envelope(
+        &self,
+        snapshot: DurableOperationSnapshot,
+    ) -> Result<OperationEnvelope, ApiError> {
+        let session = if snapshot.state() == CreateOperationState::Succeeded {
+            let result = snapshot.result().ok_or_else(|| {
+                ApiError::new(ErrorCode::Internal, "completed operation has no result")
+            })?;
+            let value = result.value();
+            let object = value
+                .as_object()
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal, "operation result is invalid"))?;
+            let stored_id = object
+                .get("id")
+                .cloned()
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal, "session ID is missing"))
+                .and_then(|value| {
+                    serde_json::from_value::<SessionId>(value).map_err(|_| {
+                        ApiError::new(ErrorCode::Internal, "stored session ID is invalid")
+                    })
+                })?;
+            if &stored_id != result.session_id() {
+                return Err(ApiError::new(
+                    ErrorCode::Internal,
+                    "stored session ID does not match operation result",
+                ));
+            }
+            let lifecycle = match object.get("lifecycle").and_then(serde_json::Value::as_str) {
+                Some("creating") => SessionLifecycle::Creating,
+                Some("ready") => SessionLifecycle::Ready,
+                Some("closing") => SessionLifecycle::Closing,
+                Some("closed") => SessionLifecycle::Closed,
+                Some("failed") => SessionLifecycle::Failed,
+                _ => {
+                    return Err(ApiError::new(
+                        ErrorCode::Internal,
+                        "stored session lifecycle is invalid",
+                    ));
+                }
+            };
+            let requested_isolation = match object
+                .get("requested_isolation")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("shared_context") => IsolationProfile::SharedContext,
+                Some("tenant_dedicated_shard") => IsolationProfile::TenantDedicatedShard,
+                Some("dedicated_process") => IsolationProfile::DedicatedProcess,
+                Some("dedicated_worker") => IsolationProfile::DedicatedWorker,
+                _ => {
+                    return Err(ApiError::new(
+                        ErrorCode::Internal,
+                        "stored requested isolation is invalid",
+                    ));
+                }
+            };
+            let effective_isolation = match object
+                .get("effective_isolation")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("shared_context") => IsolationProfile::SharedContext,
+                Some("tenant_dedicated_shard") => IsolationProfile::TenantDedicatedShard,
+                Some("dedicated_process") => IsolationProfile::DedicatedProcess,
+                Some("dedicated_worker") => IsolationProfile::DedicatedWorker,
+                _ => {
+                    return Err(ApiError::new(
+                        ErrorCode::Internal,
+                        "stored effective isolation is invalid",
+                    ));
+                }
+            };
+            let incarnation = object
+                .get("incarnation")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|incarnation| *incarnation > 0)
+                .ok_or_else(|| {
+                    ApiError::new(ErrorCode::Internal, "stored incarnation is invalid")
+                })?;
+            let metadata = object
+                .get("metadata")
+                .cloned()
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal, "metadata is missing"))
+                .and_then(|value| {
+                    serde_json::from_value::<BTreeMap<String, String>>(value).map_err(|_| {
+                        ApiError::new(ErrorCode::Internal, "stored metadata is invalid")
+                    })
+                })?;
+            Some(SessionResource {
+                id: stored_id,
+                lifecycle,
+                incarnation,
+                requested_isolation,
+                effective_isolation,
+                metadata,
+            })
+        } else {
+            None
+        };
+        let failure = snapshot.error().map(|error| OperationFailure {
+            code: error.code().to_owned(),
+            message: error.message().to_owned(),
+            retryable: error.retryable(),
+            details: serde_json::from_value(error.details().clone()).unwrap_or_default(),
+        });
+        Ok(OperationEnvelope {
+            id: snapshot.operation_id().clone(),
+            state: snapshot.state(),
+            poll_url: format!("/v1/operations/{}", snapshot.operation_id()),
+            session,
+            failure,
+        })
+    }
+
+    fn map_coordination_error(error: CoordinationError) -> ApiError {
+        match error {
+            CoordinationError::IdempotencyConflict { .. } => {
+                ApiError::new(ErrorCode::IdempotencyConflict, "idempotency body conflict")
+            }
+            CoordinationError::NotFound => {
+                ApiError::new(ErrorCode::OperationNotFound, "operation not found")
+            }
+            _ => ApiError::new(
+                ErrorCode::WorkerUnavailable,
+                "durable coordination unavailable",
+            ),
+        }
+    }
+}
+
+impl<B> ApiService for DurableApiRouter<B>
+where
+    B: RuntimeApiBackend + 'static,
+{
+    fn execute(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+    ) -> Result<ApiResponse, ApiError> {
+        request.authorize(principal)?;
+        request.validate()?;
+        match request {
+            ApiRequest::CreateSession {
+                body,
+                idempotency_key,
+                received_at,
+            } => self
+                .create_session_for_principal(principal, body, &idempotency_key, received_at)
+                .map(ApiResponse::SessionCreate),
+            ApiRequest::GetOperation(operation_id) => self
+                .get_operation_for_tenant(principal.tenant_id(), &operation_id)
+                .map(ApiResponse::Operation),
+            ApiRequest::CancelOperation(operation_id) => self
+                .cancel_operation_for_tenant(principal.tenant_id(), &operation_id)
+                .map(ApiResponse::Operation),
+            resume @ ApiRequest::ResumeEvents { .. } => self.auxiliary.execute(principal, resume),
             runtime_request => self.runtime.execute_runtime(principal, runtime_request),
         }
     }
@@ -2208,10 +3000,13 @@ impl InMemoryApiService {
         Ok((
             operation,
             SessionCreateDispatch {
+                downstream_dedupe_key: DownstreamDedupeKey::for_operation(&operation_id),
                 operation_id,
-                idempotency_key: parsed_key.to_string(),
                 canonical_request_hash: *request_hash.as_bytes(),
-                received_at: now,
+                accepted_at: Utc::now(),
+                admission_deadline: Utc::now() + ChronoDuration::seconds(30),
+                dispatch_generation: 1,
+                runtime_timeout: StdDuration::from_secs(25),
             },
             created,
         ))
@@ -2249,6 +3044,7 @@ impl InMemoryApiService {
             state,
             poll_url: format!("/v1/operations/{operation_id}"),
             session,
+            failure: None,
         })
     }
 

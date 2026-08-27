@@ -13,11 +13,11 @@ use browserd_actions::{
 };
 use browserd_api::{
     ActionSubmissionAdapter, ActionSubmitCommand, ApiEnvelope, ApiError, ApiErrorCode, ApiRequest,
-    ApiResponse, ApiRouter, ApiService, ApiVersion, EventKind, EventResource, EventStore, GrpcCode,
-    InMemoryApiService, PUBLIC_ROUTES, ResponseRepresentation, RuntimeApiBackend,
-    SessionCreateDispatch, SessionCreateRequest, SessionResource, decode_action_resolve,
-    decode_action_submit, decode_session_create, decode_viewer_ticket, validate_idempotency_key,
-    validate_last_event_id,
+    ApiResponse, ApiRouter, ApiService, ApiVersion, CreateAuthority, EventKind, EventResource,
+    EventStore, GrpcCode, InMemoryApiService, PUBLIC_ROUTES, ResponseRepresentation,
+    RuntimeApiBackend, RuntimeCreateResult, SessionCreateDispatch, SessionCreateRequest,
+    SessionResource, decode_action_resolve, decode_action_submit, decode_session_create,
+    decode_viewer_ticket, validate_idempotency_key, validate_last_event_id,
 };
 use browserd_auth::{
     AuthConfig, RevocationRegistry, ServiceClaims, ServiceTokenSigner, ServiceTokenVerifier,
@@ -132,14 +132,14 @@ struct RecordingRuntime {
 impl RuntimeApiBackend for RecordingRuntime {
     fn create_session(
         &self,
-        _principal: &browserd_auth::AuthenticatedPrincipal,
+        _principal: &CreateAuthority,
         dispatch: &SessionCreateDispatch,
         request: &SessionCreateRequest,
-    ) -> Result<SessionResource, ApiError> {
+    ) -> RuntimeCreateResult {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
-        assert!(!dispatch.idempotency_key().is_empty());
+        assert_ne!(dispatch.downstream_dedupe_key().as_bytes(), [0; 32]);
         assert_ne!(dispatch.canonical_request_hash(), &[0; 32]);
-        Ok(SessionResource {
+        RuntimeCreateResult::Succeeded(SessionResource {
             id: SessionId::new(),
             lifecycle: SessionLifecycle::Ready,
             incarnation: 1,
