@@ -155,6 +155,36 @@ pub struct SessionCreateRequest {
     pub metadata: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SessionCreateDispatch {
+    operation_id: OperationId,
+    idempotency_key: String,
+    canonical_request_hash: [u8; 32],
+    received_at: Instant,
+}
+
+impl SessionCreateDispatch {
+    #[must_use]
+    pub const fn operation_id(&self) -> &OperationId {
+        &self.operation_id
+    }
+
+    #[must_use]
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+
+    #[must_use]
+    pub const fn canonical_request_hash(&self) -> &[u8; 32] {
+        &self.canonical_request_hash
+    }
+
+    #[must_use]
+    pub const fn received_at(&self) -> Instant {
+        self.received_at
+    }
+}
+
 impl SessionCreateRequest {
     pub fn validate(&self) -> Result<(), ApiError> {
         let metadata_bytes = self
@@ -1753,6 +1783,13 @@ pub trait ApiService: Send + Sync {
 /// Runtime-dependent endpoint adapter. A gateway binary can connect its
 /// session/action/viewer/artifact implementation without coupling it to HTTP.
 pub trait RuntimeApiBackend: Send + Sync {
+    fn create_session(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        dispatch: &SessionCreateDispatch,
+        request: &SessionCreateRequest,
+    ) -> Result<SessionResource, ApiError>;
+
     fn execute_runtime(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -1797,8 +1834,21 @@ where
         request.authorize(principal)?;
         request.validate()?;
         match request {
-            coordination_request @ (ApiRequest::CreateSession { .. }
-            | ApiRequest::GetOperation(_)
+            ApiRequest::CreateSession {
+                body,
+                idempotency_key,
+                received_at,
+            } => self
+                .coordination
+                .create_session_for_tenant_with_runtime(
+                    principal.tenant_id().clone(),
+                    body,
+                    &idempotency_key,
+                    received_at,
+                    |dispatch, request| self.runtime.create_session(principal, dispatch, request),
+                )
+                .map(ApiResponse::SessionCreate),
+            coordination_request @ (ApiRequest::GetOperation(_)
             | ApiRequest::CancelOperation(_)
             | ApiRequest::ResumeEvents { .. }) => {
                 self.coordination.execute(principal, coordination_request)
@@ -2010,6 +2060,7 @@ pub struct InMemoryApiService {
     create_coordination: Mutex<()>,
     idempotency: IdempotencyRegistry,
     operations: Mutex<HashMap<OperationId, Arc<CreateSessionOperation>>>,
+    operation_sessions: Mutex<HashMap<OperationId, SessionResource>>,
     events: EventStore,
 }
 
@@ -2019,6 +2070,7 @@ impl Default for InMemoryApiService {
             create_coordination: Mutex::new(()),
             idempotency: IdempotencyRegistry::default(),
             operations: Mutex::new(HashMap::new()),
+            operation_sessions: Mutex::new(HashMap::new()),
             events: EventStore::default(),
         }
     }
@@ -2033,8 +2085,71 @@ impl InMemoryApiService {
         now: Instant,
     ) -> Result<ApiEnvelope<SessionCreateResponse>, ApiError> {
         request.validate()?;
+        let (operation, dispatch, _) =
+            self.claim_session_creation(tenant_id, &request, idempotency_key, now)?;
+        let operation = self.operation_envelope(dispatch.operation_id(), &operation)?;
+        Ok(ApiEnvelope::new(SessionCreateResponse { operation }))
+    }
+
+    pub fn create_session_for_tenant_with_runtime<F>(
+        &self,
+        tenant_id: TenantId,
+        request: SessionCreateRequest,
+        idempotency_key: &str,
+        now: Instant,
+        create: F,
+    ) -> Result<ApiEnvelope<SessionCreateResponse>, ApiError>
+    where
+        F: FnOnce(
+            &SessionCreateDispatch,
+            &SessionCreateRequest,
+        ) -> Result<SessionResource, ApiError>,
+    {
+        request.validate()?;
+        let (operation, dispatch, created) =
+            self.claim_session_creation(tenant_id, &request, idempotency_key, now)?;
+        if created {
+            operation
+                .begin_reservation()
+                .map_err(|_| ApiError::new(ErrorCode::Internal, "operation reservation failed"))?;
+            operation
+                .commit_creation()
+                .map_err(|_| ApiError::new(ErrorCode::Internal, "operation commit failed"))?;
+            match create(&dispatch, &request) {
+                Ok(session) => {
+                    self.operation_sessions
+                        .lock()
+                        .map_err(|_| {
+                            ApiError::new(
+                                ErrorCode::WorkerUnavailable,
+                                "operation result store unavailable",
+                            )
+                        })?
+                        .insert(dispatch.operation_id().clone(), session);
+                    operation.succeed().map_err(|_| {
+                        ApiError::new(ErrorCode::Internal, "operation completion failed")
+                    })?;
+                }
+                Err(_) => {
+                    operation.fail().map_err(|_| {
+                        ApiError::new(ErrorCode::Internal, "operation failure recording failed")
+                    })?;
+                }
+            }
+        }
+        let operation = self.operation_envelope(dispatch.operation_id(), &operation)?;
+        Ok(ApiEnvelope::new(SessionCreateResponse { operation }))
+    }
+
+    fn claim_session_creation(
+        &self,
+        tenant_id: TenantId,
+        request: &SessionCreateRequest,
+        idempotency_key: &str,
+        now: Instant,
+    ) -> Result<(Arc<CreateSessionOperation>, SessionCreateDispatch, bool), ApiError> {
         let parsed_key = validate_idempotency_key(idempotency_key)?;
-        let request_json = serde_json::to_value(&request)
+        let request_json = serde_json::to_value(request)
             .map_err(|_| ApiError::new(ErrorCode::Internal, "request canonicalization failed"))?;
         let request_hash = CanonicalRequestHash::from_json(&request_json);
         let _coordination = self
@@ -2059,6 +2174,7 @@ impl InMemoryApiService {
                 }
             })?;
         let operation_id = claim.operation_id().clone();
+        let created = matches!(&claim, IdempotencyClaim::Created(_));
         let operation = match claim {
             IdempotencyClaim::Created(_) => {
                 let operation = Arc::new(CreateSessionOperation::new(
@@ -2089,17 +2205,51 @@ impl InMemoryApiService {
                     ApiError::new(ErrorCode::Internal, "idempotency mapping has no operation")
                 })?,
         };
+        Ok((
+            operation,
+            SessionCreateDispatch {
+                operation_id,
+                idempotency_key: parsed_key.to_string(),
+                canonical_request_hash: *request_hash.as_bytes(),
+                received_at: now,
+            },
+            created,
+        ))
+    }
+
+    fn operation_envelope(
+        &self,
+        operation_id: &OperationId,
+        operation: &CreateSessionOperation,
+    ) -> Result<OperationEnvelope, ApiError> {
         let state = operation.state().map_err(|_| {
             ApiError::new(ErrorCode::WorkerUnavailable, "operation state unavailable")
         })?;
-        Ok(ApiEnvelope::new(SessionCreateResponse {
-            operation: OperationEnvelope {
-                id: operation_id.clone(),
-                state,
-                poll_url: format!("/v1/operations/{operation_id}"),
-                session: None,
-            },
-        }))
+        let session = if state == CreateOperationState::Succeeded {
+            Some(
+                self.operation_sessions
+                    .lock()
+                    .map_err(|_| {
+                        ApiError::new(
+                            ErrorCode::WorkerUnavailable,
+                            "operation result store unavailable",
+                        )
+                    })?
+                    .get(operation_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ApiError::new(ErrorCode::Internal, "completed operation has no session")
+                    })?,
+            )
+        } else {
+            None
+        };
+        Ok(OperationEnvelope {
+            id: operation_id.clone(),
+            state,
+            poll_url: format!("/v1/operations/{operation_id}"),
+            session,
+        })
     }
 
     pub fn operation_count(&self) -> Result<usize, ApiError> {
@@ -2117,22 +2267,18 @@ impl InMemoryApiService {
         tenant_id: &TenantId,
         operation_id: &OperationId,
     ) -> Result<ApiEnvelope<OperationEnvelope>, ApiError> {
-        let operations = self.operations.lock().map_err(|_| {
-            ApiError::new(ErrorCode::WorkerUnavailable, "operation store unavailable")
-        })?;
-        let operation = operations
+        let operation = self
+            .operations
+            .lock()
+            .map_err(|_| {
+                ApiError::new(ErrorCode::WorkerUnavailable, "operation store unavailable")
+            })?
             .get(operation_id)
             .filter(|operation| operation.tenant_id() == tenant_id)
+            .cloned()
             .ok_or_else(|| ApiError::new(ErrorCode::OperationNotFound, "operation not found"))?;
-        let state = operation.state().map_err(|_| {
-            ApiError::new(ErrorCode::WorkerUnavailable, "operation state unavailable")
-        })?;
-        Ok(ApiEnvelope::new(OperationEnvelope {
-            id: operation_id.clone(),
-            state,
-            poll_url: format!("/v1/operations/{operation_id}"),
-            session: None,
-        }))
+        self.operation_envelope(operation_id, &operation)
+            .map(ApiEnvelope::new)
     }
 
     pub fn cancel_operation_for_tenant(
@@ -2140,25 +2286,21 @@ impl InMemoryApiService {
         tenant_id: &TenantId,
         operation_id: &OperationId,
     ) -> Result<ApiEnvelope<OperationEnvelope>, ApiError> {
-        let operations = self.operations.lock().map_err(|_| {
-            ApiError::new(ErrorCode::WorkerUnavailable, "operation store unavailable")
-        })?;
-        let operation = operations
+        let operation = self
+            .operations
+            .lock()
+            .map_err(|_| {
+                ApiError::new(ErrorCode::WorkerUnavailable, "operation store unavailable")
+            })?
             .get(operation_id)
             .filter(|operation| operation.tenant_id() == tenant_id)
+            .cloned()
             .ok_or_else(|| ApiError::new(ErrorCode::OperationNotFound, "operation not found"))?;
         operation.request_cancel().map_err(|_| {
             ApiError::new(ErrorCode::WorkerUnavailable, "operation state unavailable")
         })?;
-        let state = operation.state().map_err(|_| {
-            ApiError::new(ErrorCode::WorkerUnavailable, "operation state unavailable")
-        })?;
-        Ok(ApiEnvelope::new(OperationEnvelope {
-            id: operation_id.clone(),
-            state,
-            poll_url: format!("/v1/operations/{operation_id}"),
-            session: None,
-        }))
+        self.operation_envelope(operation_id, &operation)
+            .map(ApiEnvelope::new)
     }
 
     pub fn publish_event(

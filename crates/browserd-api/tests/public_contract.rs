@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Instant;
@@ -14,8 +15,9 @@ use browserd_api::{
     ActionSubmissionAdapter, ActionSubmitCommand, ApiEnvelope, ApiError, ApiErrorCode, ApiRequest,
     ApiResponse, ApiRouter, ApiService, ApiVersion, EventKind, EventResource, EventStore, GrpcCode,
     InMemoryApiService, PUBLIC_ROUTES, ResponseRepresentation, RuntimeApiBackend,
-    SessionCreateRequest, SessionResource, decode_action_resolve, decode_action_submit,
-    decode_session_create, decode_viewer_ticket, validate_idempotency_key, validate_last_event_id,
+    SessionCreateDispatch, SessionCreateRequest, SessionResource, decode_action_resolve,
+    decode_action_submit, decode_session_create, decode_viewer_ticket, validate_idempotency_key,
+    validate_last_event_id,
 };
 use browserd_auth::{
     AuthConfig, RevocationRegistry, ServiceClaims, ServiceTokenSigner, ServiceTokenVerifier,
@@ -124,9 +126,29 @@ fn public_route_manifest_contains_the_required_contract() {
 #[derive(Default)]
 struct RecordingRuntime {
     calls: AtomicUsize,
+    create_calls: AtomicUsize,
 }
 
 impl RuntimeApiBackend for RecordingRuntime {
+    fn create_session(
+        &self,
+        _principal: &browserd_auth::AuthenticatedPrincipal,
+        dispatch: &SessionCreateDispatch,
+        request: &SessionCreateRequest,
+    ) -> Result<SessionResource, ApiError> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
+        assert!(!dispatch.idempotency_key().is_empty());
+        assert_ne!(dispatch.canonical_request_hash(), &[0; 32]);
+        Ok(SessionResource {
+            id: SessionId::new(),
+            lifecycle: SessionLifecycle::Ready,
+            incarnation: 1,
+            requested_isolation: request.isolation.into(),
+            effective_isolation: request.isolation.into(),
+            metadata: request.metadata.clone(),
+        })
+    }
+
     fn execute_runtime(
         &self,
         _principal: &browserd_auth::AuthenticatedPrincipal,
@@ -205,6 +227,163 @@ fn router_delegates_runtime_endpoints_through_the_typed_backend() -> Result<(), 
         ApiResponse::Session(envelope) if envelope.data().id == session_id
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
+fn router_dispatches_a_new_create_once_and_exposes_the_terminal_session_on_retry()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::new();
+    let principal_id = PrincipalId::new();
+    let secret = b"browserd-api-create-router-secret";
+    let mut keys = VerificationKeySet::new();
+    keys.insert_hmac("test", Algorithm::HS256, secret)?;
+    let verifier = ServiceTokenVerifier::new(
+        AuthConfig::new("issuer", "audience", [Algorithm::HS256], 0, false),
+        keys,
+        RevocationRegistry::new(),
+    );
+    let signer = ServiceTokenSigner::new("test", Algorithm::HS256, secret);
+    let token = signer.sign(&ServiceClaims::new(
+        "issuer",
+        "audience",
+        principal_id,
+        tenant,
+        BTreeSet::from(["session:create".to_owned()]),
+        "router-create",
+        1,
+        100,
+        None,
+    ))?;
+    let principal = verifier.verify_at(&token, None, 10)?;
+    let backend = Arc::new(RecordingRuntime::default());
+    let router = ApiRouter::new(Arc::clone(&backend));
+    let body = decode_session_create(CREATE_JSON)?;
+    let idempotency_key = Uuid::new_v4().to_string();
+    let received_at = Instant::now();
+
+    let first = router.execute(
+        &principal,
+        ApiRequest::CreateSession {
+            body: body.clone(),
+            idempotency_key: idempotency_key.clone(),
+            received_at,
+        },
+    )?;
+    let ApiResponse::SessionCreate(first) = first else {
+        return Err("unexpected create response".into());
+    };
+    assert_eq!(
+        first.data().operation().state(),
+        browserd_core::CreateOperationState::Succeeded
+    );
+    let created_session = first
+        .data()
+        .operation()
+        .session()
+        .map(|session| session.id.clone());
+    assert!(created_session.is_some());
+
+    let retry = router.execute(
+        &principal,
+        ApiRequest::CreateSession {
+            body,
+            idempotency_key,
+            received_at,
+        },
+    )?;
+    let ApiResponse::SessionCreate(retry) = retry else {
+        return Err("unexpected retry response".into());
+    };
+    assert_eq!(
+        retry
+            .data()
+            .operation()
+            .session()
+            .map(|session| session.id.clone()),
+        created_session
+    );
+    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
+fn an_inflight_create_does_not_block_or_redispatch_an_identical_retry() -> Result<(), Box<dyn Error>>
+{
+    let service = Arc::new(InMemoryApiService::default());
+    let tenant = TenantId::new();
+    let body = decode_session_create(CREATE_JSON)?;
+    let idempotency_key = Uuid::new_v4().to_string();
+    let received_at = Instant::now();
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first_service = Arc::clone(&service);
+    let first_tenant = tenant.clone();
+    let first_body = body.clone();
+    let first_key = idempotency_key.clone();
+    let first_calls = Arc::clone(&create_calls);
+    let first = thread::spawn(move || {
+        first_service.create_session_for_tenant_with_runtime(
+            first_tenant,
+            first_body,
+            &first_key,
+            received_at,
+            move |_dispatch, request| {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                entered_tx
+                    .send(())
+                    .map_err(|_| ApiError::new(ErrorCode::Internal, "test create signal failed"))?;
+                release_rx.recv().map_err(|_| {
+                    ApiError::new(ErrorCode::Internal, "test create release failed")
+                })?;
+                Ok(SessionResource {
+                    id: SessionId::new(),
+                    lifecycle: SessionLifecycle::Ready,
+                    incarnation: 1,
+                    requested_isolation: request.isolation.into(),
+                    effective_isolation: request.isolation.into(),
+                    metadata: request.metadata.clone(),
+                })
+            },
+        )
+    });
+    entered_rx.recv_timeout(std::time::Duration::from_secs(1))?;
+
+    let retry_service = Arc::clone(&service);
+    let retry_calls = Arc::clone(&create_calls);
+    let (retry_tx, retry_rx) = mpsc::channel();
+    let retry = thread::spawn(move || {
+        let result = retry_service.create_session_for_tenant_with_runtime(
+            tenant,
+            body,
+            &idempotency_key,
+            received_at,
+            move |_dispatch, _request| {
+                retry_calls.fetch_add(1, Ordering::SeqCst);
+                Err(ApiError::new(
+                    ErrorCode::Internal,
+                    "an existing operation must not be redispatched",
+                ))
+            },
+        );
+        let _ = retry_tx.send(result);
+    });
+    let retry_result = retry_rx.recv_timeout(std::time::Duration::from_secs(1))??;
+    assert_eq!(
+        retry_result.data().operation().state(),
+        browserd_core::CreateOperationState::Creating
+    );
+    assert!(retry_result.data().operation().session().is_none());
+
+    release_tx.send(())?;
+    let first_result = first.join().map_err(|_| "first create panicked")??;
+    retry.join().map_err(|_| "retry create panicked")?;
+    assert_eq!(
+        first_result.data().operation().state(),
+        browserd_core::CreateOperationState::Succeeded
+    );
+    assert_eq!(create_calls.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
