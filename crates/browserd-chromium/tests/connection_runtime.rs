@@ -159,6 +159,51 @@ async fn connects_real_chromium_pipes_and_verifies_the_pinned_version() {
 }
 
 #[tokio::test]
+async fn verified_connection_splits_into_one_command_channel_one_event_stream_and_driver_owner() {
+    let expected = identity();
+    let (pipes, mut command_reader, mut event_writer) = pipe_pair();
+    let connect_expected = expected.clone();
+    let connect = tokio::spawn(async move {
+        ChromiumConnection::connect(pipes, &connect_expected, config()).await
+    });
+    let version = read_command(&mut command_reader).await;
+    let id = version["id"].as_u64().expect("version command ID");
+    write_message(
+        &mut event_writer,
+        json!({"id": id, "result": {
+            "protocolVersion": "1.3", "product": "HeadlessChrome/149.0.7827.55",
+            "revision": "r1234567", "userAgent": "test", "jsVersion": "14.9"
+        }}),
+    )
+    .await;
+    let connection = connect.await.expect("connect joins").expect("connects");
+    let (client, mut events, owner) = connection.into_verified_parts();
+    let command = tokio::spawn(async move {
+        client
+            .command("Target.getTargets", json!({}), None, None)
+            .await
+    });
+    let get_targets = read_command(&mut command_reader).await;
+    let command_id = get_targets["id"].as_u64().expect("target command ID");
+    write_message(
+        &mut event_writer,
+        json!({"method":"Target.attachedToTarget","params":{}}),
+    )
+    .await;
+    write_message(
+        &mut event_writer,
+        json!({"id":command_id,"result":{"targetInfos":[]}}),
+    )
+    .await;
+    assert!(command.await.expect("command joins").is_ok());
+    assert!(matches!(
+        events.recv().await,
+        Some(browserd_cdp::CdpIncoming::Event { .. })
+    ));
+    owner.shutdown().await;
+}
+
+#[tokio::test]
 async fn rejects_product_version_or_revision_mismatch_and_closes_the_pipes() {
     for (product, revision, version_mismatch) in [
         ("HeadlessChrome/150.0.0.0", "r1234567", true),

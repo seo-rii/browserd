@@ -4,6 +4,7 @@ mod connection;
 
 pub use connection::{
     ChromiumConnection, ChromiumConnectionConfig, ChromiumConnectionError, ChromiumVersion,
+    VerifiedChromiumDriverOwner,
 };
 
 use std::collections::BTreeMap;

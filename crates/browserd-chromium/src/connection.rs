@@ -58,6 +58,24 @@ pub struct ChromiumConnection {
     version: ChromiumVersion,
 }
 
+/// Non-cloneable owner of the verified transport lifetime after splitting its capabilities.
+#[derive(Debug)]
+pub struct VerifiedChromiumDriverOwner {
+    driver: CdpDriver,
+    version: ChromiumVersion,
+}
+
+impl VerifiedChromiumDriverOwner {
+    #[must_use]
+    pub const fn version(&self) -> &ChromiumVersion {
+        &self.version
+    }
+
+    pub async fn shutdown(self) {
+        self.driver.shutdown().await;
+    }
+}
+
 impl ChromiumConnection {
     pub async fn connect(
         pipes: ChromiumCdpPipes,
@@ -195,6 +213,25 @@ impl ChromiumConnection {
 
     pub async fn shutdown(self) {
         self.driver.shutdown().await;
+    }
+
+    /// Consumes the verified connection into one command channel, one event stream, and their
+    /// non-cloneable driver owner. No API can split the underlying pipe endpoints a second time.
+    pub fn into_verified_parts(
+        self,
+    ) -> (
+        CdpClient,
+        mpsc::Receiver<CdpIncoming>,
+        VerifiedChromiumDriverOwner,
+    ) {
+        (
+            self.client,
+            self.events,
+            VerifiedChromiumDriverOwner {
+                driver: self.driver,
+                version: self.version,
+            },
+        )
     }
 }
 
