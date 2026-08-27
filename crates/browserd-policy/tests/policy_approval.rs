@@ -128,6 +128,43 @@ fn proposal_hash_binds_every_security_relevant_field() {
 }
 
 #[test]
+fn canonical_proposal_hash_material_can_be_reconstructed_without_raw_credentials() {
+    let original = proposal(
+        TenantId::new(),
+        PrincipalId::new(),
+        SessionId::new(),
+        PageId::new(),
+    );
+    let arguments = ActionArgumentsHash::from_bytes(original.canonical_arguments_hash().as_bytes());
+    let credentials = CredentialRefsHash::from_bytes(original.credential_refs_hash().as_bytes());
+
+    assert_eq!(arguments, Ok(original.canonical_arguments_hash()));
+    assert_eq!(credentials, Ok(original.credential_refs_hash()));
+    assert!(ActionArgumentsHash::from_bytes(&[0_u8; 31]).is_err());
+    assert!(CredentialRefsHash::from_bytes(&[0_u8; 33]).is_err());
+    assert_eq!(original.action_type(), &ActionType::Click);
+
+    let rebuilt = CanonicalActionProposal::new(
+        original.tenant_id().clone(),
+        original.requester_principal_id().clone(),
+        original.session_id().clone(),
+        original.session_incarnation(),
+        original.page_id().clone(),
+        original.target_incarnation(),
+        original.frame_document_epoch(),
+        original.current_origin().clone(),
+        original.url_revision(),
+        original.action_type().clone(),
+        arguments.expect("fixed-length arguments hash"),
+        original.node_ref().cloned(),
+        credentials.expect("fixed-length credentials hash"),
+        original.expires_at_unix_ms(),
+    );
+    assert_eq!(rebuilt, original);
+    assert_eq!(rebuilt.hash(), original.hash());
+}
+
+#[test]
 fn internal_token_binding_contains_exact_identity_and_a_unique_jti() {
     let tenant = TenantId::new();
     let requester = PrincipalId::new();

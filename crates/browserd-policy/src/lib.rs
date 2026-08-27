@@ -148,6 +148,16 @@ impl ActionArgumentsHash {
     pub fn digest(canonical_arguments: impl AsRef<[u8]>) -> Self {
         Self(Sha256::digest(canonical_arguments.as_ref()).into())
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InvalidCanonicalHashMaterial> {
+        let bytes = <[u8; 32]>::try_from(bytes).map_err(|_| InvalidCanonicalHashMaterial)?;
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,7 +181,28 @@ impl CredentialRefsHash {
         }
         Self(hasher.finalize().into())
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InvalidCanonicalHashMaterial> {
+        let bytes = <[u8; 32]>::try_from(bytes).map_err(|_| InvalidCanonicalHashMaterial)?;
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidCanonicalHashMaterial;
+
+impl fmt::Display for InvalidCanonicalHashMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("canonical hash material must contain exactly 32 bytes")
+    }
+}
+
+impl std::error::Error for InvalidCanonicalHashMaterial {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ActionType {
@@ -377,8 +408,23 @@ impl CanonicalActionProposal {
     }
 
     #[must_use]
+    pub const fn action_type(&self) -> &ActionType {
+        &self.action_type
+    }
+
+    #[must_use]
+    pub const fn canonical_arguments_hash(&self) -> ActionArgumentsHash {
+        self.canonical_arguments_hash
+    }
+
+    #[must_use]
     pub const fn node_ref(&self) -> Option<&NodeReference> {
         self.node_ref.as_ref()
+    }
+
+    #[must_use]
+    pub const fn credential_refs_hash(&self) -> CredentialRefsHash {
+        self.credential_refs_hash
     }
 
     #[must_use]
