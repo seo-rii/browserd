@@ -1,6 +1,6 @@
 use browserd_actions::{
-    ActionKind, ActionSequence, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
-    TerminalDetail,
+    ActionKind, ActionSequence, ApprovalDecision as ActionApprovalDecision, KnownFailureReason,
+    OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind, TerminalDetail,
 };
 use browserd_core::{
     ActionId, ApprovalId, ArtifactId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
@@ -218,6 +218,83 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
             .and_then(|encoded| serde_json::from_slice::<WorkerRpcResponse>(&encoded).ok());
         assert_eq!(decoded, Some(response));
     }
+}
+
+#[test]
+fn action_receipt_rejects_results_and_dispatch_acknowledgements_that_contradict_status() {
+    let base = WorkerActionReceipt {
+        fence: fence(),
+        action_id: ActionId::new(),
+        action_sequence: ActionSequence::new(1),
+        idempotency_key: "action-contradictions".to_owned(),
+        canonical_request_hash: [4; 32],
+        kind: ActionKind::Mutating,
+        status: WorkerActionStatus::Queued,
+        dispatch_acknowledged: false,
+        approval_decision: None,
+        terminal_detail: None,
+        result: None,
+        resolution: None,
+    };
+    assert!(base.to_action_snapshot().is_ok());
+
+    let mut valid_failed_after_dispatch = base.clone();
+    valid_failed_after_dispatch.status = WorkerActionStatus::FailedKnown;
+    valid_failed_after_dispatch.dispatch_acknowledged = true;
+    valid_failed_after_dispatch.terminal_detail = Some(TerminalDetail::FailedKnown(
+        KnownFailureReason::BrowserRejected,
+    ));
+    assert!(valid_failed_after_dispatch.to_action_snapshot().is_ok());
+
+    let mut failed_with_result = valid_failed_after_dispatch.clone();
+    failed_with_result.result = Some(b"impossible failure result".to_vec());
+    assert!(failed_with_result.to_action_snapshot().is_err());
+
+    let mut pending_after_dispatch = base.clone();
+    pending_after_dispatch.status = WorkerActionStatus::PendingApproval;
+    pending_after_dispatch.dispatch_acknowledged = true;
+    assert!(pending_after_dispatch.to_action_snapshot().is_err());
+
+    let mut queued_after_dispatch = base.clone();
+    queued_after_dispatch.dispatch_acknowledged = true;
+    assert!(queued_after_dispatch.to_action_snapshot().is_err());
+
+    let mut cancelled_before_dispatch_after_ack = base.clone();
+    cancelled_before_dispatch_after_ack.status = WorkerActionStatus::CancelledBeforeDispatch;
+    cancelled_before_dispatch_after_ack.dispatch_acknowledged = true;
+    cancelled_before_dispatch_after_ack.terminal_detail =
+        Some(TerminalDetail::CancelledBeforeDispatch);
+    assert!(
+        cancelled_before_dispatch_after_ack
+            .to_action_snapshot()
+            .is_err()
+    );
+
+    let mut not_dispatched_after_ack = base.clone();
+    not_dispatched_after_ack.status = WorkerActionStatus::FailedKnown;
+    not_dispatched_after_ack.dispatch_acknowledged = true;
+    not_dispatched_after_ack.terminal_detail = Some(TerminalDetail::FailedKnown(
+        KnownFailureReason::NotDispatched,
+    ));
+    assert!(not_dispatched_after_ack.to_action_snapshot().is_err());
+
+    let mut approval_denied_after_ack = base.clone();
+    approval_denied_after_ack.status = WorkerActionStatus::FailedKnown;
+    approval_denied_after_ack.dispatch_acknowledged = true;
+    approval_denied_after_ack.approval_decision = Some(ActionApprovalDecision::Denied);
+    approval_denied_after_ack.terminal_detail = Some(TerminalDetail::FailedKnown(
+        KnownFailureReason::ApprovalDenied,
+    ));
+    assert!(approval_denied_after_ack.to_action_snapshot().is_err());
+
+    let mut approval_timed_out_after_ack = base;
+    approval_timed_out_after_ack.status = WorkerActionStatus::FailedKnown;
+    approval_timed_out_after_ack.dispatch_acknowledged = true;
+    approval_timed_out_after_ack.approval_decision = Some(ActionApprovalDecision::TimedOut);
+    approval_timed_out_after_ack.terminal_detail = Some(TerminalDetail::FailedKnown(
+        KnownFailureReason::ApprovalTimedOut,
+    ));
+    assert!(approval_timed_out_after_ack.to_action_snapshot().is_err());
 }
 
 #[test]

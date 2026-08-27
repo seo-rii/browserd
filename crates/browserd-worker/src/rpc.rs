@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use browserd_actions::{
     ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts,
     ApprovalDecision as ActionApprovalDecision, CanonicalRequestHash as ActionCanonicalRequestHash,
-    IdempotencyKey as ActionIdempotencyKey, ResolutionAnnotation, ResolutionKind, TerminalDetail,
+    IdempotencyKey as ActionIdempotencyKey, KnownFailureReason, ResolutionAnnotation,
+    ResolutionKind, TerminalDetail,
 };
 use browserd_artifacts::{ArtifactContentSource, ArtifactState};
 use browserd_core::{
@@ -176,29 +177,50 @@ impl WorkerActionReceipt {
             }
             WorkerActionStatus::OutcomeUnknown => browserd_core::ActionState::OutcomeUnknown,
         };
-        if match (self.status, &self.result, self.terminal_detail) {
-            (
-                WorkerActionStatus::Succeeded,
-                Some(result),
-                Some(TerminalDetail::Succeeded(expected)),
-            ) => {
-                let actual: [u8; 32] = Sha256::digest(result).into();
-                actual != *expected.as_bytes()
+        let contradicts_dispatch_acknowledgement = self.dispatch_acknowledged
+            && matches!(
+                (self.status, self.terminal_detail),
+                (
+                    WorkerActionStatus::PendingApproval
+                        | WorkerActionStatus::Queued
+                        | WorkerActionStatus::CancelledBeforeDispatch,
+                    _
+                ) | (
+                    WorkerActionStatus::FailedKnown,
+                    Some(TerminalDetail::FailedKnown(
+                        KnownFailureReason::NotDispatched
+                            | KnownFailureReason::PolicyDenied
+                            | KnownFailureReason::ApprovalDenied
+                            | KnownFailureReason::ApprovalTimedOut
+                    ))
+                )
+            );
+        if contradicts_dispatch_acknowledgement
+            || match (self.status, &self.result, self.terminal_detail) {
+                (
+                    WorkerActionStatus::Succeeded,
+                    Some(result),
+                    Some(TerminalDetail::Succeeded(expected)),
+                ) => {
+                    let actual: [u8; 32] = Sha256::digest(result).into();
+                    actual != *expected.as_bytes()
+                }
+                (WorkerActionStatus::Succeeded, _, _) => true,
+                (
+                    WorkerActionStatus::PendingApproval
+                    | WorkerActionStatus::Queued
+                    | WorkerActionStatus::Running
+                    | WorkerActionStatus::CancelledBeforeDispatch
+                    | WorkerActionStatus::CancelledConfirmed
+                    | WorkerActionStatus::OutcomeUnknown,
+                    Some(_),
+                    _,
+                ) => true,
+                (WorkerActionStatus::FailedKnown, Some(_), _) => true,
+                (WorkerActionStatus::FailedKnown, None, _) => false,
+                (_, None, _) => false,
             }
-            (WorkerActionStatus::Succeeded, _, _) => true,
-            (
-                WorkerActionStatus::PendingApproval
-                | WorkerActionStatus::Queued
-                | WorkerActionStatus::Running
-                | WorkerActionStatus::CancelledBeforeDispatch
-                | WorkerActionStatus::CancelledConfirmed
-                | WorkerActionStatus::OutcomeUnknown,
-                Some(_),
-                _,
-            ) => true,
-            (WorkerActionStatus::FailedKnown, _, _) => false,
-            (_, None, _) => false,
-        } {
+        {
             return Err(WorkerRpcError::Protocol);
         }
         ActionSnapshot::from_facts(ActionSnapshotFacts {
