@@ -337,6 +337,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "browserd-local-ipc"
+version = "0.1.0"
+dependencies = [
+ "browserd-core",
+ "nix",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "browserd-observability"
 version = "0.1.0"
 dependencies = [
