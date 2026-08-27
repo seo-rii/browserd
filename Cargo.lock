@@ -292,6 +292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "browserd-egress-control"
+version = "0.1.0"
+dependencies = [
+ "browserd-core",
+ "browserd-local-ipc",
+ "nix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "browserd-features"
 version = "0.1.0"
 
