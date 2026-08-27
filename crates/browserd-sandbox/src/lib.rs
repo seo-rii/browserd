@@ -2,7 +2,11 @@
 
 mod journal;
 mod linux;
+mod netns_listener;
 mod rpc;
+
+#[cfg(test)]
+mod netns_listener_tests;
 
 pub use journal::{
     FilePreparedShardJournal, JournalSequence, PreparedShardCleanupFailure,
@@ -20,6 +24,10 @@ pub use linux::{
     PreparedLinuxChild, ProcessSignal, ReadOnlyMount, SandboxFilesystem, ShardEgressFence,
     ShardEgressReservation, ShardIngressLease, ShardIngressReceipt, SpawnRequest,
     StdLinuxProcessBackend, StdSandboxFilesystem,
+};
+pub use netns_listener::{
+    DedicatedEgressListener, DedicatedEgressListenerError, DedicatedEgressListenerReceipt,
+    create_dedicated_egress_listener,
 };
 pub use rpc::{
     RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer,
