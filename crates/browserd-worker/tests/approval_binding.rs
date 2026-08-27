@@ -21,9 +21,9 @@ use browserd_sandbox::CleanupReason;
 use browserd_session::{LeasePolicy, OwnershipFence, SessionTime, SessionTimeoutPolicy};
 use browserd_worker::{
     ActionApprovalRequirement, ActionExecutionResult, ActionJournalConfig, ApprovedActionError,
-    ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand, DependencyError,
-    InternalEndpoint, LiveApprovalContext, SandboxClient, WorkerClock, WorkerConfig,
-    WorkerControlPlane, WorkerError,
+    ArtifactStoreReceipt, ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver,
+    CreateSessionCommand, DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient,
+    WorkerClock, WorkerConfig, WorkerControlPlane, WorkerError,
 };
 use sha2::{Digest, Sha256};
 
@@ -288,10 +288,9 @@ impl SandboxClient for Sandbox {
 
     fn store_artifact(
         &self,
-        _session_id: &SessionId,
-        _upload: &ArtifactUpload,
-    ) -> Result<(), DependencyError> {
-        Ok(())
+        _request: &ArtifactStoreRequest,
+    ) -> Result<ArtifactStoreReceipt, DependencyError> {
+        Err(DependencyError::Unavailable)
     }
 }
 

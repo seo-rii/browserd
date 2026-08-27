@@ -19,7 +19,10 @@ use browserd_actions::{
     KnownFailureReason, LedgerSession, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
     ResolutionOutcome, ResolutionPolicy, ResultDigest, TransportLoss,
 };
-use browserd_artifacts::{Artifact, ArtifactEvent, ArtifactKey, ArtifactState};
+use browserd_artifacts::{
+    Artifact, ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactEvent,
+    ArtifactKey, ArtifactObjectGeneration, ArtifactState,
+};
 use browserd_core::{
     ActionId, ActionState, ArtifactId, IsolationProfile, LeaseId, OperationId, PageId, PrincipalId,
     SessionExecution, SessionId, TenantId, WorkerId,
@@ -226,9 +229,8 @@ pub trait SandboxClient: Send + Sync + 'static {
     fn heartbeat(&self, worker_id: &WorkerId, worker_epoch: u64) -> Result<(), DependencyError>;
     fn store_artifact(
         &self,
-        session_id: &SessionId,
-        upload: &ArtifactUpload,
-    ) -> Result<(), DependencyError>;
+        request: &ArtifactStoreRequest,
+    ) -> Result<ArtifactStoreReceipt, DependencyError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -326,6 +328,50 @@ pub struct WorkerConfig {
     timeout_policy: SessionTimeoutPolicy,
     approval_timeout_millis: u64,
     action_journal: ActionJournalConfig,
+    artifact_limits: WorkerArtifactLimits,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerArtifactLimits {
+    max_file_bytes: u64,
+    max_committed_bytes: u64,
+    max_in_flight_bytes: u64,
+}
+
+impl WorkerArtifactLimits {
+    pub const DEFAULT_MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
+    pub const DEFAULT_MAX_COMMITTED_BYTES: u64 = 500 * 1024 * 1024;
+    pub const DEFAULT_MAX_IN_FLIGHT_BYTES: u64 = 128 * 1024 * 1024;
+
+    pub const fn new(
+        max_file_bytes: u64,
+        max_committed_bytes: u64,
+        max_in_flight_bytes: u64,
+    ) -> Result<Self, WorkerError> {
+        if max_file_bytes == 0
+            || max_committed_bytes == 0
+            || max_in_flight_bytes == 0
+            || max_file_bytes > max_committed_bytes
+            || max_file_bytes > max_in_flight_bytes
+        {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        Ok(Self {
+            max_file_bytes,
+            max_committed_bytes,
+            max_in_flight_bytes,
+        })
+    }
+}
+
+impl Default for WorkerArtifactLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: Self::DEFAULT_MAX_FILE_BYTES,
+            max_committed_bytes: Self::DEFAULT_MAX_COMMITTED_BYTES,
+            max_in_flight_bytes: Self::DEFAULT_MAX_IN_FLIGHT_BYTES,
+        }
+    }
 }
 
 impl WorkerConfig {
@@ -362,7 +408,14 @@ impl WorkerConfig {
             timeout_policy,
             approval_timeout_millis,
             action_journal,
+            artifact_limits: WorkerArtifactLimits::default(),
         })
+    }
+
+    #[must_use]
+    pub const fn with_artifact_limits(mut self, limits: WorkerArtifactLimits) -> Self {
+        self.artifact_limits = limits;
+        self
     }
 
     pub const fn endpoint(&self) -> &InternalEndpoint {
@@ -425,12 +478,140 @@ pub struct ArtifactUpload {
     pub content_type: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactScanVerdict {
+    Clean,
+    Quarantined,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactStoreRequest {
+    key: ArtifactKey,
+    fence: OwnershipFence,
+    bytes: Vec<u8>,
+    declared_content_type: String,
+    expected_size_bytes: u64,
+    expected_checksum: ArtifactChecksum,
+    max_bytes: u64,
+}
+
+impl ArtifactStoreRequest {
+    #[must_use]
+    pub const fn key(&self) -> &ArtifactKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn fence(&self) -> &OwnershipFence {
+        &self.fence
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub fn declared_content_type(&self) -> &str {
+        &self.declared_content_type
+    }
+
+    #[must_use]
+    pub const fn expected_size_bytes(&self) -> u64 {
+        self.expected_size_bytes
+    }
+
+    #[must_use]
+    pub const fn expected_checksum(&self) -> &ArtifactChecksum {
+        &self.expected_checksum
+    }
+
+    #[must_use]
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactStoreReceipt {
+    key: ArtifactKey,
+    size_bytes: u64,
+    checksum: ArtifactChecksum,
+    detected_content_type: String,
+    object_generation: ArtifactObjectGeneration,
+    scan_verdict: ArtifactScanVerdict,
+}
+
+impl ArtifactStoreReceipt {
+    pub fn new(
+        key: ArtifactKey,
+        size_bytes: u64,
+        checksum: ArtifactChecksum,
+        detected_content_type: impl Into<String>,
+        object_generation: ArtifactObjectGeneration,
+        scan_verdict: ArtifactScanVerdict,
+    ) -> Result<Self, WorkerError> {
+        let detected_content_type = detected_content_type.into();
+        ArtifactContentMetadata::new(
+            size_bytes,
+            checksum,
+            detected_content_type.clone(),
+            ArtifactContentSource::ClientUpload,
+            "artifact-store-receipt",
+        )
+        .map_err(|_| WorkerError::InvalidConfiguration)?;
+        Ok(Self {
+            key,
+            size_bytes,
+            checksum,
+            detected_content_type,
+            object_generation,
+            scan_verdict,
+        })
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> &ArtifactKey {
+        &self.key
+    }
+
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
+    #[must_use]
+    pub const fn checksum(&self) -> &ArtifactChecksum {
+        &self.checksum
+    }
+
+    #[must_use]
+    pub fn detected_content_type(&self) -> &str {
+        &self.detected_content_type
+    }
+
+    #[must_use]
+    pub const fn object_generation(&self) -> ArtifactObjectGeneration {
+        self.object_generation
+    }
+
+    #[must_use]
+    pub const fn scan_verdict(&self) -> ArtifactScanVerdict {
+        self.scan_verdict
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerArtifactSnapshot {
     pub artifact_id: ArtifactId,
     pub state: ArtifactState,
     pub size_bytes: u64,
+    pub checksum_sha256: [u8; 32],
     pub content_type: String,
+    pub source: ArtifactContentSource,
+    pub origin: String,
+    pub object_generation: ArtifactObjectGeneration,
 }
 
 pub type ApprovalId = LeaseId;
@@ -481,8 +662,7 @@ struct ActionRecord {
 
 struct ArtifactRecord {
     artifact: Artifact,
-    size_bytes: u64,
-    content_type: String,
+    object_generation: ArtifactObjectGeneration,
 }
 
 struct ApprovalRecord {
@@ -533,6 +713,7 @@ struct SessionState {
     actions: HashMap<ActionId, ActionRecord>,
     action_queue: VecDeque<ActionId>,
     artifacts: HashMap<ArtifactId, ArtifactRecord>,
+    artifact_committed_bytes: u64,
     approvals: HashMap<ApprovalId, ApprovalRecord>,
     action_ledger: ActionLedger<FileActionJournal>,
     durability_degraded: bool,
@@ -915,6 +1096,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     actions: HashMap::new(),
                     action_queue: VecDeque::new(),
                     artifacts: HashMap::new(),
+                    artifact_committed_bytes: 0,
                     approvals: HashMap::new(),
                     action_ledger,
                     durability_degraded: false,
@@ -2351,42 +2533,100 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .cleanup_owner
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
+        let size_bytes =
+            u64::try_from(upload.bytes.len()).map_err(|_| WorkerError::CapacityExceeded)?;
+        if size_bytes > self.config.artifact_limits.max_file_bytes
+            || size_bytes > self.config.artifact_limits.max_in_flight_bytes
+        {
+            return Err(WorkerError::CapacityExceeded);
+        }
+        let checksum = ArtifactChecksum::new(Sha256::digest(&upload.bytes).into());
+        ArtifactContentMetadata::new(
+            size_bytes,
+            checksum,
+            upload.content_type.clone(),
+            ArtifactContentSource::ClientUpload,
+            "browserd-worker-upload",
+        )
+        .map_err(|_| WorkerError::InvalidConfiguration)?;
         let tenant_id = {
             let mut session = executor
                 .state
                 .lock()
                 .map_err(|_| WorkerError::StateUnavailable)?;
             validate_fence(&session, fence)?;
+            let projected_committed = session
+                .artifact_committed_bytes
+                .checked_add(size_bytes)
+                .ok_or(WorkerError::CapacityExceeded)?;
+            if projected_committed > self.config.artifact_limits.max_committed_bytes {
+                return Err(WorkerError::CapacityExceeded);
+            }
             session
                 .machine
                 .record_activity(fence, now)
                 .map_err(map_session_error)?;
             session.tenant_id.clone()
         };
-        self.sandbox
-            .store_artifact(session_id, &upload)
-            .map_err(|_| WorkerError::DependencyUnavailable)?;
         let artifact_id = ArtifactId::new();
         let key = ArtifactKey::new(tenant_id, session_id.clone(), artifact_id.clone());
+        let request = ArtifactStoreRequest {
+            key: key.clone(),
+            fence: fence.clone(),
+            bytes: upload.bytes,
+            declared_content_type: upload.content_type,
+            expected_size_bytes: size_bytes,
+            expected_checksum: checksum,
+            max_bytes: self.config.artifact_limits.max_file_bytes,
+        };
+        let receipt = self
+            .sandbox
+            .store_artifact(&request)
+            .map_err(|_| WorkerError::DependencyUnavailable)?;
+        if receipt.key() != &key
+            || receipt.size_bytes() != size_bytes
+            || receipt.checksum() != &checksum
+        {
+            return Err(WorkerError::DependencyUnavailable);
+        }
+        let metadata = ArtifactContentMetadata::new(
+            receipt.size_bytes(),
+            *receipt.checksum(),
+            receipt.detected_content_type(),
+            ArtifactContentSource::ClientUpload,
+            "browserd-worker-upload",
+        )
+        .map_err(|_| WorkerError::DependencyUnavailable)?;
         let mut artifact = Artifact::new_upload(key);
         artifact
-            .apply(ArtifactEvent::UploadStored)
+            .apply_materialized(ArtifactEvent::UploadStored, metadata)
             .and_then(|_| artifact.apply(ArtifactEvent::ScanStarted))
-            .and_then(|_| artifact.apply(ArtifactEvent::ScanPassed))
+            .and_then(|_| {
+                artifact.apply(match receipt.scan_verdict() {
+                    ArtifactScanVerdict::Clean => ArtifactEvent::ScanPassed,
+                    ArtifactScanVerdict::Quarantined => ArtifactEvent::ScanQuarantined,
+                    ArtifactScanVerdict::Rejected => ArtifactEvent::ScanRejected,
+                })
+            })
             .map_err(|_| WorkerError::DependencyUnavailable)?;
-        let size_bytes =
-            u64::try_from(upload.bytes.len()).map_err(|_| WorkerError::CapacityExceeded)?;
         let mut session = executor
             .state
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
+        let projected_committed = session
+            .artifact_committed_bytes
+            .checked_add(size_bytes)
+            .ok_or(WorkerError::CapacityExceeded)?;
+        if projected_committed > self.config.artifact_limits.max_committed_bytes {
+            return Err(WorkerError::CapacityExceeded);
+        }
+        session.artifact_committed_bytes = projected_committed;
         session.artifacts.insert(
             artifact_id.clone(),
             ArtifactRecord {
                 artifact,
-                size_bytes,
-                content_type: upload.content_type,
+                object_generation: receipt.object_generation(),
             },
         );
         Ok(artifact_id)
@@ -2410,11 +2650,19 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .artifacts
             .get(artifact_id)
             .ok_or(WorkerError::ArtifactNotFound)?;
+        let metadata = artifact
+            .artifact
+            .content_metadata()
+            .ok_or(WorkerError::StateUnavailable)?;
         Ok(WorkerArtifactSnapshot {
             artifact_id: artifact.artifact.key().artifact_id().clone(),
             state: artifact.artifact.state(),
-            size_bytes: artifact.size_bytes,
-            content_type: artifact.content_type.clone(),
+            size_bytes: metadata.size_bytes(),
+            checksum_sha256: *metadata.checksum().as_bytes(),
+            content_type: metadata.content_type().to_owned(),
+            source: metadata.source(),
+            origin: metadata.origin().to_owned(),
+            object_generation: artifact.object_generation,
         })
     }
 
@@ -3327,9 +3575,8 @@ impl SandboxClient for UnavailableSandboxClient {
     }
     fn store_artifact(
         &self,
-        _session_id: &SessionId,
-        _upload: &ArtifactUpload,
-    ) -> Result<(), DependencyError> {
+        _request: &ArtifactStoreRequest,
+    ) -> Result<ArtifactStoreReceipt, DependencyError> {
         Err(DependencyError::Unavailable)
     }
 }
@@ -3456,10 +3703,17 @@ mod tests {
 
         fn store_artifact(
             &self,
-            _session_id: &SessionId,
-            _upload: &ArtifactUpload,
-        ) -> Result<(), DependencyError> {
-            Ok(())
+            request: &ArtifactStoreRequest,
+        ) -> Result<ArtifactStoreReceipt, DependencyError> {
+            ArtifactStoreReceipt::new(
+                request.key().clone(),
+                request.expected_size_bytes(),
+                *request.expected_checksum(),
+                request.declared_content_type(),
+                ArtifactObjectGeneration::new([1; ArtifactObjectGeneration::LENGTH]),
+                ArtifactScanVerdict::Clean,
+            )
+            .map_err(|_| DependencyError::Rejected)
         }
     }
 

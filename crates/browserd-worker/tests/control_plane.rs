@@ -1,12 +1,16 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use browserd_actions::{ActionJournalLimits, ActionKind, ResolutionKind};
-use browserd_core::{IsolationProfile, LeaseId, PageId, PrincipalId, TenantId, WorkerId};
+use browserd_artifacts::{ArtifactChecksum, ArtifactContentSource, ArtifactObjectGeneration};
+use browserd_core::{
+    ArtifactId, IsolationProfile, LeaseId, PageId, PrincipalId, TenantId, WorkerId,
+};
 use browserd_features::BuiltinFeature;
 use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalDecision, CanonicalActionProposal, CredentialRefsHash,
@@ -16,10 +20,12 @@ use browserd_session::{LeasePolicy, SessionLifecycle, SessionTime, SessionTimeou
 use browserd_viewer::ViewerScopes;
 use browserd_worker::{
     ActionApprovalRequirement, ActionExecutionResult, ActionJournalConfig, ActionStatus,
-    ApprovedActionError, ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand,
-    CreateSessionOutcome, DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient,
+    ApprovedActionError, ArtifactScanVerdict, ArtifactStoreReceipt, ArtifactStoreRequest,
+    ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand, CreateSessionOutcome,
+    DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient, WorkerArtifactLimits,
     WorkerClock, WorkerConfig, WorkerControlPlane, WorkerError,
 };
+use sha2::{Digest, Sha256};
 
 struct TestClock;
 
@@ -193,6 +199,10 @@ struct FakeSandbox {
     cleanup_count: Mutex<usize>,
     provision_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     artifact_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    artifact_store_count: AtomicUsize,
+    corrupt_artifact_receipt: AtomicBool,
+    wrong_artifact_key: AtomicBool,
+    quarantine_artifact: AtomicBool,
 }
 
 impl SandboxClient for FakeSandbox {
@@ -256,9 +266,9 @@ impl SandboxClient for FakeSandbox {
 
     fn store_artifact(
         &self,
-        _session_id: &browserd_core::SessionId,
-        _upload: &ArtifactUpload,
-    ) -> Result<(), DependencyError> {
+        request: &ArtifactStoreRequest,
+    ) -> Result<ArtifactStoreReceipt, DependencyError> {
+        self.artifact_store_count.fetch_add(1, Ordering::SeqCst);
         let barriers = self
             .artifact_barriers
             .lock()
@@ -268,7 +278,33 @@ impl SandboxClient for FakeSandbox {
             started.wait();
             release.wait();
         }
-        Ok(())
+        let mut checksum: [u8; 32] = Sha256::digest(request.bytes()).into();
+        if self.corrupt_artifact_receipt.load(Ordering::SeqCst) {
+            checksum[0] ^= 0xff;
+        }
+        let key = if self.wrong_artifact_key.load(Ordering::SeqCst) {
+            browserd_artifacts::ArtifactKey::new(
+                request.key().tenant_id().clone(),
+                request.key().session_id().clone(),
+                ArtifactId::new(),
+            )
+        } else {
+            request.key().clone()
+        };
+        let verdict = if self.quarantine_artifact.load(Ordering::SeqCst) {
+            ArtifactScanVerdict::Quarantined
+        } else {
+            ArtifactScanVerdict::Clean
+        };
+        ArtifactStoreReceipt::new(
+            key,
+            u64::try_from(request.bytes().len()).map_err(|_| DependencyError::Rejected)?,
+            ArtifactChecksum::new(checksum),
+            request.declared_content_type(),
+            ArtifactObjectGeneration::new([1; ArtifactObjectGeneration::LENGTH]),
+            verdict,
+        )
+        .map_err(|_| DependencyError::Rejected)
     }
 }
 
@@ -334,6 +370,25 @@ fn ready_worker(queue_capacity: usize) -> Option<ReadyWorker> {
     Some((worker, peer, driver, sandbox))
 }
 
+fn ready_worker_with_artifact_limits(limits: WorkerArtifactLimits) -> Option<ReadyWorker> {
+    let driver = Arc::new(FakeDriver {
+        qualified: true,
+        ..FakeDriver::default()
+    });
+    let sandbox = Arc::new(FakeSandbox {
+        qualified: true,
+        ..FakeSandbox::default()
+    });
+    let peer = AuthenticatedPeer::new("gateway-internal").ok()?;
+    let worker = WorkerControlPlane::new_with_clock(
+        config(2)?.with_artifact_limits(limits),
+        driver.clone(),
+        sandbox.clone(),
+        Arc::new(TestClock),
+    );
+    Some((worker, peer, driver, sandbox))
+}
+
 fn create_command(tenant_id: TenantId, key: &str, hash_byte: u8) -> CreateSessionCommand {
     CreateSessionCommand {
         tenant_id,
@@ -342,6 +397,20 @@ fn create_command(tenant_id: TenantId, key: &str, hash_byte: u8) -> CreateSessio
         placement_version: 1,
         session_incarnation: 1,
     }
+}
+
+fn create_ready_session(
+    worker: &WorkerControlPlane<FakeDriver, FakeSandbox>,
+    peer: &AuthenticatedPeer,
+    key: &str,
+) -> Option<CreateSessionOutcome> {
+    worker
+        .create_session(
+            peer,
+            create_command(TenantId::new(), key, 1),
+            SessionTime::new(0),
+        )
+        .ok()
 }
 
 fn approval_requirement(
@@ -1032,11 +1101,16 @@ fn artifact_approval_viewer_and_cleanup_commands_remain_fenced() {
     let Some(artifact) = artifact.ok() else {
         return;
     };
-    assert!(
-        worker
-            .get_artifact(&peer, &created.session_id, &artifact, &created.fence)
-            .is_ok()
-    );
+    let stored = worker.get_artifact(&peer, &created.session_id, &artifact, &created.fence);
+    assert!(stored.is_ok());
+    let Some(stored) = stored.ok() else {
+        return;
+    };
+    assert_eq!(stored.size_bytes, 3);
+    let expected_checksum: [u8; 32] = Sha256::digest([1, 2, 3]).into();
+    assert_eq!(stored.checksum_sha256, expected_checksum);
+    assert_eq!(stored.source, ArtifactContentSource::ClientUpload);
+    assert_eq!(stored.origin, "browserd-worker-upload");
     assert!(
         worker
             .issue_viewer_ticket(
@@ -1104,6 +1178,135 @@ fn artifact_approval_viewer_and_cleanup_commands_remain_fenced() {
             .ok()
             .is_some_and(|count| *count == 1)
     );
+}
+
+#[test]
+fn artifact_receipt_checksum_and_key_mismatches_fail_closed() {
+    for wrong_key in [false, true] {
+        let Some((worker, peer, _driver, sandbox)) = ready_worker(2) else {
+            return;
+        };
+        let Some(created) = create_ready_session(&worker, &peer, "artifact-receipt") else {
+            return;
+        };
+        sandbox
+            .corrupt_artifact_receipt
+            .store(!wrong_key, Ordering::SeqCst);
+        sandbox
+            .wrong_artifact_key
+            .store(wrong_key, Ordering::SeqCst);
+
+        assert_eq!(
+            worker.upload_artifact(
+                &peer,
+                &created.session_id,
+                &created.fence,
+                ArtifactUpload {
+                    bytes: vec![1, 2, 3],
+                    content_type: "application/octet-stream".to_owned(),
+                },
+                SessionTime::new(1),
+            ),
+            Err(WorkerError::DependencyUnavailable)
+        );
+        assert_eq!(sandbox.artifact_store_count.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn artifact_without_clean_scan_receipt_is_never_available() {
+    let Some((worker, peer, _driver, sandbox)) = ready_worker(2) else {
+        return;
+    };
+    sandbox.quarantine_artifact.store(true, Ordering::SeqCst);
+    let Some(created) = create_ready_session(&worker, &peer, "artifact-quarantine") else {
+        return;
+    };
+    let artifact_id = worker.upload_artifact(
+        &peer,
+        &created.session_id,
+        &created.fence,
+        ArtifactUpload {
+            bytes: vec![1, 2, 3],
+            content_type: "application/octet-stream".to_owned(),
+        },
+        SessionTime::new(1),
+    );
+    assert!(artifact_id.is_ok());
+    let Some(artifact_id) = artifact_id.ok() else {
+        return;
+    };
+    let snapshot = worker.get_artifact(&peer, &created.session_id, &artifact_id, &created.fence);
+    assert!(snapshot.is_ok());
+    assert_eq!(
+        snapshot.ok().map(|snapshot| snapshot.state),
+        Some(browserd_artifacts::ArtifactState::Quarantined)
+    );
+}
+
+#[test]
+fn artifact_file_and_committed_quotas_reject_before_storage() {
+    let Some(file_limits) = WorkerArtifactLimits::new(2, 8, 4).ok() else {
+        return;
+    };
+    let Some((worker, peer, _driver, sandbox)) = ready_worker_with_artifact_limits(file_limits)
+    else {
+        return;
+    };
+    let Some(created) = create_ready_session(&worker, &peer, "artifact-file-limit") else {
+        return;
+    };
+    assert_eq!(
+        worker.upload_artifact(
+            &peer,
+            &created.session_id,
+            &created.fence,
+            ArtifactUpload {
+                bytes: vec![1, 2, 3],
+                content_type: "application/octet-stream".to_owned(),
+            },
+            SessionTime::new(1),
+        ),
+        Err(WorkerError::CapacityExceeded)
+    );
+    assert_eq!(sandbox.artifact_store_count.load(Ordering::SeqCst), 0);
+
+    let Some(committed_limits) = WorkerArtifactLimits::new(4, 5, 4).ok() else {
+        return;
+    };
+    let Some((worker, peer, _driver, sandbox)) =
+        ready_worker_with_artifact_limits(committed_limits)
+    else {
+        return;
+    };
+    let Some(created) = create_ready_session(&worker, &peer, "artifact-committed-limit") else {
+        return;
+    };
+    let first = worker.upload_artifact(
+        &peer,
+        &created.session_id,
+        &created.fence,
+        ArtifactUpload {
+            bytes: vec![1, 2, 3],
+            content_type: "application/octet-stream".to_owned(),
+        },
+        SessionTime::new(1),
+    );
+    assert!(first.is_ok());
+    assert_eq!(
+        worker.upload_artifact(
+            &peer,
+            &created.session_id,
+            &created.fence,
+            ArtifactUpload {
+                bytes: vec![4, 5, 6],
+                content_type: "application/octet-stream".to_owned(),
+            },
+            SessionTime::new(2),
+        ),
+        Err(WorkerError::CapacityExceeded)
+    );
+    assert_eq!(sandbox.artifact_store_count.load(Ordering::SeqCst), 1);
 }
 
 #[test]

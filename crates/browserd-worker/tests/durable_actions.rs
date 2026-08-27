@@ -24,9 +24,9 @@ use browserd_session::{
 };
 use browserd_worker::{
     ActionApprovalRequirement, ActionExecutionResult, ActionJournalConfig, ApprovedActionError,
-    ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand, CreateSessionOutcome,
-    DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient, WorkerClock,
-    WorkerConfig, WorkerControlPlane, WorkerError,
+    ArtifactStoreReceipt, ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver,
+    CreateSessionCommand, CreateSessionOutcome, DependencyError, InternalEndpoint,
+    LiveApprovalContext, SandboxClient, WorkerClock, WorkerConfig, WorkerControlPlane, WorkerError,
 };
 use tempfile::TempDir;
 
@@ -206,10 +206,9 @@ impl SandboxClient for JournalCheckingSandbox {
 
     fn store_artifact(
         &self,
-        _session_id: &SessionId,
-        _upload: &ArtifactUpload,
-    ) -> Result<(), DependencyError> {
-        Ok(())
+        _request: &ArtifactStoreRequest,
+    ) -> Result<ArtifactStoreReceipt, DependencyError> {
+        Err(DependencyError::Unavailable)
     }
 }
 
