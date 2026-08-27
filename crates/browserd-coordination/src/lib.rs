@@ -1,6 +1,9 @@
 mod actor;
+mod ephemeral;
 mod memory;
+mod memory_ephemeral;
 mod postgres;
+mod redis;
 
 use std::fmt;
 use std::time::Duration;
@@ -15,8 +18,15 @@ use thiserror::Error;
 use uuid::{Uuid, Version};
 
 pub use actor::{CoordinationActorConfig, CoordinationBlockingClient};
+pub use ephemeral::{
+    DirectoryEntry, DirectoryFence, DirectoryKey, DirectoryMutation, DirectorySnapshot,
+    EphemeralCoordinationError, EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume,
+    OneTimeIssue,
+};
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
+pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};
 pub use postgres::PostgresCreateSessionStore;
+pub use redis::{RedisEphemeralConfig, RedisEphemeralCoordinationStore};
 
 pub const MINIMUM_IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MINIMUM_DISPATCH_LEASE_TTL: Duration = Duration::from_millis(1);
