@@ -296,6 +296,31 @@ impl ResolutionPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionSnapshotFacts {
+    pub action_id: ActionId,
+    pub action_sequence: ActionSequence,
+    pub idempotency_key: IdempotencyKey,
+    pub canonical_request_hash: CanonicalRequestHash,
+    pub kind: ActionKind,
+    pub state: ActionState,
+    pub dispatch_acknowledged: bool,
+    pub approval_decision: Option<ApprovalDecision>,
+    pub terminal_detail: Option<TerminalDetail>,
+    pub resolution: Option<ResolutionAnnotation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActionSnapshotReconstructionError;
+
+impl fmt::Display for ActionSnapshotReconstructionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("action snapshot facts are contradictory or out of bounds")
+    }
+}
+
+impl std::error::Error for ActionSnapshotReconstructionError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionSnapshot {
     pub(crate) action_id: ActionId,
     pub(crate) action_sequence: ActionSequence,
@@ -309,6 +334,78 @@ pub struct ActionSnapshot {
 }
 
 impl ActionSnapshot {
+    pub fn from_facts(
+        facts: ActionSnapshotFacts,
+    ) -> Result<Self, ActionSnapshotReconstructionError> {
+        let idempotency_key = facts.idempotency_key.as_str();
+        if facts.action_sequence.get() == 0
+            || idempotency_key.is_empty()
+            || idempotency_key.len() > 255
+            || idempotency_key.trim() != idempotency_key
+            || idempotency_key.chars().any(char::is_control)
+            || if facts.state.is_terminal() {
+                !facts
+                    .terminal_detail
+                    .is_some_and(|detail| detail.state() == facts.state)
+            } else {
+                facts.terminal_detail.is_some()
+            }
+            || (facts.resolution.is_some() && facts.state != ActionState::OutcomeUnknown)
+            || matches!(
+                (facts.approval_decision, facts.terminal_detail),
+                (
+                    Some(ApprovalDecision::Denied),
+                    Some(TerminalDetail::FailedKnown(reason))
+                ) if reason != KnownFailureReason::ApprovalDenied
+            )
+            || matches!(
+                (facts.approval_decision, facts.terminal_detail),
+                (
+                    Some(ApprovalDecision::TimedOut),
+                    Some(TerminalDetail::FailedKnown(reason))
+                ) if reason != KnownFailureReason::ApprovalTimedOut
+            )
+            || matches!(
+                facts.terminal_detail,
+                Some(TerminalDetail::FailedKnown(
+                    KnownFailureReason::ApprovalDenied
+                ))
+            ) && facts.approval_decision != Some(ApprovalDecision::Denied)
+            || matches!(
+                facts.terminal_detail,
+                Some(TerminalDetail::FailedKnown(
+                    KnownFailureReason::ApprovalTimedOut
+                ))
+            ) && facts.approval_decision != Some(ApprovalDecision::TimedOut)
+            || (matches!(
+                facts.approval_decision,
+                Some(ApprovalDecision::Denied | ApprovalDecision::TimedOut)
+            ) && facts.state != ActionState::FailedKnown)
+            || (facts.approval_decision == Some(ApprovalDecision::Granted)
+                && matches!(
+                    facts.state,
+                    ActionState::Accepted | ActionState::Queued | ActionState::PendingApproval
+                ))
+        {
+            return Err(ActionSnapshotReconstructionError);
+        }
+        Ok(Self {
+            action_id: facts.action_id,
+            action_sequence: facts.action_sequence,
+            request: ActionRequest::new(
+                facts.idempotency_key,
+                facts.canonical_request_hash,
+                facts.kind,
+            ),
+            state: facts.state,
+            dispatch_permit: None,
+            dispatch_acknowledged: facts.dispatch_acknowledged,
+            approval_decision: facts.approval_decision,
+            terminal_detail: facts.terminal_detail,
+            resolution: facts.resolution,
+        })
+    }
+
     #[must_use]
     pub const fn action_id(&self) -> &ActionId {
         &self.action_id
