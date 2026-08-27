@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use browserd_core::LeaseId;
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, Interest};
+use tokio::io::Interest;
 use tokio::net::UnixStream;
 
 const RECEIVER_READY: u8 = 0x51;
@@ -639,21 +639,43 @@ async fn receive_plain_frame(stream: &mut UnixStream) -> Result<[u8; FRAME_BYTES
 }
 
 async fn receive_raw_frame(stream: &mut UnixStream) -> Result<ReceivedFrame, HandoffError> {
-    let mut received = stream
-        .async_io(Interest::READABLE, || receive_raw_frame_now(stream))
-        .await?;
-    let bytes = received.1;
-    if bytes == 0 {
-        return Err(HandoffError::ConnectionClosed);
+    let mut received = ReceivedFrame {
+        frame: [0_u8; FRAME_BYTES],
+        flags: MsgFlags::empty(),
+        rights_messages: 0,
+        unexpected_control: false,
+        malformed_control: false,
+        descriptors: Vec::new(),
+    };
+    let mut filled = 0_usize;
+    while filled < FRAME_BYTES {
+        let mut bytes = [0_u8; FRAME_BYTES];
+        let remaining = FRAME_BYTES - filled;
+        let (flags, parsed, count) = stream
+            .async_io(Interest::READABLE, || {
+                receive_raw_frame_now(stream, &mut bytes[..remaining])
+            })
+            .await?;
+        if count == 0 {
+            return Err(HandoffError::ConnectionClosed);
+        }
+        received.frame[filled..filled + count].copy_from_slice(&bytes[..count]);
+        received.flags |= flags;
+        received.rights_messages = received
+            .rights_messages
+            .saturating_add(parsed.rights_messages);
+        received.unexpected_control |= parsed.unexpected_control;
+        received.malformed_control |= parsed.malformed_control;
+        received.descriptors.extend(parsed.descriptors);
+        filled += count;
     }
-    if bytes < FRAME_BYTES {
-        stream.read_exact(&mut received.0.frame[bytes..]).await?;
-    }
-    Ok(received.0)
+    Ok(received)
 }
 
-fn receive_raw_frame_now(stream: &UnixStream) -> std::io::Result<(ReceivedFrame, usize)> {
-    let mut frame = [0_u8; FRAME_BYTES];
+fn receive_raw_frame_now(
+    stream: &UnixStream,
+    frame: &mut [u8],
+) -> std::io::Result<(MsgFlags, ParsedControl, usize)> {
     let required_control_bytes = nix::cmsg_space!([RawFd; MAX_DESCRIPTOR_COUNT]).len();
     let mut control = vec![0_usize; required_control_bytes.div_ceil(std::mem::size_of::<usize>())];
     let control_capacity = control.len().saturating_mul(std::mem::size_of::<usize>());
@@ -683,14 +705,8 @@ fn receive_raw_frame_now(stream: &UnixStream) -> std::io::Result<(ReceivedFrame,
     let control_start = control.as_ptr() as usize;
     let parsed = parse_control_messages(&message, control_start, control_capacity);
     Ok((
-        ReceivedFrame {
-            frame,
-            flags: MsgFlags::from_bits_truncate(message.msg_flags),
-            rights_messages: parsed.rights_messages,
-            unexpected_control: parsed.unexpected_control,
-            malformed_control: parsed.malformed_control,
-            descriptors: parsed.descriptors,
-        },
+        MsgFlags::from_bits_truncate(message.msg_flags),
+        parsed,
         bytes as usize,
     ))
 }

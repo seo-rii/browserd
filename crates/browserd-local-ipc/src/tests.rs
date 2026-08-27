@@ -99,10 +99,14 @@ async fn raw_send(
     descriptors: &[i32],
     credentials: bool,
 ) {
+    raw_send_bytes(stream, frame, descriptors, credentials).await;
+}
+
+async fn raw_send_bytes(stream: &UnixStream, bytes: &[u8], descriptors: &[i32], credentials: bool) {
     let credentials_value = UnixCredentials::new();
     let sent = stream
         .async_io(Interest::WRITABLE, || {
-            let buffers = [IoSlice::new(frame)];
+            let buffers = [IoSlice::new(bytes)];
             let rights = ControlMessage::ScmRights(descriptors);
             let credential_message = ControlMessage::ScmCredentials(&credentials_value);
             let controls = if credentials {
@@ -123,7 +127,7 @@ async fn raw_send(
         })
         .await
         .expect("raw protocol frame must be sent");
-    assert_eq!(sent, FRAME_BYTES);
+    assert_eq!(sent, bytes.len());
 }
 
 fn assert_writer_closed(reader: &OwnedFd) {
@@ -406,6 +410,32 @@ async fn excess_descriptors_fail_closed() {
             expected: 1,
             received: 2
         }
+    ));
+    assert_writer_closed(&first_reader);
+    assert_writer_closed(&second_reader);
+}
+
+#[tokio::test]
+async fn descriptors_on_a_fragmented_frame_continuation_fail_closed() {
+    let (receiver, peer, transfer_id) = ready_receiver(1, false).await;
+    let (first_reader, first_writer) = pipe();
+    let (second_reader, second_writer) = pipe();
+    let nonce = LeaseId::new();
+    let frame = crate::protocol_frame(DESCRIPTOR_OFFER, &transfer_id, nonce.as_bytes());
+    raw_send_bytes(&peer, &frame[..1], &[first_writer.as_raw_fd()], false).await;
+    let mut receiving = Box::pin(receiver.receive());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), receiving.as_mut())
+            .await
+            .is_err()
+    );
+    raw_send_bytes(&peer, &frame[1..], &[second_writer.as_raw_fd()], false).await;
+    drop(first_writer);
+    drop(second_writer);
+
+    assert!(matches!(
+        receiving.await,
+        Err(HandoffError::RightsMessageCount { received: 2 })
     ));
     assert_writer_closed(&first_reader);
     assert_writer_closed(&second_reader);
