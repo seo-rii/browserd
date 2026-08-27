@@ -2,10 +2,15 @@
 
 #![forbid(unsafe_code)]
 
+mod directory;
 mod placement;
 mod queue;
 mod reservation;
 
+pub use directory::{
+    AttachOutcome, DirectoryError, DirectoryFence, DirectoryTime, SessionAttachment,
+    SessionDirectory, SessionRoute,
+};
 pub use placement::{
     CandidateAdmission, CandidateHealth, CandidateLifecycle, CompatibilityKey, EpochError,
     ShardCandidate, ShardSelector, WorkerEpochRegistry,
