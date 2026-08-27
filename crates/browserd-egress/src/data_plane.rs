@@ -2,13 +2,16 @@ use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::ShardId;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
+#[cfg(test)]
+use crate::RouteClaim;
+use crate::ingress::AcceptedRouteIngress;
+use crate::route::RouteIngressGuard;
 use crate::{
     DnsResolution, InspectedSocketAddr, MonotonicMillis, ProxyProtocolError, ProxyProtocolLimits,
-    ProxyRequest, ProxyRequestKind, RouteEndpoint, RouteError, RouteRegistry,
+    ProxyRequest, ProxyRequestKind, RouteError, RouteRegistry,
 };
 
 pub trait EgressIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -55,22 +58,27 @@ impl Connector for TcpConnector {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedRouteSource {
-    endpoint: RouteEndpoint,
-    source_shard: ShardId,
+/// A route source can only be created by the ingress attribution boundary.
+///
+/// ```compile_fail
+/// use browserd_core::ShardId;
+/// use browserd_egress::{RouteEndpoint, VerifiedRouteSource};
+///
+/// let endpoint = RouteEndpoint::new(7).expect("nonzero endpoint");
+/// let forged = VerifiedRouteSource::new(endpoint, ShardId::new());
+/// # let _ = forged;
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(test)]
+pub(crate) struct VerifiedRouteSource {
+    claim: RouteClaim,
 }
 
+#[cfg(test)]
 impl VerifiedRouteSource {
-    /// Constructs identity already established by a dedicated route listener or a
-    /// source-shard resolver at the network-namespace boundary. Proxy credentials
-    /// are deliberately not an input to this type.
     #[must_use]
-    pub const fn new(endpoint: RouteEndpoint, source_shard: ShardId) -> Self {
-        Self {
-            endpoint,
-            source_shard,
-        }
+    pub(crate) const fn new(claim: RouteClaim) -> Self {
+        Self { claim }
     }
 }
 
@@ -146,6 +154,7 @@ impl From<std::io::Error> for DataPlaneError {
 
 #[derive(Clone)]
 pub struct DataPlane<R, C> {
+    #[cfg(test)]
     registry: RouteRegistry,
     resolver: R,
     connector: C,
@@ -177,7 +186,10 @@ where
         {
             return Err(DataPlaneError::InvalidLimits);
         }
+        #[cfg(not(test))]
+        let _ = registry;
         Ok(Self {
+            #[cfg(test)]
             registry,
             resolver,
             connector,
@@ -185,9 +197,32 @@ where
         })
     }
 
-    pub async fn serve_connection<S>(
+    #[cfg(test)]
+    pub(crate) async fn serve_verified_connection<S>(
         &self,
         source: VerifiedRouteSource,
+        client: S,
+        now: MonotonicMillis,
+    ) -> Result<(), DataPlaneError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let ingress = self.registry.begin_ingress(&source.claim, now)?;
+        self.serve_attributed_connection(ingress, client, now).await
+    }
+
+    pub async fn serve_accepted_connection(
+        &self,
+        accepted: AcceptedRouteIngress,
+    ) -> Result<(), DataPlaneError> {
+        let (client, ingress, accepted_at) = accepted.into_parts();
+        self.serve_attributed_connection(ingress, client, accepted_at)
+            .await
+    }
+
+    async fn serve_attributed_connection<S>(
+        &self,
+        ingress: RouteIngressGuard,
         mut client: S,
         now: MonotonicMillis,
     ) -> Result<(), DataPlaneError>
@@ -195,9 +230,6 @@ where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let started_at = tokio::time::Instant::now();
-        let ingress = self
-            .registry
-            .begin_ingress(source.endpoint, &source.source_shard, now)?;
         let cancellation = ingress.cancellation_token();
         let request = tokio::select! {
             biased;

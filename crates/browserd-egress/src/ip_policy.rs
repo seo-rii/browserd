@@ -14,7 +14,7 @@ pub enum IpDenyReason {
 }
 
 /// The strong public-web IP policy.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IpPolicy;
 
 impl IpPolicy {

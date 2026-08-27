@@ -20,14 +20,14 @@ impl fmt::Display for EgressPolicyError {
 
 impl std::error::Error for EgressPolicyError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum HostPolicy {
     AnyPublic,
     ExactAuthorities(BTreeSet<(String, u16)>),
 }
 
 /// Network policy used to plan an outbound connection.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EgressPolicy {
     host_policy: HostPolicy,
     ip_policy: IpPolicy,

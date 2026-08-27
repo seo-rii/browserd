@@ -6,12 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use browserd_core::{SessionId, ShardId, TenantId};
-use browserd_egress::{
+use crate::{
     BoxedEgressIo, Connector, DataPlane, DataPlaneError, DataPlaneLimits, DnsResolution,
-    EgressPolicy, MonotonicMillis, QuotaLimits, Resolver, RouteBinding, RouteEndpoint,
-    RouteRegistry, VerifiedRouteSource,
+    EgressPolicy, InspectedSocketAddr, MonotonicMillis, QuotaLimits, Resolver, RouteBinding,
+    RouteClaim, RouteEndpoint, RouteError, RouteIngressListener, RouteRegistry,
+    VerifiedRouteSource,
+};
+use async_trait::async_trait;
+use browserd_core::{
+    EgressFence, LaunchGeneration, OwnerFence, RouteGeneration, SessionId, SessionIncarnation,
+    ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::Notify;
@@ -200,10 +204,7 @@ struct HangingShutdownConnector {
 
 #[async_trait]
 impl Connector for HangingShutdownConnector {
-    async fn connect(
-        &self,
-        _target: browserd_egress::InspectedSocketAddr,
-    ) -> Result<BoxedEgressIo, DataPlaneError> {
+    async fn connect(&self, _target: InspectedSocketAddr) -> Result<BoxedEgressIo, DataPlaneError> {
         self.upstream
             .lock()
             .expect("upstream lock should work")
@@ -260,10 +261,7 @@ struct StagedConnector {
 
 #[async_trait]
 impl Connector for StagedConnector {
-    async fn connect(
-        &self,
-        _target: browserd_egress::InspectedSocketAddr,
-    ) -> Result<BoxedEgressIo, DataPlaneError> {
+    async fn connect(&self, _target: InspectedSocketAddr) -> Result<BoxedEgressIo, DataPlaneError> {
         self.upstream
             .lock()
             .expect("upstream lock should work")
@@ -275,10 +273,7 @@ impl Connector for StagedConnector {
 
 #[async_trait]
 impl Connector for GatedConnector {
-    async fn connect(
-        &self,
-        _target: browserd_egress::InspectedSocketAddr,
-    ) -> Result<BoxedEgressIo, DataPlaneError> {
+    async fn connect(&self, _target: InspectedSocketAddr) -> Result<BoxedEgressIo, DataPlaneError> {
         self.started.notify_one();
         self.gate.notified().await;
         Err(DataPlaneError::Connect("gate unexpectedly opened".into()))
@@ -287,10 +282,7 @@ impl Connector for GatedConnector {
 
 #[async_trait]
 impl Connector for FakeConnector {
-    async fn connect(
-        &self,
-        target: browserd_egress::InspectedSocketAddr,
-    ) -> Result<BoxedEgressIo, DataPlaneError> {
+    async fn connect(&self, target: InspectedSocketAddr) -> Result<BoxedEgressIo, DataPlaneError> {
         self.targets
             .lock()
             .expect("target lock should work")
@@ -317,25 +309,43 @@ fn limits() -> QuotaLimits {
     }
 }
 
-fn setup() -> (RouteRegistry, RouteEndpoint, ShardId) {
+fn setup() -> (RouteRegistry, RouteClaim) {
     setup_with_limits(limits())
 }
 
-fn setup_with_limits(quota_limits: QuotaLimits) -> (RouteRegistry, RouteEndpoint, ShardId) {
+fn setup_with_limits(quota_limits: QuotaLimits) -> (RouteRegistry, RouteClaim) {
     let registry = RouteRegistry::new(Duration::from_secs(30));
     let endpoint = RouteEndpoint::new(71).expect("endpoint should be valid");
     let shard = ShardId::new();
+    let session_id = SessionId::new();
+    let shard_fence = ShardFence::new(
+        OwnerFence::new(
+            WorkerId::new("worker-a").expect("worker ID should be valid"),
+            WorkerEpoch::new(7).expect("worker epoch should be nonzero"),
+        ),
+        shard.clone(),
+        LaunchGeneration::new(1).expect("launch generation should be nonzero"),
+    );
+    let claim = RouteClaim::new(
+        endpoint,
+        EgressFence::new(
+            shard_fence,
+            RouteGeneration::new(1).expect("route generation should be nonzero"),
+            session_id.clone(),
+            SessionIncarnation::new(1).expect("session incarnation should be nonzero"),
+        ),
+    );
     registry
-        .prepare_shard(&shard, 7)
+        .prepare_shard(claim.fence().shard())
         .expect("shard should be prepared");
     registry
         .bind(
-            endpoint,
+            &claim,
             RouteBinding::new(
                 TenantId::new(),
-                SessionId::new(),
+                session_id,
                 shard.clone(),
-                7,
+                claim.worker_epoch(),
                 EgressPolicy::public_web_default(),
                 quota_limits,
                 MonotonicMillis::new(20_000),
@@ -343,7 +353,7 @@ fn setup_with_limits(quota_limits: QuotaLimits) -> (RouteRegistry, RouteEndpoint
             MonotonicMillis::new(1_000),
         )
         .expect("route should bind");
-    (registry, endpoint, shard)
+    (registry, claim)
 }
 
 fn data_limits() -> DataPlaneLimits {
@@ -360,8 +370,47 @@ fn data_limits() -> DataPlaneLimits {
 }
 
 #[tokio::test]
+async fn accepted_listener_capability_is_the_public_data_plane_entrypoint() {
+    let (registry, claim) = setup();
+    let raw = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("loopback listener should bind");
+    let address = raw.local_addr().expect("listener should have an address");
+    let listener = RouteIngressListener::new(raw, claim, registry.clone())
+        .expect("listener should be attributed");
+    let mut client = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("client should connect");
+    client
+        .write_all(b"not-http\r\n\r\n")
+        .await
+        .expect("invalid request should write");
+    let accepted = listener
+        .accept(|| MonotonicMillis::new(1_001))
+        .await
+        .expect("attributed ingress should accept");
+    let service = DataPlane::new(
+        registry,
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(None)),
+        },
+        data_limits(),
+    )
+    .expect("limits should be valid");
+
+    let result = service.serve_accepted_connection(accepted).await;
+
+    assert!(matches!(result, Err(DataPlaneError::Request(_))));
+}
+
+#[tokio::test]
 async fn wrong_source_route_cannot_trigger_dns_even_with_proxy_credentials() {
-    let (registry, endpoint, _) = setup();
+    let (registry, claim) = setup();
     let resolver_calls = Arc::new(Mutex::new(Vec::new()));
     let connector_targets = Arc::new(Mutex::new(Vec::new()));
     let service = DataPlane::new(
@@ -386,8 +435,20 @@ async fn wrong_source_route_cannot_trigger_dns_even_with_proxy_credentials() {
         .expect("request should write");
 
     let result = service
-        .serve_connection(
-            VerifiedRouteSource::new(endpoint, ShardId::new()),
+        .serve_verified_connection(
+            VerifiedRouteSource::new(RouteClaim::new(
+                claim.endpoint(),
+                EgressFence::new(
+                    ShardFence::new(
+                        claim.fence().shard().owner().clone(),
+                        ShardId::new(),
+                        claim.fence().shard().launch_generation(),
+                    ),
+                    claim.fence().route_generation(),
+                    claim.fence().session_id().clone(),
+                    claim.fence().session_incarnation(),
+                ),
+            )),
             server,
             MonotonicMillis::new(1_001),
         )
@@ -409,7 +470,7 @@ async fn wrong_source_route_cannot_trigger_dns_even_with_proxy_credentials() {
 
 #[tokio::test]
 async fn resolves_once_and_connects_only_the_inspected_socket_address() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let resolver_calls = Arc::new(Mutex::new(Vec::new()));
     let connector_targets = Arc::new(Mutex::new(Vec::new()));
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
@@ -441,10 +502,11 @@ async fn resolves_once_and_connects_only_the_inspected_socket_address() {
         .write_all(b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .await
         .expect("request should write");
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -474,7 +536,10 @@ async fn resolves_once_and_connects_only_the_inspected_socket_address() {
     );
     assert!(response.ends_with(b"\r\n\r\nOK"));
     assert_eq!(
-        registry.usage(endpoint).total_egress_bytes,
+        registry
+            .usage(&claim)
+            .expect("usage should exist")
+            .total_egress_bytes,
         u64::try_from(response.len().saturating_add(request_bytes))
             .expect("network usage should fit u64")
     );
@@ -482,7 +547,7 @@ async fn resolves_once_and_connects_only_the_inspected_socket_address() {
 
 #[tokio::test]
 async fn revoke_cancels_blocked_dns_before_connect() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let resolver_calls = Arc::new(Mutex::new(Vec::new()));
     let gate = Arc::new(Notify::new());
     let connector_targets = Arc::new(Mutex::new(Vec::new()));
@@ -504,11 +569,11 @@ async fn revoke_cancels_blocked_dns_before_connect() {
         .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
         .await
         .expect("request should write");
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -521,9 +586,7 @@ async fn revoke_cancels_blocked_dns_before_connect() {
     {
         tokio::task::yield_now().await;
     }
-    registry
-        .revoke(endpoint, &shard, 7)
-        .expect("revoke should work");
+    registry.revoke(&claim).expect("revoke should work");
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
         .expect("serve should cancel promptly")
@@ -539,7 +602,7 @@ async fn revoke_cancels_blocked_dns_before_connect() {
 
 #[tokio::test]
 async fn shard_release_waits_for_a_header_stalled_connection_to_cancel() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let read_polled = Arc::new(Notify::new());
     let mut configured = data_limits();
     configured.header_timeout = Duration::from_secs(30);
@@ -556,12 +619,12 @@ async fn shard_release_waits_for_a_header_stalled_connection_to_cancel() {
         configured,
     )
     .expect("limits should be valid");
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let header_started = read_polled.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 StalledHeaderIo {
                     read_polled: header_started,
                 },
@@ -571,22 +634,22 @@ async fn shard_release_waits_for_a_header_stalled_connection_to_cancel() {
     });
     read_polled.notified().await;
 
-    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    assert_eq!(registry.revoke_shard(claim.fence().shard()), Ok(1));
     assert_eq!(
-        registry.release_shard(&shard, 7),
-        Err(browserd_egress::RouteError::ShardNotDrained)
+        registry.release_shard(claim.fence().shard()),
+        Err(RouteError::ShardNotDrained)
     );
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
         .expect("header read should cancel promptly")
         .expect("serve task should join");
     assert!(matches!(result, Err(DataPlaneError::RouteRevoked)));
-    assert_eq!(registry.release_shard(&shard, 7), Ok(()));
+    assert_eq!(registry.release_shard(claim.fence().shard()), Ok(()));
 }
 
 #[tokio::test]
 async fn revoke_cancels_blocked_connect() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let started = Arc::new(Notify::new());
     let service = DataPlane::new(
         registry.clone(),
@@ -606,20 +669,18 @@ async fn revoke_cancels_blocked_connect() {
         .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
         .await
         .expect("request should write");
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
             .await
     });
     started.notified().await;
-    registry
-        .revoke(endpoint, &shard, 7)
-        .expect("revoke should work");
+    registry.revoke(&claim).expect("revoke should work");
 
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
@@ -630,7 +691,7 @@ async fn revoke_cancels_blocked_connect() {
 
 #[tokio::test]
 async fn shard_revoke_cancels_a_blocked_initial_upstream_write() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let write_blocked = Arc::new(Notify::new());
     let mut configured = data_limits();
     configured.write_timeout = Duration::from_secs(30);
@@ -655,11 +716,11 @@ async fn shard_revoke_cancels_a_blocked_initial_upstream_write() {
         .write_all(b"GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n")
         .await
         .expect("request should write");
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -667,18 +728,18 @@ async fn shard_revoke_cancels_a_blocked_initial_upstream_write() {
     });
     write_blocked.notified().await;
 
-    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    assert_eq!(registry.revoke_shard(claim.fence().shard()), Ok(1));
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
         .expect("initial write should cancel promptly")
         .expect("serve task should join");
     assert!(matches!(result, Err(DataPlaneError::RouteRevoked)));
-    assert_eq!(registry.release_shard(&shard, 7), Ok(()));
+    assert_eq!(registry.release_shard(claim.fence().shard()), Ok(()));
 }
 
 #[tokio::test]
 async fn shard_revoke_cancels_a_blocked_request_body_read() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let write_completed = Arc::new(Notify::new());
     let mut configured = data_limits();
     configured.read_timeout = Duration::from_secs(30);
@@ -705,11 +766,11 @@ async fn shard_revoke_cancels_a_blocked_request_body_read() {
         )
         .await
         .expect("request head should write");
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -717,18 +778,18 @@ async fn shard_revoke_cancels_a_blocked_request_body_read() {
     });
     write_completed.notified().await;
 
-    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    assert_eq!(registry.revoke_shard(claim.fence().shard()), Ok(1));
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
         .expect("request body read should cancel promptly")
         .expect("serve task should join");
     assert!(matches!(result, Err(DataPlaneError::RouteRevoked)));
-    assert_eq!(registry.release_shard(&shard, 7), Ok(()));
+    assert_eq!(registry.release_shard(claim.fence().shard()), Ok(()));
 }
 
 #[tokio::test]
 async fn shard_revoke_cancels_a_blocked_request_body_write() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let write_completed = Arc::new(Notify::new());
     let write_blocked = Arc::new(Notify::new());
     let mut configured = data_limits();
@@ -756,11 +817,11 @@ async fn shard_revoke_cancels_a_blocked_request_body_write() {
         )
         .await
         .expect("request head should write");
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -773,18 +834,18 @@ async fn shard_revoke_cancels_a_blocked_request_body_write() {
         .expect("request body should write");
     write_blocked.notified().await;
 
-    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    assert_eq!(registry.revoke_shard(claim.fence().shard()), Ok(1));
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
         .expect("request body write should cancel promptly")
         .expect("serve task should join");
     assert!(matches!(result, Err(DataPlaneError::RouteRevoked)));
-    assert_eq!(registry.release_shard(&shard, 7), Ok(()));
+    assert_eq!(registry.release_shard(claim.fence().shard()), Ok(()));
 }
 
 #[tokio::test]
 async fn shard_revoke_cancels_a_blocked_relay_write_before_more_bytes_flush() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let blocked = Arc::new(Notify::new());
     let completed_writes = Arc::new(Mutex::new(Vec::new()));
@@ -803,11 +864,11 @@ async fn shard_revoke_cancels_a_blocked_relay_write_before_more_bytes_flush() {
     .expect("limits should be valid");
     let writes = completed_writes.clone();
     let client_blocked = blocked.clone();
-    let serving_shard = shard.clone();
+    let serving_claim = claim.clone();
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, serving_shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
                 BlockingRelayClientIo {
                     request: b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
                         .to_vec(),
@@ -826,7 +887,7 @@ async fn shard_revoke_cancels_a_blocked_relay_write_before_more_bytes_flush() {
         .expect("origin bytes should write");
     blocked.notified().await;
 
-    assert_eq!(registry.revoke_shard(&shard, 7), Ok(1));
+    assert_eq!(registry.revoke_shard(claim.fence().shard()), Ok(1));
     let result = tokio::time::timeout(Duration::from_secs(1), serve)
         .await
         .expect("blocked relay write should cancel promptly")
@@ -839,12 +900,12 @@ async fn shard_revoke_cancels_a_blocked_relay_write_before_more_bytes_flush() {
             .as_slice(),
         [b"HTTP/1.1 200 Connection Established\r\n\r\n".to_vec()]
     );
-    assert_eq!(registry.release_shard(&shard, 7), Ok(()));
+    assert_eq!(registry.release_shard(claim.fence().shard()), Ok(()));
 }
 
 #[tokio::test]
 async fn tunnel_half_close_is_bounded_by_the_write_timeout() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let shutdown_started = Arc::new(Notify::new());
     let mut configured = data_limits();
     configured.write_timeout = Duration::from_millis(20);
@@ -869,8 +930,8 @@ async fn tunnel_half_close_is_bounded_by_the_write_timeout() {
         .expect("request should write");
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -896,7 +957,7 @@ async fn tunnel_half_close_is_bounded_by_the_write_timeout() {
 
 #[tokio::test]
 async fn forward_http_does_not_tunnel_a_time_split_second_request() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let first_request_received = Arc::new(Notify::new());
     let origin_started = first_request_received.clone();
@@ -934,8 +995,8 @@ async fn forward_http_does_not_tunnel_a_time_split_second_request() {
         .expect("first request should write");
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -962,7 +1023,7 @@ async fn forward_http_does_not_tunnel_a_time_split_second_request() {
 
 #[tokio::test]
 async fn websocket_rejection_does_not_enable_a_raw_tunnel() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let origin_task = tokio::spawn(async move {
         let mut request = vec![0_u8; 1_024];
@@ -1001,8 +1062,8 @@ async fn websocket_rejection_does_not_enable_a_raw_tunnel() {
         .expect("upgrade request should write");
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -1026,7 +1087,7 @@ async fn websocket_rejection_does_not_enable_a_raw_tunnel() {
 
 #[tokio::test]
 async fn websocket_response_header_uses_one_absolute_timeout() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let mut configured = data_limits();
     configured.header_timeout = Duration::from_millis(15);
@@ -1052,8 +1113,8 @@ async fn websocket_response_header_uses_one_absolute_timeout() {
         .expect("upgrade request should write");
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -1085,7 +1146,7 @@ async fn websocket_response_header_uses_one_absolute_timeout() {
 #[tokio::test]
 async fn revoke_or_expiry_immediately_closes_live_connect_tunnel() {
     for expire in [false, true] {
-        let (registry, endpoint, shard) = setup();
+        let (registry, claim) = setup();
         let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
         let service = DataPlane::new(
             registry.clone(),
@@ -1105,11 +1166,11 @@ async fn revoke_or_expiry_immediately_closes_live_connect_tunnel() {
             .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
             .await
             .expect("request should write");
-        let serving_shard = shard.clone();
+        let serving_claim = claim.clone();
         let serve = tokio::spawn(async move {
             service
-                .serve_connection(
-                    VerifiedRouteSource::new(endpoint, serving_shard),
+                .serve_verified_connection(
+                    VerifiedRouteSource::new(serving_claim),
                     server,
                     MonotonicMillis::new(1_001),
                 )
@@ -1125,9 +1186,7 @@ async fn revoke_or_expiry_immediately_closes_live_connect_tunnel() {
         if expire {
             assert_eq!(registry.expire_routes(MonotonicMillis::new(20_000)), 1);
         } else {
-            registry
-                .revoke(endpoint, &shard, 7)
-                .expect("revoke should work");
+            registry.revoke(&claim).expect("revoke should work");
         }
         let result = tokio::time::timeout(Duration::from_secs(1), serve)
             .await
@@ -1147,7 +1206,7 @@ async fn revoke_or_expiry_immediately_closes_live_connect_tunnel() {
 
 #[tokio::test]
 async fn forward_http_requires_the_exact_declared_content_length() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let service = DataPlane::new(
         registry,
@@ -1172,8 +1231,8 @@ async fn forward_http_requires_the_exact_declared_content_length() {
     client.shutdown().await.expect("client write should close");
 
     let result = service
-        .serve_connection(
-            VerifiedRouteSource::new(endpoint, shard),
+        .serve_verified_connection(
+            VerifiedRouteSource::new(claim),
             server,
             MonotonicMillis::new(1_001),
         )
@@ -1188,7 +1247,7 @@ async fn forward_http_requires_the_exact_declared_content_length() {
 
 #[tokio::test]
 async fn websocket_upgrade_uses_the_same_bidirectional_bounded_tunnel() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let service = DataPlane::new(
         registry,
@@ -1231,8 +1290,8 @@ async fn websocket_upgrade_uses_the_same_bidirectional_bounded_tunnel() {
         .expect("upgrade request should write");
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -1259,7 +1318,7 @@ async fn request_body_quota_is_checked_before_bytes_are_forwarded() {
     let mut quota = limits();
     quota.max_egress_bytes_per_window = head_bytes;
     quota.max_total_egress_bytes = head_bytes;
-    let (registry, endpoint, shard) = setup_with_limits(quota);
+    let (registry, claim) = setup_with_limits(quota);
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let service = DataPlane::new(
         registry.clone(),
@@ -1291,8 +1350,8 @@ async fn request_body_quota_is_checked_before_bytes_are_forwarded() {
         .expect("request should write");
 
     let result = service
-        .serve_connection(
-            VerifiedRouteSource::new(endpoint, shard),
+        .serve_verified_connection(
+            VerifiedRouteSource::new(claim.clone()),
             server,
             MonotonicMillis::new(1_001),
         )
@@ -1303,14 +1362,20 @@ async fn request_body_quota_is_checked_before_bytes_are_forwarded() {
         origin_task.await.expect("origin task should join"),
         expected_head
     );
-    assert_eq!(registry.usage(endpoint).total_egress_bytes, head_bytes);
+    assert_eq!(
+        registry
+            .usage(&claim)
+            .expect("usage should exist")
+            .total_egress_bytes,
+        head_bytes
+    );
 }
 
 #[tokio::test]
 async fn response_quota_is_checked_before_bytes_are_forwarded() {
     let mut quota = limits();
     quota.max_response_bytes = Some(32);
-    let (registry, endpoint, shard) = setup_with_limits(quota);
+    let (registry, claim) = setup_with_limits(quota);
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let service = DataPlane::new(
         registry.clone(),
@@ -1340,8 +1405,8 @@ async fn response_quota_is_checked_before_bytes_are_forwarded() {
         .await
         .expect("request should write");
     let result = service
-        .serve_connection(
-            VerifiedRouteSource::new(endpoint, shard),
+        .serve_verified_connection(
+            VerifiedRouteSource::new(claim.clone()),
             server,
             MonotonicMillis::new(1_001),
         )
@@ -1355,14 +1420,17 @@ async fn response_quota_is_checked_before_bytes_are_forwarded() {
     assert!(response.is_empty());
     let request_bytes = origin_task.await.expect("origin task should join");
     assert_eq!(
-        registry.usage(endpoint).total_egress_bytes,
+        registry
+            .usage(&claim)
+            .expect("usage should exist")
+            .total_egress_bytes,
         u64::try_from(request_bytes).expect("request usage should fit u64")
     );
 }
 
 #[tokio::test]
 async fn incomplete_header_is_bounded_by_the_header_timeout() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let mut configured = data_limits();
     configured.header_timeout = Duration::from_millis(20);
     let service = DataPlane::new(
@@ -1382,8 +1450,8 @@ async fn incomplete_header_is_bounded_by_the_header_timeout() {
 
     assert!(matches!(
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )
@@ -1394,7 +1462,7 @@ async fn incomplete_header_is_bounded_by_the_header_timeout() {
 
 #[tokio::test]
 async fn tunnel_idle_timeout_resets_on_traffic_in_either_direction() {
-    let (registry, endpoint, shard) = setup();
+    let (registry, claim) = setup();
     let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
     let mut configured = data_limits();
     configured.idle_timeout = Duration::from_millis(40);
@@ -1427,8 +1495,8 @@ async fn tunnel_idle_timeout_resets_on_traffic_in_either_direction() {
         .expect("request should write");
     let serve = tokio::spawn(async move {
         service
-            .serve_connection(
-                VerifiedRouteSource::new(endpoint, shard),
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
                 server,
                 MonotonicMillis::new(1_001),
             )

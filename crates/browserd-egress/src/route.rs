@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use browserd_core::{LeaseId, SessionId, ShardId, TenantId};
+use browserd_core::{EgressFence, SessionId, ShardFence, ShardId, TenantId, WorkerId};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -14,7 +14,14 @@ use crate::{
 pub struct RouteEndpoint(u64);
 
 impl RouteEndpoint {
-    pub const fn new(value: u64) -> Result<Self, RouteError> {
+    /// Endpoints are allocated by the egress attachment manager, not callers.
+    ///
+    /// ```compile_fail
+    /// use browserd_egress::RouteEndpoint;
+    /// let forged = RouteEndpoint::new(7);
+    /// # let _ = forged;
+    /// ```
+    pub(crate) const fn new(value: u64) -> Result<Self, RouteError> {
         if value == 0 {
             Err(RouteError::InvalidEndpoint)
         } else {
@@ -28,7 +35,65 @@ impl RouteEndpoint {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Read-only proof that an allocated endpoint belongs to one exact egress fence.
+///
+/// ```compile_fail
+/// use browserd_core::{
+///     EgressFence, LaunchGeneration, OwnerFence, RouteGeneration, SessionId,
+///     SessionIncarnation, ShardFence, ShardId, WorkerEpoch, WorkerId,
+/// };
+/// use browserd_egress::{RouteClaim, RouteEndpoint};
+/// # let fence = EgressFence::new(
+/// #     ShardFence::new(
+/// #         OwnerFence::new(
+/// #             WorkerId::new("worker-a").expect("valid worker"),
+/// #             WorkerEpoch::new(1).expect("nonzero epoch"),
+/// #         ),
+/// #         ShardId::new(),
+/// #         LaunchGeneration::new(1).expect("nonzero launch generation"),
+/// #     ),
+/// #     RouteGeneration::new(1).expect("nonzero route generation"),
+/// #     SessionId::new(),
+/// #     SessionIncarnation::new(1).expect("nonzero session incarnation"),
+/// # );
+/// # let endpoint: RouteEndpoint = todo!();
+/// let forged = RouteClaim::new(endpoint, fence);
+/// # let _ = forged;
+/// ```
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RouteClaim {
+    endpoint: RouteEndpoint,
+    fence: EgressFence,
+}
+
+impl RouteClaim {
+    #[must_use]
+    pub(crate) const fn new(endpoint: RouteEndpoint, fence: EgressFence) -> Self {
+        Self { endpoint, fence }
+    }
+
+    #[must_use]
+    pub const fn endpoint(&self) -> RouteEndpoint {
+        self.endpoint
+    }
+
+    #[must_use]
+    pub const fn fence(&self) -> &EgressFence {
+        &self.fence
+    }
+
+    #[must_use]
+    pub const fn source_shard(&self) -> &ShardId {
+        self.fence.shard().shard_id()
+    }
+
+    #[must_use]
+    pub const fn worker_epoch(&self) -> u64 {
+        self.fence.shard().owner().worker_epoch().get()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteBinding {
     tenant_id: TenantId,
     session_id: SessionId,
@@ -80,18 +145,27 @@ impl RouteBinding {
     pub const fn worker_epoch(&self) -> u64 {
         self.worker_epoch
     }
+
+    #[must_use]
+    pub const fn expires_at(&self) -> MonotonicMillis {
+        self.expires_at
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouteIdentity {
+    claim: RouteClaim,
     tenant_id: TenantId,
     session_id: SessionId,
-    shard_id: ShardId,
-    worker_epoch: u64,
     expires_at: MonotonicMillis,
 }
 
 impl RouteIdentity {
+    #[must_use]
+    pub const fn claim(&self) -> &RouteClaim {
+        &self.claim
+    }
+
     #[must_use]
     pub const fn tenant_id(&self) -> &TenantId {
         &self.tenant_id
@@ -104,12 +178,12 @@ impl RouteIdentity {
 
     #[must_use]
     pub const fn shard_id(&self) -> &ShardId {
-        &self.shard_id
+        self.claim.fence().shard().shard_id()
     }
 
     #[must_use]
     pub const fn worker_epoch(&self) -> u64 {
-        self.worker_epoch
+        self.claim.worker_epoch()
     }
 
     #[must_use]
@@ -121,23 +195,18 @@ impl RouteIdentity {
 impl From<&RouteEntry> for RouteIdentity {
     fn from(entry: &RouteEntry) -> Self {
         Self {
-            tenant_id: entry.tenant_id.clone(),
-            session_id: entry.session_id.clone(),
-            shard_id: entry.shard_id.clone(),
-            worker_epoch: entry.worker_epoch,
-            expires_at: entry.expires_at,
+            claim: entry.claim.clone(),
+            tenant_id: entry.binding.tenant_id.clone(),
+            session_id: entry.binding.session_id.clone(),
+            expires_at: entry.binding.expires_at,
         }
     }
 }
 
 #[derive(Debug)]
 struct RouteEntry {
-    incarnation: LeaseId,
-    tenant_id: TenantId,
-    session_id: SessionId,
-    shard_id: ShardId,
-    worker_epoch: u64,
-    expires_at: MonotonicMillis,
+    claim: RouteClaim,
+    binding: RouteBinding,
     planner: ConnectionPlanner,
     quota: QuotaLedger,
     cancellation: CancellationToken,
@@ -145,16 +214,15 @@ struct RouteEntry {
 
 #[derive(Clone, Debug)]
 struct RetiredRoute {
-    shard_id: ShardId,
-    worker_epoch: u64,
+    claim: RouteClaim,
     final_usage: QuotaUsage,
 }
 
 #[derive(Debug)]
 struct ShardRoutes {
-    worker_epoch: u64,
+    fence: ShardFence,
     lifecycle: ShardRouteLifecycle,
-    endpoints: HashSet<RouteEndpoint>,
+    routes: HashSet<EgressFence>,
     cancellation: CancellationToken,
     active_connections: usize,
 }
@@ -168,11 +236,11 @@ enum ShardRouteLifecycle {
 
 #[derive(Debug, Default)]
 struct RouteState {
-    active: HashMap<RouteEndpoint, RouteEntry>,
-    retired: HashMap<RouteEndpoint, RetiredRoute>,
-    session_endpoints: HashMap<SessionId, RouteEndpoint>,
+    active: HashMap<EgressFence, RouteEntry>,
+    retired: HashMap<EgressFence, RetiredRoute>,
+    session_routes: HashMap<SessionId, EgressFence>,
     shards: HashMap<ShardId, ShardRoutes>,
-    worker_epoch_high_watermark: Option<u64>,
+    worker_epoch_high_watermarks: HashMap<WorkerId, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +279,16 @@ impl Default for RouteRegistryLimits {
     }
 }
 
+/// Route ingress accounting is minted only by an attached listener capability.
+///
+/// ```compile_fail
+/// use browserd_egress::{MonotonicMillis, RouteClaim, RouteRegistry};
+///
+/// fn forge(registry: &RouteRegistry, claim: &RouteClaim) {
+///     let forged = registry.begin_ingress(claim, MonotonicMillis::new(1));
+///     let _ = forged;
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct RouteRegistry {
     max_lease_millis: Option<u64>,
@@ -236,22 +314,15 @@ impl RouteRegistry {
         }
     }
 
-    pub fn prepare_shard(
-        &self,
-        source_shard: &ShardId,
-        worker_epoch: u64,
-    ) -> Result<(), RouteError> {
-        if worker_epoch == 0 {
-            return Err(RouteError::InvalidWorkerEpoch);
-        }
+    pub fn prepare_shard(&self, fence: &ShardFence) -> Result<(), RouteError> {
         if self.max_lease_millis.is_none() || !self.limits.is_valid() {
             return Err(RouteError::InvalidRegistryConfig);
         }
         let mut state = self.lock_state();
-        let advances_worker_epoch = state
-            .worker_epoch_high_watermark
-            .is_some_and(|high_watermark| worker_epoch > high_watermark);
-        if let Some(high_watermark) = state.worker_epoch_high_watermark {
+        let worker_id = fence.owner().worker_id();
+        let worker_epoch = fence.owner().worker_epoch().get();
+        let high_watermark = state.worker_epoch_high_watermarks.get(worker_id).copied();
+        if let Some(high_watermark) = high_watermark {
             if worker_epoch < high_watermark {
                 return Err(RouteError::WorkerEpochMismatch {
                     expected: high_watermark,
@@ -259,17 +330,21 @@ impl RouteRegistry {
                 });
             }
             if worker_epoch > high_watermark
-                && state
-                    .shards
-                    .values()
-                    .any(|shard| shard.lifecycle != ShardRouteLifecycle::Released)
+                && state.shards.values().any(|shard| {
+                    shard.fence.owner().worker_id() == worker_id
+                        && shard.lifecycle != ShardRouteLifecycle::Released
+                })
             {
                 return Err(RouteError::ShardNotReleased);
             }
         }
-        if advances_worker_epoch {
-            state.shards.clear();
+        if high_watermark.is_some_and(|high_watermark| worker_epoch > high_watermark) {
+            state.shards.retain(|_, shard| {
+                shard.fence.owner().worker_id() != worker_id
+                    || shard.lifecycle != ShardRouteLifecycle::Released
+            });
         }
+        let source_shard = fence.shard_id();
         let Some(shard) = state.shards.get_mut(source_shard) else {
             if state.shards.len() >= self.limits.max_tracked_shards {
                 return Err(RouteError::ShardCapacityExceeded);
@@ -277,64 +352,105 @@ impl RouteRegistry {
             state.shards.insert(
                 source_shard.clone(),
                 ShardRoutes {
-                    worker_epoch,
+                    fence: fence.clone(),
                     lifecycle: ShardRouteLifecycle::Prepared,
-                    endpoints: HashSet::new(),
+                    routes: HashSet::new(),
                     cancellation: CancellationToken::new(),
                     active_connections: 0,
                 },
             );
-            state.worker_epoch_high_watermark = Some(worker_epoch);
+            state
+                .worker_epoch_high_watermarks
+                .insert(worker_id.clone(), worker_epoch);
             return Ok(());
         };
-        if worker_epoch < shard.worker_epoch {
-            return Err(RouteError::WorkerEpochMismatch {
-                expected: shard.worker_epoch,
-                actual: worker_epoch,
-            });
-        }
-        if worker_epoch == shard.worker_epoch {
+        if &shard.fence == fence {
             return match shard.lifecycle {
                 ShardRouteLifecycle::Prepared => Ok(()),
                 ShardRouteLifecycle::Revoked => Err(RouteError::ShardRevoked),
                 ShardRouteLifecycle::Released => Err(RouteError::ShardReleased),
             };
         }
+        if shard.fence.owner().worker_id() != worker_id {
+            return Err(RouteError::ShardFenceMismatch);
+        }
+        let stored_epoch = shard.fence.owner().worker_epoch().get();
+        if worker_epoch < stored_epoch {
+            return Err(RouteError::WorkerEpochMismatch {
+                expected: stored_epoch,
+                actual: worker_epoch,
+            });
+        }
         if shard.lifecycle != ShardRouteLifecycle::Released {
             return Err(RouteError::ShardNotReleased);
         }
-        if !shard.endpoints.is_empty() {
+        if !shard.routes.is_empty() {
             return Err(RouteError::InconsistentRegistryState);
         }
-        shard.worker_epoch = worker_epoch;
+        if worker_epoch == stored_epoch
+            && fence.launch_generation() <= shard.fence.launch_generation()
+        {
+            return Err(RouteError::ShardFenceMismatch);
+        }
+        shard.fence = fence.clone();
         shard.lifecycle = ShardRouteLifecycle::Prepared;
         shard.cancellation = CancellationToken::new();
         shard.active_connections = 0;
-        state.worker_epoch_high_watermark = Some(worker_epoch);
+        state
+            .worker_epoch_high_watermarks
+            .insert(worker_id.clone(), worker_epoch);
         Ok(())
     }
 
     pub fn bind(
         &self,
-        endpoint: RouteEndpoint,
+        claim: &RouteClaim,
         binding: RouteBinding,
         now: MonotonicMillis,
     ) -> Result<RouteIdentity, RouteError> {
-        if binding.worker_epoch == 0 {
-            return Err(RouteError::InvalidWorkerEpoch);
+        if claim.source_shard() != &binding.shard_id {
+            return Err(RouteError::SourceShardMismatch);
+        }
+        if claim.worker_epoch() != binding.worker_epoch {
+            return Err(RouteError::WorkerEpochMismatch {
+                expected: claim.worker_epoch(),
+                actual: binding.worker_epoch,
+            });
+        }
+        if claim.fence().session_id() != &binding.session_id {
+            return Err(RouteError::EgressFenceMismatch);
         }
         if !self.limits.is_valid() {
             return Err(RouteError::InvalidRegistryConfig);
         }
         self.validate_expiry(now, binding.expires_at)?;
         let mut state = self.lock_state();
-        if state.retired.contains_key(&endpoint) {
+        let fence = claim.fence().clone();
+        if state
+            .active
+            .get(&fence)
+            .is_some_and(|entry| entry.binding.expires_at <= now)
+        {
+            Self::retire_route(&mut state, &fence);
+        }
+        if let Some(retired) = state.retired.get(&fence) {
+            Self::validate_claim(&retired.claim, claim)?;
             return Err(RouteError::EndpointRetired);
         }
-        if state.active.contains_key(&endpoint) {
-            return Err(RouteError::EndpointAlreadyBound);
+        if let Some(entry) = state.active.get(&fence) {
+            Self::validate_claim(&entry.claim, claim)?;
+            if entry.binding.tenant_id == binding.tenant_id
+                && entry.binding.session_id == binding.session_id
+                && entry.binding.shard_id == binding.shard_id
+                && entry.binding.worker_epoch == binding.worker_epoch
+                && entry.binding.policy == binding.policy
+                && entry.binding.quota_limits == binding.quota_limits
+            {
+                return Ok(RouteIdentity::from(entry));
+            }
+            return Err(RouteError::BindingConflict);
         }
-        if state.session_endpoints.contains_key(&binding.session_id) {
+        if state.session_routes.contains_key(&binding.session_id) {
             return Err(RouteError::SessionAlreadyBound);
         }
         if state.active.len().saturating_add(state.retired.len()) >= self.limits.max_tracked_routes
@@ -343,13 +459,10 @@ impl RouteRegistry {
         }
         let shard = state
             .shards
-            .get_mut(&binding.shard_id)
+            .get_mut(claim.source_shard())
             .ok_or(RouteError::ShardNotPrepared)?;
-        if shard.worker_epoch != binding.worker_epoch {
-            return Err(RouteError::WorkerEpochMismatch {
-                expected: shard.worker_epoch,
-                actual: binding.worker_epoch,
-            });
+        if &shard.fence != claim.fence().shard() {
+            return Err(RouteError::ShardFenceMismatch);
         }
         match shard.lifecycle {
             ShardRouteLifecycle::Prepared => {}
@@ -357,115 +470,66 @@ impl RouteRegistry {
             ShardRouteLifecycle::Released => return Err(RouteError::ShardReleased),
         }
         let cancellation = shard.cancellation.child_token();
-        shard.endpoints.insert(endpoint);
+        shard.routes.insert(fence.clone());
         let session_id = binding.session_id.clone();
         let entry = RouteEntry {
-            incarnation: LeaseId::new(),
-            tenant_id: binding.tenant_id,
-            session_id: binding.session_id,
-            shard_id: binding.shard_id,
-            worker_epoch: binding.worker_epoch,
-            expires_at: binding.expires_at,
-            planner: ConnectionPlanner::new(binding.policy),
-            quota: QuotaLedger::new(binding.quota_limits),
+            claim: claim.clone(),
+            planner: ConnectionPlanner::new(binding.policy.clone()),
+            quota: QuotaLedger::new(binding.quota_limits.clone()),
+            binding,
             cancellation,
         };
         let identity = RouteIdentity::from(&entry);
-        state.active.insert(endpoint, entry);
-        state.session_endpoints.insert(session_id, endpoint);
+        state.active.insert(fence.clone(), entry);
+        state.session_routes.insert(session_id, fence);
         Ok(identity)
     }
 
     pub fn binding(
         &self,
-        endpoint: RouteEndpoint,
-        source_shard: &ShardId,
+        claim: &RouteClaim,
         now: MonotonicMillis,
     ) -> Result<RouteIdentity, RouteError> {
         let mut state = self.lock_state();
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if &entry.shard_id != source_shard {
-            return Err(RouteError::SourceShardMismatch);
-        }
+        let entry = Self::active_entry(&mut state, claim, now)?;
         Ok(RouteIdentity::from(&*entry))
     }
 
     pub fn renew(
         &self,
-        endpoint: RouteEndpoint,
-        source_shard: &ShardId,
-        worker_epoch: u64,
+        claim: &RouteClaim,
         now: MonotonicMillis,
         new_expires_at: MonotonicMillis,
     ) -> Result<(), RouteError> {
         self.validate_expiry(now, new_expires_at)?;
         let mut state = self.lock_state();
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if &entry.shard_id != source_shard {
-            return Err(RouteError::SourceShardMismatch);
-        }
-        if entry.worker_epoch != worker_epoch {
-            return Err(RouteError::WorkerEpochMismatch {
-                expected: entry.worker_epoch,
-                actual: worker_epoch,
-            });
-        }
-        entry.expires_at = new_expires_at;
+        let entry = Self::active_entry(&mut state, claim, now)?;
+        entry.binding.expires_at = new_expires_at;
         Ok(())
     }
 
-    pub fn revoke(
-        &self,
-        endpoint: RouteEndpoint,
-        source_shard: &ShardId,
-        worker_epoch: u64,
-    ) -> Result<(), RouteError> {
+    pub fn revoke(&self, claim: &RouteClaim) -> Result<(), RouteError> {
         let mut state = self.lock_state();
-        if let Some(retired) = state.retired.get(&endpoint) {
-            if &retired.shard_id != source_shard {
-                return Err(RouteError::SourceShardMismatch);
-            }
-            if retired.worker_epoch != worker_epoch {
-                return Err(RouteError::WorkerEpochMismatch {
-                    expected: retired.worker_epoch,
-                    actual: worker_epoch,
-                });
-            }
+        let fence = claim.fence();
+        if let Some(retired) = state.retired.get(fence) {
+            Self::validate_claim(&retired.claim, claim)?;
             return Ok(());
         }
-        let entry = state
-            .active
-            .get(&endpoint)
-            .ok_or(RouteError::RouteNotFound)?;
-        if &entry.shard_id != source_shard {
-            return Err(RouteError::SourceShardMismatch);
-        }
-        if entry.worker_epoch != worker_epoch {
-            return Err(RouteError::WorkerEpochMismatch {
-                expected: entry.worker_epoch,
-                actual: worker_epoch,
-            });
-        }
-        Self::retire_route(&mut state, endpoint);
+        let entry = state.active.get(fence).ok_or(RouteError::RouteNotFound)?;
+        Self::validate_claim(&entry.claim, claim)?;
+        Self::retire_route(&mut state, fence);
         Ok(())
     }
 
-    pub fn revoke_shard(
-        &self,
-        source_shard: &ShardId,
-        worker_epoch: u64,
-    ) -> Result<usize, RouteError> {
+    pub fn revoke_shard(&self, fence: &ShardFence) -> Result<usize, RouteError> {
         let mut state = self.lock_state();
-        let endpoints = {
+        let routes = {
             let shard = state
                 .shards
-                .get(source_shard)
+                .get(fence.shard_id())
                 .ok_or(RouteError::RouteNotFound)?;
-            if shard.worker_epoch != worker_epoch {
-                return Err(RouteError::WorkerEpochMismatch {
-                    expected: shard.worker_epoch,
-                    actual: worker_epoch,
-                });
+            if &shard.fence != fence {
+                return Err(RouteError::ShardFenceMismatch);
             }
             if matches!(
                 shard.lifecycle,
@@ -473,57 +537,51 @@ impl RouteRegistry {
             ) {
                 return Ok(0);
             }
-            shard.endpoints.iter().copied().collect::<Vec<_>>()
+            shard.routes.iter().cloned().collect::<Vec<_>>()
         };
 
-        for endpoint in &endpoints {
+        for route_fence in &routes {
             let entry = state
                 .active
-                .get(endpoint)
+                .get(route_fence)
                 .ok_or(RouteError::InconsistentRegistryState)?;
-            if &entry.shard_id != source_shard || entry.worker_epoch != worker_epoch {
+            if entry.claim.fence().shard() != fence {
                 return Err(RouteError::InconsistentRegistryState);
             }
         }
 
-        if let Some(shard) = state.shards.get(source_shard) {
+        if let Some(shard) = state.shards.get(fence.shard_id()) {
             shard.cancellation.cancel();
         }
-        for endpoint in &endpoints {
-            Self::retire_route(&mut state, *endpoint);
+        for route_fence in &routes {
+            Self::retire_route(&mut state, route_fence);
         }
-        if let Some(shard) = state.shards.get_mut(source_shard) {
+        if let Some(shard) = state.shards.get_mut(fence.shard_id()) {
             shard.lifecycle = ShardRouteLifecycle::Revoked;
         }
-        Ok(endpoints.len())
+        Ok(routes.len())
     }
 
-    pub fn release_shard(
-        &self,
-        source_shard: &ShardId,
-        worker_epoch: u64,
-    ) -> Result<(), RouteError> {
+    pub fn release_shard(&self, fence: &ShardFence) -> Result<(), RouteError> {
         let mut state = self.lock_state();
-        let Some(shard) = state.shards.get_mut(source_shard) else {
+        let Some(shard) = state.shards.get_mut(fence.shard_id()) else {
             return if state
-                .worker_epoch_high_watermark
-                .is_some_and(|high_watermark| worker_epoch < high_watermark)
+                .worker_epoch_high_watermarks
+                .get(fence.owner().worker_id())
+                .is_some_and(|high_watermark| fence.owner().worker_epoch().get() < *high_watermark)
             {
                 Ok(())
             } else {
                 Err(RouteError::ShardNotPrepared)
             };
         };
-        if shard.worker_epoch != worker_epoch {
-            return Err(RouteError::WorkerEpochMismatch {
-                expected: shard.worker_epoch,
-                actual: worker_epoch,
-            });
+        if &shard.fence != fence {
+            return Err(RouteError::ShardFenceMismatch);
         }
         match shard.lifecycle {
             ShardRouteLifecycle::Prepared => Err(RouteError::ShardNotRevoked),
             ShardRouteLifecycle::Revoked => {
-                if !shard.endpoints.is_empty() {
+                if !shard.routes.is_empty() {
                     return Err(RouteError::InconsistentRegistryState);
                 }
                 if shard.active_connections != 0 {
@@ -536,56 +594,47 @@ impl RouteRegistry {
         }
     }
 
-    pub fn begin_connection(
+    #[cfg(test)]
+    pub(crate) fn begin_connection(
         &self,
-        endpoint: RouteEndpoint,
-        source_shard: &ShardId,
+        claim: &RouteClaim,
         url: &CanonicalUrl,
         resolution: DnsResolution,
         now: MonotonicMillis,
     ) -> Result<RoutePermit, RouteError> {
-        self.authorize_dns(endpoint, source_shard, url, now)?
-            .finish(resolution, now)
+        self.authorize_dns(claim, url, now)?.finish(resolution, now)
     }
 
-    pub fn authorize_dns(
+    #[cfg(test)]
+    pub(crate) fn authorize_dns(
         &self,
-        endpoint: RouteEndpoint,
-        source_shard: &ShardId,
+        claim: &RouteClaim,
         url: &CanonicalUrl,
         now: MonotonicMillis,
     ) -> Result<PreDnsPermit, RouteError> {
-        self.begin_ingress(endpoint, source_shard, now)?
-            .authorize_dns(url, now)
+        self.begin_ingress(claim, now)?.authorize_dns(url, now)
     }
 
-    pub fn begin_ingress(
+    pub(crate) fn begin_ingress(
         &self,
-        endpoint: RouteEndpoint,
-        source_shard: &ShardId,
+        claim: &RouteClaim,
         now: MonotonicMillis,
     ) -> Result<RouteIngressGuard, RouteError> {
         let mut state = self.lock_state();
-        let (incarnation, shard_id, worker_epoch, cancellation) = {
-            let entry = Self::active_entry(&mut state, endpoint, now)?;
-            if &entry.shard_id != source_shard {
-                return Err(RouteError::SourceShardMismatch);
-            }
+        let (fence, shard_fence, cancellation) = {
+            let entry = Self::active_entry(&mut state, claim, now)?;
             (
-                entry.incarnation.clone(),
-                entry.shard_id.clone(),
-                entry.worker_epoch,
+                entry.claim.fence().clone(),
+                entry.claim.fence().shard().clone(),
                 entry.cancellation.clone(),
             )
         };
         let next_active_connections = {
             let shard = state
                 .shards
-                .get(&shard_id)
+                .get(shard_fence.shard_id())
                 .ok_or(RouteError::InconsistentRegistryState)?;
-            if shard.worker_epoch != worker_epoch
-                || shard.lifecycle != ShardRouteLifecycle::Prepared
-            {
+            if shard.fence != shard_fence || shard.lifecycle != ShardRouteLifecycle::Prepared {
                 return Err(RouteError::InconsistentRegistryState);
             }
             shard
@@ -593,18 +642,13 @@ impl RouteRegistry {
                 .checked_add(1)
                 .ok_or(RouteError::InconsistentRegistryState)?
         };
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if entry.incarnation != incarnation {
-            return Err(RouteError::RouteRevoked);
-        }
+        let entry = Self::active_entry(&mut state, claim, now)?;
         entry
             .quota
             .reserve_connection(now)
             .map_err(RouteError::Quota)?;
-        let Some(shard) = state.shards.get_mut(&shard_id) else {
-            if let Some(entry) = state.active.get_mut(&endpoint)
-                && entry.incarnation == incarnation
-            {
+        let Some(shard) = state.shards.get_mut(shard_fence.shard_id()) else {
+            if let Some(entry) = state.active.get_mut(&fence) {
                 entry.quota.cancel_connection_reservation();
             }
             return Err(RouteError::InconsistentRegistryState);
@@ -612,11 +656,10 @@ impl RouteRegistry {
         shard.active_connections = next_active_connections;
         Ok(RouteIngressGuard {
             registry: self.clone(),
-            endpoint,
-            incarnation: incarnation.clone(),
+            fence: fence.clone(),
             cancellation,
-            reservation: ConnectionReservationGuard::new(self.clone(), endpoint, incarnation),
-            drain_guard: ShardDrainGuard::new(self.clone(), shard_id, worker_epoch),
+            reservation: ConnectionReservationGuard::new(self.clone(), fence),
+            drain_guard: ShardDrainGuard::new(self.clone(), shard_fence),
         })
     }
 
@@ -625,38 +668,40 @@ impl RouteRegistry {
         let expired = state
             .active
             .iter()
-            .filter_map(|(endpoint, entry)| (entry.expires_at <= now).then_some(*endpoint))
+            .filter_map(|(fence, entry)| (entry.binding.expires_at <= now).then_some(fence.clone()))
             .collect::<Vec<_>>();
-        for endpoint in &expired {
-            Self::retire_route(&mut state, *endpoint);
+        for fence in &expired {
+            Self::retire_route(&mut state, fence);
         }
         expired.len()
     }
 
-    #[must_use]
-    pub fn usage(&self, endpoint: RouteEndpoint) -> QuotaUsage {
+    pub fn usage(&self, claim: &RouteClaim) -> Result<QuotaUsage, RouteError> {
         let state = self.lock_state();
-        state
+        let entry = state
             .active
-            .get(&endpoint)
-            .map(|entry| entry.quota.usage())
-            .or_else(|| state.retired.get(&endpoint).map(|entry| entry.final_usage))
-            .unwrap_or_default()
+            .get(claim.fence())
+            .map(|entry| (&entry.claim, entry.quota.usage()))
+            .or_else(|| {
+                state
+                    .retired
+                    .get(claim.fence())
+                    .map(|entry| (&entry.claim, entry.final_usage))
+            })
+            .ok_or(RouteError::RouteNotFound)?;
+        Self::validate_claim(entry.0, claim)?;
+        Ok(entry.1)
     }
 
     fn record_egress_bytes(
         &self,
-        endpoint: RouteEndpoint,
-        incarnation: &LeaseId,
+        fence: &EgressFence,
         connection_id: ConnectionId,
         bytes: u64,
         now: MonotonicMillis,
     ) -> Result<(), RouteError> {
         let mut state = self.lock_state();
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if &entry.incarnation != incarnation {
-            return Err(RouteError::RouteRevoked);
-        }
+        let entry = Self::active_entry_by_fence(&mut state, fence, now)?;
         entry
             .quota
             .record_egress(connection_id, bytes, now)
@@ -665,69 +710,52 @@ impl RouteRegistry {
 
     fn record_request_bytes(
         &self,
-        endpoint: RouteEndpoint,
-        incarnation: &LeaseId,
+        fence: &EgressFence,
         connection_id: ConnectionId,
         bytes: u64,
         now: MonotonicMillis,
     ) -> Result<(), RouteError> {
         let mut state = self.lock_state();
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if &entry.incarnation != incarnation {
-            return Err(RouteError::RouteRevoked);
-        }
+        let entry = Self::active_entry_by_fence(&mut state, fence, now)?;
         entry
             .quota
             .record_request(connection_id, bytes, now)
             .map_err(RouteError::Quota)
     }
 
-    fn close_connection(
-        &self,
-        endpoint: RouteEndpoint,
-        incarnation: &LeaseId,
-        connection_id: ConnectionId,
-    ) {
+    fn close_connection(&self, fence: &EgressFence, connection_id: ConnectionId) {
         let mut state = self.lock_state();
-        if let Some(entry) = state.active.get_mut(&endpoint)
-            && &entry.incarnation == incarnation
-        {
+        if let Some(entry) = state.active.get_mut(fence) {
             entry.quota.close_connection(connection_id);
         }
     }
 
     fn commit_connection_reservation(
         &self,
-        endpoint: RouteEndpoint,
-        incarnation: &LeaseId,
+        fence: &EgressFence,
         now: MonotonicMillis,
     ) -> Result<ConnectionId, RouteError> {
         let mut state = self.lock_state();
-        let entry = Self::active_entry(&mut state, endpoint, now)?;
-        if &entry.incarnation != incarnation {
-            return Err(RouteError::RouteRevoked);
-        }
+        let entry = Self::active_entry_by_fence(&mut state, fence, now)?;
         entry
             .quota
             .open_reserved_connection(now)
             .map_err(RouteError::Quota)
     }
 
-    fn cancel_connection_reservation(&self, endpoint: RouteEndpoint, incarnation: &LeaseId) {
+    fn cancel_connection_reservation(&self, fence: &EgressFence) {
         let mut state = self.lock_state();
-        if let Some(entry) = state.active.get_mut(&endpoint)
-            && &entry.incarnation == incarnation
-        {
+        if let Some(entry) = state.active.get_mut(fence) {
             entry.quota.cancel_connection_reservation();
         }
     }
 
-    fn close_shard_connection(&self, shard_id: &ShardId, worker_epoch: u64) {
+    fn close_shard_connection(&self, fence: &ShardFence) {
         let mut state = self.lock_state();
-        let Some(shard) = state.shards.get_mut(shard_id) else {
+        let Some(shard) = state.shards.get_mut(fence.shard_id()) else {
             return;
         };
-        if shard.worker_epoch != worker_epoch || shard.active_connections == 0 {
+        if &shard.fence != fence || shard.active_connections == 0 {
             return;
         }
         shard.active_connections -= 1;
@@ -749,43 +777,62 @@ impl RouteRegistry {
         Ok(())
     }
 
-    fn retire_route(state: &mut RouteState, endpoint: RouteEndpoint) {
-        let Some(entry) = state.active.remove(&endpoint) else {
+    fn retire_route(state: &mut RouteState, fence: &EgressFence) {
+        let Some(entry) = state.active.remove(fence) else {
             return;
         };
         entry.cancellation.cancel();
         let mut final_usage = entry.quota.usage();
         final_usage.active_connections = 0;
-        if let Some(shard) = state.shards.get_mut(&entry.shard_id)
-            && shard.worker_epoch == entry.worker_epoch
+        if let Some(shard) = state.shards.get_mut(entry.claim.source_shard())
+            && &shard.fence == entry.claim.fence().shard()
         {
-            shard.endpoints.remove(&endpoint);
+            shard.routes.remove(fence);
         }
         state.retired.insert(
-            endpoint,
+            fence.clone(),
             RetiredRoute {
-                shard_id: entry.shard_id,
-                worker_epoch: entry.worker_epoch,
+                claim: entry.claim,
                 final_usage,
             },
         );
     }
 
-    fn active_entry(
-        state: &mut RouteState,
-        endpoint: RouteEndpoint,
+    fn validate_claim(stored: &RouteClaim, candidate: &RouteClaim) -> Result<(), RouteError> {
+        if stored.fence != candidate.fence {
+            return Err(RouteError::EgressFenceMismatch);
+        }
+        if stored.endpoint != candidate.endpoint {
+            return Err(RouteError::BindingConflict);
+        }
+        Ok(())
+    }
+
+    fn active_entry<'state>(
+        state: &'state mut RouteState,
+        claim: &RouteClaim,
         now: MonotonicMillis,
-    ) -> Result<&mut RouteEntry, RouteError> {
+    ) -> Result<&'state mut RouteEntry, RouteError> {
+        let entry = Self::active_entry_by_fence(state, claim.fence(), now)?;
+        Self::validate_claim(&entry.claim, claim)?;
+        Ok(entry)
+    }
+
+    fn active_entry_by_fence<'state>(
+        state: &'state mut RouteState,
+        fence: &EgressFence,
+        now: MonotonicMillis,
+    ) -> Result<&'state mut RouteEntry, RouteError> {
         let expired = state
             .active
-            .get(&endpoint)
-            .is_some_and(|entry| entry.expires_at <= now);
+            .get(fence)
+            .is_some_and(|entry| entry.binding.expires_at <= now);
         if expired {
-            Self::retire_route(state, endpoint);
+            Self::retire_route(state, fence);
             return Err(RouteError::RouteExpired);
         }
-        state.active.get_mut(&endpoint).ok_or_else(|| {
-            if state.retired.contains_key(&endpoint) {
+        state.active.get_mut(fence).ok_or_else(|| {
+            if state.retired.contains_key(fence) {
                 RouteError::RouteRevoked
             } else {
                 RouteError::RouteNotFound
@@ -801,10 +848,9 @@ impl RouteRegistry {
 }
 
 #[derive(Debug)]
-pub struct RouteIngressGuard {
+pub(crate) struct RouteIngressGuard {
     registry: RouteRegistry,
-    endpoint: RouteEndpoint,
-    incarnation: LeaseId,
+    fence: EgressFence,
     cancellation: CancellationToken,
     reservation: ConnectionReservationGuard,
     drain_guard: ShardDrainGuard,
@@ -823,17 +869,13 @@ impl RouteIngressGuard {
     ) -> Result<PreDnsPermit, RouteError> {
         let Self {
             registry,
-            endpoint,
-            incarnation,
+            fence,
             cancellation,
             reservation,
             drain_guard,
         } = self;
         let mut state = registry.lock_state();
-        let entry = RouteRegistry::active_entry(&mut state, endpoint, now)?;
-        if entry.incarnation != incarnation {
-            return Err(RouteError::RouteRevoked);
-        }
+        let entry = RouteRegistry::active_entry_by_fence(&mut state, &fence, now)?;
         entry.planner.authorize(url).map_err(RouteError::Plan)?;
         entry
             .quota
@@ -842,8 +884,7 @@ impl RouteIngressGuard {
         drop(state);
         Ok(PreDnsPermit {
             registry,
-            endpoint,
-            incarnation,
+            fence,
             url: url.clone(),
             cancellation,
             reservation,
@@ -853,10 +894,9 @@ impl RouteIngressGuard {
 }
 
 #[derive(Debug)]
-pub struct PreDnsPermit {
+pub(crate) struct PreDnsPermit {
     registry: RouteRegistry,
-    endpoint: RouteEndpoint,
-    incarnation: LeaseId,
+    fence: EgressFence,
     url: CanonicalUrl,
     cancellation: CancellationToken,
     reservation: ConnectionReservationGuard,
@@ -876,10 +916,7 @@ impl PreDnsPermit {
     ) -> Result<RoutePermit, RouteError> {
         let plan = {
             let mut state = self.registry.lock_state();
-            let entry = RouteRegistry::active_entry(&mut state, self.endpoint, now)?;
-            if entry.incarnation != self.incarnation {
-                return Err(RouteError::RouteRevoked);
-            }
+            let entry = RouteRegistry::active_entry_by_fence(&mut state, &self.fence, now)?;
             entry
                 .planner
                 .plan(&self.url, resolution)
@@ -888,8 +925,7 @@ impl PreDnsPermit {
         let connection_id = self.reservation.commit(now)?;
         let Self {
             registry,
-            endpoint,
-            incarnation,
+            fence,
             url: _,
             cancellation,
             reservation: _,
@@ -897,8 +933,7 @@ impl PreDnsPermit {
         } = self;
         Ok(RoutePermit {
             registry,
-            endpoint,
-            incarnation,
+            fence,
             connection_id,
             plan,
             cancellation,
@@ -911,25 +946,23 @@ impl PreDnsPermit {
 #[derive(Debug)]
 struct ConnectionReservationGuard {
     registry: RouteRegistry,
-    endpoint: RouteEndpoint,
-    incarnation: LeaseId,
+    fence: EgressFence,
     open: bool,
 }
 
 impl ConnectionReservationGuard {
-    fn new(registry: RouteRegistry, endpoint: RouteEndpoint, incarnation: LeaseId) -> Self {
+    fn new(registry: RouteRegistry, fence: EgressFence) -> Self {
         Self {
             registry,
-            endpoint,
-            incarnation,
+            fence,
             open: true,
         }
     }
 
     fn commit(&mut self, now: MonotonicMillis) -> Result<ConnectionId, RouteError> {
-        let connection_id =
-            self.registry
-                .commit_connection_reservation(self.endpoint, &self.incarnation, now)?;
+        let connection_id = self
+            .registry
+            .commit_connection_reservation(&self.fence, now)?;
         self.open = false;
         Ok(connection_id)
     }
@@ -938,8 +971,7 @@ impl ConnectionReservationGuard {
         if !self.open {
             return;
         }
-        self.registry
-            .cancel_connection_reservation(self.endpoint, &self.incarnation);
+        self.registry.cancel_connection_reservation(&self.fence);
         self.open = false;
     }
 }
@@ -951,10 +983,9 @@ impl Drop for ConnectionReservationGuard {
 }
 
 #[derive(Debug)]
-pub struct RoutePermit {
+pub(crate) struct RoutePermit {
     registry: RouteRegistry,
-    endpoint: RouteEndpoint,
-    incarnation: LeaseId,
+    fence: EgressFence,
     connection_id: ConnectionId,
     plan: ConnectPlan,
     cancellation: CancellationToken,
@@ -981,13 +1012,8 @@ impl RoutePermit {
         if !self.open {
             return Err(RouteError::ConnectionClosed);
         }
-        self.registry.record_egress_bytes(
-            self.endpoint,
-            &self.incarnation,
-            self.connection_id,
-            bytes,
-            now,
-        )
+        self.registry
+            .record_egress_bytes(&self.fence, self.connection_id, bytes, now)
     }
 
     pub fn record_request_bytes(
@@ -998,13 +1024,8 @@ impl RoutePermit {
         if !self.open {
             return Err(RouteError::ConnectionClosed);
         }
-        self.registry.record_request_bytes(
-            self.endpoint,
-            &self.incarnation,
-            self.connection_id,
-            bytes,
-            now,
-        )
+        self.registry
+            .record_request_bytes(&self.fence, self.connection_id, bytes, now)
     }
 
     pub fn close(&mut self) -> bool {
@@ -1012,7 +1033,7 @@ impl RoutePermit {
             return false;
         }
         self.registry
-            .close_connection(self.endpoint, &self.incarnation, self.connection_id);
+            .close_connection(&self.fence, self.connection_id);
         self.drain_guard.close();
         self.open = false;
         true
@@ -1028,17 +1049,15 @@ impl Drop for RoutePermit {
 #[derive(Debug)]
 struct ShardDrainGuard {
     registry: RouteRegistry,
-    shard_id: ShardId,
-    worker_epoch: u64,
+    fence: ShardFence,
     open: bool,
 }
 
 impl ShardDrainGuard {
-    fn new(registry: RouteRegistry, shard_id: ShardId, worker_epoch: u64) -> Self {
+    fn new(registry: RouteRegistry, fence: ShardFence) -> Self {
         Self {
             registry,
-            shard_id,
-            worker_epoch,
+            fence,
             open: true,
         }
     }
@@ -1047,8 +1066,7 @@ impl ShardDrainGuard {
         if !self.open {
             return;
         }
-        self.registry
-            .close_shard_connection(&self.shard_id, self.worker_epoch);
+        self.registry.close_shard_connection(&self.fence);
         self.open = false;
     }
 }
@@ -1065,11 +1083,15 @@ pub enum RouteError {
     InvalidWorkerEpoch,
     InvalidRegistryConfig,
     InvalidLeaseExpiry,
+    BindingConflict,
+    EgressFenceMismatch,
+    GenerationMismatch,
     EndpointAlreadyBound,
     SessionAlreadyBound,
     EndpointRetired,
     RouteCapacityExceeded,
     ShardCapacityExceeded,
+    ShardFenceMismatch,
     ShardNotPrepared,
     ShardNotDrained,
     ShardNotReleased,

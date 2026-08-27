@@ -19,7 +19,7 @@ pub enum SchemeDecision {
 }
 
 /// Browserd's fixed scheme policy.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SchemePolicy;
 
 impl SchemePolicy {

@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 async-trait.workspace = true
 browserd-core = { path = "../browserd-core" }
+nix.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 url.workspace = true
