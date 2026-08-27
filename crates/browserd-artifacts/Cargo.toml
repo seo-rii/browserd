@@ -10,6 +10,7 @@ publish.workspace = true
 browserd-core = { path = "../browserd-core" }
 bytes.workspace = true
 chrono.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

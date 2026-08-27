@@ -21,6 +21,7 @@ pub enum QuotaDimension {
 pub enum QuotaError {
     NamespaceDenied,
     ReservationAlreadyExists,
+    ArtifactAlreadyCommitted,
     ReservationClosed,
     SizeOverflow,
     HardLimitExceeded {
@@ -36,6 +37,9 @@ impl fmt::Display for QuotaError {
             Self::NamespaceDenied => formatter.write_str("artifact quota namespace denied"),
             Self::ReservationAlreadyExists => {
                 formatter.write_str("an active reservation already exists for this artifact")
+            }
+            Self::ArtifactAlreadyCommitted => {
+                formatter.write_str("this artifact has already committed storage")
             }
             Self::ReservationClosed => formatter.write_str("artifact reservation is closed"),
             Self::SizeOverflow => formatter.write_str("artifact byte accounting overflowed"),
@@ -75,6 +79,7 @@ struct QuotaInner {
 #[derive(Default)]
 struct QuotaState {
     committed_bytes: u64,
+    committed: HashMap<ArtifactKey, u64>,
     reserved_bytes: u64,
     actual_bytes_in_flight: u64,
     next_reservation_id: u64,
@@ -114,6 +119,12 @@ pub enum ReservationAbortOutcome {
     AlreadyAborted,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommittedReleaseOutcome {
+    Released { bytes: u64 },
+    AlreadyReleased,
+}
+
 impl ArtifactQuota {
     #[must_use]
     pub fn new(namespace: ArtifactNamespace, limits: QuotaLimits) -> Self {
@@ -142,6 +153,9 @@ impl ArtifactQuota {
             .any(|reservation| reservation.key == key)
         {
             return Err(QuotaError::ReservationAlreadyExists);
+        }
+        if state.committed.contains_key(&key) {
+            return Err(QuotaError::ArtifactAlreadyCommitted);
         }
 
         let attempted_in_flight = checked_total(state.reserved_bytes, requested_bytes)?;
@@ -195,6 +209,27 @@ impl ArtifactQuota {
             actual_bytes_in_flight: state.actual_bytes_in_flight,
             active_reservations: state.reservations.len(),
         }
+    }
+
+    pub async fn release_committed(
+        &self,
+        key: &ArtifactKey,
+    ) -> Result<CommittedReleaseOutcome, QuotaError> {
+        self.namespace
+            .authorize(key)
+            .map_err(|_| QuotaError::NamespaceDenied)?;
+
+        let mut state = lock(&self.inner.state);
+        let Some(bytes) = state.committed.get(key).copied() else {
+            return Ok(CommittedReleaseOutcome::AlreadyReleased);
+        };
+        let next_committed = state
+            .committed_bytes
+            .checked_sub(bytes)
+            .ok_or(QuotaError::SizeOverflow)?;
+        state.committed.remove(key);
+        state.committed_bytes = next_committed;
+        Ok(CommittedReleaseOutcome::Released { bytes })
     }
 }
 
@@ -259,12 +294,17 @@ impl ArtifactReservation {
         }
 
         let mut quota = lock(&self.quota.state);
-        let active = quota
-            .reservations
-            .get(&self.id)
-            .ok_or(QuotaError::ReservationClosed)?;
-        let requested_bytes = active.requested_bytes;
-        let actual_bytes = active.actual_bytes;
+        let (key, requested_bytes, actual_bytes) = {
+            let active = quota
+                .reservations
+                .get(&self.id)
+                .ok_or(QuotaError::ReservationClosed)?;
+            (
+                active.key.clone(),
+                active.requested_bytes,
+                active.actual_bytes,
+            )
+        };
         let next_reserved = quota
             .reserved_bytes
             .checked_sub(requested_bytes)
@@ -276,6 +316,7 @@ impl ArtifactReservation {
         let next_committed = checked_total(quota.committed_bytes, actual_bytes)?;
 
         quota.reservations.remove(&self.id);
+        quota.committed.insert(key, actual_bytes);
         quota.reserved_bytes = next_reserved;
         quota.actual_bytes_in_flight = next_actual_in_flight;
         quota.committed_bytes = next_committed;

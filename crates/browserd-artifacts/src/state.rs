@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::{ArtifactError, ArtifactKey};
+use crate::{ArtifactContentMetadata, ArtifactContentSource, ArtifactError, ArtifactKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactKind {
@@ -49,6 +49,7 @@ pub struct Artifact {
     kind: ArtifactKind,
     state: ArtifactState,
     applied_events: HashSet<ArtifactEvent>,
+    content_metadata: Option<ArtifactContentMetadata>,
 }
 
 impl Artifact {
@@ -59,6 +60,7 @@ impl Artifact {
             kind: ArtifactKind::Upload,
             state: ArtifactState::Uploading,
             applied_events: HashSet::new(),
+            content_metadata: None,
         }
     }
 
@@ -69,6 +71,7 @@ impl Artifact {
             kind: ArtifactKind::Generated,
             state: ArtifactState::Generating,
             applied_events: HashSet::new(),
+            content_metadata: None,
         }
     }
 
@@ -87,7 +90,66 @@ impl Artifact {
         self.state
     }
 
+    #[must_use]
+    pub const fn content_metadata(&self) -> Option<&ArtifactContentMetadata> {
+        self.content_metadata.as_ref()
+    }
+
+    pub fn apply_materialized(
+        &mut self,
+        event: ArtifactEvent,
+        metadata: ArtifactContentMetadata,
+    ) -> Result<TransitionOutcome, ArtifactError> {
+        let event_matches = matches!(
+            (self.kind, event),
+            (ArtifactKind::Upload, ArtifactEvent::UploadStored)
+                | (ArtifactKind::Generated, ArtifactEvent::GenerationCompleted)
+        );
+        if !event_matches {
+            return Err(ArtifactError::MetadataNotAllowed);
+        }
+
+        let source_matches = matches!(
+            (self.kind, metadata.source()),
+            (
+                ArtifactKind::Upload,
+                ArtifactContentSource::ClientUpload | ArtifactContentSource::BrowserDownload
+            ) | (ArtifactKind::Generated, ArtifactContentSource::Generated)
+        );
+        if !source_matches {
+            return Err(ArtifactError::MetadataSourceMismatch);
+        }
+
+        if self.applied_events.contains(&event) {
+            return match self.content_metadata.as_ref() {
+                Some(committed) if committed == &metadata => Ok(TransitionOutcome::AlreadyApplied),
+                Some(_) | None => Err(ArtifactError::MetadataConflict),
+            };
+        }
+        if self.content_metadata.is_some() {
+            return Err(ArtifactError::MetadataConflict);
+        }
+
+        let outcome = self.apply_transition(event)?;
+        self.content_metadata = Some(metadata);
+        Ok(outcome)
+    }
+
     pub fn apply(&mut self, event: ArtifactEvent) -> Result<TransitionOutcome, ArtifactError> {
+        if matches!(
+            (self.kind, event),
+            (ArtifactKind::Upload, ArtifactEvent::UploadStored)
+                | (ArtifactKind::Generated, ArtifactEvent::GenerationCompleted)
+        ) {
+            return Err(ArtifactError::MetadataRequired);
+        }
+        self.apply_transition(event)
+    }
+
+    fn apply_transition(
+        &mut self,
+        event: ArtifactEvent,
+    ) -> Result<TransitionOutcome, ArtifactError> {
         if self.applied_events.contains(&event) {
             return Ok(TransitionOutcome::AlreadyApplied);
         }

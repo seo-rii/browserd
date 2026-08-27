@@ -79,6 +79,11 @@ impl ArtifactKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArtifactError {
     NamespaceDenied,
+    InvalidMetadata,
+    MetadataConflict,
+    MetadataNotAllowed,
+    MetadataRequired,
+    MetadataSourceMismatch,
     InvalidTransition {
         from: ArtifactState,
         event: ArtifactEvent,
@@ -89,6 +94,19 @@ impl fmt::Display for ArtifactError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NamespaceDenied => formatter.write_str("artifact namespace access denied"),
+            Self::InvalidMetadata => formatter.write_str("artifact metadata is invalid"),
+            Self::MetadataConflict => {
+                formatter.write_str("artifact metadata conflicts with the committed metadata")
+            }
+            Self::MetadataNotAllowed => {
+                formatter.write_str("artifact metadata is not allowed for this transition")
+            }
+            Self::MetadataRequired => {
+                formatter.write_str("artifact materialization metadata is required")
+            }
+            Self::MetadataSourceMismatch => {
+                formatter.write_str("artifact metadata source does not match the artifact kind")
+            }
             Self::InvalidTransition { from, event } => {
                 write!(
                     formatter,

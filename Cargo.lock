@@ -231,6 +231,7 @@ dependencies = [
  "browserd-core",
  "bytes",
  "chrono",
+ "sha2",
  "tokio",
 ]
 

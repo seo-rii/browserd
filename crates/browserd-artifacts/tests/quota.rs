@@ -5,7 +5,8 @@ mod common;
 use std::sync::Arc;
 
 use browserd_artifacts::{
-    ArtifactQuota, QuotaError, QuotaLimits, ReservationAbortOutcome, ReservationCommitOutcome,
+    ArtifactQuota, CommittedReleaseOutcome, QuotaError, QuotaLimits, ReservationAbortOutcome,
+    ReservationCommitOutcome,
 };
 use tokio::sync::Barrier;
 
@@ -199,4 +200,102 @@ async fn committed_capacity_is_reserved_before_a_writer_can_start() {
         quota.reserve(artifact_key(&namespace), 1).await,
         Err(QuotaError::HardLimitExceeded { .. })
     ));
+}
+
+#[tokio::test]
+async fn deleting_a_committed_artifact_releases_its_exact_size_idempotently() {
+    let fixture = artifact_fixture();
+    let quota = ArtifactQuota::new(
+        fixture.namespace,
+        QuotaLimits {
+            max_committed_bytes: 100,
+            max_in_flight_bytes: 100,
+        },
+    );
+    let reservation = quota
+        .reserve(fixture.key.clone(), 60)
+        .await
+        .expect("reservation should succeed");
+    reservation
+        .add_actual_bytes(40)
+        .await
+        .expect("actual bytes should fit");
+    reservation.commit().await.expect("commit should succeed");
+
+    assert_eq!(
+        quota
+            .release_committed(&fixture.key)
+            .await
+            .expect("first release should succeed"),
+        CommittedReleaseOutcome::Released { bytes: 40 }
+    );
+    assert_eq!(
+        quota
+            .release_committed(&fixture.key)
+            .await
+            .expect("release replay should be idempotent"),
+        CommittedReleaseOutcome::AlreadyReleased
+    );
+    assert_eq!(quota.snapshot().await.committed_bytes, 0);
+}
+
+#[tokio::test]
+async fn alien_namespace_cannot_release_or_burn_committed_capacity() {
+    let owner = artifact_fixture();
+    let alien = artifact_fixture();
+    let quota = ArtifactQuota::new(
+        owner.namespace,
+        QuotaLimits {
+            max_committed_bytes: 100,
+            max_in_flight_bytes: 100,
+        },
+    );
+    let reservation = quota
+        .reserve(owner.key.clone(), 10)
+        .await
+        .expect("owner reservation should succeed");
+    reservation
+        .add_actual_bytes(10)
+        .await
+        .expect("owner bytes should fit");
+    reservation.commit().await.expect("commit should succeed");
+
+    assert_eq!(
+        quota.release_committed(&alien.key).await,
+        Err(QuotaError::NamespaceDenied)
+    );
+    assert_eq!(quota.snapshot().await.committed_bytes, 10);
+    assert_eq!(
+        quota
+            .release_committed(&owner.key)
+            .await
+            .expect("owner release should still succeed"),
+        CommittedReleaseOutcome::Released { bytes: 10 }
+    );
+}
+
+#[tokio::test]
+async fn committed_artifact_key_cannot_be_reserved_again() {
+    let fixture = artifact_fixture();
+    let quota = ArtifactQuota::new(
+        fixture.namespace,
+        QuotaLimits {
+            max_committed_bytes: 100,
+            max_in_flight_bytes: 100,
+        },
+    );
+    let reservation = quota
+        .reserve(fixture.key.clone(), 10)
+        .await
+        .expect("first reservation should succeed");
+    reservation
+        .add_actual_bytes(1)
+        .await
+        .expect("actual bytes should fit");
+    reservation.commit().await.expect("commit should succeed");
+
+    assert_eq!(
+        quota.reserve(fixture.key, 10).await.err(),
+        Some(QuotaError::ArtifactAlreadyCommitted)
+    );
 }
