@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use browserd_core::{ActionId, CreateOperationState, OperationId, TenantId};
 use browserd_operations::{
-    ActionTracker, CancelDecision, CanonicalRequestHash, CreateSessionOperation,
-    GatewayActionState, IDEMPOTENCY_RETENTION, IdempotencyClaim, IdempotencyError, IdempotencyKey,
-    IdempotencyRegistry, KnownActionFailure, OperationTransitionError, RegistryConfigError,
-    TenantFairQueue, UncertaintyReason,
+    ActionCancelDecision, ActionTracker, CancelDecision, CanonicalRequestHash,
+    CreateSessionOperation, GatewayActionState, IDEMPOTENCY_RETENTION, IdempotencyClaim,
+    IdempotencyError, IdempotencyKey, IdempotencyRegistry, KnownActionFailure,
+    OperationTransitionError, RegistryConfigError, TenantFairQueue, UncertaintyReason,
 };
 use serde_json::json;
 
@@ -398,6 +398,7 @@ fn worker_loss_before_dispatch_is_known_not_dispatched() {
     for state in [
         GatewayActionState::Accepted,
         GatewayActionState::Queued,
+        GatewayActionState::PendingApproval,
         GatewayActionState::ReadyToDispatch,
     ] {
         let tracker = ActionTracker::from_state(ActionId::new(), state);
@@ -462,10 +463,22 @@ fn worker_loss_never_overwrites_a_known_terminal_result() {
     for state in [
         GatewayActionState::Succeeded,
         GatewayActionState::FailedKnown(KnownActionFailure::WorkerRejected),
+        GatewayActionState::CancelledBeforeDispatch,
         GatewayActionState::CancelledConfirmed,
     ] {
         let tracker = ActionTracker::from_state(ActionId::new(), state.clone());
         assert_eq!(tracker.on_worker_loss(), Ok(state));
+    }
+}
+
+#[test]
+fn recovered_cancelled_action_preserves_its_cancellation_evidence() {
+    for state in [
+        GatewayActionState::CancelledBeforeDispatch,
+        GatewayActionState::CancelledConfirmed,
+    ] {
+        let tracker = ActionTracker::from_state(ActionId::new(), state);
+        assert_eq!(tracker.cancellation_requested(), Ok(true));
     }
 }
 
@@ -502,5 +515,156 @@ fn worker_loss_and_known_completion_race_has_one_monotonic_terminal_result() {
         ));
         assert!(success.is_ok() ^ matches!(loss, Ok(GatewayActionState::OutcomeUnknown(_))));
         assert_eq!(tracker.on_worker_loss(), Ok(terminal));
+    }
+}
+
+#[test]
+fn action_cancel_is_known_safe_only_before_dispatch_intent() {
+    for state in [
+        GatewayActionState::Accepted,
+        GatewayActionState::Queued,
+        GatewayActionState::PendingApproval,
+        GatewayActionState::ReadyToDispatch,
+    ] {
+        let tracker = ActionTracker::from_state(ActionId::new(), state);
+
+        assert_eq!(
+            tracker.request_cancel(),
+            Ok(ActionCancelDecision::CancelledBeforeDispatch)
+        );
+        assert_eq!(
+            tracker.state(),
+            Ok(GatewayActionState::CancelledBeforeDispatch)
+        );
+        assert_eq!(tracker.cancellation_requested(), Ok(true));
+    }
+
+    for state in [
+        GatewayActionState::DispatchIntentRecorded,
+        GatewayActionState::MayHaveExecuted,
+    ] {
+        let tracker = ActionTracker::from_state(ActionId::new(), state.clone());
+
+        assert_eq!(
+            tracker.request_cancel(),
+            Ok(ActionCancelDecision::CancelPending)
+        );
+        assert_eq!(tracker.state(), Ok(state));
+        assert_eq!(tracker.cancellation_requested(), Ok(true));
+        assert_eq!(
+            tracker.confirm_cancelled(),
+            Ok(GatewayActionState::CancelledConfirmed)
+        );
+    }
+}
+
+#[test]
+fn action_dispatch_and_cancel_race_linearizes_at_dispatch_intent() {
+    for _ in 0..64 {
+        let tracker = Arc::new(ActionTracker::from_state(
+            ActionId::new(),
+            GatewayActionState::ReadyToDispatch,
+        ));
+        let barrier = Arc::new(Barrier::new(2));
+
+        let dispatch_tracker = Arc::clone(&tracker);
+        let dispatch_barrier = Arc::clone(&barrier);
+        let dispatch = thread::spawn(move || {
+            dispatch_barrier.wait();
+            dispatch_tracker.record_dispatch_intent()
+        });
+        let cancel_tracker = Arc::clone(&tracker);
+        let cancel = thread::spawn(move || {
+            barrier.wait();
+            cancel_tracker.request_cancel()
+        });
+
+        let dispatch = dispatch.join().expect("dispatch thread must not panic");
+        let cancel = cancel.join().expect("cancel thread must not panic");
+        match (dispatch, cancel) {
+            (
+                Ok(GatewayActionState::DispatchIntentRecorded),
+                Ok(ActionCancelDecision::CancelPending),
+            ) => {
+                assert_eq!(
+                    tracker.state(),
+                    Ok(GatewayActionState::DispatchIntentRecorded)
+                );
+                assert_eq!(tracker.cancellation_requested(), Ok(true));
+            }
+            (
+                Err(OperationTransitionError::ActionTerminal(
+                    GatewayActionState::CancelledBeforeDispatch,
+                )),
+                Ok(ActionCancelDecision::CancelledBeforeDispatch),
+            ) => assert_eq!(
+                tracker.state(),
+                Ok(GatewayActionState::CancelledBeforeDispatch)
+            ),
+            outcome => panic!("non-linearizable dispatch/cancel outcome: {outcome:?}"),
+        }
+    }
+}
+
+#[test]
+fn ambiguous_transport_loss_uses_gateway_delivery_state() {
+    for state in [
+        GatewayActionState::Accepted,
+        GatewayActionState::Queued,
+        GatewayActionState::PendingApproval,
+        GatewayActionState::ReadyToDispatch,
+    ] {
+        let tracker = ActionTracker::from_state(ActionId::new(), state);
+        assert_eq!(
+            tracker.on_ambiguous_transport_loss(),
+            Ok(GatewayActionState::FailedKnown(
+                KnownActionFailure::NotDispatched
+            ))
+        );
+    }
+
+    for state in [
+        GatewayActionState::DispatchIntentRecorded,
+        GatewayActionState::MayHaveExecuted,
+    ] {
+        let tracker = ActionTracker::from_state(ActionId::new(), state);
+        assert_eq!(
+            tracker.on_ambiguous_transport_loss(),
+            Ok(GatewayActionState::OutcomeUnknown(
+                UncertaintyReason::AmbiguousTransportLoss
+            ))
+        );
+        assert_eq!(
+            tracker.request_cancel(),
+            Ok(ActionCancelDecision::Terminal(
+                GatewayActionState::OutcomeUnknown(UncertaintyReason::AmbiguousTransportLoss)
+            ))
+        );
+        assert!(matches!(
+            tracker.succeed(),
+            Err(OperationTransitionError::ActionTerminal(
+                GatewayActionState::OutcomeUnknown(UncertaintyReason::AmbiguousTransportLoss)
+            ))
+        ));
+    }
+}
+
+#[test]
+fn unconfirmed_cancel_does_not_turn_worker_loss_into_known_cancellation() {
+    for state in [
+        GatewayActionState::DispatchIntentRecorded,
+        GatewayActionState::MayHaveExecuted,
+    ] {
+        let tracker = ActionTracker::from_state(ActionId::new(), state);
+        assert_eq!(
+            tracker.request_cancel(),
+            Ok(ActionCancelDecision::CancelPending)
+        );
+        assert_eq!(
+            tracker.on_worker_loss(),
+            Ok(GatewayActionState::OutcomeUnknown(
+                UncertaintyReason::WorkerLost
+            ))
+        );
     }
 }

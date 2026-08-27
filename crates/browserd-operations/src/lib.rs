@@ -667,32 +667,67 @@ pub enum KnownActionFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UncertaintyReason {
     WorkerLost,
+    AmbiguousTransportLoss,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayActionState {
     Accepted,
     Queued,
+    PendingApproval,
     ReadyToDispatch,
     DispatchIntentRecorded,
     MayHaveExecuted,
     Succeeded,
     FailedKnown(KnownActionFailure),
+    CancelledBeforeDispatch,
     CancelledConfirmed,
     OutcomeUnknown(UncertaintyReason),
 }
 
+impl GatewayActionState {
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::FailedKnown(_)
+                | Self::CancelledBeforeDispatch
+                | Self::CancelledConfirmed
+                | Self::OutcomeUnknown(_)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActionCancelDecision {
+    CancelledBeforeDispatch,
+    CancelPending,
+    Terminal(GatewayActionState),
+}
+
+struct ActionTrackerInner {
+    state: GatewayActionState,
+    cancellation_requested: bool,
+}
+
 pub struct ActionTracker {
     id: ActionId,
-    state: Mutex<GatewayActionState>,
+    inner: Mutex<ActionTrackerInner>,
 }
 
 impl ActionTracker {
     #[must_use]
     pub fn from_state(id: ActionId, state: GatewayActionState) -> Self {
+        let cancellation_requested = matches!(
+            state,
+            GatewayActionState::CancelledBeforeDispatch | GatewayActionState::CancelledConfirmed
+        );
         Self {
             id,
-            state: Mutex::new(state),
+            inner: Mutex::new(ActionTrackerInner {
+                state,
+                cancellation_requested,
+            }),
         }
     }
 
@@ -703,133 +738,184 @@ impl ActionTracker {
 
     pub fn state(&self) -> Result<GatewayActionState, OperationTransitionError> {
         Ok(self
-            .state
+            .inner
             .lock()
             .map_err(|_| OperationTransitionError::CoordinationUnavailable)?
+            .state
             .clone())
     }
 
     pub fn record_dispatch_intent(&self) -> Result<GatewayActionState, OperationTransitionError> {
-        let mut state = self
-            .state
+        let mut inner = self
+            .inner
             .lock()
             .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
-        if *state != GatewayActionState::ReadyToDispatch {
-            return Err(
-                if matches!(
-                    *state,
-                    GatewayActionState::Succeeded
-                        | GatewayActionState::FailedKnown(_)
-                        | GatewayActionState::CancelledConfirmed
-                        | GatewayActionState::OutcomeUnknown(_)
-                ) {
-                    OperationTransitionError::ActionTerminal(state.clone())
-                } else {
-                    OperationTransitionError::InvalidActionTransition {
-                        state: state.clone(),
-                        attempted: "record dispatch intent for",
-                    }
-                },
-            );
+        if inner.state != GatewayActionState::ReadyToDispatch {
+            return Err(if inner.state.is_terminal() {
+                OperationTransitionError::ActionTerminal(inner.state.clone())
+            } else {
+                OperationTransitionError::InvalidActionTransition {
+                    state: inner.state.clone(),
+                    attempted: "record dispatch intent for",
+                }
+            });
         }
-        *state = GatewayActionState::DispatchIntentRecorded;
-        Ok(state.clone())
+        inner.state = GatewayActionState::DispatchIntentRecorded;
+        Ok(inner.state.clone())
     }
 
     pub fn mark_may_have_executed(&self) -> Result<GatewayActionState, OperationTransitionError> {
-        let mut state = self
-            .state
+        let mut inner = self
+            .inner
             .lock()
             .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
-        if *state != GatewayActionState::DispatchIntentRecorded {
-            return Err(
-                if matches!(
-                    *state,
-                    GatewayActionState::Succeeded
-                        | GatewayActionState::FailedKnown(_)
-                        | GatewayActionState::CancelledConfirmed
-                        | GatewayActionState::OutcomeUnknown(_)
-                ) {
-                    OperationTransitionError::ActionTerminal(state.clone())
-                } else {
-                    OperationTransitionError::InvalidActionTransition {
-                        state: state.clone(),
-                        attempted: "mark possibly executed",
-                    }
-                },
-            );
+        if inner.state != GatewayActionState::DispatchIntentRecorded {
+            return Err(if inner.state.is_terminal() {
+                OperationTransitionError::ActionTerminal(inner.state.clone())
+            } else {
+                OperationTransitionError::InvalidActionTransition {
+                    state: inner.state.clone(),
+                    attempted: "mark possibly executed",
+                }
+            });
         }
-        *state = GatewayActionState::MayHaveExecuted;
-        Ok(state.clone())
+        inner.state = GatewayActionState::MayHaveExecuted;
+        Ok(inner.state.clone())
     }
 
     pub fn record_proven_delivery_failure(
         &self,
     ) -> Result<GatewayActionState, OperationTransitionError> {
-        let mut state = self
-            .state
+        let mut inner = self
+            .inner
             .lock()
             .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
         if !matches!(
-            *state,
+            inner.state,
             GatewayActionState::ReadyToDispatch | GatewayActionState::DispatchIntentRecorded
         ) {
-            return Err(
-                if matches!(
-                    *state,
-                    GatewayActionState::Succeeded
-                        | GatewayActionState::FailedKnown(_)
-                        | GatewayActionState::CancelledConfirmed
-                        | GatewayActionState::OutcomeUnknown(_)
-                ) {
-                    OperationTransitionError::ActionTerminal(state.clone())
-                } else {
-                    OperationTransitionError::InvalidActionTransition {
-                        state: state.clone(),
-                        attempted: "record proven delivery failure for",
-                    }
-                },
-            );
+            return Err(if inner.state.is_terminal() {
+                OperationTransitionError::ActionTerminal(inner.state.clone())
+            } else {
+                OperationTransitionError::InvalidActionTransition {
+                    state: inner.state.clone(),
+                    attempted: "record proven delivery failure for",
+                }
+            });
         }
-        *state = GatewayActionState::FailedKnown(KnownActionFailure::NotDispatched);
-        Ok(state.clone())
+        inner.state = GatewayActionState::FailedKnown(KnownActionFailure::NotDispatched);
+        Ok(inner.state.clone())
     }
 
     pub fn succeed(&self) -> Result<GatewayActionState, OperationTransitionError> {
-        let mut state = self
-            .state
+        let mut inner = self
+            .inner
             .lock()
             .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
-        if matches!(
-            *state,
-            GatewayActionState::Succeeded
-                | GatewayActionState::FailedKnown(_)
-                | GatewayActionState::CancelledConfirmed
-                | GatewayActionState::OutcomeUnknown(_)
-        ) {
-            return Err(OperationTransitionError::ActionTerminal(state.clone()));
+        if inner.state.is_terminal() {
+            return Err(OperationTransitionError::ActionTerminal(
+                inner.state.clone(),
+            ));
         }
         if !matches!(
-            *state,
+            inner.state,
             GatewayActionState::DispatchIntentRecorded | GatewayActionState::MayHaveExecuted
         ) {
             return Err(OperationTransitionError::InvalidActionTransition {
-                state: state.clone(),
+                state: inner.state.clone(),
                 attempted: "succeed",
             });
         }
-        *state = GatewayActionState::Succeeded;
-        Ok(state.clone())
+        inner.state = GatewayActionState::Succeeded;
+        Ok(inner.state.clone())
+    }
+
+    pub fn request_cancel(&self) -> Result<ActionCancelDecision, OperationTransitionError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
+        if inner.state.is_terminal() {
+            return Ok(ActionCancelDecision::Terminal(inner.state.clone()));
+        }
+        inner.cancellation_requested = true;
+        if matches!(
+            inner.state,
+            GatewayActionState::Accepted
+                | GatewayActionState::Queued
+                | GatewayActionState::PendingApproval
+                | GatewayActionState::ReadyToDispatch
+        ) {
+            inner.state = GatewayActionState::CancelledBeforeDispatch;
+            return Ok(ActionCancelDecision::CancelledBeforeDispatch);
+        }
+        Ok(ActionCancelDecision::CancelPending)
+    }
+
+    pub fn confirm_cancelled(&self) -> Result<GatewayActionState, OperationTransitionError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
+        if inner.state.is_terminal() {
+            return Err(OperationTransitionError::ActionTerminal(
+                inner.state.clone(),
+            ));
+        }
+        if !inner.cancellation_requested
+            || !matches!(
+                inner.state,
+                GatewayActionState::DispatchIntentRecorded | GatewayActionState::MayHaveExecuted
+            )
+        {
+            return Err(OperationTransitionError::InvalidActionTransition {
+                state: inner.state.clone(),
+                attempted: "confirm cancellation of",
+            });
+        }
+        inner.state = GatewayActionState::CancelledConfirmed;
+        Ok(inner.state.clone())
+    }
+
+    pub fn cancellation_requested(&self) -> Result<bool, OperationTransitionError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| OperationTransitionError::CoordinationUnavailable)?
+            .cancellation_requested)
+    }
+
+    pub fn on_ambiguous_transport_loss(
+        &self,
+    ) -> Result<GatewayActionState, OperationTransitionError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
+        inner.state = match &inner.state {
+            GatewayActionState::Accepted
+            | GatewayActionState::Queued
+            | GatewayActionState::PendingApproval
+            | GatewayActionState::ReadyToDispatch => {
+                GatewayActionState::FailedKnown(KnownActionFailure::NotDispatched)
+            }
+            GatewayActionState::DispatchIntentRecorded | GatewayActionState::MayHaveExecuted => {
+                GatewayActionState::OutcomeUnknown(UncertaintyReason::AmbiguousTransportLoss)
+            }
+            terminal => terminal.clone(),
+        };
+        Ok(inner.state.clone())
     }
 
     pub fn on_worker_loss(&self) -> Result<GatewayActionState, OperationTransitionError> {
-        let mut state = self
-            .state
+        let mut inner = self
+            .inner
             .lock()
             .map_err(|_| OperationTransitionError::CoordinationUnavailable)?;
-        *state = match &*state {
+        inner.state = match &inner.state {
             GatewayActionState::Accepted
             | GatewayActionState::Queued
+            | GatewayActionState::PendingApproval
             | GatewayActionState::ReadyToDispatch => {
                 GatewayActionState::FailedKnown(KnownActionFailure::NotDispatched)
             }
@@ -838,9 +924,10 @@ impl ActionTracker {
             }
             terminal @ (GatewayActionState::Succeeded
             | GatewayActionState::FailedKnown(_)
+            | GatewayActionState::CancelledBeforeDispatch
             | GatewayActionState::CancelledConfirmed
             | GatewayActionState::OutcomeUnknown(_)) => terminal.clone(),
         };
-        Ok(state.clone())
+        Ok(inner.state.clone())
     }
 }
