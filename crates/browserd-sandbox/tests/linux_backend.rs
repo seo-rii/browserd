@@ -1481,7 +1481,7 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
         arguments
             .iter()
             .rev()
-            .take(6)
+            .take(8)
             .rev()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>(),
@@ -1490,9 +1490,27 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
             "--",
             "/opt/browser/chrome",
             "--remote-debugging-pipe",
+            "--headless",
+            "--no-startup-window",
             "--user-data-dir=/profile",
             "--disable-features=BackForwardCache",
         ]
+    );
+    assert!(
+        arguments.iter().any(|argument| argument == "--headless"),
+        "the production launch profile must explicitly select Chromium headless mode"
+    );
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| argument == "--no-startup-window"),
+        "the production launch profile must suppress automatic browser windows and tabs"
+    );
+    assert!(
+        arguments
+            .iter()
+            .all(|argument| argument != "test-public-web"),
+        "tenant policy profile data must not become a Chromium argument"
     );
     assert!(!arguments.iter().any(|argument| argument == "--block-fd"));
 }

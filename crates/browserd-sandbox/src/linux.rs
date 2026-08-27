@@ -2914,6 +2914,8 @@ where
                 .clone()
                 .into_os_string(),
             OsString::from("--remote-debugging-pipe"),
+            OsString::from("--headless"),
+            OsString::from("--no-startup-window"),
             OsString::from("--user-data-dir=/profile"),
             OsString::from("--disable-features=BackForwardCache"),
         ]);
