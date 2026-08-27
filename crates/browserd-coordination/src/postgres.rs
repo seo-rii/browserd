@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{CreateOperationState, OperationId, PrincipalId, TenantId};
@@ -12,8 +13,9 @@ use uuid::Uuid;
 use crate::{
     CanonicalRequestHash, ClaimCreateOperation, ClaimOutcome, CoordinationError,
     CreateOperationError, CreateOperationResult, CreateOperationSnapshot,
-    CreateSessionCoordination, OperationMutation, StoreConfig, is_terminal, parse_state,
-    state_name, validate_mutation,
+    CreateSessionCoordination, DispatchLease, DispatchLeaseToken, DownstreamDedupeKey,
+    MINIMUM_DISPATCH_LEASE_TTL, OperationMutation, RecoverableCreateIntent, StoreConfig,
+    is_terminal, parse_state, state_name, validate_mutation,
 };
 
 #[derive(Clone)]
@@ -48,7 +50,22 @@ impl PostgresCreateSessionStore {
             include_str!("../migrations/0001_create_session_coordination.sql").into_sql_str(),
             false,
         );
-        let mut migrator = Migrator::with_migrations(vec![migration]);
+        let dispatch_lease_migration = Migration::new(
+            2,
+            Cow::Borrowed("dispatch leases"),
+            MigrationType::Simple,
+            include_str!("../migrations/0002_dispatch_leases.sql").into_sql_str(),
+            false,
+        );
+        let intent_migration = Migration::new(
+            3,
+            Cow::Borrowed("recoverable create intent"),
+            MigrationType::Simple,
+            include_str!("../migrations/0003_recoverable_create_intent.sql").into_sql_str(),
+            false,
+        );
+        let mut migrator =
+            Migrator::with_migrations(vec![migration, dispatch_lease_migration, intent_migration]);
         migrator.dangerous_set_table_name("_browserd_coordination_migrations");
         migrator.run(&self.pool).await?;
         Ok(())
@@ -65,21 +82,19 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
     async fn claim_create(
         &self,
         claim: ClaimCreateOperation,
-        now: DateTime<Utc>,
+        _now: DateTime<Utc>,
     ) -> Result<ClaimOutcome, CoordinationError> {
-        let retention = chrono::Duration::from_std(self.config.retention())
-            .map_err(|_| CoordinationError::CorruptData("retention exceeds chrono range"))?;
-        let retain_until =
-            now.checked_add_signed(retention)
-                .ok_or(CoordinationError::CorruptData(
-                    "retention timestamp overflow",
-                ))?;
+        let retention_ms = i64::try_from(self.config.retention().as_millis())
+            .map_err(|_| CoordinationError::CorruptData("retention exceeds PostgreSQL range"))?;
         let mut transaction = self.pool.begin().await?;
         let inserted = sqlx::query(
             "INSERT INTO browserd_create_session_operations \
              (tenant_id, idempotency_key, request_hash, operation_id, principal_id, state, \
-              revision, result, operation_error, created_at, updated_at, retain_until) \
-             VALUES ($1, $2, $3, $4, $5, 'accepted', 0, NULL, NULL, $6, $6, $7) \
+              revision, result, operation_error, created_at, updated_at, retain_until, \
+              canonical_request, downstream_dedupe_key, accepted_at, admission_deadline, policy_context) \
+             VALUES ($1, $2, $3, $4, $5, 'accepted', 0, NULL, NULL, clock_timestamp(), \
+                     clock_timestamp(), clock_timestamp() + ($6 * interval '1 millisecond'), \
+                     $7, $8, $9, $10, $11) \
              ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
         )
         .bind(*claim.tenant_id.as_uuid())
@@ -87,15 +102,21 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
         .bind(claim.request_hash.as_bytes().to_vec())
         .bind(*claim.operation_id.as_uuid())
         .bind(*claim.principal_id.as_uuid())
-        .bind(now)
-        .bind(retain_until)
+        .bind(retention_ms)
+        .bind(claim.intent.canonical_request())
+        .bind(claim.intent.downstream_dedupe_key().as_bytes().to_vec())
+        .bind(claim.intent.accepted_at())
+        .bind(claim.intent.admission_deadline())
+        .bind(claim.intent.policy_context())
         .execute(&mut *transaction)
         .await?
         .rows_affected()
             == 1;
         let row = sqlx::query(
             "SELECT tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
-                    operation_error, created_at, updated_at, retain_until \
+                    operation_error, dispatch_lease_token, dispatch_lease_expires_at, \
+                    dispatch_generation, canonical_request, downstream_dedupe_key, accepted_at, \
+                    admission_deadline, policy_context, created_at, updated_at, retain_until \
              FROM browserd_create_session_operations \
              WHERE tenant_id = $1 AND idempotency_key = $2",
         )
@@ -124,7 +145,9 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
     ) -> Result<Option<CreateOperationSnapshot>, CoordinationError> {
         sqlx::query(
             "SELECT tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
-                    operation_error, created_at, updated_at, retain_until \
+                    operation_error, dispatch_lease_token, dispatch_lease_expires_at, \
+                    dispatch_generation, canonical_request, downstream_dedupe_key, accepted_at, \
+                    admission_deadline, policy_context, created_at, updated_at, retain_until \
              FROM browserd_create_session_operations \
              WHERE tenant_id = $1 AND operation_id = $2",
         )
@@ -149,7 +172,9 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
-                    operation_error, created_at, updated_at, retain_until \
+                    operation_error, dispatch_lease_token, dispatch_lease_expires_at, \
+                    dispatch_generation, canonical_request, downstream_dedupe_key, accepted_at, \
+                    admission_deadline, policy_context, created_at, updated_at, retain_until \
              FROM browserd_create_session_operations \
              WHERE tenant_id = $1 AND operation_id = $2 FOR UPDATE",
         )
@@ -165,7 +190,7 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
         if is_terminal(current.state) {
             return Err(CoordinationError::TerminalImmutable(current.state));
         }
-        validate_mutation(current.state, &mutation)?;
+        validate_mutation(&current, &mutation, now)?;
         let expected_revision = i64::try_from(expected_revision)
             .map_err(|_| CoordinationError::CorruptData("revision exceeds PostgreSQL bigint"))?;
         let result = mutation
@@ -180,18 +205,29 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
             .map(serde_json::to_value)
             .transpose()
             .map_err(|_| CoordinationError::CorruptData("error serialization failed"))?;
+        let dispatch_lease_token = mutation
+            .dispatch_lease
+            .as_ref()
+            .map(|lease| *lease.token().as_uuid());
+        let dispatch_lease_expires_at = mutation
+            .dispatch_lease
+            .as_ref()
+            .map(DispatchLease::expires_at);
         let updated = sqlx::query(
             "UPDATE browserd_create_session_operations \
              SET state = $1, revision = revision + 1, result = $2, operation_error = $3, \
-                 updated_at = $4 \
-             WHERE tenant_id = $5 AND operation_id = $6 AND revision = $7 AND state = $8 \
+                 dispatch_lease_token = $4, dispatch_lease_expires_at = $5, updated_at = clock_timestamp() \
+             WHERE tenant_id = $6 AND operation_id = $7 AND revision = $8 AND state = $9 \
              RETURNING tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
-                       operation_error, created_at, updated_at, retain_until",
+                       operation_error, dispatch_lease_token, dispatch_lease_expires_at, \
+                       dispatch_generation, canonical_request, downstream_dedupe_key, accepted_at, \
+                       admission_deadline, policy_context, created_at, updated_at, retain_until",
         )
         .bind(state_name(mutation.next_state))
         .bind(result)
         .bind(error)
-        .bind(now)
+        .bind(dispatch_lease_token)
+        .bind(dispatch_lease_expires_at)
         .bind(*tenant_id.as_uuid())
         .bind(*operation_id.as_uuid())
         .bind(expected_revision)
@@ -203,17 +239,142 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
         Ok(snapshot)
     }
 
-    async fn purge_expired(&self, now: DateTime<Utc>) -> Result<u64, CoordinationError> {
+    async fn acquire_dispatch_lease(
+        &self,
+        tenant_id: &TenantId,
+        operation_id: &OperationId,
+        expected_revision: u64,
+        token: DispatchLeaseToken,
+        ttl: Duration,
+        _now: DateTime<Utc>,
+    ) -> Result<CreateOperationSnapshot, CoordinationError> {
+        if ttl < MINIMUM_DISPATCH_LEASE_TTL {
+            return Err(CoordinationError::InvalidDispatchLease);
+        }
+        let ttl_ms =
+            i64::try_from(ttl.as_millis()).map_err(|_| CoordinationError::InvalidDispatchLease)?;
+        let expected_revision = i64::try_from(expected_revision)
+            .map_err(|_| CoordinationError::CorruptData("revision exceeds PostgreSQL bigint"))?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
+                    operation_error, dispatch_lease_token, dispatch_lease_expires_at, \
+                    dispatch_generation, canonical_request, downstream_dedupe_key, accepted_at, \
+                    admission_deadline, policy_context, created_at, updated_at, retain_until, \
+                    clock_timestamp() AS server_now \
+             FROM browserd_create_session_operations \
+             WHERE tenant_id = $1 AND operation_id = $2 FOR UPDATE",
+        )
+        .bind(*tenant_id.as_uuid())
+        .bind(*operation_id.as_uuid())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(CoordinationError::NotFound)?;
+        let current = snapshot_from_row(&row)?;
+        if current.revision != u64::try_from(expected_revision).unwrap_or_default() {
+            return Err(CoordinationError::StaleWrite(Box::new(current)));
+        }
+        let server_now: DateTime<Utc> = row.try_get("server_now")?;
+        match current.state {
+            CreateOperationState::Reserving => {}
+            CreateOperationState::Creating
+                if current
+                    .dispatch_lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.is_expired_at(server_now)) =>
+            {
+                return Err(CoordinationError::DispatchLeaseActive(Box::new(current)));
+            }
+            CreateOperationState::Creating => {}
+            state => {
+                return Err(CoordinationError::InvalidTransition {
+                    from: state,
+                    to: CreateOperationState::Creating,
+                });
+            }
+        }
+        let updated = sqlx::query(
+            "UPDATE browserd_create_session_operations SET state = 'creating', revision = revision + 1, \
+                    dispatch_generation = dispatch_generation + 1, dispatch_lease_token = $1, \
+                    dispatch_lease_expires_at = clock_timestamp() + ($2 * interval '1 millisecond'), \
+                    updated_at = clock_timestamp() WHERE tenant_id = $3 AND operation_id = $4 AND revision = $5 \
+             RETURNING tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
+                    operation_error, dispatch_lease_token, dispatch_lease_expires_at, dispatch_generation, \
+                    canonical_request, downstream_dedupe_key, accepted_at, admission_deadline, policy_context, \
+                    created_at, updated_at, retain_until",
+        ).bind(*token.as_uuid()).bind(ttl_ms).bind(*tenant_id.as_uuid()).bind(*operation_id.as_uuid())
+         .bind(expected_revision).fetch_one(&mut *transaction).await?;
+        let snapshot = snapshot_from_row(&updated)?;
+        transaction.commit().await?;
+        Ok(snapshot)
+    }
+
+    async fn scan_reconcilable(
+        &self,
+        limit: usize,
+        _now: DateTime<Utc>,
+    ) -> Result<Vec<CreateOperationSnapshot>, CoordinationError> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(CoordinationError::InvalidScanLimit);
+        }
+        let limit = i64::try_from(limit).map_err(|_| CoordinationError::InvalidScanLimit)?;
+        sqlx::query(
+            "SELECT tenant_id, request_hash, operation_id, principal_id, state, revision, result, \
+                    operation_error, dispatch_lease_token, dispatch_lease_expires_at, dispatch_generation, \
+                    canonical_request, downstream_dedupe_key, accepted_at, admission_deadline, policy_context, \
+                    created_at, updated_at, retain_until FROM browserd_create_session_operations \
+             WHERE state IN ('accepted', 'queued', 'reserving') \
+                OR (state = 'creating' AND dispatch_lease_expires_at <= clock_timestamp()) \
+             ORDER BY created_at, operation_id LIMIT $1",
+        ).bind(limit).fetch_all(&self.pool).await?.iter().map(snapshot_from_row).collect()
+    }
+
+    async fn renew_dispatch_lease(
+        &self,
+        tenant_id: &TenantId,
+        operation_id: &OperationId,
+        expected_revision: u64,
+        token: DispatchLeaseToken,
+        ttl: Duration,
+        _now: DateTime<Utc>,
+    ) -> Result<CreateOperationSnapshot, CoordinationError> {
+        if ttl < MINIMUM_DISPATCH_LEASE_TTL {
+            return Err(CoordinationError::InvalidDispatchLease);
+        }
+        let revision = i64::try_from(expected_revision)
+            .map_err(|_| CoordinationError::CorruptData("revision exceeds PostgreSQL bigint"))?;
+        let ttl_ms =
+            i64::try_from(ttl.as_millis()).map_err(|_| CoordinationError::InvalidDispatchLease)?;
+        let updated = sqlx::query(
+            "UPDATE browserd_create_session_operations SET revision = revision + 1, \
+                    dispatch_lease_expires_at = clock_timestamp() + ($1 * interval '1 millisecond'), updated_at = clock_timestamp() \
+             WHERE tenant_id = $2 AND operation_id = $3 AND revision = $4 AND state = 'creating' AND dispatch_lease_token = $5 \
+             RETURNING tenant_id, request_hash, operation_id, principal_id, state, revision, result, operation_error, \
+                    dispatch_lease_token, dispatch_lease_expires_at, dispatch_generation, canonical_request, \
+                    downstream_dedupe_key, accepted_at, admission_deadline, policy_context, created_at, updated_at, retain_until",
+        ).bind(ttl_ms).bind(*tenant_id.as_uuid()).bind(*operation_id.as_uuid()).bind(revision).bind(*token.as_uuid()).fetch_optional(&self.pool).await?;
+        if let Some(row) = updated {
+            return snapshot_from_row(&row);
+        }
+        let current = self
+            .get(tenant_id, operation_id)
+            .await?
+            .ok_or(CoordinationError::NotFound)?;
+        if current.revision != expected_revision {
+            Err(CoordinationError::StaleWrite(Box::new(current)))
+        } else {
+            Err(CoordinationError::DispatchLeaseMismatch)
+        }
+    }
+
+    async fn purge_expired(&self, _now: DateTime<Utc>) -> Result<u64, CoordinationError> {
         let result = self
             .pool
-            .execute(
-                sqlx::query(
-                    "DELETE FROM browserd_create_session_operations \
+            .execute(sqlx::query(
+                "DELETE FROM browserd_create_session_operations \
                      WHERE state IN ('succeeded', 'timed_out', 'cancelled', 'failed') \
-                       AND retain_until <= $1",
-                )
-                .bind(now),
-            )
+                       AND retain_until <= clock_timestamp()",
+            ))
             .await?;
         Ok(result.rows_affected())
     }
@@ -242,6 +403,33 @@ fn snapshot_from_row(row: &PgRow) -> Result<CreateOperationSnapshot, Coordinatio
         .map(serde_json::from_value::<CreateOperationError>)
         .transpose()
         .map_err(|_| CoordinationError::CorruptData("invalid operation error"))?;
+    let dispatch_lease_token = row.try_get::<Option<Uuid>, _>("dispatch_lease_token")?;
+    let dispatch_lease_expires_at =
+        row.try_get::<Option<DateTime<Utc>>, _>("dispatch_lease_expires_at")?;
+    let dispatch_lease = match (dispatch_lease_token, dispatch_lease_expires_at) {
+        (Some(token), Some(expires_at)) => Some(DispatchLease {
+            token: DispatchLeaseToken::from_uuid(token)?,
+            expires_at,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(CoordinationError::CorruptData(
+                "dispatch lease columns are not paired",
+            ));
+        }
+    };
+    let dispatch_generation = u64::try_from(row.try_get::<i64, _>("dispatch_generation")?)
+        .map_err(|_| CoordinationError::CorruptData("dispatch generation is negative"))?;
+    let downstream_dedupe_key =
+        <[u8; 32]>::try_from(row.try_get::<Vec<u8>, _>("downstream_dedupe_key")?)
+            .map_err(|_| CoordinationError::CorruptData("downstream dedupe key is not 32 bytes"))?;
+    let intent = RecoverableCreateIntent {
+        canonical_request: row.try_get("canonical_request")?,
+        downstream_dedupe_key: DownstreamDedupeKey::from_bytes(downstream_dedupe_key),
+        accepted_at: row.try_get("accepted_at")?,
+        admission_deadline: row.try_get("admission_deadline")?,
+        policy_context: row.try_get("policy_context")?,
+    };
     Ok(CreateOperationSnapshot {
         tenant_id,
         principal_id,
@@ -251,6 +439,9 @@ fn snapshot_from_row(row: &PgRow) -> Result<CreateOperationSnapshot, Coordinatio
         revision,
         result,
         error,
+        dispatch_lease,
+        dispatch_generation,
+        intent,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         retain_until: row.try_get("retain_until")?,

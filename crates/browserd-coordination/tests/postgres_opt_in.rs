@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use browserd_coordination::{
     CanonicalRequestHash, ClaimCreateOperation, ClaimOutcome, CreateOperationResult,
-    CreateSessionCoordination, OperationMutation, PostgresCreateSessionStore, StoreConfig,
+    CreateSessionCoordination, DispatchLeaseToken, OperationMutation, PostgresCreateSessionStore,
+    RecoverableCreateIntent, StoreConfig,
 };
 use browserd_core::{CreateOperationState, OperationId, PrincipalId, SessionId, TenantId};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use serde_json::json;
 
 #[tokio::test]
@@ -31,14 +32,30 @@ async fn postgres_claim_and_terminal_result_survive_a_store_restart() {
         original_operation_id.clone(),
         "postgres-response-loss",
         CanonicalRequestHash::new([42; 32]),
+        RecoverableCreateIntent::new(
+            &original_operation_id,
+            json!({}),
+            now,
+            now + Duration::seconds(30),
+            json!({}),
+        )
+        .expect("intent"),
     )
     .expect("claim should be valid");
     let retry_claim = ClaimCreateOperation::new(
         tenant_id.clone(),
         principal_id,
-        OperationId::new(),
+        original_operation_id.clone(),
         "postgres-response-loss",
         CanonicalRequestHash::new([42; 32]),
+        RecoverableCreateIntent::new(
+            &original_operation_id,
+            json!({}),
+            now,
+            now + Duration::seconds(30),
+            json!({}),
+        )
+        .expect("intent"),
     )
     .expect("claim should be valid");
 
@@ -59,7 +76,6 @@ async fn postgres_claim_and_terminal_result_survive_a_store_restart() {
     for next in [
         CreateOperationState::Queued,
         CreateOperationState::Reserving,
-        CreateOperationState::Creating,
     ] {
         snapshot = store
             .compare_and_set(
@@ -73,6 +89,18 @@ async fn postgres_claim_and_terminal_result_survive_a_store_restart() {
             .await
             .expect("transition should succeed");
     }
+    let dispatch_token = DispatchLeaseToken::new();
+    snapshot = store
+        .acquire_dispatch_lease(
+            &tenant_id,
+            snapshot.operation_id(),
+            snapshot.revision(),
+            dispatch_token.clone(),
+            std::time::Duration::from_secs(30),
+            now,
+        )
+        .await
+        .expect("dispatch lease should be stored");
     let result = CreateOperationResult::new(SessionId::new(), json!({"ready": true}));
     snapshot = store
         .compare_and_set(
@@ -80,7 +108,7 @@ async fn postgres_claim_and_terminal_result_survive_a_store_restart() {
             snapshot.operation_id(),
             snapshot.revision(),
             snapshot.state(),
-            OperationMutation::succeed(result.clone()),
+            OperationMutation::succeed_with_lease(dispatch_token, result.clone()),
             now,
         )
         .await
