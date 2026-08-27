@@ -4,6 +4,7 @@ use std::io::IoSlice;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use browserd_core::LeaseId;
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::socket::{ControlMessage, MsgFlags, UnixCredentials, sendmsg, setsockopt, sockopt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
@@ -71,6 +72,47 @@ async fn accepted_pair() -> (
         .await
         .expect("sender sees acceptance");
     (sender, receiver)
+}
+
+#[tokio::test]
+async fn offered_descriptors_can_be_cloned_cloexec_before_domain_commit() {
+    let (reader, writer) = pipe();
+    let (sender_stream, receiver_stream) = UnixStream::pair().expect("socket pair must be created");
+    let transfer_id = LeaseId::new();
+    let sender = Sender::new(sender_stream, transfer_id.clone(), vec![writer])
+        .expect("sender owns one descriptor");
+    let receiver = Receiver::new(
+        receiver_stream,
+        transfer_id,
+        DescriptorCount::new(1).expect("one descriptor is valid"),
+    );
+    let receiver = receiver.ready().await.expect("receiver becomes ready");
+    let sender = sender
+        .await_ready()
+        .await
+        .expect("sender observes readiness");
+    let sender = sender.offer().await.expect("sender offers descriptor");
+    let receiver = receiver
+        .receive()
+        .await
+        .expect("receiver receives descriptor");
+
+    let clones = receiver
+        .try_clone_descriptors()
+        .expect("offered descriptor clones before commit");
+    assert_eq!(clones.len(), 1);
+    let descriptor_flags = fcntl(&clones[0], FcntlArg::F_GETFD).expect("flags are readable");
+    assert!(FdFlag::from_bits_retain(descriptor_flags).contains(FdFlag::FD_CLOEXEC));
+
+    drop(receiver);
+    drop(sender);
+    nix::unistd::write(&clones[0], b"x").expect("clone remains independently owned");
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        nix::unistd::read(&reader, &mut byte).expect("pipe reads from the clone"),
+        1
+    );
+    assert_eq!(byte, [b'x']);
 }
 
 async fn receiver_follows_raw_coordinator(

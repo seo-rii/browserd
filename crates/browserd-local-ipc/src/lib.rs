@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use browserd_core::LeaseId;
+use nix::fcntl::{FcntlArg, fcntl};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use thiserror::Error;
 use tokio::io::Interest;
@@ -382,6 +383,25 @@ impl Receiver<ReceiverOffered> {
     #[must_use]
     pub fn descriptors(&self) -> &[OwnedFd] {
         self.descriptors.as_deref().unwrap_or_default()
+    }
+
+    /// Clones every offered capability with close-on-exec set atomically.
+    ///
+    /// This is intended for a receiver that must install a capability before
+    /// it can announce its domain commit. The receiver continues to retain its
+    /// protocol-owned copies through the completion frame; the caller owns and
+    /// must close the returned copies on any failed installation.
+    pub fn try_clone_descriptors(&self) -> std::io::Result<Vec<OwnedFd>> {
+        let descriptors = self.descriptors();
+        let mut clones = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            let raw_descriptor =
+                fcntl(descriptor, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(std::io::Error::from)?;
+            // SAFETY: F_DUPFD_CLOEXEC returned a fresh descriptor owned by this
+            // process, and ownership is transferred exactly once into OwnedFd.
+            clones.push(unsafe { OwnedFd::from_raw_fd(raw_descriptor) });
+        }
+        Ok(clones)
     }
 
     pub async fn accept(self) -> Result<Receiver<ReceiverAccepted>, HandoffError> {
