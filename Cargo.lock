@@ -235,7 +235,9 @@ dependencies = [
  "bytes",
  "chrono",
  "sha2",
+ "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

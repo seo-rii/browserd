@@ -158,9 +158,9 @@ pub enum WriterAbortOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactWriteReceipt {
-    key: ArtifactKey,
-    size_bytes: u64,
-    checksum: ArtifactChecksum,
+    pub(crate) key: ArtifactKey,
+    pub(crate) size_bytes: u64,
+    pub(crate) checksum: ArtifactChecksum,
 }
 
 impl ArtifactWriteReceipt {

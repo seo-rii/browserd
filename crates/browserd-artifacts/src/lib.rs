@@ -1,6 +1,7 @@
 //! Session-scoped artifact state, quota, streaming, token, and cleanup
 //! primitives for browserd.
 
+mod filesystem;
 mod integrity;
 mod janitor;
 mod namespace;
@@ -9,6 +10,7 @@ mod state;
 mod streaming;
 mod token;
 
+pub use filesystem::{FilesystemArtifactStore, VerifiedArtifact};
 pub use integrity::{ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource};
 pub use janitor::{
     ArtifactJanitor, ArtifactObjectGeneration, AuthorizedCleanupCandidate, CleanupCandidate,
