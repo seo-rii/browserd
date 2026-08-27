@@ -261,6 +261,69 @@ fn rpc_config() -> SandboxRpcConfig {
     .expect("RPC config is valid")
 }
 
+fn bound_rpc_config() -> SandboxRpcConfig {
+    let uid = nix::unistd::Uid::effective().as_raw();
+    rpc_config()
+        .with_peer_binding(
+            SandboxRpcPeerBinding::new(uid, worker(), 9)
+                .expect("probe peer binding should be valid"),
+        )
+        .expect("probe peer binding should match the allowed UID")
+}
+
+async fn accept_probe_request(listener: &UnixListener) -> (UnixStream, serde_json::Value) {
+    let (mut stream, _) = listener.accept().await.expect("fake server accepts probe");
+    let mut request_length = [0_u8; 4];
+    stream
+        .read_exact(&mut request_length)
+        .await
+        .expect("probe request length reads");
+    let request_length = u32::from_be_bytes(request_length) as usize;
+    let mut request = vec![0_u8; request_length];
+    stream
+        .read_exact(&mut request)
+        .await
+        .expect("probe request body reads");
+    let request = serde_json::from_slice(&request).expect("probe request is JSON");
+    (stream, request)
+}
+
+async fn respond_to_probe(
+    listener: UnixListener,
+    response_epoch: u64,
+    echo_request_nonce: bool,
+) -> serde_json::Value {
+    let (mut stream, request) = accept_probe_request(&listener).await;
+    let response_nonce = if echo_request_nonce {
+        request["request_nonce"].clone()
+    } else {
+        json!(LeaseId::new())
+    };
+    let response = serde_json::to_vec(&json!({
+        "status": "success",
+        "value": {
+            "result": "daemon_epoch_probe",
+            "value": {
+                "daemon_epoch": response_epoch,
+                "request_nonce": response_nonce,
+            }
+        }
+    }))
+    .expect("probe response encodes");
+    let response_length = u32::try_from(response.len())
+        .expect("probe response fits")
+        .to_be_bytes();
+    stream
+        .write_all(&response_length)
+        .await
+        .expect("probe response length writes");
+    stream
+        .write_all(&response)
+        .await
+        .expect("probe response body writes");
+    request
+}
+
 async fn accept_fake_claim_through_final_receipt(listener: &UnixListener) -> UnixStream {
     let (command_reader, command_writer) =
         nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).expect("command pipe is created");
@@ -372,6 +435,237 @@ fn rpc_server_requires_an_explicit_local_peer_uid() {
             None,
         ),
         Err(SandboxRpcError::InvalidConfig)
+    );
+    assert_eq!(
+        SandboxRpcConfig::new(
+            4 * 1024,
+            0,
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+            Some(nix::unistd::Uid::effective().as_raw()),
+        ),
+        Err(SandboxRpcError::InvalidConfig)
+    );
+}
+
+#[tokio::test]
+async fn authenticated_epoch_probe_succeeds_without_creating_a_shard() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let server = SandboxRpcServer::new(supervisor(backend), bound_rpc_config());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+
+    assert_eq!(
+        client.probe_daemon_epoch(&worker(), 9).await,
+        Ok(SANDBOXD_EPOCH)
+    );
+    assert!(
+        observed_backend.events().is_empty(),
+        "an epoch probe must not provision, inspect, or terminate a shard"
+    );
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn epoch_probe_rejects_stale_daemon_or_wrong_worker_binding() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let server = SandboxRpcServer::new(supervisor(backend), bound_rpc_config());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let stale_client = SandboxRpcClient::new(
+        socket.clone(),
+        4 * 1024,
+        Duration::from_millis(200),
+        uid,
+        SANDBOXD_EPOCH + 1,
+    )
+    .expect("stale client config is structurally valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        uid,
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    let impostor = WorkerId::new("worker-rpc-probe-impostor").expect("impostor worker ID is valid");
+
+    assert!(matches!(
+        stale_client.probe_daemon_epoch(&worker(), 9).await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(matches!(
+        client.probe_daemon_epoch(&impostor, 9).await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(matches!(
+        client.probe_daemon_epoch(&worker(), 8).await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(observed_backend.events().is_empty());
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn epoch_probe_rejects_a_wrong_peer_uid_before_backend_access() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let actual_uid = nix::unistd::Uid::effective().as_raw();
+    let rejected_uid = actual_uid.wrapping_add(1);
+    let config = SandboxRpcConfig::new(
+        4 * 1024,
+        4,
+        Duration::from_millis(200),
+        Duration::from_millis(5),
+        Some(rejected_uid),
+    )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(SANDBOXD_EPOCH)
+    .expect("daemon epoch is valid")
+    .with_peer_binding(
+        SandboxRpcPeerBinding::new(rejected_uid, worker(), 9)
+            .expect("rejected peer binding is structurally valid"),
+    )
+    .expect("peer binding matches the configured rejected UID");
+    let server = SandboxRpcServer::new(supervisor(backend), config);
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        actual_uid,
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+
+    assert!(matches!(
+        client.probe_daemon_epoch(&worker(), 9).await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(observed_backend.events().is_empty());
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn epoch_probe_rejects_zero_or_unrepresentable_worker_identity_locally() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let client = SandboxRpcClient::new(
+        temporary.path().join("absent.sock"),
+        4 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+
+    assert!(WorkerId::new("").is_err());
+    assert_eq!(
+        client.probe_daemon_epoch(&worker(), 0).await,
+        Err(SandboxRpcError::InvalidConfig)
+    );
+}
+
+#[tokio::test]
+async fn epoch_probe_response_must_echo_the_exact_request_nonce_and_epoch() {
+    for (response_epoch, echo_nonce) in [(SANDBOXD_EPOCH, false), (SANDBOXD_EPOCH + 1, true)] {
+        let temporary = tempdir().expect("temporary directory is available");
+        let socket = temporary.path().join("sandboxd.sock");
+        let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+        let fake = tokio::spawn(respond_to_probe(listener, response_epoch, echo_nonce));
+        let client = SandboxRpcClient::new(
+            socket,
+            4 * 1024,
+            Duration::from_millis(200),
+            nix::unistd::Uid::effective().as_raw(),
+            SANDBOXD_EPOCH,
+        )
+        .expect("client config is valid");
+
+        assert_eq!(
+            client.probe_daemon_epoch(&worker(), 9).await,
+            Err(SandboxRpcError::Protocol)
+        );
+        let request = fake.await.expect("fake probe server completes");
+        assert_eq!(request["operation"], "probe_daemon_epoch");
+        assert_eq!(request["sandboxd_epoch"], SANDBOXD_EPOCH);
+        assert_eq!(request["worker_id"], worker().to_string());
+        assert_eq!(request["worker_epoch"], 9);
+        assert!(
+            request["request_nonce"]
+                .as_str()
+                .is_some_and(|nonce| nonce.parse::<LeaseId>().is_ok())
+        );
+    }
+}
+
+#[tokio::test]
+async fn epoch_probe_uses_the_existing_timeout_and_frame_limits() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("timeout.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let fake = tokio::spawn(async move {
+        let (_stream, request) = accept_probe_request(&listener).await;
+        assert_eq!(request["operation"], "probe_daemon_epoch");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(20),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    assert_eq!(
+        client.probe_daemon_epoch(&worker(), 9).await,
+        Err(SandboxRpcError::TimedOut)
+    );
+    assert!(fake.await.is_ok());
+
+    let frame_temporary = tempdir().expect("frame temporary directory is available");
+    let frame_socket = frame_temporary.path().join("frame.sock");
+    let _listener = UnixListener::bind(&frame_socket).expect("frame Unix socket binds");
+    let bounded_client = SandboxRpcClient::new(
+        frame_socket,
+        32,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("bounded client config is valid");
+    assert_eq!(
+        bounded_client.probe_daemon_epoch(&worker(), 9).await,
+        Err(SandboxRpcError::FrameTooLarge)
     );
 }
 

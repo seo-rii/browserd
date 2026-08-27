@@ -237,6 +237,12 @@ impl From<RenewLeaseError> for RpcFailure {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum RpcRequest {
+    ProbeDaemonEpoch {
+        sandboxd_epoch: u64,
+        worker_id: WorkerId,
+        worker_epoch: u64,
+        request_nonce: LeaseId,
+    },
     CreateShard {
         sandboxd_epoch: u64,
         shard_id: ShardId,
@@ -278,7 +284,8 @@ enum RpcRequest {
 impl RpcRequest {
     const fn sandboxd_epoch(&self) -> u64 {
         match self {
-            Self::CreateShard { sandboxd_epoch, .. }
+            Self::ProbeDaemonEpoch { sandboxd_epoch, .. }
+            | Self::CreateShard { sandboxd_epoch, .. }
             | Self::RenewOwnerLease { sandboxd_epoch, .. }
             | Self::KillShard { sandboxd_epoch, .. }
             | Self::InspectResources { sandboxd_epoch, .. }
@@ -288,7 +295,12 @@ impl RpcRequest {
 
     fn is_authorized_for(&self, binding: &SandboxRpcPeerBinding) -> bool {
         match self {
-            Self::CreateShard {
+            Self::ProbeDaemonEpoch {
+                worker_id,
+                worker_epoch,
+                ..
+            }
+            | Self::CreateShard {
                 worker_id,
                 worker_epoch,
                 ..
@@ -308,11 +320,17 @@ impl RpcRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 enum RpcSuccess {
+    DaemonEpochProbe {
+        daemon_epoch: u64,
+        request_nonce: LeaseId,
+    },
     CreateShard(CreateShardOutcome),
     Renewed,
     KillShard(KillShardOutcome),
     InspectResources(InspectResources),
-    CdpPipesReady { transfer_id: LeaseId },
+    CdpPipesReady {
+        transfer_id: LeaseId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -370,6 +388,34 @@ impl SandboxRpcClient {
             });
         }
         Ok(stream)
+    }
+
+    pub async fn probe_daemon_epoch(
+        &self,
+        worker_id: &WorkerId,
+        worker_epoch: u64,
+    ) -> Result<u64, SandboxRpcError> {
+        if worker_epoch == 0 {
+            return Err(SandboxRpcError::InvalidConfig);
+        }
+        let request_nonce = LeaseId::new();
+        let response = self
+            .exchange(RpcRequest::ProbeDaemonEpoch {
+                sandboxd_epoch: self.expected_daemon_epoch,
+                worker_id: worker_id.clone(),
+                worker_epoch,
+                request_nonce: request_nonce.clone(),
+            })
+            .await?;
+        match response {
+            RpcSuccess::DaemonEpochProbe {
+                daemon_epoch,
+                request_nonce: response_nonce,
+            } if daemon_epoch == self.expected_daemon_epoch && response_nonce == request_nonce => {
+                Ok(daemon_epoch)
+            }
+            _ => Err(SandboxRpcError::Protocol),
+        }
     }
 
     pub async fn create_shard(
@@ -880,6 +926,11 @@ where
                         if request.sandboxd_epoch() != config.daemon_epoch {
                             return;
                         }
+                        if matches!(&request, RpcRequest::ProbeDaemonEpoch { .. })
+                            && config.peer_binding.is_none()
+                        {
+                            return;
+                        }
                         if config
                             .peer_binding
                             .as_ref()
@@ -1068,6 +1119,15 @@ where
                         };
                         let response = tokio::time::timeout(config.request_timeout, async {
                             match request {
+                                RpcRequest::ProbeDaemonEpoch {
+                                    sandboxd_epoch: _,
+                                    worker_id: _,
+                                    worker_epoch: _,
+                                    request_nonce,
+                                } => RpcResponse::Success(RpcSuccess::DaemonEpochProbe {
+                                    daemon_epoch: config.daemon_epoch,
+                                    request_nonce,
+                                }),
                                 RpcRequest::CreateShard {
                                     sandboxd_epoch: _,
                                     shard_id,
