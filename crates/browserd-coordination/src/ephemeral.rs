@@ -270,6 +270,420 @@ pub enum DirectoryMutation {
     Expired,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerReadiness {
+    Ready,
+    Draining,
+    Unready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerCapacity {
+    memory_bytes: u64,
+    cpu_millis: u64,
+    pids: u64,
+    disk_bytes: u64,
+    contexts: u64,
+    targets: u64,
+}
+
+impl WorkerCapacity {
+    pub fn new(
+        memory_bytes: u64,
+        cpu_millis: u64,
+        pids: u64,
+        disk_bytes: u64,
+        contexts: u64,
+        targets: u64,
+    ) -> Self {
+        Self {
+            memory_bytes,
+            cpu_millis,
+            pids,
+            disk_bytes,
+            contexts,
+            targets,
+        }
+    }
+
+    #[must_use]
+    pub const fn fits_within(self, capacity: Self) -> bool {
+        self.memory_bytes <= capacity.memory_bytes
+            && self.cpu_millis <= capacity.cpu_millis
+            && self.pids <= capacity.pids
+            && self.disk_bytes <= capacity.disk_bytes
+            && self.contexts <= capacity.contexts
+            && self.targets <= capacity.targets
+    }
+    #[must_use]
+    pub const fn is_zero(self) -> bool {
+        self.memory_bytes == 0
+            && self.cpu_millis == 0
+            && self.pids == 0
+            && self.disk_bytes == 0
+            && self.contexts == 0
+            && self.targets == 0
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerCapacityWire {
+    memory_bytes: u64,
+    cpu_millis: u64,
+    pids: u64,
+    disk_bytes: u64,
+    contexts: u64,
+    targets: u64,
+}
+
+impl<'de> Deserialize<'de> for WorkerCapacity {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = WorkerCapacityWire::deserialize(deserializer)?;
+        Ok(Self::new(
+            value.memory_bytes,
+            value.cpu_millis,
+            value.pids,
+            value.disk_bytes,
+            value.contexts,
+            value.targets,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerRegistration {
+    worker_id: WorkerId,
+    worker_epoch: u64,
+    region: String,
+    release: String,
+    compatibility: Vec<String>,
+    capacity: WorkerCapacity,
+    endpoint: String,
+}
+
+impl WorkerRegistration {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        worker_id: WorkerId,
+        worker_epoch: u64,
+        region: impl Into<String>,
+        release: impl Into<String>,
+        mut compatibility: Vec<String>,
+        capacity: WorkerCapacity,
+        endpoint: impl Into<String>,
+    ) -> Result<Self, EphemeralCoordinationError> {
+        let region = region.into();
+        let release = release.into();
+        let endpoint = endpoint.into();
+        let valid_field = |value: &str, maximum: usize| {
+            !value.is_empty()
+                && value.len() <= maximum
+                && value.trim() == value
+                && !value.chars().any(char::is_control)
+        };
+        if worker_epoch == 0
+            || capacity.is_zero()
+            || !valid_field(&region, 255)
+            || !valid_field(&release, 255)
+            || !valid_field(&endpoint, 2_048)
+            || compatibility.is_empty()
+            || compatibility.len() > 128
+            || compatibility.iter().any(|value| !valid_field(value, 1_024))
+        {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        compatibility.sort();
+        compatibility.dedup();
+        Ok(Self {
+            worker_id,
+            worker_epoch,
+            region,
+            release,
+            compatibility,
+            capacity,
+            endpoint,
+        })
+    }
+
+    #[must_use]
+    pub const fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+    #[must_use]
+    pub const fn worker_epoch(&self) -> u64 {
+        self.worker_epoch
+    }
+    #[must_use]
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+    #[must_use]
+    pub fn compatibility(&self) -> &[String] {
+        &self.compatibility
+    }
+    #[must_use]
+    pub const fn capacity(&self) -> WorkerCapacity {
+        self.capacity
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerRegistrationWire {
+    worker_id: WorkerId,
+    worker_epoch: u64,
+    region: String,
+    release: String,
+    compatibility: Vec<String>,
+    capacity: WorkerCapacity,
+    endpoint: String,
+}
+
+impl<'de> Deserialize<'de> for WorkerRegistration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = WorkerRegistrationWire::deserialize(deserializer)?;
+        Self::new(
+            value.worker_id,
+            value.worker_epoch,
+            value.region,
+            value.release,
+            value.compatibility,
+            value.capacity,
+            value.endpoint,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerHeartbeat {
+    free: WorkerCapacity,
+    queue_depth: usize,
+    active_shards: usize,
+    readiness: WorkerReadiness,
+}
+
+impl WorkerHeartbeat {
+    pub fn new(
+        free: WorkerCapacity,
+        queue_depth: usize,
+        active_shards: usize,
+        readiness: WorkerReadiness,
+    ) -> Result<Self, EphemeralCoordinationError> {
+        if queue_depth > 65_536 || active_shards > 65_536 {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        Ok(Self {
+            free,
+            queue_depth,
+            active_shards,
+            readiness,
+        })
+    }
+    #[must_use]
+    pub const fn free(&self) -> WorkerCapacity {
+        self.free
+    }
+    #[must_use]
+    pub const fn readiness(&self) -> WorkerReadiness {
+        self.readiness
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerHeartbeatWire {
+    free: WorkerCapacity,
+    queue_depth: usize,
+    active_shards: usize,
+    readiness: WorkerReadiness,
+}
+
+impl<'de> Deserialize<'de> for WorkerHeartbeat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = WorkerHeartbeatWire::deserialize(deserializer)?;
+        Self::new(
+            value.free,
+            value.queue_depth,
+            value.active_shards,
+            value.readiness,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerRegistrationSnapshot {
+    registration: WorkerRegistration,
+    heartbeat: WorkerHeartbeat,
+    revision: u64,
+    expires_at_millis: u64,
+}
+
+impl WorkerRegistrationSnapshot {
+    pub fn from_persisted(
+        registration: WorkerRegistration,
+        heartbeat: WorkerHeartbeat,
+        revision: u64,
+        expires_at_millis: u64,
+    ) -> Result<Self, EphemeralCoordinationError> {
+        if revision == 0
+            || expires_at_millis == 0
+            || !heartbeat.free.fits_within(registration.capacity)
+        {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        Ok(Self {
+            registration,
+            heartbeat,
+            revision,
+            expires_at_millis,
+        })
+    }
+    #[must_use]
+    pub const fn worker_epoch(&self) -> u64 {
+        self.registration.worker_epoch
+    }
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+    #[must_use]
+    pub const fn registration(&self) -> &WorkerRegistration {
+        &self.registration
+    }
+    #[must_use]
+    pub const fn heartbeat(&self) -> &WorkerHeartbeat {
+        &self.heartbeat
+    }
+    #[must_use]
+    pub const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerRegistrationSnapshotWire {
+    registration: WorkerRegistration,
+    heartbeat: WorkerHeartbeat,
+    revision: u64,
+    expires_at_millis: u64,
+}
+
+impl<'de> Deserialize<'de> for WorkerRegistrationSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = WorkerRegistrationSnapshotWire::deserialize(deserializer)?;
+        Self::from_persisted(
+            value.registration,
+            value.heartbeat,
+            value.revision,
+            value.expires_at_millis,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerLeaseMutation {
+    Applied(Box<WorkerRegistrationSnapshot>),
+    AlreadyApplied,
+    FenceMismatch,
+    CasMismatch,
+    Expired,
+}
+
+impl WorkerLeaseMutation {
+    pub fn into_snapshot(self) -> Result<WorkerRegistrationSnapshot, EphemeralCoordinationError> {
+        match self {
+            Self::Applied(snapshot) => Ok(*snapshot),
+            _ => Err(EphemeralCoordinationError::InvalidResponse),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerRegistrationQuery {
+    region: String,
+    compatibility: String,
+    limit: usize,
+}
+
+impl WorkerRegistrationQuery {
+    pub fn new(
+        region: impl Into<String>,
+        compatibility: impl Into<String>,
+        limit: usize,
+    ) -> Result<Self, EphemeralCoordinationError> {
+        let region = region.into();
+        let compatibility = compatibility.into();
+        if limit == 0
+            || limit > 1_024
+            || region.is_empty()
+            || region.len() > 255
+            || region.trim() != region
+            || region.chars().any(char::is_control)
+            || compatibility.is_empty()
+            || compatibility.len() > 1_024
+            || compatibility.trim() != compatibility
+            || compatibility.chars().any(char::is_control)
+        {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        Ok(Self {
+            region,
+            compatibility,
+            limit,
+        })
+    }
+    #[must_use]
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+    #[must_use]
+    pub fn compatibility(&self) -> &str {
+        &self.compatibility
+    }
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+#[async_trait]
+pub trait WorkerLeaseStore: Send + Sync {
+    async fn register_worker(
+        &self,
+        registration: WorkerRegistration,
+        heartbeat: WorkerHeartbeat,
+        ttl: Duration,
+    ) -> Result<WorkerLeaseMutation, EphemeralCoordinationError>;
+    async fn heartbeat_worker(
+        &self,
+        expected: &WorkerRegistrationSnapshot,
+        heartbeat: WorkerHeartbeat,
+        ttl: Duration,
+    ) -> Result<WorkerLeaseMutation, EphemeralCoordinationError>;
+    async fn query_ready_workers(
+        &self,
+        query: &WorkerRegistrationQuery,
+    ) -> Result<Vec<WorkerRegistrationSnapshot>, EphemeralCoordinationError>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OneTimeCapability {
     tenant_id: TenantId,

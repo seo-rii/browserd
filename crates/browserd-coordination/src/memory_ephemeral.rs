@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use crate::ephemeral::{MAX_EPHEMERAL_TTL_MILLIS, ttl_millis};
 use crate::{
     DirectoryEntry, DirectoryKey, DirectoryMutation, DirectorySnapshot, EphemeralCoordinationError,
-    EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume, OneTimeIssue,
+    EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume, OneTimeIssue, WorkerHeartbeat,
+    WorkerLeaseMutation, WorkerLeaseStore, WorkerReadiness, WorkerRegistration,
+    WorkerRegistrationQuery, WorkerRegistrationSnapshot,
 };
 
 #[derive(Clone, Default)]
@@ -33,6 +35,8 @@ impl ManualCoordinationClock {
 
 struct MemoryState {
     directories: HashMap<DirectoryKey, DirectorySnapshot>,
+    workers: HashMap<browserd_core::WorkerId, WorkerRegistrationSnapshot>,
+    worker_epoch_high_water: HashMap<browserd_core::WorkerId, u64>,
     capabilities:
         HashMap<(browserd_core::TenantId, browserd_core::SessionId, [u8; 32]), CapabilityRecord>,
 }
@@ -55,6 +59,8 @@ impl MemoryEphemeralCoordinationStore {
             available: AtomicBool::new(true),
             state: Mutex::new(MemoryState {
                 directories: HashMap::new(),
+                workers: HashMap::new(),
+                worker_epoch_high_water: HashMap::new(),
                 capabilities: HashMap::new(),
             }),
         }
@@ -255,5 +261,140 @@ impl EphemeralCoordinationStore for MemoryEphemeralCoordinationStore {
             .checked_add(MAX_EPHEMERAL_TTL_MILLIS)
             .ok_or(EphemeralCoordinationError::InvalidInput)?;
         Ok(OneTimeConsume::Consumed)
+    }
+}
+
+#[async_trait]
+impl WorkerLeaseStore for MemoryEphemeralCoordinationStore {
+    async fn register_worker(
+        &self,
+        registration: WorkerRegistration,
+        heartbeat: WorkerHeartbeat,
+        ttl: Duration,
+    ) -> Result<WorkerLeaseMutation, EphemeralCoordinationError> {
+        let now = self.clock.now();
+        let expires = now
+            .checked_add(ttl_millis(ttl)?)
+            .ok_or(EphemeralCoordinationError::InvalidInput)?;
+        if !heartbeat.free().fits_within(registration.capacity()) {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        let mut state = self.lock()?;
+        if state
+            .worker_epoch_high_water
+            .get(registration.worker_id())
+            .is_some_and(|high_water| registration.worker_epoch() < *high_water)
+        {
+            return Ok(WorkerLeaseMutation::FenceMismatch);
+        }
+        let current = state.workers.get(registration.worker_id()).cloned();
+        if let Some(current) = current
+            .as_ref()
+            .filter(|value| value.expires_at_millis() > now)
+        {
+            if registration.worker_epoch() < current.worker_epoch() {
+                return Ok(WorkerLeaseMutation::FenceMismatch);
+            }
+            if registration.worker_epoch() == current.worker_epoch() {
+                return Ok(if &registration == current.registration() {
+                    WorkerLeaseMutation::AlreadyApplied
+                } else {
+                    WorkerLeaseMutation::FenceMismatch
+                });
+            }
+        }
+        let revision = current
+            .map_or(Some(1), |value| value.revision().checked_add(1))
+            .ok_or(EphemeralCoordinationError::InvalidInput)?;
+        let worker_id = registration.worker_id().clone();
+        state
+            .worker_epoch_high_water
+            .insert(worker_id.clone(), registration.worker_epoch());
+        let snapshot =
+            WorkerRegistrationSnapshot::from_persisted(registration, heartbeat, revision, expires)?;
+        state.workers.insert(worker_id, snapshot.clone());
+        Ok(WorkerLeaseMutation::Applied(Box::new(snapshot)))
+    }
+
+    async fn heartbeat_worker(
+        &self,
+        expected: &WorkerRegistrationSnapshot,
+        heartbeat: WorkerHeartbeat,
+        ttl: Duration,
+    ) -> Result<WorkerLeaseMutation, EphemeralCoordinationError> {
+        let now = self.clock.now();
+        let expires = now
+            .checked_add(ttl_millis(ttl)?)
+            .ok_or(EphemeralCoordinationError::InvalidInput)?;
+        if !heartbeat
+            .free()
+            .fits_within(expected.registration().capacity())
+        {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        let mut state = self.lock()?;
+        let Some(current) = state
+            .workers
+            .get(expected.registration().worker_id())
+            .cloned()
+        else {
+            return Ok(WorkerLeaseMutation::Expired);
+        };
+        if current.expires_at_millis() <= now {
+            state.workers.remove(expected.registration().worker_id());
+            return Ok(WorkerLeaseMutation::Expired);
+        }
+        if current.worker_epoch() != expected.worker_epoch() {
+            return Ok(WorkerLeaseMutation::FenceMismatch);
+        }
+        if &current != expected {
+            return Ok(WorkerLeaseMutation::CasMismatch);
+        }
+        let revision = current
+            .revision()
+            .checked_add(1)
+            .ok_or(EphemeralCoordinationError::InvalidInput)?;
+        let snapshot = WorkerRegistrationSnapshot::from_persisted(
+            current.registration().clone(),
+            heartbeat,
+            revision,
+            expires,
+        )?;
+        state.workers.insert(
+            expected.registration().worker_id().clone(),
+            snapshot.clone(),
+        );
+        Ok(WorkerLeaseMutation::Applied(Box::new(snapshot)))
+    }
+
+    async fn query_ready_workers(
+        &self,
+        query: &WorkerRegistrationQuery,
+    ) -> Result<Vec<WorkerRegistrationSnapshot>, EphemeralCoordinationError> {
+        let now = self.clock.now();
+        let state = self.lock()?;
+        let mut matches = state
+            .workers
+            .values()
+            .filter(|snapshot| {
+                snapshot.expires_at_millis() > now
+                    && snapshot.heartbeat().readiness() == WorkerReadiness::Ready
+                    && snapshot.registration().region() == query.region()
+                    && snapshot
+                        .registration()
+                        .compatibility()
+                        .iter()
+                        .any(|value| value == query.compatibility())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            left.registration()
+                .worker_id()
+                .as_str()
+                .cmp(right.registration().worker_id().as_str())
+        });
+        matches.truncate(query.limit());
+        Ok(matches)
     }
 }

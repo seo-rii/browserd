@@ -21,7 +21,8 @@ pub use actor::{CoordinationActorConfig, CoordinationBlockingClient};
 pub use ephemeral::{
     DirectoryEntry, DirectoryFence, DirectoryKey, DirectoryMutation, DirectorySnapshot,
     EphemeralCoordinationError, EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume,
-    OneTimeIssue,
+    OneTimeIssue, WorkerCapacity, WorkerHeartbeat, WorkerLeaseMutation, WorkerLeaseStore,
+    WorkerReadiness, WorkerRegistration, WorkerRegistrationQuery, WorkerRegistrationSnapshot,
 };
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
 pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};

@@ -12,7 +12,9 @@ use tokio::time::timeout;
 use crate::ephemeral::{MAX_EPHEMERAL_TTL_MILLIS, ttl_millis};
 use crate::{
     DirectoryEntry, DirectoryKey, DirectoryMutation, DirectorySnapshot, EphemeralCoordinationError,
-    EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume, OneTimeIssue,
+    EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume, OneTimeIssue, WorkerHeartbeat,
+    WorkerLeaseMutation, WorkerLeaseStore, WorkerReadiness, WorkerRegistration,
+    WorkerRegistrationQuery, WorkerRegistrationSnapshot,
 };
 
 const REGISTER_SCRIPT: &str = r#"
@@ -119,6 +121,128 @@ return 1
 const CONSUME_SCRIPT: &str = r#"
 if redis.call('GET', KEYS[1]) == 'issued' then redis.call('SET', KEYS[1], 'consumed', 'PX', ARGV[1]); return 1 end
 return 0
+"#;
+
+const WORKER_REGISTER_SCRIPT: &str = r#"
+local function valid_u64(value)
+  return value and value ~= '0' and string.match(value, '^[0-9]+$') and string.sub(value, 1, 1) ~= '0' and (#value < 20 or (#value == 20 and value <= '18446744073709551615'))
+end
+local function compare_u64(left, right)
+  if #left ~= #right then return #left < #right and -1 or 1 end
+  if left == right then return 0 end
+  return left < right and -1 or 1
+end
+local function increment_u64(value)
+  if value == '18446744073709551615' then return nil end
+  local output, carry = '', 1
+  for index = #value, 1, -1 do
+    local digit = string.byte(value, index) - 48 + carry
+    if digit == 10 then digit = 0 else carry = 0 end
+    output = string.char(digit + 48) .. output
+  end
+  if carry == 1 then output = '1' .. output end
+  return output
+end
+if not valid_u64(ARGV[1]) then return {'6'} end
+local high_water = redis.call('GET', KEYS[2])
+if high_water and not valid_u64(high_water) then return {'6'} end
+if high_water and compare_u64(ARGV[1], high_water) < 0 then return {'0'} end
+local exists = redis.call('EXISTS', KEYS[1])
+local current_epoch = redis.call('HGET', KEYS[1], 'worker_epoch')
+local current_revision = redis.call('HGET', KEYS[1], 'revision')
+local current_entry = redis.call('HGET', KEYS[1], 'entry')
+if exists == 1 and redis.call('PTTL', KEYS[1]) <= 0 then return {'6'} end
+if exists == 1 and (not valid_u64(current_epoch) or not valid_u64(current_revision) or not current_entry or not redis.call('HGET', KEYS[1], 'heartbeat') or not redis.call('HGET', KEYS[1], 'region') or not redis.call('HGET', KEYS[1], 'compatibility') or not redis.call('HGET', KEYS[1], 'readiness') or not valid_u64(redis.call('HGET', KEYS[1], 'expires_at'))) then return {'6'} end
+if exists == 1 then
+  local ordering = compare_u64(ARGV[1], current_epoch)
+  if ordering < 0 then return {'0'} end
+  if ordering == 0 then
+    if current_entry == ARGV[2] then return {'5'} end
+    return {'0'}
+  end
+end
+local revision = exists == 1 and increment_u64(current_revision) or '1'
+if not revision then return {'4'} end
+local now = redis.call('TIME')
+local expires_at = tostring(now[1] * 1000 + math.floor(now[2] / 1000) + (ARGV[7] + 0))
+redis.call('SET', KEYS[2], ARGV[1])
+redis.call('HSET', KEYS[1], 'worker_epoch', ARGV[1], 'revision', revision, 'entry', ARGV[2], 'heartbeat', ARGV[3], 'region', ARGV[4], 'compatibility', ARGV[5], 'readiness', ARGV[6], 'expires_at', expires_at)
+redis.call('PEXPIRE', KEYS[1], ARGV[7])
+return {'1', revision, expires_at}
+"#;
+
+const WORKER_HEARTBEAT_SCRIPT: &str = r#"
+local function valid_u64(value)
+  return value and value ~= '0' and string.match(value, '^[0-9]+$') and string.sub(value, 1, 1) ~= '0' and (#value < 20 or (#value == 20 and value <= '18446744073709551615'))
+end
+local function increment_u64(value)
+  if value == '18446744073709551615' then return nil end
+  local output, carry = '', 1
+  for index = #value, 1, -1 do
+    local digit = string.byte(value, index) - 48 + carry
+    if digit == 10 then digit = 0 else carry = 0 end
+    output = string.char(digit + 48) .. output
+  end
+  if carry == 1 then output = '1' .. output end
+  return output
+end
+if redis.call('EXISTS', KEYS[1]) == 0 then return {'3'} end
+if redis.call('PTTL', KEYS[1]) <= 0 then return {'6'} end
+local current_epoch = redis.call('HGET', KEYS[1], 'worker_epoch')
+local current_revision = redis.call('HGET', KEYS[1], 'revision')
+local current_entry = redis.call('HGET', KEYS[1], 'entry')
+local current_heartbeat = redis.call('HGET', KEYS[1], 'heartbeat')
+local current_expiry = redis.call('HGET', KEYS[1], 'expires_at')
+if not valid_u64(current_epoch) or not valid_u64(current_revision) or not valid_u64(current_expiry) or not current_entry or not current_heartbeat then return {'6'} end
+if current_epoch ~= ARGV[1] then return {'0'} end
+if current_revision ~= ARGV[2] or current_entry ~= ARGV[3] or current_heartbeat ~= ARGV[4] or current_expiry ~= ARGV[5] then return {'2'} end
+local revision = increment_u64(current_revision)
+if not revision then return {'4'} end
+local now = redis.call('TIME')
+local expires_at = tostring(now[1] * 1000 + math.floor(now[2] / 1000) + (ARGV[8] + 0))
+redis.call('HSET', KEYS[1], 'revision', revision, 'heartbeat', ARGV[6], 'readiness', ARGV[7], 'expires_at', expires_at)
+redis.call('PEXPIRE', KEYS[1], ARGV[8])
+return {'1', revision, expires_at}
+"#;
+
+const WORKER_QUERY_SCRIPT: &str = r#"
+local function valid_u64(value)
+  return value and value ~= '0' and string.match(value, '^[0-9]+$') and string.sub(value, 1, 1) ~= '0' and (#value < 20 or (#value == 20 and value <= '18446744073709551615'))
+end
+local output = {'1'}
+local cursor = '0'
+local scans = 0
+repeat
+  local page = redis.call('SCAN', cursor, 'MATCH', ARGV[4], 'COUNT', ARGV[3])
+  cursor = page[1]
+  scans = scans + 1
+  for _, key in ipairs(page[2]) do
+    local ttl = redis.call('PTTL', key)
+    if ttl <= 0 then return {'6'} end
+    local entry = redis.call('HGET', key, 'entry')
+    local heartbeat = redis.call('HGET', key, 'heartbeat')
+    local revision = redis.call('HGET', key, 'revision')
+    local expires_at = redis.call('HGET', key, 'expires_at')
+    local region = redis.call('HGET', key, 'region')
+    local compatibility = redis.call('HGET', key, 'compatibility')
+    local readiness = redis.call('HGET', key, 'readiness')
+    if not entry or not heartbeat or not valid_u64(revision) or not valid_u64(expires_at) or not region or not compatibility or not readiness then return {'6'} end
+    if region == ARGV[1] and readiness == 'ready' then
+      local decoded_ok, decoded = pcall(cjson.decode, compatibility)
+      if not decoded_ok or type(decoded) ~= 'table' then return {'6'} end
+      local compatible = false
+      for _, value in ipairs(decoded) do if value == ARGV[2] then compatible = true end end
+      if compatible then
+        table.insert(output, entry)
+        table.insert(output, heartbeat)
+        table.insert(output, revision)
+        table.insert(output, expires_at)
+        if (#output - 1) / 4 >= (ARGV[3] + 0) then return output end
+      end
+    end
+  end
+until cursor == '0' or scans >= 16
+return output
 "#;
 
 #[derive(Clone)]
@@ -233,6 +357,15 @@ impl RedisEphemeralCoordinationStore {
             hex::encode(capability.secret_hash())
         )
     }
+    fn worker_key(&self, worker_id: &browserd_core::WorkerId) -> String {
+        format!("{}:worker:{{{worker_id}}}:lease", self.config.key_prefix)
+    }
+    fn worker_epoch_high_water_key(&self, worker_id: &browserd_core::WorkerId) -> String {
+        format!("{}:worker:{{{worker_id}}}:epoch", self.config.key_prefix)
+    }
+    fn worker_scan_pattern(&self) -> String {
+        format!("{}:worker:*:lease", self.config.key_prefix)
+    }
 }
 
 fn mutation(code: i64) -> Result<DirectoryMutation, EphemeralCoordinationError> {
@@ -311,6 +444,73 @@ fn decode_snapshot_values(
         .map_err(|_| EphemeralCoordinationError::InvalidResponse)?;
     DirectorySnapshot::from_persisted(entry, revision, expires)
         .map_err(|_| EphemeralCoordinationError::InvalidResponse)
+}
+
+fn readiness_wire(readiness: WorkerReadiness) -> &'static str {
+    match readiness {
+        WorkerReadiness::Ready => "ready",
+        WorkerReadiness::Draining => "draining",
+        WorkerReadiness::Unready => "unready",
+    }
+}
+
+fn decode_worker_snapshot(
+    registration_json: &str,
+    heartbeat_json: &str,
+    revision: &str,
+    expires_at: &str,
+) -> Result<WorkerRegistrationSnapshot, EphemeralCoordinationError> {
+    if !valid_u64_decimal(revision)
+        || revision == "0"
+        || !valid_u64_decimal(expires_at)
+        || expires_at == "0"
+    {
+        return Err(EphemeralCoordinationError::InvalidResponse);
+    }
+    let registration = serde_json::from_str(registration_json)
+        .map_err(|_| EphemeralCoordinationError::InvalidResponse)?;
+    let heartbeat = serde_json::from_str(heartbeat_json)
+        .map_err(|_| EphemeralCoordinationError::InvalidResponse)?;
+    WorkerRegistrationSnapshot::from_persisted(
+        registration,
+        heartbeat,
+        revision
+            .parse()
+            .map_err(|_| EphemeralCoordinationError::InvalidResponse)?,
+        expires_at
+            .parse()
+            .map_err(|_| EphemeralCoordinationError::InvalidResponse)?,
+    )
+    .map_err(|_| EphemeralCoordinationError::InvalidResponse)
+}
+
+fn worker_mutation(
+    values: &[String],
+    registration: Option<&WorkerRegistration>,
+    heartbeat: Option<&WorkerHeartbeat>,
+) -> Result<WorkerLeaseMutation, EphemeralCoordinationError> {
+    let Some(code) = values.first().map(String::as_str) else {
+        return Err(EphemeralCoordinationError::InvalidResponse);
+    };
+    match code {
+        "0" => Ok(WorkerLeaseMutation::FenceMismatch),
+        "1" if values.len() == 3 => {
+            let registration = registration.ok_or(EphemeralCoordinationError::InvalidResponse)?;
+            let heartbeat = heartbeat.ok_or(EphemeralCoordinationError::InvalidResponse)?;
+            let registration_json = serde_json::to_string(registration)
+                .map_err(|_| EphemeralCoordinationError::InvalidResponse)?;
+            let heartbeat_json = serde_json::to_string(heartbeat)
+                .map_err(|_| EphemeralCoordinationError::InvalidResponse)?;
+            decode_worker_snapshot(&registration_json, &heartbeat_json, &values[1], &values[2])
+                .map(Box::new)
+                .map(WorkerLeaseMutation::Applied)
+        }
+        "2" => Ok(WorkerLeaseMutation::CasMismatch),
+        "3" => Ok(WorkerLeaseMutation::Expired),
+        "4" => Err(EphemeralCoordinationError::RevisionExhausted),
+        "5" => Ok(WorkerLeaseMutation::AlreadyApplied),
+        _ => Err(EphemeralCoordinationError::InvalidResponse),
+    }
 }
 
 #[async_trait]
@@ -450,6 +650,131 @@ impl EphemeralCoordinationStore for RedisEphemeralCoordinationStore {
     }
 }
 
+#[async_trait]
+impl WorkerLeaseStore for RedisEphemeralCoordinationStore {
+    async fn register_worker(
+        &self,
+        registration: WorkerRegistration,
+        heartbeat: WorkerHeartbeat,
+        ttl: Duration,
+    ) -> Result<WorkerLeaseMutation, EphemeralCoordinationError> {
+        if !heartbeat.free().fits_within(registration.capacity()) {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        let key = self.worker_key(registration.worker_id());
+        let high_water_key = self.worker_epoch_high_water_key(registration.worker_id());
+        let ttl = ttl_millis(ttl)?;
+        let epoch = registration.worker_epoch();
+        let region = registration.region().to_owned();
+        let compatibility = serde_json::to_string(registration.compatibility())
+            .map_err(|_| EphemeralCoordinationError::InvalidInput)?;
+        let readiness = readiness_wire(heartbeat.readiness());
+        let registration_json = serde_json::to_string(&registration)
+            .map_err(|_| EphemeralCoordinationError::InvalidInput)?;
+        let heartbeat_json = serde_json::to_string(&heartbeat)
+            .map_err(|_| EphemeralCoordinationError::InvalidInput)?;
+        let script_registration = registration_json.clone();
+        let script_heartbeat = heartbeat_json.clone();
+        let values: Vec<String> = self
+            .execute(move |mut connection| async move {
+                Script::new(WORKER_REGISTER_SCRIPT)
+                    .key(key)
+                    .key(high_water_key)
+                    .arg(epoch)
+                    .arg(script_registration)
+                    .arg(script_heartbeat)
+                    .arg(region)
+                    .arg(compatibility)
+                    .arg(readiness)
+                    .arg(ttl)
+                    .invoke_async(&mut connection)
+                    .await
+            })
+            .await?;
+        worker_mutation(&values, Some(&registration), Some(&heartbeat))
+    }
+
+    async fn heartbeat_worker(
+        &self,
+        expected: &WorkerRegistrationSnapshot,
+        heartbeat: WorkerHeartbeat,
+        ttl: Duration,
+    ) -> Result<WorkerLeaseMutation, EphemeralCoordinationError> {
+        if !heartbeat
+            .free()
+            .fits_within(expected.registration().capacity())
+        {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        let key = self.worker_key(expected.registration().worker_id());
+        let ttl = ttl_millis(ttl)?;
+        let registration_json = serde_json::to_string(expected.registration())
+            .map_err(|_| EphemeralCoordinationError::InvalidInput)?;
+        let old_heartbeat_json = serde_json::to_string(expected.heartbeat())
+            .map_err(|_| EphemeralCoordinationError::InvalidInput)?;
+        let heartbeat_json = serde_json::to_string(&heartbeat)
+            .map_err(|_| EphemeralCoordinationError::InvalidInput)?;
+        let readiness = readiness_wire(heartbeat.readiness());
+        let epoch = expected.worker_epoch();
+        let revision = expected.revision();
+        let expiry = expected.expires_at_millis();
+        let script_registration = registration_json.clone();
+        let script_heartbeat = heartbeat_json.clone();
+        let values: Vec<String> = self
+            .execute(move |mut connection| async move {
+                Script::new(WORKER_HEARTBEAT_SCRIPT)
+                    .key(key)
+                    .arg(epoch)
+                    .arg(revision)
+                    .arg(script_registration)
+                    .arg(old_heartbeat_json)
+                    .arg(expiry)
+                    .arg(script_heartbeat)
+                    .arg(readiness)
+                    .arg(ttl)
+                    .invoke_async(&mut connection)
+                    .await
+            })
+            .await?;
+        worker_mutation(&values, Some(expected.registration()), Some(&heartbeat))
+    }
+
+    async fn query_ready_workers(
+        &self,
+        query: &WorkerRegistrationQuery,
+    ) -> Result<Vec<WorkerRegistrationSnapshot>, EphemeralCoordinationError> {
+        let region = query.region().to_owned();
+        let compatibility = query.compatibility().to_owned();
+        let limit = query.limit();
+        let pattern = self.worker_scan_pattern();
+        let values: Vec<String> = self
+            .execute(move |mut connection| async move {
+                Script::new(WORKER_QUERY_SCRIPT)
+                    .arg(region)
+                    .arg(compatibility)
+                    .arg(limit)
+                    .arg(pattern)
+                    .invoke_async(&mut connection)
+                    .await
+            })
+            .await?;
+        if values.first().map(String::as_str) != Some("1") || !(values.len() - 1).is_multiple_of(4)
+        {
+            return Err(EphemeralCoordinationError::InvalidResponse);
+        }
+        let mut snapshots = Vec::with_capacity((values.len() - 1) / 4);
+        for chunk in values[1..].chunks_exact(4) {
+            snapshots.push(decode_worker_snapshot(
+                &chunk[0], &chunk[1], &chunk[2], &chunk[3],
+            )?);
+        }
+        if snapshots.len() > limit {
+            return Err(EphemeralCoordinationError::InvalidResponse);
+        }
+        Ok(snapshots)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -473,6 +798,45 @@ mod tests {
         assert!(ISSUE_SCRIPT.contains("if current ~= false then return 6 end"));
         assert!(ISSUE_SCRIPT.contains("local stored = redis.call('SET'"));
         assert!(ISSUE_SCRIPT.contains("if not stored then return 6 end"));
+    }
+
+    #[test]
+    fn worker_lease_scripts_use_store_time_ttl_and_full_u64_fencing() {
+        for script in [WORKER_REGISTER_SCRIPT, WORKER_HEARTBEAT_SCRIPT] {
+            assert!(script.contains("redis.call('TIME')"));
+            assert!(script.contains("PTTL"));
+            assert!(!script.contains("tonumber"));
+            assert!(script.contains("valid_u64"));
+            assert!(script.contains("return {'6'}"));
+        }
+        assert!(WORKER_REGISTER_SCRIPT.contains("worker_epoch"));
+        assert!(WORKER_REGISTER_SCRIPT.contains("PEXPIRE"));
+        assert!(WORKER_HEARTBEAT_SCRIPT.contains("revision"));
+        assert!(WORKER_HEARTBEAT_SCRIPT.contains("entry"));
+    }
+
+    #[test]
+    fn worker_registration_rejects_corrupt_or_non_expiring_existing_hashes() {
+        assert!(WORKER_REGISTER_SCRIPT.contains("redis.call('PTTL', KEYS[1]) <= 0"));
+        assert!(WORKER_REGISTER_SCRIPT.contains("valid_u64(current_epoch)"));
+        assert!(WORKER_REGISTER_SCRIPT.contains("valid_u64(current_revision)"));
+        assert!(WORKER_HEARTBEAT_SCRIPT.contains("redis.call('PTTL', KEYS[1]) <= 0"));
+    }
+
+    #[test]
+    fn worker_registration_retains_a_non_expiring_epoch_high_water_mark() {
+        assert!(WORKER_REGISTER_SCRIPT.contains("redis.call('GET', KEYS[2])"));
+        assert!(WORKER_REGISTER_SCRIPT.contains("redis.call('SET', KEYS[2], ARGV[1])"));
+        assert!(!WORKER_REGISTER_SCRIPT.contains("PEXPIRE', KEYS[2]"));
+    }
+
+    #[test]
+    fn worker_ready_query_is_cursor_and_result_bounded() {
+        assert!(WORKER_QUERY_SCRIPT.contains("SCAN"));
+        assert!(!WORKER_QUERY_SCRIPT.contains("KEYS"));
+        assert!(WORKER_QUERY_SCRIPT.contains("ARGV[3]"));
+        assert!(WORKER_QUERY_SCRIPT.contains("PTTL"));
+        assert!(WORKER_QUERY_SCRIPT.contains("ready"));
     }
     #[test]
     fn redis_debug_redacts_endpoint_credentials() {
