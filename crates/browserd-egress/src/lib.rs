@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+mod attachment;
+#[cfg(test)]
+mod attachment_tests;
 mod data_plane;
 mod ip_policy;
 mod planner;
@@ -12,6 +15,12 @@ mod scheme;
 mod upstream_proxy;
 mod url;
 
+pub use attachment::{
+    ActiveAttachmentReceipt, AttachmentError, AttachmentExpiry, AttachmentId, AttachmentRegistry,
+    AttachmentState, AttachmentStatus, BindingDigest, CancelledAttachmentReceipt, DaemonEpoch,
+    InstallReceipt, InstallingAttachmentReceipt, PreparedAttachmentReceipt,
+    ReleasedAttachmentReceipt,
+};
 pub use data_plane::{
     BoxedEgressIo, Connector, DataPlane, DataPlaneError, DataPlaneLimits, EgressIo, Resolver,
     TcpConnector, TokioResolver, VerifiedRouteSource,
