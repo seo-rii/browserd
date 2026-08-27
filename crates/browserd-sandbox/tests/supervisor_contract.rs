@@ -109,6 +109,9 @@ struct ClaimingBackend {
     pipes: Arc<Mutex<Option<ChromiumCdpPipes>>>,
     claim_calls: Arc<AtomicUsize>,
     claim_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    revoke_calls: Arc<AtomicUsize>,
+    revoke_called: Arc<Notify>,
+    fail_first_revoke: bool,
     kill_reasons: Arc<Mutex<Vec<CleanupReason>>>,
     kill_called: Arc<Notify>,
     claim_completed: Arc<Notify>,
@@ -127,6 +130,12 @@ impl ClaimingBackend {
         let proceed = Arc::new(Notify::new());
         let (backend, command_reader) =
             Self::with_gate(Some((Arc::clone(&entered), Arc::clone(&proceed))));
+        (backend, entered, proceed, command_reader)
+    }
+
+    fn blocked_with_transient_revoke_failure() -> (Self, Arc<Notify>, Arc<Notify>, OwnedFd) {
+        let (mut backend, entered, proceed, command_reader) = Self::blocked();
+        backend.fail_first_revoke = true;
         (backend, entered, proceed, command_reader)
     }
 
@@ -150,6 +159,9 @@ impl ClaimingBackend {
                 ))),
                 claim_calls: Arc::new(AtomicUsize::new(0)),
                 claim_gate: gate,
+                revoke_calls: Arc::new(AtomicUsize::new(0)),
+                revoke_called: Arc::new(Notify::new()),
+                fail_first_revoke: false,
                 kill_reasons: Arc::new(Mutex::new(Vec::new())),
                 kill_called: Arc::new(Notify::new()),
                 claim_completed: Arc::new(Notify::new()),
@@ -199,7 +211,15 @@ impl SandboxBackend for ClaimingBackend {
         _handle: &SandboxHandle,
         _reason: CleanupReason,
     ) -> Result<(), SandboxError> {
-        Ok(())
+        let call = self.revoke_calls.fetch_add(1, Ordering::AcqRel);
+        self.revoke_called.notify_one();
+        if self.fail_first_revoke && call == 0 {
+            Err(SandboxError::Backend(
+                "transient route revoke failure".to_owned(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     async fn kill_cgroup(
@@ -434,6 +454,75 @@ async fn cancelling_cdp_claim_caller_drops_returned_fds_and_fails_closed() {
     tokio::time::timeout(Duration::from_millis(200), backend.kill_called.notified())
         .await
         .expect("cancelled handoff should start cleanup");
+    assert_eq!(
+        backend.kill_reasons.lock().unwrap().as_slice(),
+        [CleanupReason::BrowserFailure]
+    );
+    let mut byte = [0_u8; 1];
+    assert_eq!(nix::unistd::read(&command_reader, &mut byte), Ok(0));
+}
+
+#[tokio::test]
+async fn cancelling_claim_during_backend_retries_incomplete_cleanup_to_terminal() {
+    let (backend, claim_entered, release_claim, command_reader) =
+        ClaimingBackend::blocked_with_transient_revoke_failure();
+    nix::fcntl::fcntl(
+        &command_reader,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .expect("test command reader should become nonblocking");
+    let bounded_config = config()
+        .with_cleanup_stage_timeout(Duration::from_millis(20))
+        .expect("cleanup timeout should be valid");
+    let supervisor = Arc::new(SandboxSupervisor::new(bounded_config, backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let claim_supervisor = Arc::clone(&supervisor);
+    let claim_shard_id = shard_id.clone();
+    let claim = tokio::spawn(async move {
+        claim_supervisor
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(200), claim_entered.notified())
+        .await
+        .expect("claim backend must reach its blocking boundary");
+    claim.abort();
+    assert!(
+        claim
+            .await
+            .expect_err("claim caller should be cancelled while the backend is blocked")
+            .is_cancelled()
+    );
+    release_claim.notify_one();
+
+    let cleanup_retried = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if backend.revoke_calls.load(Ordering::Acquire) >= 2 {
+                break;
+            }
+            backend.revoke_called.notified().await;
+        }
+    })
+    .await;
+    assert!(
+        cleanup_retried.is_ok(),
+        "an incomplete cancellation cleanup must retry its failed stage"
+    );
+    assert_eq!(backend.revoke_calls.load(Ordering::Acquire), 2);
+    assert!(matches!(
+        supervisor
+            .kill_shard(&shard_id, 17, CleanupReason::BrowserFailure)
+            .await,
+        Ok(KillShardOutcome::AlreadyTerminated)
+    ));
     assert_eq!(
         backend.kill_reasons.lock().unwrap().as_slice(),
         [CleanupReason::BrowserFailure]
@@ -890,6 +979,139 @@ async fn partial_cleanup_retries_only_failed_stages_before_claiming_termination(
         supervisor
             .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
             .await,
+        Ok(KillShardOutcome::Terminated(CleanupResult {
+            route_revoked: true,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
+    );
+    assert_eq!(
+        supervisor
+            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .await,
+        Ok(KillShardOutcome::AlreadyTerminated)
+    );
+    assert_eq!(
+        backend.events.lock().unwrap().as_slice(),
+        ["revoke", "kill", "namespaces", "revoke"]
+    );
+}
+
+#[derive(Clone)]
+struct PanickingFirstRevokeBackend {
+    revoke_calls: Arc<AtomicUsize>,
+    revoke_started: Arc<Notify>,
+    release_revoke: Arc<Notify>,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl SandboxBackend for PanickingFirstRevokeBackend {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities::production_required()
+    }
+
+    async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        Ok(SandboxHandle::new(
+            spec.shard_id().clone(),
+            "panic-retry-cleanup",
+        ))
+    }
+
+    async fn revoke_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        let call = self.revoke_calls.fetch_add(1, Ordering::AcqRel);
+        self.events.lock().unwrap().push("revoke");
+        if call == 0 {
+            self.revoke_started.notify_one();
+            self.release_revoke.notified().await;
+            panic!("simulated first revoke panic");
+        }
+        Ok(())
+    }
+
+    async fn kill_cgroup(
+        &self,
+        _handle: &SandboxHandle,
+        _reason: CleanupReason,
+    ) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("kill");
+        Ok(())
+    }
+
+    async fn cleanup_namespaces(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        self.events.lock().unwrap().push("namespaces");
+        Ok(())
+    }
+
+    async fn inspect(&self, _handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
+        Err(SandboxError::Backend("not used".to_owned()))
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cleanup_stage_panic_is_bounded_retryable_and_wakes_a_concurrent_waiter() {
+    let backend = PanickingFirstRevokeBackend {
+        revoke_calls: Arc::new(AtomicUsize::new(0)),
+        revoke_started: Arc::new(Notify::new()),
+        release_revoke: Arc::new(Notify::new()),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let supervisor_config = config()
+        .with_cleanup_stage_timeout(Duration::from_millis(50))
+        .expect("cleanup timeout should be valid");
+    let supervisor = Arc::new(SandboxSupervisor::new(supervisor_config, backend.clone()));
+    let shard_id = ShardId::new();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation should succeed");
+
+    let owner_supervisor = Arc::clone(&supervisor);
+    let owner_shard_id = shard_id.clone();
+    let owner = tokio::spawn(async move {
+        owner_supervisor
+            .kill_shard(&owner_shard_id, 17, CleanupReason::SecurityViolation)
+            .await
+    });
+    backend.revoke_started.notified().await;
+
+    let waiter_supervisor = Arc::clone(&supervisor);
+    let waiter_shard_id = shard_id.clone();
+    let waiter = tokio::spawn(async move {
+        waiter_supervisor
+            .kill_shard(&waiter_shard_id, 17, CleanupReason::SecurityViolation)
+            .await
+    });
+    tokio::task::yield_now().await;
+    backend.release_revoke.notify_one();
+
+    let (owner_outcome, waiter_outcome) = tokio::time::timeout(Duration::from_millis(500), async {
+        (
+            owner.await.expect("cleanup owner task should finish"),
+            waiter
+                .await
+                .expect("concurrent cleanup waiter should finish"),
+        )
+    })
+    .await
+    .expect("a panicking cleanup stage must not strand its concurrent waiter");
+    assert_eq!(
+        owner_outcome,
+        Ok(KillShardOutcome::CleanupIncomplete(CleanupResult {
+            route_revoked: false,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
+    );
+    assert_eq!(
+        waiter_outcome,
         Ok(KillShardOutcome::Terminated(CleanupResult {
             route_revoked: true,
             cgroup_killed: true,
