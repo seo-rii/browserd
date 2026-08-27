@@ -2,11 +2,30 @@
 
 #![forbid(unsafe_code)]
 
+mod cdp_driver;
+mod chromium_owner;
+mod production_sandbox;
 mod shard_actor;
+mod shard_driver;
+mod target_manager;
 
+pub use cdp_driver::CdpChromiumDriver;
+pub use chromium_owner::{
+    ChromiumConnectionOwner, ChromiumTargetManager, ChromiumTargetManagerBackend,
+    ChromiumTargetRoute,
+};
+pub use production_sandbox::{
+    CdpPipeAcceptor, ProductionSandboxShardRuntime, SandboxShardRpc, ShardLaunchDescriptor,
+};
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
     BrowserShardSnapshot, DetachSessionOutcome, ShardActorError, ShardRuntimeError,
+};
+pub use shard_driver::{ActorChromiumDriver, ChromiumDriverShardRuntime};
+pub use target_manager::{
+    ProductionTargetManager, TargetBootstrapSnapshot, TargetManagedShardRuntime,
+    TargetManagerBackend, TargetManagerDrain, TargetManagerEvent, TargetManagerIngress,
+    TargetManagerIngressError,
 };
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -176,8 +195,33 @@ enum ApprovalAdmissionClockError {
 
 pub trait ChromiumDriver: Send + Sync + 'static {
     fn qualify(&self) -> Result<(), DependencyError>;
+    fn shard_managed_contexts(&self) -> bool {
+        false
+    }
     fn create_context(&self, session_id: &SessionId) -> Result<PageId, DependencyError>;
+    fn create_context_fenced(
+        &self,
+        session_id: &SessionId,
+        _fence: &OwnershipFence,
+    ) -> Result<PageId, DependencyError> {
+        self.create_context(session_id)
+    }
+    fn create_context_owned(
+        &self,
+        _tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<PageId, DependencyError> {
+        self.create_context_fenced(session_id, fence)
+    }
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError>;
+    fn close_context_fenced(
+        &self,
+        session_id: &SessionId,
+        _fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        self.close_context(session_id)
+    }
     fn create_page(&self, session_id: &SessionId) -> Result<PageId, DependencyError>;
     fn close_page(&self, session_id: &SessionId, page_id: &PageId) -> Result<(), DependencyError>;
     fn activate_page(
@@ -480,6 +524,15 @@ pub struct WorkerActionSnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerPageSnapshot {
+    pub page_id: PageId,
+    pub active: bool,
+    pub target_incarnation: u64,
+    pub document_epoch: u64,
+    pub url_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactUpload {
     pub bytes: Vec<u8>,
     pub content_type: String,
@@ -713,6 +766,7 @@ struct SessionState {
     machine: SessionMachine,
     occupies_capacity: bool,
     primary_page_id: PageId,
+    active_page_id: PageId,
     pages: BTreeSet<PageId>,
     closing_pages: BTreeSet<PageId>,
     closed_pages: BTreeSet<PageId>,
@@ -1048,7 +1102,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .start(&fence, now)
                 .and_then(|_| machine.mark_running(&fence, now))
                 .map_err(map_session_error)?;
-            if self.sandbox.provision(&session_id, &fence).is_err() {
+            if !self.driver.shard_managed_contexts()
+                && self.sandbox.provision(&session_id, &fence).is_err()
+            {
                 return if self
                     .sandbox
                     .cleanup(&session_id, CleanupReason::BrowserFailure)
@@ -1059,29 +1115,38 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     Err(WorkerError::CleanupFailed)
                 };
             }
-            let primary_page_id = match self.driver.create_context(&session_id) {
-                Ok(page_id) => page_id,
-                Err(_) => {
-                    let sandbox_clean = self
-                        .sandbox
-                        .cleanup(&session_id, CleanupReason::BrowserFailure)
-                        .is_ok();
-                    return if sandbox_clean {
-                        Err(WorkerError::DependencyUnavailable)
-                    } else {
-                        Err(WorkerError::CleanupFailed)
-                    };
-                }
-            };
+            let primary_page_id =
+                match self
+                    .driver
+                    .create_context_owned(&command.tenant_id, &session_id, &fence)
+                {
+                    Ok(page_id) => page_id,
+                    Err(_) => {
+                        let sandbox_clean = self.driver.shard_managed_contexts()
+                            || self
+                                .sandbox
+                                .cleanup(&session_id, CleanupReason::BrowserFailure)
+                                .is_ok();
+                        return if sandbox_clean {
+                            Err(WorkerError::DependencyUnavailable)
+                        } else {
+                            Err(WorkerError::CleanupFailed)
+                        };
+                    }
+                };
             if let Err(error) = machine
                 .register_target(&fence, TargetId::new(primary_page_id.to_string()))
                 .map_err(map_session_error)
             {
-                let driver_clean = self.driver.close_context(&session_id).is_ok();
-                let sandbox_clean = self
-                    .sandbox
-                    .cleanup(&session_id, CleanupReason::BrowserFailure)
+                let driver_clean = self
+                    .driver
+                    .close_context_fenced(&session_id, &fence)
                     .is_ok();
+                let sandbox_clean = self.driver.shard_managed_contexts()
+                    || self
+                        .sandbox
+                        .cleanup(&session_id, CleanupReason::BrowserFailure)
+                        .is_ok();
                 return if driver_clean && sandbox_clean {
                     Err(error)
                 } else {
@@ -1096,6 +1161,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     machine,
                     occupies_capacity: true,
                     primary_page_id: primary_page_id.clone(),
+                    active_page_id: primary_page_id.clone(),
                     pages,
                     closing_pages: BTreeSet::new(),
                     closed_pages: BTreeSet::new(),
@@ -1156,10 +1222,14 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 let mut worker = match self.lock_worker() {
                     Ok(worker) => worker,
                     Err(_) => {
-                        let _ = self.driver.close_context(&outcome.session_id);
                         let _ = self
-                            .sandbox
-                            .cleanup(&outcome.session_id, CleanupReason::BrowserFailure);
+                            .driver
+                            .close_context_fenced(&outcome.session_id, &outcome.fence);
+                        if !self.driver.shard_managed_contexts() {
+                            let _ = self
+                                .sandbox
+                                .cleanup(&outcome.session_id, CleanupReason::BrowserFailure);
+                        }
                         let mut completion = waiter
                             .completion
                             .lock()
@@ -1178,11 +1248,15 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 };
                 if let Some(error) = rejected {
                     drop(worker);
-                    let driver_clean = self.driver.close_context(&outcome.session_id).is_ok();
-                    let sandbox_clean = self
-                        .sandbox
-                        .cleanup(&outcome.session_id, CleanupReason::Administrative)
+                    let driver_clean = self
+                        .driver
+                        .close_context_fenced(&outcome.session_id, &outcome.fence)
                         .is_ok();
+                    let sandbox_clean = self.driver.shard_managed_contexts()
+                        || self
+                            .sandbox
+                            .cleanup(&outcome.session_id, CleanupReason::Administrative)
+                            .is_ok();
                     drop(journal_guard);
                     let final_error = if driver_clean && sandbox_clean {
                         error
@@ -1302,7 +1376,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             driver: &*self.driver,
             sandbox: &*self.sandbox,
             session_id,
-            reason: CleanupReason::Administrative,
+            fence,
         };
         let cleanup_result = cleanup_machine.run_cleanup(fence, &mut cleanup);
         let mut session = executor
@@ -1373,6 +1447,43 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         registration
     }
 
+    pub fn get_page(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+    ) -> Result<WorkerPageSnapshot, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        validate_fence(&session, fence)?;
+        page_snapshot(&session, page_id)
+    }
+
+    pub fn list_pages(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<Vec<WorkerPageSnapshot>, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        validate_fence(&session, fence)?;
+        session
+            .pages
+            .iter()
+            .map(|page_id| page_snapshot(&session, page_id))
+            .collect()
+    }
+
     pub fn activate_page(
         &self,
         peer: &AuthenticatedPeer,
@@ -1407,7 +1518,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         }
         self.driver
             .activate_page(session_id, page_id)
-            .map_err(|_| WorkerError::DependencyUnavailable)
+            .map_err(|_| WorkerError::DependencyUnavailable)?;
+        let mut session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        validate_fence(&session, fence)?;
+        if !session.pages.contains(page_id) || session.closing_pages.contains(page_id) {
+            return Err(WorkerError::InvalidActionTransition);
+        }
+        session.active_page_id = page_id.clone();
+        Ok(())
     }
 
     pub fn close_page(
@@ -1528,6 +1649,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .first()
                 .cloned()
                 .ok_or(WorkerError::StateUnavailable)?;
+        }
+        if session.active_page_id == *page_id {
+            session.active_page_id = session.primary_page_id.clone();
         }
         Ok(())
     }
@@ -2694,6 +2818,49 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .ok_or(WorkerError::ApprovalNotFound)
     }
 
+    pub fn get_approval(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        fence: &OwnershipFence,
+    ) -> Result<WorkerApprovalSnapshot, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        validate_fence(&session, fence)?;
+        let approval = session
+            .approvals
+            .get(approval_id)
+            .ok_or(WorkerError::ApprovalNotFound)?;
+        Ok(worker_approval_snapshot(approval_id, approval))
+    }
+
+    pub fn list_approvals(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<Vec<WorkerApprovalSnapshot>, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        validate_fence(&session, fence)?;
+        let mut approvals = session
+            .approvals
+            .iter()
+            .map(|(approval_id, approval)| worker_approval_snapshot(approval_id, approval))
+            .collect::<Vec<_>>();
+        approvals.sort_by(|left, right| left.approval_id.cmp(&right.approval_id));
+        Ok(approvals)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn decide_approval(
         &self,
@@ -2734,7 +2901,19 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             if current == ApprovalState::Expired {
                 return Err(WorkerError::ApprovalPolicy(ApprovalError::ApprovalExpired));
             }
-            return Err(WorkerError::InvalidApprovalTransition);
+            let same_decision = match (&current, decision) {
+                (ApprovalState::Approved { by }, ApprovalDecision::Approve)
+                | (ApprovalState::Denied { by }, ApprovalDecision::Deny) => by == &principal_id,
+                _ => false,
+            };
+            if !same_decision {
+                return Err(WorkerError::InvalidApprovalTransition);
+            }
+            let approval = session
+                .approvals
+                .get(approval_id)
+                .ok_or(WorkerError::ApprovalNotFound)?;
+            return Ok(worker_approval_snapshot(approval_id, approval));
         }
         if require_four_eyes && principal_id == *proposal.requester_principal_id() {
             return Err(WorkerError::ApprovalPolicy(
@@ -2788,12 +2967,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .ok_or(WorkerError::ApprovalNotFound)?;
         approval.state = state.clone();
         approval.request = Some(Arc::clone(&request));
-        Ok(WorkerApprovalSnapshot {
-            approval_id: approval_id.clone(),
-            action_id,
-            state,
-            proposal_hash: request.proposal_hash(),
-        })
+        Ok(worker_approval_snapshot(approval_id, approval))
     }
 
     pub fn issue_viewer_ticket(
@@ -2944,7 +3118,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         driver: &*self.driver,
                         sandbox: &*self.sandbox,
                         session_id: &session_id,
-                        reason: CleanupReason::Administrative,
+                        fence: &fence,
                     };
                     let cleanup_result = cleanup_machine.run_cleanup(&fence, &mut cleanup);
                     let mut session = executor
@@ -2967,9 +3141,12 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     }
                     let session_id = session.machine.session_id().clone();
                     drop(session);
-                    let cleanup_result = self
-                        .sandbox
-                        .cleanup(&session_id, CleanupReason::WorkerLeaseExpired);
+                    let cleanup_result = if self.driver.shard_managed_contexts() {
+                        self.driver.close_context_fenced(&session_id, &fence)
+                    } else {
+                        self.sandbox
+                            .cleanup(&session_id, CleanupReason::WorkerLeaseExpired)
+                    };
                     let mut session = executor
                         .state
                         .lock()
@@ -3051,9 +3228,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 SessionLifecycle::Closed => {}
                 SessionLifecycle::Failed => {
                     if occupies_capacity {
-                        self.sandbox
-                            .cleanup(&session_id, CleanupReason::WorkerLeaseExpired)
-                            .map_err(|_| WorkerError::CleanupFailed)?;
+                        if !self.driver.shard_managed_contexts() {
+                            self.sandbox
+                                .cleanup(&session_id, CleanupReason::WorkerLeaseExpired)
+                                .map_err(|_| WorkerError::CleanupFailed)?;
+                        }
                         executor
                             .state
                             .lock()
@@ -3153,7 +3332,7 @@ struct WorkerCleanup<'a, D, S> {
     driver: &'a D,
     sandbox: &'a S,
     session_id: &'a SessionId,
-    reason: CleanupReason,
+    fence: &'a OwnershipFence,
 }
 
 impl<D: ChromiumDriver, S: SandboxClient> CleanupBackend for WorkerCleanup<'_, D, S> {
@@ -3165,12 +3344,20 @@ impl<D: ChromiumDriver, S: SandboxClient> CleanupBackend for WorkerCleanup<'_, D
         let result = match stage {
             CleanupStage::ForceCloseTargets | CleanupStage::DisposeBrowserContext => {
                 if stage == CleanupStage::DisposeBrowserContext {
-                    self.driver.close_context(self.session_id)
+                    self.driver
+                        .close_context_fenced(self.session_id, self.fence)
                 } else {
                     Ok(())
                 }
             }
-            CleanupStage::RevokeProxyRoute => self.sandbox.cleanup(self.session_id, self.reason),
+            CleanupStage::RevokeProxyRoute => {
+                if self.driver.shard_managed_contexts() {
+                    Ok(())
+                } else {
+                    self.sandbox
+                        .cleanup(self.session_id, CleanupReason::Administrative)
+                }
+            }
             _ => Ok(()),
         };
         result.map_err(|_| CleanupFailure::Injected)
@@ -3182,6 +3369,34 @@ fn validate_fence(session: &SessionState, fence: &OwnershipFence) -> Result<(), 
         Ok(())
     } else {
         Err(WorkerError::StaleFence)
+    }
+}
+
+fn page_snapshot(
+    session: &SessionState,
+    page_id: &PageId,
+) -> Result<WorkerPageSnapshot, WorkerError> {
+    if !session.pages.contains(page_id) && !session.closed_pages.contains(page_id) {
+        return Err(WorkerError::PageNotFound);
+    }
+    Ok(WorkerPageSnapshot {
+        page_id: page_id.clone(),
+        active: session.pages.contains(page_id) && session.active_page_id == *page_id,
+        target_incarnation: 1,
+        document_epoch: 1,
+        url_revision: 0,
+    })
+}
+
+fn worker_approval_snapshot(
+    approval_id: &ApprovalId,
+    approval: &ApprovalRecord,
+) -> WorkerApprovalSnapshot {
+    WorkerApprovalSnapshot {
+        approval_id: approval_id.clone(),
+        action_id: approval.action_id.clone(),
+        state: approval.state.clone(),
+        proposal_hash: approval.proposal.hash(),
     }
 }
 

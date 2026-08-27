@@ -564,6 +564,68 @@ fn create_is_idempotent_fenced_and_page_lifecycle_is_serialized() {
 }
 
 #[test]
+fn page_snapshots_are_opaque_ordered_and_track_activation() {
+    let Some((worker, peer, _driver, _sandbox)) = ready_worker(4) else {
+        return;
+    };
+    let Some(session) = create_ready_session(&worker, &peer, "page-snapshots") else {
+        return;
+    };
+
+    let initial = worker.list_pages(&peer, &session.session_id, &session.fence);
+    assert!(initial.is_ok());
+    let Some(initial) = initial.ok() else {
+        return;
+    };
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].page_id, session.primary_page_id);
+    assert!(initial[0].active);
+    assert_eq!(initial[0].target_incarnation, 1);
+    assert_eq!(initial[0].document_epoch, 1);
+    assert_eq!(initial[0].url_revision, 0);
+
+    let second = worker.create_page(
+        &peer,
+        &session.session_id,
+        &session.fence,
+        SessionTime::new(1),
+    );
+    assert!(second.is_ok());
+    let Some(second) = second.ok() else {
+        return;
+    };
+    assert!(
+        worker
+            .activate_page(
+                &peer,
+                &session.session_id,
+                &second,
+                &session.fence,
+                SessionTime::new(2),
+            )
+            .is_ok()
+    );
+    let activated = worker.list_pages(&peer, &session.session_id, &session.fence);
+    assert!(activated.is_ok());
+    let Some(activated) = activated.ok() else {
+        return;
+    };
+    assert_eq!(activated.len(), 2);
+    assert!(
+        activated
+            .iter()
+            .find(|page| page.page_id == second)
+            .is_some_and(|page| page.active && page.target_incarnation == 1)
+    );
+    assert!(
+        activated
+            .iter()
+            .find(|page| page.page_id == session.primary_page_id)
+            .is_some_and(|page| !page.active)
+    );
+}
+
+#[test]
 fn blocked_session_provisioning_does_not_hold_the_global_worker_mutex() {
     let Some((worker, peer, _driver, sandbox)) = ready_worker(4) else {
         return;
@@ -1148,6 +1210,21 @@ fn artifact_approval_viewer_and_cleanup_commands_remain_fenced() {
     let Some(approval) = approval.ok() else {
         return;
     };
+    let pending = worker.get_approval(&peer, &created.session_id, &approval, &created.fence);
+    assert!(pending.is_ok());
+    assert!(
+        pending
+            .as_ref()
+            .is_ok_and(|snapshot| snapshot.action_id == action
+                && snapshot.proposal_hash.as_bytes() != &[0; 32])
+    );
+    let approvals = worker.list_approvals(&peer, &created.session_id, &created.fence);
+    assert!(approvals.is_ok());
+    assert!(
+        approvals
+            .as_ref()
+            .is_ok_and(|snapshots| snapshots.len() == 1 && snapshots[0].approval_id == approval)
+    );
     assert!(
         worker
             .decide_approval(
@@ -1161,6 +1238,12 @@ fn artifact_approval_viewer_and_cleanup_commands_remain_fenced() {
             )
             .is_ok()
     );
+    let decided = worker.get_approval(&peer, &created.session_id, &approval, &created.fence);
+    assert!(decided.is_ok());
+    assert!(decided.as_ref().is_ok_and(|snapshot| matches!(
+        snapshot.state,
+        browserd_policy::ApprovalState::Approved { .. }
+    )));
     assert!(
         worker
             .close_session(

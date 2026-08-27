@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 browserd-actions = { path = "../browserd-actions" }
+browserd-cdp = { path = "../browserd-cdp" }
+browserd-chromium = { path = "../browserd-chromium" }
 browserd-artifacts = { path = "../browserd-artifacts" }
 browserd-core = { path = "../browserd-core" }
 browserd-features = { path = "../browserd-features" }
@@ -22,6 +24,8 @@ browserd-sandbox = { path = "../browserd-sandbox" }
 browserd-session = { path = "../browserd-session" }
 browserd-targets = { path = "../browserd-targets" }
 browserd-viewer = { path = "../browserd-viewer" }
+futures.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
@@ -29,4 +33,5 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+nix.workspace = true
 tempfile.workspace = true

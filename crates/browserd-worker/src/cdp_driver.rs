@@ -1,0 +1,385 @@
+use std::sync::{Arc, Mutex};
+
+use browserd_core::{ActionId, IsolationProfile, PageId, SessionId, TenantId};
+use browserd_policy::{CanonicalActionProposal, Origin};
+use browserd_session::OwnershipFence;
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::chromium_owner::{
+    ChromiumTargetManagerBackend, OwnerActorError, PageCommand, PageExecutionFence,
+};
+use crate::{
+    ActionExecutionResult, ApprovedActionError, ChromiumDriver, DependencyError,
+    LiveApprovalContext,
+};
+
+const MAX_ACTION_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_ACTION_RESULT_BYTES: usize = 64 * 1024;
+const MAX_NAVIGATION_URL_BYTES: usize = 8 * 1024;
+const MAX_INSERT_TEXT_BYTES: usize = 16 * 1024;
+const MAX_POINTER_COORDINATE: f64 = 1_000_000.0;
+
+#[derive(Clone)]
+pub struct CdpChromiumDriver {
+    backend: ChromiumTargetManagerBackend,
+    effect_gate: Arc<Mutex<()>>,
+    chromium_build: Arc<str>,
+    isolation: IsolationProfile,
+}
+
+impl CdpChromiumDriver {
+    pub(crate) fn new(
+        backend: ChromiumTargetManagerBackend,
+        effect_gate: Arc<Mutex<()>>,
+        chromium_build: String,
+        isolation: IsolationProfile,
+    ) -> Self {
+        Self {
+            backend,
+            effect_gate,
+            chromium_build: Arc::from(chromium_build),
+            isolation,
+        }
+    }
+
+    pub fn list_pages_owned(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<Vec<PageId>, DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .list_pages_owned(tenant_id.clone(), session_id.clone(), fence.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn dispatch_action(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        command: PageCommand,
+        result_shape: ActionResultShape,
+        execution_fence: Option<PageExecutionFence>,
+    ) -> ActionExecutionResult {
+        match self.backend.execute_page_command(
+            session_id.clone(),
+            page_id.clone(),
+            command,
+            execution_fence,
+        ) {
+            Ok(result) => {
+                let safe_result = match result_shape {
+                    ActionResultShape::Unit => json!({"ok": true}),
+                    ActionResultShape::Url | ActionResultShape::Title => {
+                        let Some(value) = result
+                            .get("result")
+                            .and_then(|result| result.get("value"))
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| {
+                                value.len() <= MAX_ACTION_RESULT_BYTES
+                                    && !value.chars().any(char::is_control)
+                            })
+                        else {
+                            return ActionExecutionResult::OutcomeUnknown;
+                        };
+                        if matches!(result_shape, ActionResultShape::Url) {
+                            json!({"url": value})
+                        } else {
+                            json!({"title": value})
+                        }
+                    }
+                };
+                match serde_json::to_vec(&safe_result) {
+                    Ok(encoded) if encoded.len() <= MAX_ACTION_RESULT_BYTES => {
+                        ActionExecutionResult::Succeeded(encoded)
+                    }
+                    _ => ActionExecutionResult::OutcomeUnknown,
+                }
+            }
+            Err(OwnerActorError::Rejected | OwnerActorError::UnknownOwnership) => {
+                ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+            }
+            Err(
+                OwnerActorError::StateOverflow
+                | OwnerActorError::Unavailable
+                | OwnerActorError::OutcomeUncertain,
+            ) => ActionExecutionResult::OutcomeUnknown,
+        }
+    }
+
+    fn observe(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        let observed = self
+            .backend
+            .observe_page(
+                proposal.tenant_id().clone(),
+                session_id.clone(),
+                proposal.session_incarnation(),
+                page_id.clone(),
+            )
+            .map_err(map_owner_error)?;
+        if observed.tenant_id != *proposal.tenant_id()
+            || observed.session_id != *proposal.session_id()
+            || observed.session_incarnation != proposal.session_incarnation()
+            || page_id != proposal.page_id()
+        {
+            return Err(DependencyError::Rejected);
+        }
+        let origin = Origin::parse(&observed.origin).map_err(|_| DependencyError::Rejected)?;
+        Ok(LiveApprovalContext {
+            target_incarnation: observed.target_incarnation,
+            frame_document_epoch: observed.frame_document_epoch,
+            current_origin: origin,
+            url_revision: observed.url_revision,
+            node_ref: proposal.node_ref().cloned(),
+            node_valid: proposal.node_ref().is_none(),
+            resolved_ips: Vec::new(),
+            credential_refs: Vec::new(),
+            chromium_build: self.chromium_build.to_string(),
+            effective_isolation: self.isolation,
+        })
+    }
+}
+
+impl ChromiumDriver for CdpChromiumDriver {
+    fn qualify(&self) -> Result<(), DependencyError> {
+        self.backend.qualify().map_err(map_owner_error)
+    }
+
+    fn shard_managed_contexts(&self) -> bool {
+        true
+    }
+
+    fn create_context(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn create_context_owned(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<PageId, DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .create_context_owned(tenant_id.clone(), session_id.clone(), fence.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn close_context_fenced(
+        &self,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .dispose_context(session_id.clone(), fence.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn create_page(&self, session_id: &SessionId) -> Result<PageId, DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .create_page(session_id.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn close_page(&self, session_id: &SessionId, page_id: &PageId) -> Result<(), DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .close_page(session_id.clone(), page_id.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn activate_page(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+    ) -> Result<(), DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .activate_page(session_id.clone(), page_id.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn execute_action(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+    ) -> ActionExecutionResult {
+        let Ok(_effect) = self.effect_gate.lock() else {
+            return ActionExecutionResult::OutcomeUnknown;
+        };
+        let Some(page_id) = page_id else {
+            return ActionExecutionResult::FailedKnown("page_required".to_owned());
+        };
+        let (command, result_shape) = match parse_action_payload(payload) {
+            Ok(parsed) => parsed,
+            Err(reason) => return ActionExecutionResult::FailedKnown(reason.to_owned()),
+        };
+        self.dispatch_action(session_id, page_id, command, result_shape, None)
+    }
+
+    fn inspect_approval_context(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.observe(session_id, page_id, proposal)
+    }
+
+    fn execute_approved_action(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        let (command, result_shape) =
+            parse_action_payload(payload).map_err(|_| ApprovedActionError::DispatchRevoked)?;
+        let observed =
+            self.observe(session_id, page_id, proposal)
+                .map_err(|error| match error {
+                    DependencyError::Rejected => ApprovedActionError::DispatchRevoked,
+                    DependencyError::Unavailable => ApprovedActionError::Unavailable,
+                    DependencyError::OutcomeUncertain => ApprovedActionError::OutcomeUncertain,
+                })?;
+        if let Some(reason) = inspected.stale_reason(&observed) {
+            return Err(ApprovedActionError::ApprovalStale(reason));
+        }
+        let execution_fence = PageExecutionFence {
+            target_incarnation: observed.target_incarnation,
+            frame_document_epoch: observed.frame_document_epoch,
+            url_revision: observed.url_revision,
+        };
+        authorize_and_commit(&observed)?;
+        Ok(
+            match self.dispatch_action(
+                session_id,
+                page_id,
+                command,
+                result_shape,
+                Some(execution_fence),
+            ) {
+                ActionExecutionResult::FailedKnown(_) => ActionExecutionResult::OutcomeUnknown,
+                result => result,
+            },
+        )
+    }
+
+    fn cancel_action(
+        &self,
+        session_id: &SessionId,
+        _action_id: &ActionId,
+    ) -> Result<bool, DependencyError> {
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .validate_session(session_id.clone())
+            .map_err(map_owner_error)?;
+        Ok(false)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum CdpAction {
+    Navigate { url: String },
+    Reload,
+    Click { x: f64, y: f64 },
+    TypeText { text: String },
+    GetUrl,
+    GetTitle,
+}
+
+#[derive(Clone, Copy)]
+enum ActionResultShape {
+    Unit,
+    Url,
+    Title,
+}
+
+fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShape), &'static str> {
+    if payload.is_empty() || payload.len() > MAX_ACTION_PAYLOAD_BYTES {
+        return Err("invalid_action_payload");
+    }
+    let action = serde_json::from_slice::<CdpAction>(payload).map_err(|_| "unsupported_action")?;
+    match action {
+        CdpAction::Navigate { url }
+            if url.len() <= MAX_NAVIGATION_URL_BYTES
+                && !url.chars().any(char::is_control)
+                && (url.starts_with("https://") || url.starts_with("http://")) =>
+        {
+            Ok((PageCommand::Navigate { url }, ActionResultShape::Unit))
+        }
+        CdpAction::Reload => Ok((PageCommand::Reload, ActionResultShape::Unit)),
+        CdpAction::Click { x, y }
+            if x.is_finite()
+                && y.is_finite()
+                && x.abs() <= MAX_POINTER_COORDINATE
+                && y.abs() <= MAX_POINTER_COORDINATE =>
+        {
+            Ok((PageCommand::Click { x, y }, ActionResultShape::Unit))
+        }
+        CdpAction::TypeText { text } if text.len() <= MAX_INSERT_TEXT_BYTES => {
+            Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
+        }
+        CdpAction::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
+        CdpAction::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
+        _ => Err("invalid_action_arguments"),
+    }
+}
+
+fn map_owner_error(error: OwnerActorError) -> DependencyError {
+    match error {
+        OwnerActorError::Rejected | OwnerActorError::UnknownOwnership => DependencyError::Rejected,
+        OwnerActorError::StateOverflow | OwnerActorError::Unavailable => {
+            DependencyError::Unavailable
+        }
+        OwnerActorError::OutcomeUncertain => DependencyError::OutcomeUncertain,
+    }
+}
