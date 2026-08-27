@@ -15,9 +15,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixStream;
 
 use crate::{
-    ActiveInstallResponse, ClientInstallError, InstallRequest, MAX_CONTROL_FRAME_BYTES,
-    PendingInstall, ReceiveInstallError, ResponseMismatch, ServerCommitError, WireValidationError,
-    read_json_frame, receive_install_request, receive_listener, send_listener, write_json_frame,
+    ActiveInstallResponse, ClientInstallError, ControlRequest, EpochProbeRequest,
+    EpochProbeResponse, InstallRequest, MAX_CONTROL_FRAME_BYTES, PendingInstall,
+    ReceiveInstallError, ResponseMismatch, ServerCommitError, WireValidationError, read_json_frame,
+    receive_control_request, receive_install_request, receive_listener, send_epoch_probe,
+    send_listener, write_json_frame,
 };
 
 const HANDOFF_FRAME_BYTES: usize = 33;
@@ -79,6 +81,71 @@ async fn assert_capability_closed(observer: StdUnixStream) {
         observer.try_read(&mut byte).expect("EOF must be readable"),
         0
     );
+}
+
+#[tokio::test]
+async fn authenticated_epoch_probe_echoes_protocol_nonce_and_current_epoch() {
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair must be created");
+    let request = EpochProbeRequest::new(LeaseId::new());
+    let expected = EpochProbeResponse::new(request.protocol_version(), request.nonce().clone(), 43)
+        .expect("probe response should validate");
+    let expected_for_server = expected.clone();
+    let server = tokio::spawn(async move {
+        match receive_control_request(server_stream, current_uid())
+            .await
+            .expect("probe request must be authenticated")
+        {
+            ControlRequest::EpochProbe(probe) => probe
+                .respond(43)
+                .await
+                .expect("probe response should be written"),
+            ControlRequest::Install(_) => panic!("probe must not be parsed as an install"),
+        }
+    });
+
+    assert_eq!(
+        send_epoch_probe(client_stream, request)
+            .await
+            .expect("correlated epoch proof should validate"),
+        expected
+    );
+    assert_eq!(
+        server.await.expect("server task should finish"),
+        expected_for_server
+    );
+}
+
+#[tokio::test]
+async fn epoch_probe_rejects_a_response_for_another_nonce() {
+    let (client_stream, mut server_stream) =
+        UnixStream::pair().expect("control pair must be created");
+    let request = EpochProbeRequest::new(LeaseId::new());
+    let server = tokio::spawn(async move {
+        let _: EpochProbeRequest = read_json_frame(&mut server_stream)
+            .await
+            .expect("probe request should be readable");
+        write_json_frame(
+            &mut server_stream,
+            &EpochProbeResponse::new(1, LeaseId::new(), 43)
+                .expect("mismatched response fixture should validate"),
+        )
+        .await
+        .expect("probe response should write");
+    });
+
+    assert!(send_epoch_probe(client_stream, request).await.is_err());
+    server.await.expect("server task should finish");
+}
+
+#[tokio::test]
+async fn epoch_probe_dispatch_rejects_an_unexpected_unix_peer_uid_before_reading() {
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair must be created");
+    let result = receive_control_request(server_stream, current_uid().wrapping_add(1)).await;
+    assert!(matches!(
+        result,
+        Err(ReceiveInstallError::PeerUidMismatch { .. })
+    ));
+    drop(client_stream);
 }
 
 #[tokio::test]

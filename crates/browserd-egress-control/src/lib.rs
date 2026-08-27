@@ -18,8 +18,114 @@ use tokio::net::UnixStream;
 
 /// Maximum JSON payload size for both protocol messages.
 pub const MAX_CONTROL_FRAME_BYTES: usize = 4 * 1024;
+pub const EPOCH_PROBE_PROTOCOL_VERSION: u16 = 1;
 
 const LENGTH_BYTES: usize = 4;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpochProbeRequest {
+    protocol_version: u16,
+    nonce: LeaseId,
+}
+
+impl EpochProbeRequest {
+    #[must_use]
+    pub fn new(nonce: LeaseId) -> Self {
+        Self {
+            protocol_version: EPOCH_PROBE_PROTOCOL_VERSION,
+            nonce,
+        }
+    }
+
+    #[must_use]
+    pub const fn protocol_version(&self) -> u16 {
+        self.protocol_version
+    }
+
+    #[must_use]
+    pub const fn nonce(&self) -> &LeaseId {
+        &self.nonce
+    }
+
+    fn validate(&self) -> Result<(), EpochProbeError> {
+        if self.protocol_version != EPOCH_PROBE_PROTOCOL_VERSION {
+            return Err(EpochProbeError::ProtocolVersion);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpochProbeResponse {
+    protocol_version: u16,
+    nonce: LeaseId,
+    current_daemon_epoch: u64,
+}
+
+impl EpochProbeResponse {
+    pub fn new(
+        protocol_version: u16,
+        nonce: LeaseId,
+        current_daemon_epoch: u64,
+    ) -> Result<Self, EpochProbeError> {
+        let response = Self {
+            protocol_version,
+            nonce,
+            current_daemon_epoch,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    #[must_use]
+    pub const fn protocol_version(&self) -> u16 {
+        self.protocol_version
+    }
+
+    #[must_use]
+    pub const fn nonce(&self) -> &LeaseId {
+        &self.nonce
+    }
+
+    #[must_use]
+    pub const fn current_daemon_epoch(&self) -> u64 {
+        self.current_daemon_epoch
+    }
+
+    fn validate(&self) -> Result<(), EpochProbeError> {
+        if self.protocol_version != EPOCH_PROBE_PROTOCOL_VERSION {
+            return Err(EpochProbeError::ProtocolVersion);
+        }
+        if self.current_daemon_epoch == 0 {
+            return Err(EpochProbeError::ZeroDaemonEpoch);
+        }
+        Ok(())
+    }
+
+    fn validate_for(&self, request: &EpochProbeRequest) -> Result<(), EpochProbeError> {
+        if self.protocol_version != request.protocol_version {
+            return Err(EpochProbeError::ProtocolVersion);
+        }
+        if self.nonce != request.nonce {
+            return Err(EpochProbeError::NonceMismatch);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EpochProbeError {
+    #[error("epoch probe protocol version is unsupported")]
+    ProtocolVersion,
+    #[error("epoch probe daemon epoch must be nonzero")]
+    ZeroDaemonEpoch,
+    #[error("epoch probe response nonce does not match its request")]
+    NonceMismatch,
+    #[error("epoch probe control frame failed: {0}")]
+    Frame(#[from] ControlFrameError),
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -243,6 +349,8 @@ pub enum ReceiveInstallError {
     Metadata(#[from] ControlFrameError),
     #[error("install metadata failed validation: {0}")]
     Validation(#[from] WireValidationError),
+    #[error("epoch probe metadata failed validation: {0}")]
+    EpochProbe(#[from] EpochProbeError),
     #[error("listener descriptor handoff failed: {0}")]
     Handoff(#[from] HandoffError),
     #[error("listener capability could not be cloned: {0}")]
@@ -333,6 +441,45 @@ pub struct PendingInstall {
 pub struct PendingListenerOffer {
     request: InstallRequest,
     stream: UnixStream,
+}
+
+#[derive(Debug)]
+pub struct PendingEpochProbe {
+    request: EpochProbeRequest,
+    stream: UnixStream,
+}
+
+impl PendingEpochProbe {
+    #[must_use]
+    pub const fn request(&self) -> &EpochProbeRequest {
+        &self.request
+    }
+
+    pub async fn respond(
+        mut self,
+        current_daemon_epoch: u64,
+    ) -> Result<EpochProbeResponse, EpochProbeError> {
+        let response = EpochProbeResponse::new(
+            self.request.protocol_version,
+            self.request.nonce.clone(),
+            current_daemon_epoch,
+        )?;
+        write_json_frame(&mut self.stream, &response).await?;
+        Ok(response)
+    }
+}
+
+#[derive(Debug)]
+pub enum ControlRequest {
+    Install(PendingListenerOffer),
+    EpochProbe(PendingEpochProbe),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum IncomingControlRequest {
+    Install(InstallRequest),
+    EpochProbe(EpochProbeRequest),
 }
 
 impl PendingListenerOffer {
@@ -485,6 +632,19 @@ pub async fn send_listener(
     Ok(response)
 }
 
+/// Requests a nonce-correlated proof of the currently serving egress daemon epoch.
+pub async fn send_epoch_probe(
+    mut stream: UnixStream,
+    request: EpochProbeRequest,
+) -> Result<EpochProbeResponse, EpochProbeError> {
+    request.validate()?;
+    write_json_frame(&mut stream, &request).await?;
+    let response: EpochProbeResponse = read_json_frame(&mut stream).await?;
+    response.validate()?;
+    response.validate_for(&request)?;
+    Ok(response)
+}
+
 /// Authenticates and receives exactly one listener capability.
 pub async fn receive_listener(
     stream: UnixStream,
@@ -502,6 +662,41 @@ pub async fn receive_install_request(
     mut stream: UnixStream,
     expected_peer_uid: u32,
 ) -> Result<PendingListenerOffer, ReceiveInstallError> {
+    authenticate_peer(&stream, expected_peer_uid)?;
+
+    let request: InstallRequest = read_json_frame(&mut stream).await?;
+    request.validate()?;
+    Ok(PendingListenerOffer { request, stream })
+}
+
+/// Authenticates one Unix peer before dispatching an install or epoch-proof request.
+pub async fn receive_control_request(
+    mut stream: UnixStream,
+    expected_peer_uid: u32,
+) -> Result<ControlRequest, ReceiveInstallError> {
+    authenticate_peer(&stream, expected_peer_uid)?;
+    match read_json_frame::<IncomingControlRequest>(&mut stream).await? {
+        IncomingControlRequest::Install(request) => {
+            request.validate()?;
+            Ok(ControlRequest::Install(PendingListenerOffer {
+                request,
+                stream,
+            }))
+        }
+        IncomingControlRequest::EpochProbe(request) => {
+            request.validate()?;
+            Ok(ControlRequest::EpochProbe(PendingEpochProbe {
+                request,
+                stream,
+            }))
+        }
+    }
+}
+
+fn authenticate_peer(
+    stream: &UnixStream,
+    expected_peer_uid: u32,
+) -> Result<(), ReceiveInstallError> {
     let peer = stream
         .peer_cred()
         .map_err(ReceiveInstallError::PeerCredentials)?;
@@ -511,10 +706,7 @@ pub async fn receive_install_request(
             received: peer.uid(),
         });
     }
-
-    let request: InstallRequest = read_json_frame(&mut stream).await?;
-    request.validate()?;
-    Ok(PendingListenerOffer { request, stream })
+    Ok(())
 }
 
 async fn write_json_frame<T: Serialize>(
