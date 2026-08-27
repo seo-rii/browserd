@@ -1,12 +1,16 @@
-use browserd_actions::{ActionKind, ActionSequence, ResolutionAnnotation, ResolutionKind};
+use browserd_actions::{
+    ActionKind, ActionSequence, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
+    TerminalDetail,
+};
 use browserd_core::{
-    ActionId, ArtifactId, LeaseId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
+    ActionId, ApprovalId, ArtifactId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
     WorkerActionApprovalRequirement, WorkerActionReceipt, WorkerActionStatus,
     WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
-    WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState, WorkerPageReceipt,
-    WorkerProbeReceipt, WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
+    WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
+    WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence,
 };
 
 fn fence() -> WorkerSessionFence {
@@ -35,7 +39,7 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
-    let approval_id = LeaseId::new();
+    let approval_id = ApprovalId::new();
     let principal_id = PrincipalId::new();
 
     let requests = vec![
@@ -111,8 +115,15 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
         fence: fence.clone(),
         action_id: action_id.clone(),
         action_sequence: ActionSequence::new(8),
+        idempotency_key: "action-1".to_owned(),
+        canonical_request_hash: [4; 32],
         kind: ActionKind::Mutating,
         status: WorkerActionStatus::OutcomeUnknown,
+        dispatch_acknowledged: true,
+        approval_decision: None,
+        terminal_detail: Some(TerminalDetail::OutcomeUnknown(
+            OutcomeUnknownReason::AmbiguousTransportLoss,
+        )),
         result: None,
         resolution: Some(ResolutionAnnotation::new(
             ResolutionKind::ConfirmedNotExecuted,
@@ -121,6 +132,17 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
             "operator verified no effect",
         )),
     };
+    let public_action = action.to_action_snapshot();
+    assert!(public_action.is_ok());
+    assert!(
+        public_action
+            .as_ref()
+            .is_ok_and(|snapshot| snapshot.action_id() == &action_id
+                && snapshot.action_sequence() == ActionSequence::new(8))
+    );
+    let mut corrupted_action = action.clone();
+    corrupted_action.status = WorkerActionStatus::Succeeded;
+    assert!(corrupted_action.to_action_snapshot().is_err());
     let artifact = WorkerArtifactReceipt {
         fence: fence.clone(),
         artifact_id: ArtifactId::new(),
@@ -132,13 +154,43 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
         origin: "browserd-worker-upload".to_owned(),
         object_generation: [9; 32],
     };
+    let proposal = WorkerCanonicalActionProposal {
+        tenant_id: fence.tenant_id.clone(),
+        requester_principal_id: principal_id.clone(),
+        session_id: fence.session_id.clone(),
+        session_incarnation: fence.session_incarnation,
+        page_id: page.page_id.clone(),
+        target_incarnation: page.target_incarnation,
+        frame_document_epoch: page.document_epoch,
+        current_origin: "https://example.test".to_owned(),
+        url_revision: page.url_revision,
+        action_type: WorkerApprovalActionType::Click,
+        canonical_arguments_hash: [2; 32],
+        node_ref: Some("node-opaque".to_owned()),
+        credential_refs_hash: [3; 32],
+        expires_at_unix_millis: 20,
+    };
+    let canonical = proposal.to_canonical();
+    assert!(canonical.is_ok());
+    let proposal_hash = canonical
+        .as_ref()
+        .map(|canonical| *canonical.hash().as_bytes())
+        .unwrap_or([0; 32]);
     let approval = WorkerApprovalReceipt {
         fence,
         approval_id,
         action_id,
         state: WorkerApprovalState::Approved { by: principal_id },
-        proposal_hash: [6; 32],
+        proposal,
+        proposal_hash,
     };
+    assert!(approval.canonical_proposal().is_ok());
+    let mut corrupted_approval = approval.clone();
+    corrupted_approval.proposal_hash[0] ^= 0xff;
+    assert!(corrupted_approval.canonical_proposal().is_err());
+    let mut cross_tenant_approval = approval.clone();
+    cross_tenant_approval.proposal.tenant_id = TenantId::new();
+    assert!(cross_tenant_approval.canonical_proposal().is_err());
     let worker_id = WorkerId::new("worker-contract");
     assert!(worker_id.is_ok());
     let Some(worker_id) = worker_id.ok() else {

@@ -22,11 +22,11 @@ pub use rpc::{
     WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionReceipt,
     WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt,
     WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
-    WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
-    WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient,
-    WorkerRpcClient, WorkerRpcConfig, WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode,
-    WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
-    WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt,
+    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt,
+    WorkerRpcBlockingClient, WorkerRpcClient, WorkerRpcConfig, WorkerRpcError, WorkerRpcFailure,
+    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer,
+    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
@@ -51,17 +51,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use browserd_actions::{
     AcceptDecision, ActionJournalLimits, ActionKind, ActionLedger, ActionLedgerError,
-    ActionRequest, ActionSequence, BrowserResult, CanonicalRequestHash as ActionRequestHash,
-    DispatchDecision, DispatchPermit, FileActionJournal, IdempotencyKey as ActionIdempotencyKey,
-    KnownFailureReason, LedgerSession, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
-    ResolutionOutcome, ResolutionPolicy, ResultDigest, TransportLoss,
+    ActionRequest, ActionSequence, ApprovalDecision as ActionApprovalDecision, BrowserResult,
+    CanonicalRequestHash as ActionRequestHash, DispatchDecision, DispatchPermit, FileActionJournal,
+    IdempotencyKey as ActionIdempotencyKey, KnownFailureReason, LedgerSession,
+    OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind, ResolutionOutcome,
+    ResolutionPolicy, ResultDigest, TerminalDetail, TransportLoss,
 };
 use browserd_artifacts::{
     Artifact, ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactEvent,
     ArtifactKey, ArtifactObjectGeneration, ArtifactState,
 };
 use browserd_core::{
-    ActionId, ActionState, ArtifactId, IsolationProfile, LeaseId, OperationId, PageId, PrincipalId,
+    ActionId, ActionState, ArtifactId, IsolationProfile, OperationId, PageId, PrincipalId,
     SessionExecution, SessionId, TenantId, WorkerId,
 };
 use browserd_features::{BuiltinFeature, FeatureRegistry};
@@ -84,6 +85,8 @@ use browserd_viewer::{TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+pub use browserd_core::ApprovalId;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkerError {
@@ -527,8 +530,13 @@ pub enum ActionStatus {
 pub struct WorkerActionSnapshot {
     pub action_id: ActionId,
     pub action_sequence: ActionSequence,
+    pub idempotency_key: String,
+    pub canonical_request_hash: [u8; 32],
     pub status: ActionStatus,
     pub kind: ActionKind,
+    pub dispatch_acknowledged: bool,
+    pub approval_decision: Option<ActionApprovalDecision>,
+    pub terminal_detail: Option<TerminalDetail>,
     pub feature: Option<BuiltinFeature>,
     pub result: Option<Vec<u8>>,
     pub resolution: Option<ResolutionAnnotation>,
@@ -685,14 +693,13 @@ pub struct WorkerArtifactSnapshot {
     pub object_generation: ArtifactObjectGeneration,
 }
 
-pub type ApprovalId = LeaseId;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerApprovalSnapshot {
     pub approval_id: ApprovalId,
     pub action_id: ActionId,
     pub state: ApprovalState,
     pub proposal_hash: ProposalHash,
+    pub proposal: CanonicalActionProposal,
 }
 
 #[derive(Clone, Debug)]
@@ -1769,19 +1776,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .record_activity(fence, now)
             .map_err(map_session_error)?;
         let ledger_fence = fence.as_placement_fence();
-        let mut durable_request_hasher = Sha256::new();
-        durable_request_hasher.update(b"browserd-worker-action-request-v2\0");
-        durable_request_hasher.update(request_hash);
-        durable_request_hasher.update(requester_principal_id.as_bytes());
-        match &approval_binding {
-            Some((proposal_hash, _, require_four_eyes)) => {
-                durable_request_hasher.update([1]);
-                durable_request_hasher.update(proposal_hash.as_bytes());
-                durable_request_hasher.update([u8::from(*require_four_eyes)]);
-            }
-            None => durable_request_hasher.update([0]),
-        }
-        let durable_request_hash = durable_request_hasher.finalize().into();
+        let durable_request_hash = durable_action_request_hash(
+            request_hash,
+            &requester_principal_id,
+            approval_binding
+                .as_ref()
+                .map(|(proposal_hash, _, require_four_eyes)| (proposal_hash, *require_four_eyes)),
+        );
         let request = ActionRequest::new(
             ActionIdempotencyKey::new(idempotency_key),
             ActionRequestHash::new(durable_request_hash),
@@ -1842,8 +1843,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         snapshot: WorkerActionSnapshot {
                             action_id,
                             action_sequence,
+                            idempotency_key: idempotency_key.to_owned(),
+                            canonical_request_hash: request_hash,
                             status: ActionStatus::CancelledBeforeDispatch,
                             kind,
+                            dispatch_acknowledged: false,
+                            approval_decision: None,
+                            terminal_detail: Some(TerminalDetail::CancelledBeforeDispatch),
                             feature,
                             result: None,
                             resolution: None,
@@ -1871,7 +1877,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         } else {
             ActionStatus::Queued
         };
-        let approval_id = requires_approval.then(LeaseId::new);
+        let approval_id = requires_approval.then(ApprovalId::new);
         session.action_idempotency.insert(
             idempotency_key.to_owned(),
             (
@@ -1887,8 +1893,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 snapshot: WorkerActionSnapshot {
                     action_id: action_id.clone(),
                     action_sequence,
+                    idempotency_key: idempotency_key.to_owned(),
+                    canonical_request_hash: request_hash,
                     status,
                     kind,
+                    dispatch_acknowledged: false,
+                    approval_decision: None,
+                    terminal_detail: None,
                     feature,
                     result: None,
                     resolution: None,
@@ -1934,11 +1945,57 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
-        session
+        let action = session
             .actions
             .get(action_id)
-            .map(|action| action.snapshot.clone())
-            .ok_or(WorkerError::ActionNotFound)
+            .ok_or(WorkerError::ActionNotFound)?;
+        let durable = session
+            .action_ledger
+            .snapshot(fence.as_placement_fence(), action_id)
+            .map_err(map_action_ledger_error)?;
+        let expected_status = match durable.state() {
+            ActionState::Accepted | ActionState::Queued | ActionState::ReadyToDispatch => {
+                ActionStatus::Queued
+            }
+            ActionState::PendingApproval => ActionStatus::PendingApproval,
+            ActionState::MayHaveExecuted => ActionStatus::Running,
+            ActionState::Succeeded => ActionStatus::Succeeded,
+            ActionState::FailedKnown => ActionStatus::FailedKnown,
+            ActionState::CancelledBeforeDispatch => ActionStatus::CancelledBeforeDispatch,
+            ActionState::CancelledConfirmed => ActionStatus::CancelledConfirmed,
+            ActionState::OutcomeUnknown => ActionStatus::OutcomeUnknown,
+        };
+        let approval_binding = action
+            .approval_id
+            .as_ref()
+            .map(|approval_id| {
+                session
+                    .approvals
+                    .get(approval_id)
+                    .map(|approval| (approval.proposal.hash(), approval.require_four_eyes))
+                    .ok_or(WorkerError::StateUnavailable)
+            })
+            .transpose()?;
+        let expected_request_hash = durable_action_request_hash(
+            action.snapshot.canonical_request_hash,
+            &action.requester_principal_id,
+            approval_binding
+                .as_ref()
+                .map(|(proposal_hash, require_four_eyes)| (proposal_hash, *require_four_eyes)),
+        );
+        if action.snapshot.status != expected_status
+            || action.snapshot.idempotency_key != durable.request().idempotency_key().as_str()
+            || expected_request_hash != *durable.request().canonical_request_hash().as_bytes()
+            || action.snapshot.kind != durable.request().kind()
+        {
+            return Err(WorkerError::StateUnavailable);
+        }
+        let mut snapshot = action.snapshot.clone();
+        snapshot.dispatch_acknowledged = durable.dispatch_acknowledged();
+        snapshot.approval_decision = durable.approval_decision();
+        snapshot.terminal_detail = durable.terminal_detail();
+        snapshot.resolution = durable.resolution().cloned();
+        Ok(snapshot)
     }
 
     pub fn run_next_action(
@@ -3408,6 +3465,7 @@ fn worker_approval_snapshot(
         action_id: approval.action_id.clone(),
         state: approval.state.clone(),
         proposal_hash: approval.proposal.hash(),
+        proposal: approval.proposal.clone(),
     }
 }
 
@@ -3637,6 +3695,26 @@ fn map_session_error(error: SessionError) -> WorkerError {
         SessionError::StateUnavailable => WorkerError::StateUnavailable,
         _ => WorkerError::InvalidActionTransition,
     }
+}
+
+fn durable_action_request_hash(
+    request_hash: [u8; 32],
+    requester_principal_id: &PrincipalId,
+    approval_binding: Option<(&ProposalHash, bool)>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"browserd-worker-action-request-v2\0");
+    hasher.update(request_hash);
+    hasher.update(requester_principal_id.as_bytes());
+    match approval_binding {
+        Some((proposal_hash, require_four_eyes)) => {
+            hasher.update([1]);
+            hasher.update(proposal_hash.as_bytes());
+            hasher.update([u8::from(require_four_eyes)]);
+        }
+        None => hasher.update([0]),
+    }
+    hasher.finalize().into()
 }
 
 fn map_action_ledger_error(error: ActionLedgerError) -> WorkerError {
@@ -4082,5 +4160,77 @@ mod tests {
             decision.join().expect("decision thread should not panic"),
             Err(WorkerError::ApprovalPolicy(ApprovalError::ApprovalExpired))
         );
+    }
+
+    #[test]
+    fn action_lookup_rejects_an_in_memory_hash_that_disagrees_with_the_durable_ledger() {
+        let journal = tempfile::tempdir().expect("journal directory should be created");
+        let peer =
+            AuthenticatedPeer::new("gateway-action-hash").expect("peer identity should be valid");
+        let config = WorkerConfig::new(
+            WorkerId::new("action-hash-worker").expect("worker id should be valid"),
+            1,
+            InternalEndpoint::loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9019))
+                .expect("endpoint should be valid"),
+            peer.clone(),
+            1,
+            2,
+            LeasePolicy::new(Duration::from_secs(30), Duration::from_secs(1))
+                .expect("lease policy should be valid"),
+            SessionTimeoutPolicy::new(Duration::from_secs(60), Duration::from_secs(30))
+                .expect("timeout policy should be valid"),
+            Duration::from_millis(10),
+            ActionJournalConfig::new(journal.path(), ActionJournalLimits::default())
+                .expect("journal should be valid"),
+        )
+        .expect("worker config should be valid");
+        let worker =
+            WorkerControlPlane::new(config, Arc::new(DecisionDriver), Arc::new(DecisionSandbox));
+        let created = worker
+            .create_session(
+                &peer,
+                CreateSessionCommand {
+                    tenant_id: TenantId::new(),
+                    idempotency_key: "action-hash-create".to_owned(),
+                    canonical_request_hash: [1; 32],
+                    placement_version: 1,
+                    session_incarnation: 1,
+                },
+                SessionTime::new(0),
+            )
+            .expect("session should be created");
+        let action_id = worker
+            .submit_action(
+                &peer,
+                PrincipalId::new(),
+                &created.session_id,
+                &created.fence,
+                "action-hash-key",
+                [2; 32],
+                ActionKind::ReadOnly,
+                None,
+                Some(created.primary_page_id.clone()),
+                b"get-title".to_vec(),
+                None,
+                SessionTime::new(1),
+            )
+            .expect("action should be accepted");
+        let executor = worker
+            .session(&created.session_id)
+            .expect("session executor should exist");
+        executor
+            .state
+            .lock()
+            .expect("session lock should work")
+            .actions
+            .get_mut(&action_id)
+            .expect("action should exist")
+            .snapshot
+            .canonical_request_hash = [9; 32];
+
+        assert!(matches!(
+            worker.get_action(&peer, &created.session_id, &action_id, &created.fence),
+            Err(WorkerError::StateUnavailable)
+        ));
     }
 }

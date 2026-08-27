@@ -5,10 +5,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use browserd_actions::{ActionKind, ActionSequence, ResolutionAnnotation, ResolutionKind};
+use browserd_actions::{
+    ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts,
+    ApprovalDecision as ActionApprovalDecision, CanonicalRequestHash as ActionCanonicalRequestHash,
+    IdempotencyKey as ActionIdempotencyKey, ResolutionAnnotation, ResolutionKind, TerminalDetail,
+};
 use browserd_artifacts::{ArtifactContentSource, ArtifactState};
 use browserd_core::{
-    ActionId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
+    ActionId, ApprovalId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId,
+    TenantId, WorkerId,
 };
 use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalDecision, ApprovalState, CanonicalActionProposal,
@@ -16,6 +21,7 @@ use browserd_policy::{
 };
 use browserd_session::{OwnershipFence, SessionLifecycle, SessionTime};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -143,10 +149,72 @@ pub struct WorkerActionReceipt {
     pub fence: WorkerSessionFence,
     pub action_id: ActionId,
     pub action_sequence: ActionSequence,
+    pub idempotency_key: String,
+    pub canonical_request_hash: [u8; 32],
     pub kind: ActionKind,
     pub status: WorkerActionStatus,
+    pub dispatch_acknowledged: bool,
+    pub approval_decision: Option<ActionApprovalDecision>,
+    pub terminal_detail: Option<TerminalDetail>,
     pub result: Option<Vec<u8>>,
     pub resolution: Option<ResolutionAnnotation>,
+}
+
+impl WorkerActionReceipt {
+    pub fn to_action_snapshot(&self) -> Result<ActionSnapshot, WorkerRpcError> {
+        let state = match self.status {
+            WorkerActionStatus::PendingApproval => browserd_core::ActionState::PendingApproval,
+            WorkerActionStatus::Queued => browserd_core::ActionState::ReadyToDispatch,
+            WorkerActionStatus::Running => browserd_core::ActionState::MayHaveExecuted,
+            WorkerActionStatus::Succeeded => browserd_core::ActionState::Succeeded,
+            WorkerActionStatus::FailedKnown => browserd_core::ActionState::FailedKnown,
+            WorkerActionStatus::CancelledBeforeDispatch => {
+                browserd_core::ActionState::CancelledBeforeDispatch
+            }
+            WorkerActionStatus::CancelledConfirmed => {
+                browserd_core::ActionState::CancelledConfirmed
+            }
+            WorkerActionStatus::OutcomeUnknown => browserd_core::ActionState::OutcomeUnknown,
+        };
+        if match (self.status, &self.result, self.terminal_detail) {
+            (
+                WorkerActionStatus::Succeeded,
+                Some(result),
+                Some(TerminalDetail::Succeeded(expected)),
+            ) => {
+                let actual: [u8; 32] = Sha256::digest(result).into();
+                actual != *expected.as_bytes()
+            }
+            (WorkerActionStatus::Succeeded, _, _) => true,
+            (
+                WorkerActionStatus::PendingApproval
+                | WorkerActionStatus::Queued
+                | WorkerActionStatus::Running
+                | WorkerActionStatus::CancelledBeforeDispatch
+                | WorkerActionStatus::CancelledConfirmed
+                | WorkerActionStatus::OutcomeUnknown,
+                Some(_),
+                _,
+            ) => true,
+            (WorkerActionStatus::FailedKnown, _, _) => false,
+            (_, None, _) => false,
+        } {
+            return Err(WorkerRpcError::Protocol);
+        }
+        ActionSnapshot::from_facts(ActionSnapshotFacts {
+            action_id: self.action_id.clone(),
+            action_sequence: self.action_sequence,
+            idempotency_key: ActionIdempotencyKey::new(self.idempotency_key.clone()),
+            canonical_request_hash: ActionCanonicalRequestHash::new(self.canonical_request_hash),
+            kind: self.kind,
+            state,
+            dispatch_acknowledged: self.dispatch_acknowledged,
+            approval_decision: self.approval_decision,
+            terminal_detail: self.terminal_detail,
+            resolution: self.resolution.clone(),
+        })
+        .map_err(|_| WorkerRpcError::Protocol)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -331,12 +399,134 @@ pub enum WorkerApprovalState {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkerCanonicalActionProposal {
+    pub tenant_id: TenantId,
+    pub requester_principal_id: PrincipalId,
+    pub session_id: SessionId,
+    pub session_incarnation: u64,
+    pub page_id: PageId,
+    pub target_incarnation: u64,
+    pub frame_document_epoch: u64,
+    pub current_origin: String,
+    pub url_revision: u64,
+    pub action_type: WorkerApprovalActionType,
+    pub canonical_arguments_hash: [u8; 32],
+    pub node_ref: Option<String>,
+    pub credential_refs_hash: [u8; 32],
+    pub expires_at_unix_millis: u64,
+}
+
+impl WorkerCanonicalActionProposal {
+    fn from_canonical(proposal: &CanonicalActionProposal) -> Self {
+        let action_type = match proposal.action_type() {
+            ActionType::Click => WorkerApprovalActionType::Click,
+            ActionType::Fill => WorkerApprovalActionType::Fill,
+            ActionType::Navigate => WorkerApprovalActionType::Navigate,
+            ActionType::Evaluate => WorkerApprovalActionType::Evaluate,
+            ActionType::Upload => WorkerApprovalActionType::Upload,
+            ActionType::Download => WorkerApprovalActionType::Download,
+            ActionType::Custom(value) => WorkerApprovalActionType::Custom(value.clone()),
+        };
+        Self {
+            tenant_id: proposal.tenant_id().clone(),
+            requester_principal_id: proposal.requester_principal_id().clone(),
+            session_id: proposal.session_id().clone(),
+            session_incarnation: proposal.session_incarnation(),
+            page_id: proposal.page_id().clone(),
+            target_incarnation: proposal.target_incarnation(),
+            frame_document_epoch: proposal.frame_document_epoch(),
+            current_origin: proposal.current_origin().as_str().to_owned(),
+            url_revision: proposal.url_revision(),
+            action_type,
+            canonical_arguments_hash: *proposal.canonical_arguments_hash().as_bytes(),
+            node_ref: proposal
+                .node_ref()
+                .map(|node_ref| node_ref.as_str().to_owned()),
+            credential_refs_hash: *proposal.credential_refs_hash().as_bytes(),
+            expires_at_unix_millis: proposal.expires_at_unix_ms(),
+        }
+    }
+
+    pub fn to_canonical(&self) -> Result<CanonicalActionProposal, WorkerRpcError> {
+        if self.session_incarnation == 0
+            || self.target_incarnation == 0
+            || self.frame_document_epoch == 0
+            || self.expires_at_unix_millis == 0
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
+        let current_origin =
+            Origin::parse(&self.current_origin).map_err(|_| WorkerRpcError::Protocol)?;
+        let action_type = match &self.action_type {
+            WorkerApprovalActionType::Click => ActionType::Click,
+            WorkerApprovalActionType::Fill => ActionType::Fill,
+            WorkerApprovalActionType::Navigate => ActionType::Navigate,
+            WorkerApprovalActionType::Evaluate => ActionType::Evaluate,
+            WorkerApprovalActionType::Upload => ActionType::Upload,
+            WorkerApprovalActionType::Download => ActionType::Download,
+            WorkerApprovalActionType::Custom(value)
+                if !value.is_empty()
+                    && value.len() <= 255
+                    && value.trim() == value
+                    && !value.chars().any(char::is_control) =>
+            {
+                ActionType::Custom(value.clone())
+            }
+            WorkerApprovalActionType::Custom(_) => return Err(WorkerRpcError::Protocol),
+        };
+        let node_ref = self
+            .node_ref
+            .clone()
+            .map(NodeReference::new)
+            .transpose()
+            .map_err(|_| WorkerRpcError::Protocol)?;
+        let canonical_arguments_hash =
+            ActionArgumentsHash::from_bytes(&self.canonical_arguments_hash)
+                .map_err(|_| WorkerRpcError::Protocol)?;
+        let credential_refs_hash = CredentialRefsHash::from_bytes(&self.credential_refs_hash)
+            .map_err(|_| WorkerRpcError::Protocol)?;
+        Ok(CanonicalActionProposal::new(
+            self.tenant_id.clone(),
+            self.requester_principal_id.clone(),
+            self.session_id.clone(),
+            self.session_incarnation,
+            self.page_id.clone(),
+            self.target_incarnation,
+            self.frame_document_epoch,
+            current_origin,
+            self.url_revision,
+            action_type,
+            canonical_arguments_hash,
+            node_ref,
+            credential_refs_hash,
+            self.expires_at_unix_millis,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerApprovalReceipt {
     pub fence: WorkerSessionFence,
-    pub approval_id: LeaseId,
+    pub approval_id: ApprovalId,
     pub action_id: ActionId,
     pub state: WorkerApprovalState,
+    pub proposal: WorkerCanonicalActionProposal,
     pub proposal_hash: [u8; 32],
+}
+
+impl WorkerApprovalReceipt {
+    pub fn canonical_proposal(&self) -> Result<CanonicalActionProposal, WorkerRpcError> {
+        let proposal = self.proposal.to_canonical()?;
+        if proposal.tenant_id() != &self.fence.tenant_id
+            || proposal.session_id() != &self.fence.session_id
+            || proposal.session_incarnation() != self.fence.session_incarnation
+            || proposal.hash().as_bytes() != &self.proposal_hash
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
+        Ok(proposal)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -415,14 +605,14 @@ pub enum WorkerRpcRequest {
     },
     GetApproval {
         fence: WorkerSessionFence,
-        approval_id: LeaseId,
+        approval_id: ApprovalId,
     },
     ListApprovals {
         fence: WorkerSessionFence,
     },
     DecideApproval {
         fence: WorkerSessionFence,
-        approval_id: LeaseId,
+        approval_id: ApprovalId,
         decision: WorkerApprovalDecision,
         principal_id: PrincipalId,
         reason: String,
@@ -1068,7 +1258,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 now_unix_millis,
             } => {
                 let ownership = self.ownership_fence(&fence)?;
-                let snapshot = self
+                let _cancelled = self
                     .worker
                     .cancel_action(
                         &self.peer,
@@ -1077,6 +1267,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         &ownership,
                         SessionTime::new(now_unix_millis),
                     )
+                    .map_err(worker_failure)?;
+                let snapshot = self
+                    .worker
+                    .get_action(&self.peer, &fence.session_id, &action_id, &ownership)
                     .map_err(worker_failure)?;
                 Ok(WorkerRpcResponse::Action(action_receipt(&fence, snapshot)))
             }
@@ -1089,7 +1283,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 now_unix_millis,
             } => {
                 let ownership = self.ownership_fence(&fence)?;
-                let snapshot = self
+                let _resolved = self
                     .worker
                     .resolve_action(
                         &self.peer,
@@ -1101,6 +1295,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         &basis,
                         SessionTime::new(now_unix_millis),
                     )
+                    .map_err(worker_failure)?;
+                let snapshot = self
+                    .worker
+                    .get_action(&self.peer, &fence.session_id, &action_id, &ownership)
                     .map_err(worker_failure)?;
                 Ok(WorkerRpcResponse::Action(action_receipt(&fence, snapshot)))
             }
@@ -1601,7 +1799,7 @@ impl WorkerRpcClient {
     pub async fn get_approval(
         &self,
         fence: WorkerSessionFence,
-        approval_id: LeaseId,
+        approval_id: ApprovalId,
     ) -> Result<WorkerApprovalReceipt, WorkerRpcError> {
         match self
             .exchange(WorkerRpcRequest::GetApproval { fence, approval_id })
@@ -1881,8 +2079,13 @@ fn action_receipt(
         fence: fence.clone(),
         action_id: snapshot.action_id,
         action_sequence: snapshot.action_sequence,
+        idempotency_key: snapshot.idempotency_key,
+        canonical_request_hash: snapshot.canonical_request_hash,
         kind: snapshot.kind,
         status: action_status(snapshot.status),
+        dispatch_acknowledged: snapshot.dispatch_acknowledged,
+        approval_decision: snapshot.approval_decision,
+        terminal_detail: snapshot.terminal_detail,
         result: snapshot.result,
         resolution: snapshot.resolution,
     }
@@ -1944,6 +2147,7 @@ fn approval_receipt(
         approval_id: snapshot.approval_id,
         action_id: snapshot.action_id,
         state,
+        proposal: WorkerCanonicalActionProposal::from_canonical(&snapshot.proposal),
         proposal_hash: *snapshot.proposal_hash.as_bytes(),
     }
 }

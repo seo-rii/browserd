@@ -544,6 +544,9 @@ async fn accepted_pending_approval_action_is_returned_without_dispatching_it() {
     };
     assert_eq!(submitted.fence, fence);
     assert_eq!(submitted.status, WorkerActionStatus::PendingApproval);
+    assert_eq!(submitted.idempotency_key, "pending-action");
+    assert_eq!(submitted.canonical_request_hash, [6; 32]);
+    assert!(submitted.to_action_snapshot().is_ok());
 
     let approvals = handler
         .handle(WorkerRpcRequest::ListApprovals {
@@ -557,6 +560,17 @@ async fn accepted_pending_approval_action_is_returned_without_dispatching_it() {
     let Some(approval) = approvals.first() else {
         return;
     };
+    assert_eq!(
+        approval.approval_id.as_uuid().get_version(),
+        Some(uuid::Version::SortRand)
+    );
+    let canonical = approval.canonical_proposal();
+    assert!(canonical.is_ok());
+    assert!(canonical.as_ref().is_ok_and(|proposal| {
+        proposal.tenant_id() == &fence.tenant_id
+            && proposal.session_id() == &fence.session_id
+            && proposal.hash().as_bytes() == &approval.proposal_hash
+    }));
     let approver = PrincipalId::new();
     let decision = WorkerRpcRequest::DecideApproval {
         fence: fence.clone(),
