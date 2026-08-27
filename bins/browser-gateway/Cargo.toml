@@ -16,4 +16,7 @@ browserd-api = { path = "../../crates/browserd-api" }
 browserd-auth = { path = "../../crates/browserd-auth" }
 browserd-core = { path = "../../crates/browserd-core" }
 browserd-http = { path = "../../crates/browserd-http" }
+browserd-viewer = { path = "../../crates/browserd-viewer" }
+jsonwebtoken.workspace = true
 tokio.workspace = true
+uuid.workspace = true

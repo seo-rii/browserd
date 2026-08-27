@@ -170,7 +170,10 @@ dependencies = [
  "browserd-auth",
  "browserd-core",
  "browserd-http",
+ "browserd-viewer",
+ "jsonwebtoken",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
