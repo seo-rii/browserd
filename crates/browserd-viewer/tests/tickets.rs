@@ -89,6 +89,32 @@ fn invalid_attempt_does_not_consume_a_valid_one_time_ticket() {
 }
 
 #[test]
+fn discarded_ticket_releases_its_registry_entry_idempotently() {
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let registry = TicketRegistry::new(
+        TicketPolicy::new(Duration::from_secs(30), [ORIGIN]).expect("policy should be valid"),
+    );
+    let ticket = registry
+        .issue(
+            tenant_id.clone(),
+            session_id.clone(),
+            1,
+            ViewerScopes::new(true, false, false),
+            NOW,
+            Duration::from_secs(5),
+        )
+        .expect("ticket should be issued");
+
+    assert_eq!(registry.discard(&ticket), Ok(true));
+    assert_eq!(registry.discard(&ticket), Ok(false));
+    assert_eq!(
+        registry.consume(&ticket, &tenant_id, &session_id, 1, ORIGIN, NOW + 1),
+        Err(TicketError::UnknownTicket)
+    );
+}
+
+#[test]
 fn ticket_ttl_and_read_scope_are_fail_closed() {
     let registry = TicketRegistry::new(
         TicketPolicy::new(Duration::from_secs(30), [ORIGIN]).expect("policy should be valid"),

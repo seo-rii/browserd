@@ -107,6 +107,10 @@ impl TicketRegistry {
         })
     }
 
+    pub fn discard(&self, ticket: &ViewerTicket) -> Result<bool, TicketError> {
+        Ok(self.lock_tickets()?.remove(ticket).is_some())
+    }
+
     fn lock_tickets(
         &self,
     ) -> Result<MutexGuard<'_, HashMap<ViewerTicket, TicketRecord>>, TicketError> {
