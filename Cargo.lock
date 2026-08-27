@@ -145,9 +145,13 @@ name = "browser-egressd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "browserd-core",
  "browserd-egress",
+ "browserd-egress-control",
+ "hex",
+ "nix",
  "serde",
  "sha2",
  "subtle",

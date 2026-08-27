@@ -8,9 +8,13 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 browserd-core = { path = "../../crates/browserd-core" }
 browserd-egress = { path = "../../crates/browserd-egress" }
+browserd-egress-control = { path = "../../crates/browserd-egress-control" }
+hex.workspace = true
+nix.workspace = true
 serde.workspace = true
 sha2.workspace = true
 subtle.workspace = true
