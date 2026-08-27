@@ -1,0 +1,460 @@
+use std::io::{Read, Write};
+use std::os::unix::net::UnixListener as StdUnixListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use browserd_core::{OperationId, PageId, SessionId, TenantId, WorkerId};
+use browserd_worker::{
+    WORKER_RPC_PROTOCOL_VERSION, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
+    WorkerIsolationProfile, WorkerProbeReceipt, WorkerRpcClient, WorkerRpcConfig, WorkerRpcError,
+    WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
+};
+use tokio::net::UnixStream;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+
+struct BlockingCreateHandler {
+    calls: AtomicUsize,
+    started: Semaphore,
+    release: Semaphore,
+    receipt: WorkerCreateSessionReceipt,
+}
+
+struct KeyedCreateHandler {
+    slow_started: Semaphore,
+    slow_release: Semaphore,
+}
+
+#[async_trait]
+impl WorkerRpcHandler for KeyedCreateHandler {
+    async fn handle(&self, request: WorkerRpcRequest) -> WorkerRpcResponse {
+        let WorkerRpcRequest::CreateSession(request) = request else {
+            return WorkerRpcResponse::Empty;
+        };
+        if request.idempotency_key == "slow" {
+            self.slow_started.add_permits(1);
+            let permit = self.slow_release.acquire().await;
+            assert!(permit.is_ok());
+            if let Ok(permit) = permit {
+                permit.forget();
+            }
+        }
+        WorkerRpcResponse::SessionCreated(WorkerCreateSessionReceipt {
+            operation_id: request.operation_id,
+            tenant_id: request.tenant_id,
+            session_id: SessionId::new(),
+            session_incarnation: request.session_incarnation,
+            effective_isolation: request.requested_isolation,
+            primary_page_id: PageId::new(),
+            worker_epoch: request.expected_worker_epoch,
+            placement_version: request.placement_version,
+            existing: false,
+        })
+    }
+}
+
+#[async_trait]
+impl WorkerRpcHandler for BlockingCreateHandler {
+    async fn handle(&self, request: WorkerRpcRequest) -> WorkerRpcResponse {
+        if let WorkerRpcRequest::Probe {
+            expected_worker_epoch,
+        } = request
+        {
+            let worker_id = WorkerId::new("worker-transport");
+            assert!(worker_id.is_ok());
+            let Some(worker_id) = worker_id.ok() else {
+                return WorkerRpcResponse::Empty;
+            };
+            return WorkerRpcResponse::Probe(WorkerProbeReceipt {
+                worker_id,
+                worker_epoch: expected_worker_epoch,
+                ready: true,
+            });
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.started.add_permits(1);
+            let permit = self.release.acquire().await;
+            assert!(permit.is_ok());
+            if let Ok(permit) = permit {
+                permit.forget();
+            }
+        }
+        WorkerRpcResponse::SessionCreated(self.receipt.clone())
+    }
+}
+
+fn current_uid() -> Option<u32> {
+    let (stream, _peer) = UnixStream::pair().ok()?;
+    Some(stream.peer_cred().ok()?.uid())
+}
+
+fn create_request(operation_id: OperationId) -> WorkerCreateSessionRequest {
+    WorkerCreateSessionRequest {
+        operation_id,
+        tenant_id: TenantId::new(),
+        idempotency_key: "create-1".to_owned(),
+        canonical_request_hash: [7; 32],
+        expected_worker_epoch: 41,
+        placement_version: 9,
+        session_incarnation: 1,
+        requested_isolation: WorkerIsolationProfile::SharedContext,
+        now_unix_millis: 1234,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_create_survives_caller_disconnect_and_retry_returns_the_same_receipt() {
+    let Some(uid) = current_uid() else {
+        return;
+    };
+    let directory = tempfile::tempdir();
+    assert!(directory.is_ok());
+    let Some(directory) = directory.ok() else {
+        return;
+    };
+    let socket_path = directory.path().join("worker.sock");
+    let config = WorkerRpcConfig::new(
+        socket_path.clone(),
+        16 * 1024,
+        4,
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(config.is_ok());
+    let Some(config) = config.ok() else {
+        return;
+    };
+    let operation_id = OperationId::new();
+    let receipt = WorkerCreateSessionReceipt {
+        operation_id: operation_id.clone(),
+        tenant_id: TenantId::new(),
+        session_id: SessionId::new(),
+        session_incarnation: 1,
+        effective_isolation: WorkerIsolationProfile::SharedContext,
+        primary_page_id: PageId::new(),
+        worker_epoch: 41,
+        placement_version: 9,
+        existing: false,
+    };
+    let handler = Arc::new(BlockingCreateHandler {
+        calls: AtomicUsize::new(0),
+        started: Semaphore::new(0),
+        release: Semaphore::new(0),
+        receipt: receipt.clone(),
+    });
+    let server = WorkerRpcServer::bind(config.clone(), handler.clone()).await;
+    assert!(server.is_ok());
+    let Some(server) = server.ok() else {
+        return;
+    };
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(server.serve(shutdown.clone()));
+    let client = WorkerRpcClient::new(
+        socket_path,
+        config.max_frame_bytes(),
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(client.is_ok());
+    let Some(client) = client.ok() else {
+        return;
+    };
+
+    let first = {
+        let client = client.clone();
+        let request = create_request(operation_id.clone());
+        tokio::spawn(async move { client.create_session(request).await })
+    };
+    let started = handler.started.acquire().await;
+    assert!(started.is_ok());
+    if let Ok(started) = started {
+        started.forget();
+    }
+    first.abort();
+    handler.release.add_permits(1);
+
+    let retry = client.create_session(create_request(operation_id)).await;
+    assert_eq!(retry, Ok(receipt));
+
+    let blocking = client.blocking(4);
+    assert!(blocking.is_ok());
+    let Some(blocking) = blocking.ok() else {
+        return;
+    };
+    let blocking_receipt = blocking.create_session(create_request(OperationId::new()));
+    assert!(blocking_receipt.is_ok());
+    let probe = blocking.probe(41);
+    assert!(probe.is_ok());
+    assert!(probe.is_ok_and(|receipt| receipt.worker_epoch == 41 && receipt.ready));
+    assert_eq!(blocking.probe(0), Err(WorkerRpcError::InvalidRequest));
+
+    shutdown.cancel();
+    let stopped = server_task.await;
+    assert!(stopped.is_ok());
+    assert!(stopped.ok().is_some_and(|result| result.is_ok()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_client_runs_independent_exchanges_without_head_of_line_blocking() {
+    let Some(uid) = current_uid() else {
+        return;
+    };
+    let directory = tempfile::tempdir();
+    assert!(directory.is_ok());
+    let Some(directory) = directory.ok() else {
+        return;
+    };
+    let socket_path = directory.path().join("worker-concurrent.sock");
+    let config = WorkerRpcConfig::new(
+        socket_path.clone(),
+        16 * 1024,
+        4,
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(config.is_ok());
+    let Some(config) = config.ok() else {
+        return;
+    };
+    let handler = Arc::new(KeyedCreateHandler {
+        slow_started: Semaphore::new(0),
+        slow_release: Semaphore::new(0),
+    });
+    let server = WorkerRpcServer::bind(config.clone(), handler.clone()).await;
+    assert!(server.is_ok());
+    let Some(server) = server.ok() else {
+        return;
+    };
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(server.serve(shutdown.clone()));
+    let client = WorkerRpcClient::new(
+        socket_path,
+        config.max_frame_bytes(),
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(client.is_ok());
+    let Some(client) = client.ok() else {
+        return;
+    };
+    let blocking = client.blocking_with_limits(2, 2);
+    assert!(blocking.is_ok());
+    let Some(blocking) = blocking.ok() else {
+        return;
+    };
+
+    let slow = {
+        let blocking = blocking.clone();
+        thread::spawn(move || {
+            let mut request = create_request(OperationId::new());
+            request.idempotency_key = "slow".to_owned();
+            blocking.create_session(request)
+        })
+    };
+    let started = handler.slow_started.acquire().await;
+    assert!(started.is_ok());
+    if let Ok(started) = started {
+        started.forget();
+    }
+
+    let fast = {
+        let blocking = blocking.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut request = create_request(OperationId::new());
+            request.idempotency_key = "fast".to_owned();
+            blocking.create_session(request)
+        })
+    };
+    let fast_result = tokio::time::timeout(Duration::from_millis(500), fast).await;
+    assert!(fast_result.is_ok());
+    assert!(fast_result.ok().is_some_and(|joined| joined.is_ok()));
+
+    handler.slow_release.add_permits(1);
+    assert!(slow.join().is_ok_and(|result| result.is_ok()));
+    shutdown.cancel();
+    assert!(server_task.await.is_ok_and(|result| result.is_ok()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_client_fails_closed_when_bounded_ingress_is_full() {
+    let Some(uid) = current_uid() else {
+        return;
+    };
+    let directory = tempfile::tempdir();
+    assert!(directory.is_ok());
+    let Some(directory) = directory.ok() else {
+        return;
+    };
+    let socket_path = directory.path().join("worker-overload.sock");
+    let config = WorkerRpcConfig::new(
+        socket_path.clone(),
+        16 * 1024,
+        2,
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(config.is_ok());
+    let Some(config) = config.ok() else {
+        return;
+    };
+    let handler = Arc::new(KeyedCreateHandler {
+        slow_started: Semaphore::new(0),
+        slow_release: Semaphore::new(0),
+    });
+    let server = WorkerRpcServer::bind(config.clone(), handler.clone()).await;
+    assert!(server.is_ok());
+    let Some(server) = server.ok() else {
+        return;
+    };
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(server.serve(shutdown.clone()));
+    let client = WorkerRpcClient::new(
+        socket_path,
+        config.max_frame_bytes(),
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(client.is_ok());
+    let Some(client) = client.ok() else {
+        return;
+    };
+    let blocking = client.blocking_with_limits(1, 1);
+    assert!(blocking.is_ok());
+    let Some(blocking) = blocking.ok() else {
+        return;
+    };
+
+    let first = {
+        let blocking = blocking.clone();
+        thread::spawn(move || {
+            let mut request = create_request(OperationId::new());
+            request.idempotency_key = "slow".to_owned();
+            blocking.create_session(request)
+        })
+    };
+    let started = handler.slow_started.acquire().await;
+    assert!(started.is_ok());
+    if let Ok(started) = started {
+        started.forget();
+    }
+
+    let contenders = 8;
+    let start = Arc::new(Barrier::new(contenders + 1));
+    let (result_sender, result_receiver) = std::sync::mpsc::channel();
+    let mut joins = Vec::new();
+    for index in 0..contenders {
+        let blocking = blocking.clone();
+        let start = start.clone();
+        let result_sender = result_sender.clone();
+        joins.push(thread::spawn(move || {
+            start.wait();
+            let mut request = create_request(OperationId::new());
+            request.idempotency_key = format!("queued-{index}");
+            let _ = result_sender.send(blocking.create_session(request));
+        }));
+    }
+    drop(result_sender);
+    start.wait();
+    let mut queue_full = 0;
+    while queue_full < contenders - 1 {
+        let result = result_receiver.recv_timeout(Duration::from_secs(1));
+        assert!(result.is_ok());
+        if matches!(result.ok(), Some(Err(WorkerRpcError::QueueFull))) {
+            queue_full += 1;
+        }
+    }
+    assert_eq!(queue_full, contenders - 1);
+
+    handler.slow_release.add_permits(2);
+    assert!(first.join().is_ok_and(|result| result.is_ok()));
+    for join in joins {
+        assert!(join.join().is_ok());
+    }
+    shutdown.cancel();
+    assert!(server_task.await.is_ok_and(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn client_rejects_a_future_response_variant_as_a_protocol_violation() {
+    let response = serde_json::json!({
+        "protocol_version": WORKER_RPC_PROTOCOL_VERSION,
+        "response": {"result": "future_response", "value": {}},
+    });
+    let result = exchange_with_raw_response(response).await;
+    assert_eq!(result, Err(WorkerRpcError::Protocol));
+}
+
+#[tokio::test]
+async fn client_rejects_a_response_from_another_protocol_version() {
+    let response = serde_json::json!({
+        "protocol_version": WORKER_RPC_PROTOCOL_VERSION + 1,
+        "response": {"result": "empty"},
+    });
+    let result = exchange_with_raw_response(response).await;
+    assert_eq!(result, Err(WorkerRpcError::Protocol));
+}
+
+async fn exchange_with_raw_response(
+    mut response: serde_json::Value,
+) -> Result<WorkerRpcResponse, WorkerRpcError> {
+    let Some(uid) = current_uid() else {
+        return Err(WorkerRpcError::Runtime);
+    };
+    let directory = tempfile::tempdir().map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+    let socket_path = directory.path().join("raw-worker.sock");
+    let listener = StdUnixListener::bind(&socket_path)
+        .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+    let server = thread::spawn(move || {
+        let accepted = listener.accept();
+        assert!(accepted.is_ok());
+        let Some((mut stream, _)) = accepted.ok() else {
+            return;
+        };
+        let mut length = [0_u8; 4];
+        assert!(stream.read_exact(&mut length).is_ok());
+        let mut request = vec![0; u32::from_be_bytes(length) as usize];
+        assert!(stream.read_exact(&mut request).is_ok());
+        let request: serde_json::Value = serde_json::from_slice(&request).unwrap_or_default();
+        response["request_id"] = request["request_id"].clone();
+        let encoded = serde_json::to_vec(&response).unwrap_or_default();
+        let length = u32::try_from(encoded.len())
+            .unwrap_or_default()
+            .to_be_bytes();
+        assert!(stream.write_all(&length).is_ok());
+        assert!(stream.write_all(&encoded).is_ok());
+    });
+    let client = WorkerRpcClient::new(socket_path, 16 * 1024, Duration::from_secs(1), Some(uid))?;
+    let result = client
+        .exchange(WorkerRpcRequest::GetSession {
+            fence: WorkerSessionFence {
+                tenant_id: TenantId::new(),
+                session_id: SessionId::new(),
+                worker_epoch: 1,
+                placement_version: 1,
+                session_incarnation: 1,
+            },
+        })
+        .await;
+    assert!(server.join().is_ok());
+    result
+}
+
+#[test]
+fn rpc_configuration_requires_an_absolute_socket_and_authenticated_peer_uid() {
+    assert!(
+        WorkerRpcConfig::new("relative.sock", 1024, 1, Duration::from_secs(1), Some(1),).is_err()
+    );
+    assert!(
+        WorkerRpcConfig::new(
+            "/tmp/browserd-worker-test.sock",
+            1024,
+            1,
+            Duration::from_secs(1),
+            None,
+        )
+        .is_err()
+    );
+}

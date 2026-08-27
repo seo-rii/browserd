@@ -5,6 +5,7 @@
 mod cdp_driver;
 mod chromium_owner;
 mod production_sandbox;
+mod rpc;
 mod shard_actor;
 mod shard_driver;
 mod target_manager;
@@ -16,6 +17,16 @@ pub use chromium_owner::{
 };
 pub use production_sandbox::{
     CdpPipeAcceptor, ProductionSandboxShardRuntime, SandboxShardRpc, ShardLaunchDescriptor,
+};
+pub use rpc::{
+    WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionReceipt,
+    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt,
+    WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
+    WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
+    WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient,
+    WorkerRpcClient, WorkerRpcConfig, WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode,
+    WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
+    WorkerSessionLifecycle, WorkerSessionReceipt,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
