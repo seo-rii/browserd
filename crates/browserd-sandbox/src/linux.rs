@@ -35,6 +35,7 @@ const BWRAP_INFO_TIMEOUT: Duration = Duration::from_secs(1);
 const PREPARED_CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PREPARED_CHILD_EXIT_POLL: Duration = Duration::from_millis(5);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
+const NSFS_MAGIC: u64 = 0x6e73_6673;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CgroupLimits {
@@ -408,6 +409,125 @@ impl ChildIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NetworkNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl NetworkNamespaceIdentity {
+    #[must_use]
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    #[must_use]
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+/// An exact, close-on-exec capability that pins one Linux network namespace.
+#[derive(Debug)]
+pub struct PinnedNetworkNamespace {
+    descriptor: Arc<OwnedFd>,
+    identity: NetworkNamespaceIdentity,
+}
+
+impl PinnedNetworkNamespace {
+    pub fn from_owned_fd(descriptor: OwnedFd) -> Result<Self, SandboxError> {
+        let filesystem = fstatfs(&descriptor).map_err(|error| {
+            SandboxError::Backend(format!("network namespace filesystem type: {error}"))
+        })?;
+        if filesystem.filesystem_type().0 as u64 != NSFS_MAGIC {
+            return Err(SandboxError::Backend(
+                "network namespace capability is not an nsfs descriptor".into(),
+            ));
+        }
+        let descriptor_flags = fcntl(&descriptor, FcntlArg::F_GETFD).map_err(|error| {
+            SandboxError::Backend(format!("network namespace descriptor flags: {error}"))
+        })?;
+        if !FdFlag::from_bits_truncate(descriptor_flags).contains(FdFlag::FD_CLOEXEC) {
+            return Err(SandboxError::Backend(
+                "network namespace capability is not close-on-exec".into(),
+            ));
+        }
+        // SAFETY: NS_GET_NSTYPE takes no third argument and only queries the namespace referred to
+        // by the still-owned descriptor.
+        let namespace_type =
+            unsafe { nix::libc::ioctl(descriptor.as_raw_fd(), nix::libc::NS_GET_NSTYPE) };
+        if namespace_type != nix::libc::CLONE_NEWNET {
+            if namespace_type < 0 {
+                return Err(SandboxError::Backend(format!(
+                    "network namespace type: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            return Err(SandboxError::Backend(
+                "namespace capability is not a network namespace".into(),
+            ));
+        }
+        let metadata = fstat(&descriptor).map_err(|error| {
+            SandboxError::Backend(format!("network namespace metadata: {error}"))
+        })?;
+        Ok(Self {
+            descriptor: Arc::new(descriptor),
+            identity: NetworkNamespaceIdentity {
+                device: metadata.st_dev,
+                inode: metadata.st_ino,
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.descriptor.as_fd()
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> NetworkNamespaceIdentity {
+        self.identity
+    }
+
+    fn clone_for_owner(&self) -> Self {
+        Self {
+            descriptor: Arc::clone(&self.descriptor),
+            identity: self.identity,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreparedLinuxChild {
+    identity: ChildIdentity,
+    network_namespace: PinnedNetworkNamespace,
+}
+
+impl PreparedLinuxChild {
+    #[must_use]
+    pub const fn new(identity: ChildIdentity, network_namespace: PinnedNetworkNamespace) -> Self {
+        Self {
+            identity,
+            network_namespace,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> ChildIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn network_namespace(&self) -> &PinnedNetworkNamespace {
+        &self.network_namespace
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (ChildIdentity, PinnedNetworkNamespace) {
+        (self.identity, self.network_namespace)
+    }
+}
+
 fn open_pidfd(pid: u32) -> Result<OwnedFd, SandboxError> {
     let pid =
         i32::try_from(pid).map_err(|_| SandboxError::Backend("child PID exceeds i32".into()))?;
@@ -614,7 +734,8 @@ impl SpawnRequest {
 
 #[async_trait]
 pub trait LinuxProcessBackend: Send + Sync + 'static {
-    /// Prepares the child behind an execution gate and captures its stable PID/start-time identity.
+    /// Prepares the child behind an execution gate and captures its stable PID/start-time identity
+    /// together with a pinned, distinct network-namespace capability.
     /// The requested browser runtime must remain unable to execute until `release_prepared`
     /// succeeds for that exact identity. Before returning `Err`, implementations must either prove
     /// that every child they started exited or retain the gate so execution remains impossible.
@@ -629,7 +750,7 @@ pub trait LinuxProcessBackend: Send + Sync + 'static {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError>;
+    ) -> Result<PreparedLinuxChild, SandboxError>;
     /// Claims the parent command-write and event-read capabilities exactly once for the owned
     /// child identified by `backend_token` and `identity`. The capabilities remain registry-owned
     /// before the claim, including after a successful gate release.
@@ -642,6 +763,13 @@ pub trait LinuxProcessBackend: Send + Sync + 'static {
             "CDP pipe claim is unsupported by this process backend".into(),
         ))
     }
+    /// Revalidates that the exact gated child still occupies the pinned network namespace.
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError>;
     /// Releases the execution gate for exactly this prepared PID/start-time identity.
     /// The caller must durably record its fenced release intent before entering this one-shot
     /// boundary. `StdLinuxProcessBackend` writes the complete approval frame and closes its writer
@@ -794,6 +922,97 @@ impl Default for StdLinuxProcessBackend {
     }
 }
 
+fn read_proc_identity(pid: u32) -> Result<Option<(u32, u64)>, SandboxError> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SandboxError::Backend(error.to_string())),
+    };
+    let fields = stat
+        .rsplit_once(") ")
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| SandboxError::Backend("invalid child proc stat".into()))?;
+    let mut fields = fields.split_whitespace();
+    let parent_pid = fields
+        .nth(1)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|parent_pid| *parent_pid != 0)
+        .ok_or_else(|| SandboxError::Backend("invalid child parent PID".into()))?;
+    let start_time_ticks = fields
+        .nth(17)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|start_time_ticks| *start_time_ticks != 0)
+        .ok_or_else(|| SandboxError::Backend("invalid child start time".into()))?;
+    Ok(Some((parent_pid, start_time_ticks)))
+}
+
+fn pin_sandbox_network_namespace(
+    child: &OwnedLinuxChild,
+    identity: ChildIdentity,
+) -> Result<PinnedNetworkNamespace, SandboxError> {
+    if child.identity != Some(identity) {
+        return Err(SandboxError::Backend(
+            "prepared child PID identity changed before network namespace capture".into(),
+        ));
+    }
+    let pidfd = child
+        .sandbox_pidfd
+        .as_ref()
+        .ok_or_else(|| SandboxError::Backend("sandbox child pidfd missing".into()))?;
+    let bootstrap_pid = child
+        .bootstrap_pid
+        .ok_or_else(|| SandboxError::Backend("bootstrap process PID missing".into()))?;
+    let bootstrap_pidfd = child
+        .bootstrap_pidfd
+        .as_ref()
+        .ok_or_else(|| SandboxError::Backend("bootstrap process pidfd missing".into()))?;
+    let before = read_proc_identity(identity.pid())?.ok_or_else(|| {
+        SandboxError::Backend("sandbox child exited before network namespace capture".into())
+    })?;
+    if before.0 != bootstrap_pid
+        || before.1 != identity.start_time_ticks
+        || pidfd_has_exited(pidfd)?
+        || pidfd_has_exited(bootstrap_pidfd)?
+    {
+        return Err(SandboxError::Backend(
+            "sandbox child identity changed before network namespace capture".into(),
+        ));
+    }
+    let descriptor = open(
+        format!("/proc/{}/ns/net", identity.pid()).as_str(),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SandboxError::Backend(format!("sandbox network namespace: {error}")))?;
+    let namespace = PinnedNetworkNamespace::from_owned_fd(descriptor)?;
+    let host_descriptor = open(
+        "/proc/self/ns/net",
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SandboxError::Backend(format!("host network namespace: {error}")))?;
+    let host_namespace = PinnedNetworkNamespace::from_owned_fd(host_descriptor)?;
+    if namespace.identity() == host_namespace.identity() {
+        return Err(SandboxError::Backend(
+            "sandbox did not create a distinct network namespace".into(),
+        ));
+    }
+    let after = read_proc_identity(identity.pid())?.ok_or_else(|| {
+        SandboxError::Backend("sandbox child exited during network namespace capture".into())
+    })?;
+    if after != before
+        || after.0 != bootstrap_pid
+        || after.1 != identity.start_time_ticks
+        || pidfd_has_exited(pidfd)?
+        || pidfd_has_exited(bootstrap_pidfd)?
+    {
+        return Err(SandboxError::Backend(
+            "sandbox child identity changed around network namespace capture".into(),
+        ));
+    }
+    Ok(namespace)
+}
+
 async fn capture_sandbox_identity(
     child: &mut OwnedLinuxChild,
 ) -> Result<ChildIdentity, SandboxError> {
@@ -853,29 +1072,6 @@ async fn capture_sandbox_identity(
             "sandbox bootstrap exited before identity capture".into(),
         ));
     }
-    let read_proc_identity = |pid: u32| -> Result<Option<(u32, u64)>, SandboxError> {
-        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(SandboxError::Backend(error.to_string())),
-        };
-        let fields = stat
-            .rsplit_once(") ")
-            .map(|(_, fields)| fields)
-            .ok_or_else(|| SandboxError::Backend("invalid child proc stat".into()))?;
-        let mut fields = fields.split_whitespace();
-        let parent_pid = fields
-            .nth(1)
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|parent_pid| *parent_pid != 0)
-            .ok_or_else(|| SandboxError::Backend("invalid child parent PID".into()))?;
-        let start_time_ticks = fields
-            .nth(17)
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|start_time_ticks| *start_time_ticks != 0)
-            .ok_or_else(|| SandboxError::Backend("invalid child start time".into()))?;
-        Ok(Some((parent_pid, start_time_ticks)))
-    };
     let identity_before_pidfd = read_proc_identity(pid)?.ok_or_else(|| {
         SandboxError::Backend("sandbox child exited before identity capture".into())
     })?;
@@ -913,7 +1109,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         for descriptor in request.inherited_fds() {
             // SAFETY: this only borrows the caller-owned descriptor for the duration of fcntl.
             let descriptor = unsafe { BorrowedFd::borrow_raw(*descriptor) };
@@ -1107,7 +1303,9 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             )));
         }
         let mut checked_out = CheckedOutLinuxChild::new(backend_token, slot)?;
-        capture_sandbox_identity(checked_out.child_mut()?).await
+        let identity = capture_sandbox_identity(checked_out.child_mut()?).await?;
+        let network_namespace = pin_sandbox_network_namespace(checked_out.child_mut()?, identity)?;
+        Ok(PreparedLinuxChild::new(identity, network_namespace))
     }
 
     async fn claim_cdp_pipes(
@@ -1154,6 +1352,30 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             .ok_or_else(|| SandboxError::Backend("prepared child CDP pipes missing".into()))?;
         child.cdp_pipes_claimed = true;
         Ok(pipes)
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        let slot = self
+            .registry
+            .children
+            .lock()
+            .map_err(|_| SandboxError::Backend("child ownership lock poisoned".into()))?
+            .get(backend_token)
+            .cloned()
+            .ok_or_else(|| SandboxError::Backend("prepared child ownership missing".into()))?;
+        let state = slot
+            .lock()
+            .map_err(|_| SandboxError::Backend("child state lock poisoned".into()))?;
+        let child = state
+            .as_ref()
+            .ok_or_else(|| SandboxError::Backend("child operation already in progress".into()))?;
+        Ok(pin_sandbox_network_namespace(child, identity)?.identity()
+            == network_namespace.identity())
     }
 
     async fn release_prepared(
@@ -1533,10 +1755,37 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
 
 #[async_trait]
 pub trait EgressRouteBackend: Send + Sync + 'static {
-    async fn prepare(&self, fence: &ShardEgressFence) -> Result<(), SandboxError>;
-    async fn revoke(&self, fence: &ShardEgressFence) -> Result<(), SandboxError>;
-    async fn release(&self, fence: &ShardEgressFence) -> Result<(), SandboxError>;
-    async fn is_active(&self, fence: &ShardEgressFence) -> Result<bool, SandboxError>;
+    /// Reserves one exact generation. `cancel_reservation` is a permanent tombstone: it must win
+    /// over every concurrent or late `prepare` and `attach` completion for that generation.
+    async fn prepare(&self, reservation: &ShardEgressReservation) -> Result<(), SandboxError>;
+    /// Attaches ingress to the borrowed exact namespace. A concurrent or later
+    /// `cancel_reservation` for the same generation must win permanently.
+    async fn attach(
+        &self,
+        reservation: &ShardEgressReservation,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<ShardIngressReceipt, SandboxError>;
+    /// Permanently cancels this exact generation. Once committed, every retry with the same
+    /// reservation must return success even when the earlier caller was cancelled before it
+    /// observed the result.
+    async fn cancel_reservation(
+        &self,
+        reservation: &ShardEgressReservation,
+    ) -> Result<(), SandboxError>;
+    /// Releases a cancelled reservation. The exact operation must be idempotent across an
+    /// uncertain completion, while an active or differently generated reservation fails closed.
+    async fn release_reservation(
+        &self,
+        reservation: &ShardEgressReservation,
+    ) -> Result<(), SandboxError>;
+    /// Revokes this exact reservation, namespace, and attachment receipt. Once committed, retries
+    /// with the same lease must succeed, including after its exact release; any different receipt
+    /// or namespace must fail closed.
+    async fn revoke(&self, lease: &ShardIngressLease) -> Result<(), SandboxError>;
+    /// Releases this exact revoked lease. Once committed, retries with the same lease must return
+    /// success so cancellation between the backend commit and local acknowledgement is recoverable.
+    async fn release(&self, lease: &ShardIngressLease) -> Result<(), SandboxError>;
+    async fn is_active(&self, lease: &ShardIngressLease) -> Result<bool, SandboxError>;
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1565,13 +1814,100 @@ impl ShardEgressFence {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ShardEgressReservation {
+    fence: ShardEgressFence,
+    generation: LeaseId,
+}
+
+impl ShardEgressReservation {
+    #[must_use]
+    pub fn new(fence: ShardEgressFence) -> Self {
+        Self {
+            fence,
+            generation: LeaseId::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn fence(&self) -> &ShardEgressFence {
+        &self.fence
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> &LeaseId {
+        &self.generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardIngressReceipt {
+    attachment_generation: LeaseId,
+}
+
+impl ShardIngressReceipt {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            attachment_generation: LeaseId::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn attachment_generation(&self) -> &LeaseId {
+        &self.attachment_generation
+    }
+}
+
+impl Default for ShardIngressReceipt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShardIngressLease {
+    reservation: ShardEgressReservation,
+    network_namespace: NetworkNamespaceIdentity,
+    receipt: ShardIngressReceipt,
+}
+
+impl ShardIngressLease {
+    const fn new(
+        reservation: ShardEgressReservation,
+        network_namespace: NetworkNamespaceIdentity,
+        receipt: ShardIngressReceipt,
+    ) -> Self {
+        Self {
+            reservation,
+            network_namespace,
+            receipt,
+        }
+    }
+
+    #[must_use]
+    pub const fn reservation(&self) -> &ShardEgressReservation {
+        &self.reservation
+    }
+
+    #[must_use]
+    pub const fn namespace_identity(&self) -> NetworkNamespaceIdentity {
+        self.network_namespace
+    }
+
+    #[must_use]
+    pub const fn receipt(&self) -> &ShardIngressReceipt {
+        &self.receipt
+    }
+}
+
 struct LinuxRuntime {
     identity: ChildIdentity,
     backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
-    egress_fence: ShardEgressFence,
+    _network_namespace: PinnedNetworkNamespace,
+    ingress_lease: ShardIngressLease,
     egress_revoked: bool,
     egress_released: bool,
     process_released: bool,
@@ -1582,12 +1918,34 @@ struct LinuxRuntime {
     process_operation: Arc<AsyncMutex<()>>,
 }
 
-#[derive(Clone)]
+impl Clone for LinuxRuntime {
+    fn clone(&self) -> Self {
+        Self {
+            identity: self.identity,
+            backend_token: self.backend_token.clone(),
+            cgroup_path: self.cgroup_path.clone(),
+            runtime_path: self.runtime_path.clone(),
+            _network_namespace: self._network_namespace.clone_for_owner(),
+            ingress_lease: self.ingress_lease.clone(),
+            egress_revoked: self.egress_revoked,
+            egress_released: self.egress_released,
+            process_released: self.process_released,
+            runtime_removed: self.runtime_removed,
+            cgroup_removed: self.cgroup_removed,
+            namespaces_cleaned: self.namespaces_cleaned,
+            cleanup_operation: Arc::clone(&self.cleanup_operation),
+            process_operation: Arc::clone(&self.process_operation),
+        }
+    }
+}
+
 struct ProvisionCleanup {
     backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
-    egress_fence: ShardEgressFence,
+    egress_reservation: ShardEgressReservation,
+    _network_namespace: Option<PinnedNetworkNamespace>,
+    ingress_lease: Option<ShardIngressLease>,
     owner_active: bool,
     cgroup_created: bool,
     runtime_created: bool,
@@ -1599,6 +1957,33 @@ struct ProvisionCleanup {
     runtime_removed: bool,
     cgroup_removed: bool,
     route_released: bool,
+}
+
+impl Clone for ProvisionCleanup {
+    fn clone(&self) -> Self {
+        Self {
+            backend_token: self.backend_token.clone(),
+            cgroup_path: self.cgroup_path.clone(),
+            runtime_path: self.runtime_path.clone(),
+            egress_reservation: self.egress_reservation.clone(),
+            _network_namespace: self
+                ._network_namespace
+                .as_ref()
+                .map(PinnedNetworkNamespace::clone_for_owner),
+            ingress_lease: self.ingress_lease.clone(),
+            owner_active: self.owner_active,
+            cgroup_created: self.cgroup_created,
+            runtime_created: self.runtime_created,
+            route_may_exist: self.route_may_exist,
+            child_may_exist: self.child_may_exist,
+            identity: self.identity,
+            route_revoked: self.route_revoked,
+            child_aborted: self.child_aborted,
+            runtime_removed: self.runtime_removed,
+            cgroup_removed: self.cgroup_removed,
+            route_released: self.route_released,
+        }
+    }
 }
 
 struct ProvisionAttempt<'a> {
@@ -1797,7 +2182,13 @@ where
             if !revoke_needed {
                 return Ok(());
             }
-            self.egress.revoke(&state.egress_fence).await?;
+            if let Some(lease) = &state.ingress_lease {
+                self.egress.revoke(lease).await?;
+            } else {
+                self.egress
+                    .cancel_reservation(&state.egress_reservation)
+                    .await?;
+            }
             self.update_provision(shard_id, backend_token, |provision| {
                 provision.route_revoked = true;
             })
@@ -1854,7 +2245,14 @@ where
             && resources_removed
             && !state.route_released
         {
-            match self.egress.release(&state.egress_fence).await {
+            let release = if let Some(lease) = &state.ingress_lease {
+                self.egress.release(lease).await
+            } else {
+                self.egress
+                    .release_reservation(&state.egress_reservation)
+                    .await
+            };
+            match release {
                 Ok(()) => {
                     self.update_provision(shard_id, backend_token, |provision| {
                         provision.route_released = true;
@@ -2009,6 +2407,7 @@ where
         let cgroup_path = self.config.cgroup_root.join(spec.shard_id().to_string());
         let runtime_path = self.config.sandbox_root.join(spec.shard_id().to_string());
         let egress_fence = ShardEgressFence::new(spec.shard_id().clone(), spec.worker_epoch());
+        let egress_reservation = ShardEgressReservation::new(egress_fence);
         let backend_token = LeaseId::new().to_string();
         let cleanup_retry = {
             let mut provisions = self
@@ -2038,7 +2437,9 @@ where
                         backend_token: backend_token.clone(),
                         cgroup_path: cgroup_path.clone(),
                         runtime_path: runtime_path.clone(),
-                        egress_fence: egress_fence.clone(),
+                        egress_reservation: egress_reservation.clone(),
+                        _network_namespace: None,
+                        ingress_lease: None,
                         owner_active: true,
                         cgroup_created: false,
                         runtime_created: false,
@@ -2136,16 +2537,18 @@ where
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.route_may_exist = true;
             })?;
-            self.egress.prepare(&egress_fence).await?;
+            self.egress.prepare(&egress_reservation).await?;
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.child_may_exist = true;
             })?;
-            let identity = self
+            let prepared_child = self
                 .process
                 .spawn_prepared(&backend_token, &self.planned_spawn_request(spec.shard_id()))
                 .await?;
+            let (identity, network_namespace) = prepared_child.into_parts();
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.identity = Some(identity);
+                provision._network_namespace = Some(network_namespace.clone_for_owner());
             })?;
             if identity.pid == 0 || identity.start_time_ticks == 0 {
                 return Err(SandboxError::Backend("invalid child PID identity".into()));
@@ -2183,9 +2586,30 @@ where
                     "sandbox child PID identity changed during cgroup attachment".into(),
                 ));
             }
-            if !self.egress.is_active(&egress_fence).await? {
+            let ingress_receipt = self
+                .egress
+                .attach(&egress_reservation, &network_namespace)
+                .await?;
+            let ingress_lease = ShardIngressLease::new(
+                egress_reservation.clone(),
+                network_namespace.identity(),
+                ingress_receipt,
+            );
+            self.update_provision(spec.shard_id(), &backend_token, |provision| {
+                provision.ingress_lease = Some(ingress_lease.clone());
+            })?;
+            if !self
+                .process
+                .network_namespace_matches(&backend_token, identity, &network_namespace)
+                .await?
+            {
                 return Err(SandboxError::Backend(
-                    "sandbox egress fence became inactive before launch".into(),
+                    "sandbox child network namespace changed during ingress attachment".into(),
+                ));
+            }
+            if !self.egress.is_active(&ingress_lease).await? {
+                return Err(SandboxError::Backend(
+                    "sandbox ingress lease became inactive before launch".into(),
                 ));
             }
             self.process
@@ -2217,7 +2641,8 @@ where
                     backend_token: backend_token.clone(),
                     cgroup_path: cgroup_path.clone(),
                     runtime_path: runtime_path.clone(),
-                    egress_fence: egress_fence.clone(),
+                    _network_namespace: network_namespace,
+                    ingress_lease,
                     egress_revoked: false,
                     egress_released: false,
                     process_released: false,
@@ -2278,7 +2703,7 @@ where
     ) -> Result<(), SandboxError> {
         let operation = self.runtime_cleanup_operation(handle)?;
         let _operation_guard = operation.lock().await;
-        let (fence, already_revoked) = {
+        let (lease, already_revoked) = {
             let state = self
                 .runtimes
                 .lock()
@@ -2287,10 +2712,10 @@ where
                 .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(runtime, handle)?;
-            (runtime.egress_fence.clone(), runtime.egress_revoked)
+            (runtime.ingress_lease.clone(), runtime.egress_revoked)
         };
         if !already_revoked {
-            self.egress.revoke(&fence).await?;
+            self.egress.revoke(&lease).await?;
         }
 
         let release_after_cleanup = {
@@ -2302,14 +2727,14 @@ where
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(runtime, handle)?;
-            if runtime.egress_fence != fence {
+            if runtime.ingress_lease != lease {
                 return Err(SandboxError::ShardNotFound);
             }
             runtime.egress_revoked = true;
             runtime.namespaces_cleaned && !runtime.egress_released
         };
         if release_after_cleanup {
-            self.egress.release(&fence).await?;
+            self.egress.release(&lease).await?;
             let mut state = self
                 .runtimes
                 .lock()
@@ -2318,7 +2743,7 @@ where
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(runtime, handle)?;
-            if runtime.egress_fence != fence {
+            if runtime.ingress_lease != lease {
                 return Err(SandboxError::ShardNotFound);
             }
             runtime.egress_released = true;
@@ -2432,7 +2857,7 @@ where
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
-            if stored.egress_fence != runtime.egress_fence {
+            if stored.ingress_lease != runtime.ingress_lease {
                 return Err(SandboxError::Backend(
                     "sandbox runtime fence changed during cleanup".into(),
                 ));
@@ -2449,7 +2874,7 @@ where
                 .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
-            if stored.egress_fence != runtime.egress_fence {
+            if stored.ingress_lease != runtime.ingress_lease {
                 return Err(SandboxError::Backend(
                     "sandbox runtime fence changed during cleanup".into(),
                 ));
@@ -2466,7 +2891,7 @@ where
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
-            if stored.egress_fence != cleanup.egress_fence {
+            if stored.ingress_lease != cleanup.ingress_lease {
                 return Err(SandboxError::Backend(
                     "sandbox runtime fence changed during cleanup".into(),
                 ));
@@ -2491,7 +2916,7 @@ where
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
-            if stored.egress_fence != cleanup.egress_fence {
+            if stored.ingress_lease != cleanup.ingress_lease {
                 return Err(SandboxError::Backend(
                     "sandbox runtime fence changed during cleanup".into(),
                 ));
@@ -2511,7 +2936,7 @@ where
                 stored.process_released && stored.runtime_removed && stored.cgroup_removed;
         }
 
-        let release_fence = {
+        let release_lease = {
             let state = self
                 .runtimes
                 .lock()
@@ -2521,10 +2946,10 @@ where
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
             (stored.namespaces_cleaned && stored.egress_revoked && !stored.egress_released)
-                .then(|| stored.egress_fence.clone())
+                .then(|| stored.ingress_lease.clone())
         };
-        if let Some(fence) = release_fence {
-            self.egress.release(&fence).await?;
+        if let Some(lease) = release_lease {
+            self.egress.release(&lease).await?;
             let mut state = self
                 .runtimes
                 .lock()
@@ -2533,7 +2958,7 @@ where
                 .get_mut(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
-            if stored.egress_fence != fence {
+            if stored.ingress_lease != lease {
                 return Err(SandboxError::ShardNotFound);
             }
             stored.egress_released = true;
@@ -2547,7 +2972,7 @@ where
 
     async fn inspect(&self, handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
         self.validate_host_paths()?;
-        let (cgroup_path, egress_fence) = {
+        let (cgroup_path, ingress_lease) = {
             let state = self
                 .runtimes
                 .lock()
@@ -2559,7 +2984,7 @@ where
             if runtime.namespaces_cleaned {
                 return Err(SandboxError::ShardNotFound);
             }
-            (runtime.cgroup_path.clone(), runtime.egress_fence.clone())
+            (runtime.cgroup_path.clone(), runtime.ingress_lease.clone())
         };
         let memory_current_bytes = self
             .filesystem
@@ -2585,7 +3010,7 @@ where
             memory_current_bytes,
             memory_peak_bytes,
             process_count,
-            egress_route_active: self.egress.is_active(&egress_fence).await?,
+            egress_route_active: self.egress.is_active(&ingress_lease).await?,
         })
     }
 }

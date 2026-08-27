@@ -17,10 +17,25 @@ use browserd_core::{LeaseId, ShardId, WorkerId};
 use browserd_sandbox::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
     CleanupReason, EgressRouteBackend, LaunchGateRuntime, LaunchSpec, LinuxProcessBackend,
-    LinuxSandboxBackend, LinuxSandboxConfig, ProcessSignal, ReadOnlyMount, SandboxBackend,
-    SandboxError, SandboxFilesystem, ShardEgressFence, SpawnRequest, StdLinuxProcessBackend,
-    StdSandboxFilesystem,
+    LinuxSandboxBackend, LinuxSandboxConfig, NetworkNamespaceIdentity, PinnedNetworkNamespace,
+    PreparedLinuxChild, ProcessSignal, ReadOnlyMount, SandboxBackend, SandboxError,
+    SandboxFilesystem, ShardEgressFence, ShardEgressReservation, ShardIngressLease,
+    ShardIngressReceipt, SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
 };
+
+fn current_network_namespace() -> Result<PinnedNetworkNamespace, SandboxError> {
+    let descriptor: OwnedFd = File::open("/proc/self/ns/net")
+        .map_err(|error| SandboxError::Backend(format!("open fake network namespace: {error}")))?
+        .into();
+    PinnedNetworkNamespace::from_owned_fd(descriptor)
+}
+
+fn prepared_child(identity: ChildIdentity) -> Result<PreparedLinuxChild, SandboxError> {
+    Ok(PreparedLinuxChild::new(
+        identity,
+        current_network_namespace()?,
+    ))
+}
 
 #[derive(Clone)]
 struct CgroupReadBarriers {
@@ -289,7 +304,7 @@ impl LinuxProcessBackend for FakeProcess {
         &self,
         _backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         self.events
             .lock()
             .expect("process event lock should work")
@@ -303,7 +318,7 @@ impl LinuxProcessBackend for FakeProcess {
             .expect("process event lock should work")
             .push(format!("fds:{:?}", request.inherited_fds()));
         *self.alive.lock().expect("alive lock should work") = true;
-        Ok(ChildIdentity::new(4242, 991))
+        prepared_child(ChildIdentity::new(4242, 991))
     }
 
     async fn claim_cdp_pipes(
@@ -318,6 +333,19 @@ impl LinuxProcessBackend for FakeProcess {
         drop(command_reader);
         drop(event_writer);
         browserd_sandbox::ChromiumCdpPipes::from_owned_fds(command_writer, event_reader)
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        _backend_token: &str,
+        _identity: ChildIdentity,
+        _network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.events
+            .lock()
+            .expect("process event lock should work")
+            .push("netns:revalidate".into());
+        Ok(true)
     }
 
     async fn release_prepared(
@@ -442,6 +470,15 @@ impl AsyncPause {
     }
 }
 
+async fn wait_for_commit_pause(pause: &AsyncPause, operation: &str) {
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
+            .await
+            .is_ok(),
+        "{operation} did not reach its post-commit pause"
+    );
+}
+
 #[derive(Clone)]
 struct CancelOnceDuringSpawnProcess {
     inner: FakeProcess,
@@ -454,10 +491,21 @@ impl LinuxProcessBackend for CancelOnceDuringSpawnProcess {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
-        let identity = self.inner.spawn_prepared(backend_token, request).await?;
+    ) -> Result<PreparedLinuxChild, SandboxError> {
+        let child = self.inner.spawn_prepared(backend_token, request).await?;
         self.pause.pause_once().await;
-        Ok(identity)
+        Ok(child)
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.inner
+            .network_namespace_matches(backend_token, identity, network_namespace)
+            .await
     }
 
     async fn release_prepared(
@@ -520,8 +568,19 @@ impl LinuxProcessBackend for CancelOnceDuringReleaseProcess {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         self.inner.spawn_prepared(backend_token, request).await
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.inner
+            .network_namespace_matches(backend_token, identity, network_namespace)
+            .await
     }
 
     async fn release_prepared(
@@ -588,8 +647,19 @@ impl LinuxProcessBackend for BlockingReleaseProcess {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         self.inner.spawn_prepared(backend_token, request).await
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.inner
+            .network_namespace_matches(backend_token, identity, network_namespace)
+            .await
     }
 
     async fn release_prepared(
@@ -656,8 +726,19 @@ impl LinuxProcessBackend for BlockingTerminateProcess {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         self.inner.spawn_prepared(backend_token, request).await
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.inner
+            .network_namespace_matches(backend_token, identity, network_namespace)
+            .await
     }
 
     async fn release_prepared(
@@ -723,6 +804,7 @@ enum SpawnFault {
     Spawn,
     InvalidIdentity,
     MismatchedIdentity,
+    MismatchedNetworkNamespace,
     GateRelease,
 }
 
@@ -739,7 +821,7 @@ impl LinuxProcessBackend for FaultProcess {
         &self,
         _backend_token: &str,
         _request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         self.events
             .lock()
             .expect("process event lock should work")
@@ -748,12 +830,29 @@ impl LinuxProcessBackend for FaultProcess {
             return Err(SandboxError::Backend("injected spawn failure".into()));
         }
         *self.alive.lock().expect("alive lock should work") = true;
-        Ok(match self.fault {
+        prepared_child(match self.fault {
             SpawnFault::InvalidIdentity => ChildIdentity::new(4242, 0),
             SpawnFault::MismatchedIdentity => ChildIdentity::new(4242, 991),
+            SpawnFault::MismatchedNetworkNamespace => ChildIdentity::new(4242, 991),
             SpawnFault::GateRelease => ChildIdentity::new(4242, 991),
             SpawnFault::Spawn => unreachable!("spawn fault returned above"),
         })
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        _backend_token: &str,
+        _identity: ChildIdentity,
+        _network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.events
+            .lock()
+            .expect("process event lock should work")
+            .push("netns:revalidate".into());
+        Ok(!matches!(
+            self.fault,
+            SpawnFault::MismatchedNetworkNamespace
+        ))
     }
 
     async fn release_prepared(
@@ -842,8 +941,19 @@ impl LinuxProcessBackend for RetryCleanupProcess {
         &self,
         backend_token: &str,
         request: &SpawnRequest,
-    ) -> Result<ChildIdentity, SandboxError> {
+    ) -> Result<PreparedLinuxChild, SandboxError> {
         self.inner.spawn_prepared(backend_token, request).await
+    }
+
+    async fn network_namespace_matches(
+        &self,
+        backend_token: &str,
+        identity: ChildIdentity,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        self.inner
+            .network_namespace_matches(backend_token, identity, network_namespace)
+            .await
     }
 
     async fn release_prepared(
@@ -934,28 +1044,71 @@ impl LinuxProcessBackend for RetryCleanupProcess {
 struct FakeEgress {
     events: Arc<Mutex<Vec<String>>>,
     calls: Arc<Mutex<Vec<EgressCall>>>,
-    active: Arc<Mutex<HashSet<ShardEgressFence>>>,
+    state: Arc<Mutex<FakeEgressState>>,
+    attached_descriptors: Arc<Mutex<HashMap<ShardEgressReservation, i32>>>,
     fail_prepare: bool,
     fail_revoke: bool,
     fail_revoke_once: Arc<AtomicUsize>,
     fail_release_once: Arc<AtomicUsize>,
     prepare_pause: Option<AsyncPause>,
+    prepare_linearization_pause: Option<AsyncPause>,
+    attach_commit_pause: Option<AsyncPause>,
     revoke_pause: Option<AsyncPause>,
     release_pause: Option<AsyncPause>,
+    cancel_commit_pause: Option<AsyncPause>,
+    release_reservation_commit_pause: Option<AsyncPause>,
+    revoke_commit_pause: Option<AsyncPause>,
+    release_commit_pause: Option<AsyncPause>,
     force_inactive: bool,
+}
+
+#[derive(Default)]
+struct FakeEgressState {
+    routes: HashMap<ShardEgressReservation, FakeRouteLifecycle>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FakeIngressAttachment {
+    network_namespace: NetworkNamespaceIdentity,
+    receipt: ShardIngressReceipt,
+}
+
+impl FakeIngressAttachment {
+    fn from_lease(lease: &ShardIngressLease) -> Self {
+        Self {
+            network_namespace: lease.namespace_identity(),
+            receipt: lease.receipt().clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FakeRouteLifecycle {
+    Prepared(Option<FakeIngressAttachment>),
+    Cancelled,
+    ReservationReleased,
+    Revoked(FakeIngressAttachment),
+    LeaseReleased(FakeIngressAttachment),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum EgressCall {
-    Prepare(ShardEgressFence),
-    Revoke(ShardEgressFence),
-    Release(ShardEgressFence),
-    IsActive(ShardEgressFence),
+    Prepare(ShardEgressReservation),
+    Attach(
+        ShardEgressReservation,
+        NetworkNamespaceIdentity,
+        ShardIngressReceipt,
+    ),
+    CancelReservation(ShardEgressReservation),
+    ReleaseReservation(ShardEgressReservation),
+    Revoke(ShardIngressLease),
+    Release(ShardIngressLease),
+    IsActive(ShardIngressLease),
 }
 
 #[async_trait]
 impl EgressRouteBackend for FakeEgress {
-    async fn prepare(&self, fence: &ShardEgressFence) -> Result<(), SandboxError> {
+    async fn prepare(&self, reservation: &ShardEgressReservation) -> Result<(), SandboxError> {
         self.events
             .lock()
             .expect("egress lock should work")
@@ -963,33 +1116,107 @@ impl EgressRouteBackend for FakeEgress {
         self.calls
             .lock()
             .expect("egress call lock should work")
-            .push(EgressCall::Prepare(fence.clone()));
+            .push(EgressCall::Prepare(reservation.clone()));
+        if let Some(pause) = &self.prepare_linearization_pause {
+            pause.pause_once().await;
+        }
+        {
+            let mut state = self.state.lock().expect("route state lock should work");
+            match state.routes.get(reservation) {
+                None => {
+                    state
+                        .routes
+                        .insert(reservation.clone(), FakeRouteLifecycle::Prepared(None));
+                }
+                Some(FakeRouteLifecycle::Prepared(_)) => {}
+                Some(_) => {
+                    return Err(SandboxError::Backend(
+                        "route reservation is permanently terminal".into(),
+                    ));
+                }
+            }
+        }
         if self.fail_prepare {
-            self.active
-                .lock()
-                .expect("active lock should work")
-                .insert(fence.clone());
             return Err(SandboxError::Backend("route unavailable".into()));
         }
-        self.active
-            .lock()
-            .expect("active lock should work")
-            .insert(fence.clone());
         if let Some(pause) = &self.prepare_pause {
             pause.pause_once().await;
         }
         Ok(())
     }
 
-    async fn revoke(&self, fence: &ShardEgressFence) -> Result<(), SandboxError> {
+    async fn attach(
+        &self,
+        reservation: &ShardEgressReservation,
+        network_namespace: &PinnedNetworkNamespace,
+    ) -> Result<ShardIngressReceipt, SandboxError> {
         self.events
             .lock()
             .expect("egress lock should work")
-            .push("route:revoke".into());
+            .push("route:attach".into());
+        let namespace_identity = network_namespace.identity();
+        let receipt = {
+            let mut state = self.state.lock().expect("route state lock should work");
+            let route = state
+                .routes
+                .get_mut(reservation)
+                .ok_or_else(|| SandboxError::Backend("route reservation missing".into()))?;
+            match route {
+                FakeRouteLifecycle::Prepared(attachment @ None) => {
+                    let receipt = ShardIngressReceipt::new();
+                    *attachment = Some(FakeIngressAttachment {
+                        network_namespace: namespace_identity,
+                        receipt: receipt.clone(),
+                    });
+                    receipt
+                }
+                FakeRouteLifecycle::Prepared(Some(attachment))
+                    if attachment.network_namespace == namespace_identity =>
+                {
+                    attachment.receipt.clone()
+                }
+                FakeRouteLifecycle::Prepared(Some(_)) => {
+                    return Err(SandboxError::Backend(
+                        "route reservation namespace mismatch".into(),
+                    ));
+                }
+                _ => {
+                    return Err(SandboxError::Backend(
+                        "route reservation is permanently terminal".into(),
+                    ));
+                }
+            }
+        };
         self.calls
             .lock()
             .expect("egress call lock should work")
-            .push(EgressCall::Revoke(fence.clone()));
+            .push(EgressCall::Attach(
+                reservation.clone(),
+                namespace_identity,
+                receipt.clone(),
+            ));
+        self.attached_descriptors
+            .lock()
+            .expect("attached descriptor lock should work")
+            .insert(reservation.clone(), network_namespace.as_fd().as_raw_fd());
+        if let Some(pause) = &self.attach_commit_pause {
+            pause.pause_once().await;
+        }
+        Ok(receipt)
+    }
+
+    async fn cancel_reservation(
+        &self,
+        reservation: &ShardEgressReservation,
+    ) -> Result<(), SandboxError> {
+        self.events
+            .lock()
+            .expect("egress lock should work")
+            .push("route:cancel-reservation".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::CancelReservation(reservation.clone()));
         if let Some(pause) = &self.revoke_pause {
             pause.pause_once().await;
         }
@@ -1003,22 +1230,43 @@ impl EgressRouteBackend for FakeEgress {
         {
             return Err(SandboxError::Backend("route revoke failed".into()));
         }
-        self.active
-            .lock()
-            .expect("active lock should work")
-            .remove(fence);
+        let committed = {
+            let mut state = self.state.lock().expect("route state lock should work");
+            match state.routes.get(reservation) {
+                None | Some(FakeRouteLifecycle::Prepared(_)) => {
+                    state
+                        .routes
+                        .insert(reservation.clone(), FakeRouteLifecycle::Cancelled);
+                    true
+                }
+                Some(FakeRouteLifecycle::Cancelled | FakeRouteLifecycle::ReservationReleased) => {
+                    false
+                }
+                Some(FakeRouteLifecycle::Revoked(_) | FakeRouteLifecycle::LeaseReleased(_)) => {
+                    return Err(SandboxError::Backend(
+                        "route reservation belongs to an ingress lease".into(),
+                    ));
+                }
+            }
+        };
+        if committed && let Some(pause) = &self.cancel_commit_pause {
+            pause.pause_once().await;
+        }
         Ok(())
     }
 
-    async fn release(&self, fence: &ShardEgressFence) -> Result<(), SandboxError> {
+    async fn release_reservation(
+        &self,
+        reservation: &ShardEgressReservation,
+    ) -> Result<(), SandboxError> {
         self.events
             .lock()
             .expect("egress lock should work")
-            .push("route:release".into());
+            .push("route:release-reservation".into());
         self.calls
             .lock()
             .expect("egress call lock should work")
-            .push(EgressCall::Release(fence.clone()));
+            .push(EgressCall::ReleaseReservation(reservation.clone()));
         if let Some(pause) = &self.release_pause {
             pause.pause_once().await;
         }
@@ -1031,10 +1279,128 @@ impl EgressRouteBackend for FakeEgress {
         {
             return Err(SandboxError::Backend("route release failed".into()));
         }
+        let committed = {
+            let mut state = self.state.lock().expect("route state lock should work");
+            match state.routes.get(reservation) {
+                Some(FakeRouteLifecycle::Cancelled) => {
+                    state
+                        .routes
+                        .insert(reservation.clone(), FakeRouteLifecycle::ReservationReleased);
+                    true
+                }
+                Some(FakeRouteLifecycle::ReservationReleased) => false,
+                Some(_) | None => {
+                    return Err(SandboxError::Backend(
+                        "route reservation was not cancelled".into(),
+                    ));
+                }
+            }
+        };
+        if committed && let Some(pause) = &self.release_reservation_commit_pause {
+            pause.pause_once().await;
+        }
         Ok(())
     }
 
-    async fn is_active(&self, fence: &ShardEgressFence) -> Result<bool, SandboxError> {
+    async fn revoke(&self, lease: &ShardIngressLease) -> Result<(), SandboxError> {
+        self.events
+            .lock()
+            .expect("egress lock should work")
+            .push("route:revoke".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::Revoke(lease.clone()));
+        if let Some(pause) = &self.revoke_pause {
+            pause.pause_once().await;
+        }
+        if self.fail_revoke
+            || self
+                .fail_revoke_once
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(SandboxError::Backend("route revoke failed".into()));
+        }
+        let expected = FakeIngressAttachment::from_lease(lease);
+        let committed = {
+            let mut state = self.state.lock().expect("route state lock should work");
+            match state.routes.get(lease.reservation()).cloned() {
+                Some(FakeRouteLifecycle::Prepared(Some(attachment))) if attachment == expected => {
+                    state.routes.insert(
+                        lease.reservation().clone(),
+                        FakeRouteLifecycle::Revoked(attachment),
+                    );
+                    true
+                }
+                Some(
+                    FakeRouteLifecycle::Revoked(attachment)
+                    | FakeRouteLifecycle::LeaseReleased(attachment),
+                ) if attachment == expected => false,
+                Some(_) | None => {
+                    return Err(SandboxError::Backend(
+                        "active ingress lease receipt mismatch".into(),
+                    ));
+                }
+            }
+        };
+        if committed && let Some(pause) = &self.revoke_commit_pause {
+            pause.pause_once().await;
+        }
+        Ok(())
+    }
+
+    async fn release(&self, lease: &ShardIngressLease) -> Result<(), SandboxError> {
+        self.events
+            .lock()
+            .expect("egress lock should work")
+            .push("route:release".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::Release(lease.clone()));
+        if let Some(pause) = &self.release_pause {
+            pause.pause_once().await;
+        }
+        if self
+            .fail_release_once
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(SandboxError::Backend("route release failed".into()));
+        }
+        let expected = FakeIngressAttachment::from_lease(lease);
+        let committed = {
+            let mut state = self.state.lock().expect("route state lock should work");
+            match state.routes.get(lease.reservation()).cloned() {
+                Some(FakeRouteLifecycle::Revoked(attachment)) if attachment == expected => {
+                    state.routes.insert(
+                        lease.reservation().clone(),
+                        FakeRouteLifecycle::LeaseReleased(attachment),
+                    );
+                    true
+                }
+                Some(FakeRouteLifecycle::LeaseReleased(attachment)) if attachment == expected => {
+                    false
+                }
+                Some(_) | None => {
+                    return Err(SandboxError::Backend(
+                        "revoked ingress lease receipt mismatch".into(),
+                    ));
+                }
+            }
+        };
+        if committed && let Some(pause) = &self.release_commit_pause {
+            pause.pause_once().await;
+        }
+        Ok(())
+    }
+
+    async fn is_active(&self, lease: &ShardIngressLease) -> Result<bool, SandboxError> {
         self.events
             .lock()
             .expect("egress lock should work")
@@ -1042,13 +1408,17 @@ impl EgressRouteBackend for FakeEgress {
         self.calls
             .lock()
             .expect("egress call lock should work")
-            .push(EgressCall::IsActive(fence.clone()));
+            .push(EgressCall::IsActive(lease.clone()));
         Ok(!self.force_inactive
-            && self
-                .active
-                .lock()
-                .expect("active lock should work")
-                .contains(fence))
+            && matches!(
+                self.state
+                    .lock()
+                    .expect("route state lock should work")
+                    .routes
+                    .get(lease.reservation()),
+                Some(FakeRouteLifecycle::Prepared(Some(attachment)))
+                    if attachment == &FakeIngressAttachment::from_lease(lease)
+            ))
     }
 }
 
@@ -1129,6 +1499,132 @@ fn launch_spec(shard_id: ShardId) -> LaunchSpec {
     )
 }
 
+#[test]
+fn route_reservations_for_the_same_shard_epoch_never_alias() {
+    let fence = ShardEgressFence::new(ShardId::new(), 7);
+
+    let first = ShardEgressReservation::new(fence.clone());
+    let second = ShardEgressReservation::new(fence);
+
+    assert_ne!(first.generation(), second.generation());
+}
+
+#[tokio::test]
+async fn cancelled_route_generation_cannot_be_reprepared_or_reattached() {
+    let egress = FakeEgress::default();
+    let reservation = ShardEgressReservation::new(ShardEgressFence::new(ShardId::new(), 7));
+    let namespace = current_network_namespace().expect("network namespace should be pinnable");
+
+    egress
+        .prepare(&reservation)
+        .await
+        .expect("reservation should prepare once");
+    assert!(
+        egress.release_reservation(&reservation).await.is_err(),
+        "an active reservation must not be released before permanent cancellation"
+    );
+    egress
+        .cancel_reservation(&reservation)
+        .await
+        .expect("reservation should cancel");
+    egress
+        .cancel_reservation(&reservation)
+        .await
+        .expect("the exact cancellation must be idempotent");
+
+    assert!(egress.prepare(&reservation).await.is_err());
+    assert!(egress.attach(&reservation, &namespace).await.is_err());
+    egress
+        .release_reservation(&reservation)
+        .await
+        .expect("the cancelled reservation should release");
+    egress
+        .release_reservation(&reservation)
+        .await
+        .expect("the exact reservation release must be idempotent");
+}
+
+#[tokio::test]
+async fn cancellation_wins_a_prepare_race_before_route_state_is_published() {
+    let pause = AsyncPause::new();
+    let egress = FakeEgress {
+        prepare_linearization_pause: Some(pause.clone()),
+        ..FakeEgress::default()
+    };
+    let reservation = ShardEgressReservation::new(ShardEgressFence::new(ShardId::new(), 7));
+    let prepare = tokio::spawn({
+        let egress = egress.clone();
+        let reservation = reservation.clone();
+        async move { egress.prepare(&reservation).await }
+    });
+    pause.entered.notified().await;
+
+    egress
+        .cancel_reservation(&reservation)
+        .await
+        .expect("cancellation should become terminal");
+    pause.proceed.notify_one();
+
+    assert!(
+        prepare.await.expect("prepare task should join").is_err(),
+        "a late prepare completion must not resurrect a terminal route generation"
+    );
+    assert!(
+        !egress
+            .state
+            .lock()
+            .expect("route state lock should work")
+            .routes
+            .get(&reservation)
+            .is_some_and(|route| matches!(route, FakeRouteLifecycle::Prepared(_)))
+    );
+}
+
+#[tokio::test]
+async fn exact_terminal_ingress_operations_remain_idempotent_after_release() {
+    let egress = FakeEgress::default();
+    let backend = backend(
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        egress.clone(),
+    );
+    backend
+        .provision(&launch_spec(ShardId::new()))
+        .await
+        .expect("runtime should provision");
+    let lease = egress
+        .calls
+        .lock()
+        .expect("egress call lock should work")
+        .iter()
+        .find_map(|call| match call {
+            EgressCall::IsActive(lease) => Some(lease.clone()),
+            _ => None,
+        })
+        .expect("provisioning should validate one exact ingress lease");
+
+    egress
+        .revoke(&lease)
+        .await
+        .expect("the exact lease should revoke");
+    egress
+        .release(&lease)
+        .await
+        .expect("the exact revoked lease should release");
+    egress
+        .revoke(&lease)
+        .await
+        .expect("the exact revoke must remain successful after release");
+    egress
+        .release(&lease)
+        .await
+        .expect("the exact release must remain successful after release");
+}
+
 fn backend(
     filesystem: FakeFilesystem,
     process: FakeProcess,
@@ -1146,11 +1642,15 @@ fn assert_no_provisioning_residue(
     assert!(!filesystem.has_shard_residue(shard_id));
     assert!(
         !egress
-            .active
+            .state
             .lock()
-            .expect("active route lock should work")
+            .expect("route state lock should work")
+            .routes
             .iter()
-            .any(|fence| fence.shard_id() == shard_id)
+            .any(|(reservation, route)| {
+                reservation.fence().shard_id() == shard_id
+                    && matches!(route, FakeRouteLifecycle::Prepared(_))
+            })
     );
     assert!(!*alive.lock().expect("alive lock should work"));
 }
@@ -1167,6 +1667,25 @@ fn run_process_helper(test_name: &str) {
     assert!(
         output.status.success(),
         "process helper failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn run_network_process_helper(test_name: &str) {
+    let output = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--fork"])
+        .arg(std::env::current_exe().expect("test executable should be known"))
+        .arg("--ignored")
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env("BROWSERD_PROCESS_HELPER", "1")
+        .output()
+        .expect("network namespace helper should start");
+    assert!(
+        output.status.success(),
+        "network namespace helper failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1300,7 +1819,7 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
             .lock()
             .expect("egress lock should work")
             .as_slice(),
-        ["route:prepare", "route:is-active"]
+        ["route:prepare", "route:attach", "route:is-active"]
     );
     assert!(
         process_events.lock().expect("process lock should work")[0]
@@ -1336,7 +1855,7 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
 }
 
 #[tokio::test]
-async fn prepared_child_is_released_only_after_validated_cgroup_attachment() {
+async fn prepared_child_is_released_only_after_exact_network_namespace_route_attachment() {
     let trace = Arc::new(Mutex::new(Vec::new()));
     let mut filesystem = FakeFilesystem::production_tree();
     filesystem.events = trace.clone();
@@ -1349,7 +1868,12 @@ async fn prepared_child_is_released_only_after_validated_cgroup_attachment() {
         events: trace.clone(),
         ..FakeEgress::default()
     };
+    let egress_view = egress.clone();
     let shard_id = ShardId::new();
+    let expected_fence = ShardEgressFence::new(shard_id.clone(), 7);
+    let expected_namespace = current_network_namespace()
+        .expect("the fake child network namespace should be pinnable")
+        .identity();
 
     backend(filesystem, process, egress)
         .provision(&launch_spec(shard_id))
@@ -1365,6 +1889,14 @@ async fn prepared_child_is_released_only_after_validated_cgroup_attachment() {
         .iter()
         .position(|event| event.ends_with("cgroup.procs"))
         .expect("cgroup membership should be read back");
+    let route_attachment = events
+        .iter()
+        .position(|event| event == "route:attach")
+        .expect("the route must attach to the prepared child's exact network namespace");
+    let namespace_revalidation = events
+        .iter()
+        .position(|event| event == "netns:revalidate")
+        .expect("the exact network namespace must be revalidated after attachment");
     let release = events
         .iter()
         .position(|event| event == "gate:release")
@@ -1374,7 +1906,9 @@ async fn prepared_child_is_released_only_after_validated_cgroup_attachment() {
         .position(|event| event == "route:is-active")
         .expect("the exact route fence should be checked");
     assert!(spawn < validate);
-    assert!(validate < exact_route_check);
+    assert!(validate < route_attachment);
+    assert!(route_attachment < namespace_revalidation);
+    assert!(namespace_revalidation < exact_route_check);
     assert_eq!(
         exact_route_check + 1,
         release,
@@ -1385,6 +1919,37 @@ async fn prepared_child_is_released_only_after_validated_cgroup_attachment() {
         2,
         "PID/start-time identity must be checked before and after attachment"
     );
+    drop(events);
+
+    let calls = egress_view
+        .calls
+        .lock()
+        .expect("egress call lock should work");
+    assert!(
+        matches!(
+            calls.as_slice(),
+            [
+                EgressCall::Prepare(_),
+                EgressCall::Attach(_, _, _),
+                EgressCall::IsActive(_),
+            ]
+        ),
+        "unexpected egress calls: {calls:?}"
+    );
+    let [
+        EgressCall::Prepare(reservation),
+        EgressCall::Attach(attached_reservation, attached_namespace, attached_receipt),
+        EgressCall::IsActive(active_lease),
+    ] = calls.as_slice()
+    else {
+        return;
+    };
+    assert_eq!(reservation.fence(), &expected_fence);
+    assert_eq!(attached_reservation, reservation);
+    assert_eq!(*attached_namespace, expected_namespace);
+    assert_eq!(active_lease.reservation(), reservation);
+    assert_eq!(active_lease.namespace_identity(), expected_namespace);
+    assert_eq!(active_lease.receipt(), attached_receipt);
 }
 
 #[tokio::test]
@@ -1461,7 +2026,10 @@ async fn inactive_exact_egress_fence_prevents_gate_release_after_attachment() {
             .calls
             .lock()
             .expect("egress call lock should work")
-            .contains(&EgressCall::IsActive(expected_fence))
+            .iter()
+            .any(|call| {
+                matches!(call, EgressCall::IsActive(lease) if lease.reservation().fence() == &expected_fence)
+            })
     );
 }
 
@@ -1543,15 +2111,54 @@ async fn mismatched_cgroup_membership_never_releases_and_rolls_back_fail_closed(
     assert_no_provisioning_residue(&filesystem, &egress, &alive, &shard_id);
     let events = trace.lock().expect("trace lock should work");
     assert!(!events.iter().any(|event| event == "gate:release"));
-    let revoke = events
+    let cancel = events
         .iter()
-        .position(|event| event == "route:revoke")
-        .expect("egress should be revoked");
+        .position(|event| event == "route:cancel-reservation")
+        .expect("unattached egress reservation should be cancelled");
     let kill = events
         .iter()
         .position(|event| event == "signal:Kill")
         .expect("owned prepared child should be killed");
-    assert!(revoke < kill);
+    assert!(cancel < kill);
+}
+
+#[tokio::test]
+async fn changed_network_namespace_after_attachment_revokes_and_aborts_fail_closed() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut filesystem = FakeFilesystem::production_tree();
+    filesystem.events = trace.clone();
+    let alive = Arc::new(Mutex::new(false));
+    let process = FaultProcess {
+        fault: SpawnFault::MismatchedNetworkNamespace,
+        events: trace.clone(),
+        alive: alive.clone(),
+    };
+    let egress = FakeEgress {
+        events: trace.clone(),
+        ..FakeEgress::default()
+    };
+    let shard_id = ShardId::new();
+
+    LinuxSandboxBackend::new(config(), filesystem.clone(), process, egress.clone())
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect_err("a prepared child that leaves the attached namespace must fail closed");
+
+    assert_no_provisioning_residue(&filesystem, &egress, &alive, &shard_id);
+    let events = trace.lock().expect("trace lock should work");
+    let attach = events
+        .iter()
+        .position(|event| event == "route:attach")
+        .expect("the exact namespace should be attached before it is revalidated");
+    let revalidate = events
+        .iter()
+        .position(|event| event == "netns:revalidate")
+        .expect("the child namespace should be revalidated after attachment");
+    assert!(attach < revalidate);
+    assert!(events.iter().any(|event| event == "route:revoke"));
+    assert!(events.iter().any(|event| event == "route:release"));
+    assert!(events.iter().any(|event| event == "signal:Kill"));
+    assert!(!events.iter().any(|event| event == "gate:release"));
 }
 
 #[tokio::test]
@@ -1629,10 +2236,15 @@ async fn failed_route_revoke_still_aborts_the_child_and_retries_only_the_route_s
     );
     assert!(
         egress
-            .active
+            .state
             .lock()
-            .expect("active route lock should work")
-            .contains(&ShardEgressFence::new(shard_id.clone(), 7)),
+            .expect("route state lock should work")
+            .routes
+            .iter()
+            .any(|(reservation, route)| {
+                reservation.fence() == &ShardEgressFence::new(shard_id.clone(), 7)
+                    && matches!(route, FakeRouteLifecycle::Prepared(_))
+            }),
         "a failed revoke must preserve an active-route cleanup tombstone"
     );
 
@@ -2216,6 +2828,133 @@ async fn concurrent_egress_revocations_release_the_route_exactly_once() {
 }
 
 #[tokio::test]
+async fn cancelled_runtime_revoke_after_backend_commit_retries_the_exact_lease() {
+    let filesystem = FakeFilesystem::production_tree();
+    let commit_pause = AsyncPause::new();
+    let egress = FakeEgress {
+        revoke_commit_pause: Some(commit_pause.clone()),
+        ..FakeEgress::default()
+    };
+    let backend = Arc::new(backend(
+        filesystem,
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        egress.clone(),
+    ));
+    let handle = backend
+        .provision(&launch_spec(ShardId::new()))
+        .await
+        .expect("runtime should provision");
+    let revoke = tokio::spawn({
+        let backend = backend.clone();
+        let handle = handle.clone();
+        async move {
+            backend
+                .revoke_egress(&handle, CleanupReason::Administrative)
+                .await
+        }
+    });
+
+    wait_for_commit_pause(&commit_pause, "runtime revoke").await;
+    revoke.abort();
+    assert!(
+        revoke
+            .await
+            .expect_err("revoke caller should be cancelled after backend commit")
+            .is_cancelled()
+    );
+
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("the exact committed revoke must be retryable");
+    let calls = egress.calls.lock().expect("egress call lock should work");
+    let leases = calls
+        .iter()
+        .filter_map(|call| match call {
+            EgressCall::Revoke(lease) => Some(lease),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(leases.len(), 2);
+    assert_eq!(leases[0], leases[1]);
+}
+
+#[tokio::test]
+async fn cancelled_runtime_release_after_backend_commit_retries_the_exact_lease() {
+    let filesystem = FakeFilesystem::production_tree();
+    let commit_pause = AsyncPause::new();
+    let egress = FakeEgress {
+        release_commit_pause: Some(commit_pause.clone()),
+        ..FakeEgress::default()
+    };
+    let backend = Arc::new(backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        egress.clone(),
+    ));
+    let shard_id = ShardId::new();
+    let handle = backend
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect("runtime should provision");
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("route should revoke before namespace cleanup");
+    filesystem
+        .files
+        .lock()
+        .expect("file lock should work")
+        .insert(
+            PathBuf::from("/sys/fs/cgroup/browserd")
+                .join(shard_id.to_string())
+                .join("cgroup.events"),
+            "populated 0\n".into(),
+        );
+    let cleanup = tokio::spawn({
+        let backend = backend.clone();
+        let handle = handle.clone();
+        async move { backend.cleanup_namespaces(&handle).await }
+    });
+
+    wait_for_commit_pause(&commit_pause, "runtime release").await;
+    cleanup.abort();
+    assert!(
+        cleanup
+            .await
+            .expect_err("cleanup caller should be cancelled after route release commit")
+            .is_cancelled()
+    );
+
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("the exact committed release must be retryable");
+    assert!(matches!(
+        backend.inspect(&handle).await,
+        Err(SandboxError::ShardNotFound)
+    ));
+    let calls = egress.calls.lock().expect("egress call lock should work");
+    let leases = calls
+        .iter()
+        .filter_map(|call| match call {
+            EgressCall::Release(lease) => Some(lease),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(leases.len(), 2);
+    assert_eq!(leases[0], leases[1]);
+}
+
+#[tokio::test]
 async fn cancelled_provision_after_registration_keeps_retryable_cleanup_ownership() {
     let filesystem = FakeFilesystem::production_tree();
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -2340,6 +3079,291 @@ async fn cancelled_provision_before_spawn_retains_route_and_resource_cleanup_own
         .provision(&launch_spec(shard_id))
         .await
         .expect("a later retry may spawn after pre-spawn cleanup completed");
+}
+
+#[tokio::test]
+async fn cancelled_attach_after_backend_commit_cleans_the_exact_reservation_without_a_receipt() {
+    let filesystem = FakeFilesystem::production_tree();
+    let process_events = Arc::new(Mutex::new(Vec::new()));
+    let alive = Arc::new(Mutex::new(false));
+    let commit_pause = AsyncPause::new();
+    let egress = FakeEgress {
+        attach_commit_pause: Some(commit_pause.clone()),
+        ..FakeEgress::default()
+    };
+    let backend = Arc::new(backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: process_events.clone(),
+            alive: alive.clone(),
+            identity_matches: true,
+        },
+        egress.clone(),
+    ));
+    let shard_id = ShardId::new();
+    let provision = tokio::spawn({
+        let backend = backend.clone();
+        let shard_id = shard_id.clone();
+        async move { backend.provision(&launch_spec(shard_id)).await }
+    });
+
+    wait_for_commit_pause(&commit_pause, "ingress attachment").await;
+    provision.abort();
+    assert!(
+        provision
+            .await
+            .expect_err("provision caller should be cancelled before receiving the receipt")
+            .is_cancelled()
+    );
+
+    backend
+        .provision(&launch_spec(shard_id.clone()))
+        .await
+        .expect_err("the first retry must finish the receipt-less cleanup only");
+    assert_no_provisioning_residue(&filesystem, &egress, &alive, &shard_id);
+    assert!(
+        !process_events
+            .lock()
+            .expect("process event lock should work")
+            .iter()
+            .any(|event| event == "gate:release"),
+        "receipt-less cancellation must never release the prepared child"
+    );
+    {
+        let calls = egress.calls.lock().expect("egress call lock should work");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, EgressCall::Attach(_, _, _)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, EgressCall::CancelReservation(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, EgressCall::ReleaseReservation(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| { matches!(call, EgressCall::Revoke(_) | EgressCall::Release(_)) })
+        );
+    }
+
+    backend
+        .provision(&launch_spec(shard_id))
+        .await
+        .expect("a fresh generation may start after exact receipt-less cleanup");
+}
+
+#[tokio::test]
+async fn cancelled_provision_terminal_route_commits_are_exactly_retryable() {
+    for pause_after_cancel in [true, false] {
+        let filesystem = FakeFilesystem::production_tree();
+        *filesystem
+            .cgroup_procs_override
+            .lock()
+            .expect("cgroup override lock should work") = Some("9999\n".into());
+        let commit_pause = AsyncPause::new();
+        let egress = if pause_after_cancel {
+            FakeEgress {
+                cancel_commit_pause: Some(commit_pause.clone()),
+                ..FakeEgress::default()
+            }
+        } else {
+            FakeEgress {
+                release_reservation_commit_pause: Some(commit_pause.clone()),
+                ..FakeEgress::default()
+            }
+        };
+        let backend = Arc::new(backend(
+            filesystem.clone(),
+            FakeProcess {
+                events: Arc::new(Mutex::new(Vec::new())),
+                alive: Arc::new(Mutex::new(false)),
+                identity_matches: true,
+            },
+            egress.clone(),
+        ));
+        let shard_id = ShardId::new();
+        let provision = tokio::spawn({
+            let backend = backend.clone();
+            let shard_id = shard_id.clone();
+            async move { backend.provision(&launch_spec(shard_id)).await }
+        });
+
+        wait_for_commit_pause(&commit_pause, "provision reservation cleanup").await;
+        provision.abort();
+        assert!(
+            provision
+                .await
+                .expect_err("provision caller should be cancelled after terminal route commit")
+                .is_cancelled()
+        );
+
+        backend
+            .provision(&launch_spec(shard_id.clone()))
+            .await
+            .expect_err("the first retry must finish abandoned cleanup only");
+        let (cancellations, releases) = {
+            let calls = egress.calls.lock().expect("egress call lock should work");
+            let cancellations = calls
+                .iter()
+                .filter_map(|call| match call {
+                    EgressCall::CancelReservation(reservation) => Some(reservation.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let releases = calls
+                .iter()
+                .filter_map(|call| match call {
+                    EgressCall::ReleaseReservation(reservation) => Some(reservation.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (cancellations, releases)
+        };
+        assert_eq!(cancellations.len(), usize::from(pause_after_cancel) + 1);
+        assert_eq!(releases.len(), usize::from(!pause_after_cancel) + 1);
+        assert!(
+            cancellations
+                .iter()
+                .chain(releases.iter())
+                .all(|reservation| reservation == &cancellations[0]),
+            "cleanup retries must retain one exact reservation generation"
+        );
+
+        *filesystem
+            .cgroup_procs_override
+            .lock()
+            .expect("cgroup override lock should work") = None;
+        backend
+            .provision(&launch_spec(shard_id))
+            .await
+            .expect("a fresh generation may start only after exact cleanup completes");
+    }
+}
+
+#[tokio::test]
+async fn cancelled_attached_lease_cleanup_commits_are_exactly_retryable() {
+    for pause_after_revoke in [true, false] {
+        let filesystem = FakeFilesystem::production_tree();
+        let process_events = Arc::new(Mutex::new(Vec::new()));
+        let alive = Arc::new(Mutex::new(false));
+        let commit_pause = AsyncPause::new();
+        let egress = if pause_after_revoke {
+            FakeEgress {
+                revoke_commit_pause: Some(commit_pause.clone()),
+                ..FakeEgress::default()
+            }
+        } else {
+            FakeEgress {
+                release_commit_pause: Some(commit_pause.clone()),
+                ..FakeEgress::default()
+            }
+        };
+        let backend = Arc::new(LinuxSandboxBackend::new(
+            config(),
+            filesystem.clone(),
+            FaultProcess {
+                fault: SpawnFault::MismatchedNetworkNamespace,
+                events: process_events.clone(),
+                alive: alive.clone(),
+            },
+            egress.clone(),
+        ));
+        let shard_id = ShardId::new();
+        let provision = tokio::spawn({
+            let backend = backend.clone();
+            let shard_id = shard_id.clone();
+            async move { backend.provision(&launch_spec(shard_id)).await }
+        });
+
+        wait_for_commit_pause(&commit_pause, "attached lease cleanup").await;
+        provision.abort();
+        assert!(
+            provision
+                .await
+                .expect_err("provision caller should be cancelled after lease cleanup commit")
+                .is_cancelled()
+        );
+
+        backend
+            .provision(&launch_spec(shard_id.clone()))
+            .await
+            .expect_err("the first retry must finish abandoned attached-lease cleanup only");
+        assert_no_provisioning_residue(&filesystem, &egress, &alive, &shard_id);
+        assert!(
+            !process_events
+                .lock()
+                .expect("process event lock should work")
+                .iter()
+                .any(|event| event == "gate:release"),
+            "a mismatched attached namespace must never release the prepared child"
+        );
+        let (revokes, releases) = {
+            let calls = egress.calls.lock().expect("egress call lock should work");
+            let revokes = calls
+                .iter()
+                .filter_map(|call| match call {
+                    EgressCall::Revoke(lease) => Some(lease.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let releases = calls
+                .iter()
+                .filter_map(|call| match call {
+                    EgressCall::Release(lease) => Some(lease.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (revokes, releases)
+        };
+        assert_eq!(revokes.len(), usize::from(pause_after_revoke) + 1);
+        assert_eq!(releases.len(), usize::from(!pause_after_revoke) + 1);
+        assert!(
+            revokes
+                .iter()
+                .chain(releases.iter())
+                .all(|lease| lease == &revokes[0]),
+            "cleanup retries must retain one exact attached lease"
+        );
+        assert!(matches!(
+            egress
+                .state
+                .lock()
+                .expect("route state lock should work")
+                .routes
+                .get(revokes[0].reservation()),
+            Some(FakeRouteLifecycle::LeaseReleased(_))
+        ));
+
+        backend
+            .provision(&launch_spec(shard_id))
+            .await
+            .expect_err("the next exact-namespace mismatch should be a fresh generation");
+        let reservations = egress
+            .calls
+            .lock()
+            .expect("egress call lock should work")
+            .iter()
+            .filter_map(|call| match call {
+                EgressCall::Prepare(reservation) => Some(reservation.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reservations.len(), 2);
+        assert_ne!(reservations[0], reservations[1]);
+    }
 }
 
 #[tokio::test]
@@ -2606,7 +3630,7 @@ async fn spawn_failure_revokes_route_then_aborts_token_and_removes_resources() {
         .iter()
         .position(|event| event == "spawn")
         .expect("spawn should be attempted");
-    assert_eq!(events[spawn + 1], "route:revoke");
+    assert_eq!(events[spawn + 1], "route:cancel-reservation");
     assert_eq!(events[spawn + 2], "signal:Kill");
     assert!(events[spawn + 3].starts_with("remove:/var/lib/browserd/shards/"));
     assert!(events[spawn + 4].starts_with("remove:/sys/fs/cgroup/browserd/"));
@@ -2647,7 +3671,7 @@ async fn rollback_revoke_failure_still_aborts_the_child_and_retains_route_owners
     let events = trace.lock().expect("trace lock should work");
     let revoke = events
         .iter()
-        .position(|event| event == "route:revoke")
+        .position(|event| event == "route:cancel-reservation")
         .expect("route cleanup should run");
     assert!(
         events.iter().any(|event| event == "signal:Kill"),
@@ -2660,15 +3684,22 @@ async fn rollback_revoke_failure_still_aborts_the_child_and_retains_route_owners
         "resource cleanup should still be attempted after the child is dead"
     );
     assert!(
-        !events.iter().any(|event| event == "route:release"),
+        !events
+            .iter()
+            .any(|event| event == "route:release-reservation"),
         "a route whose revoke failed must not be released"
     );
     assert!(
         egress_view
-            .active
+            .state
             .lock()
-            .expect("active route lock should work")
-            .contains(&ShardEgressFence::new(shard_id, 7)),
+            .expect("route state lock should work")
+            .routes
+            .iter()
+            .any(|(reservation, route)| {
+                reservation.fence() == &ShardEgressFence::new(shard_id.clone(), 7)
+                    && matches!(route, FakeRouteLifecycle::Prepared(_))
+            }),
         "the active route must remain represented by a retryable tombstone"
     );
 }
@@ -2705,7 +3736,7 @@ async fn invalid_or_mismatched_identity_revokes_egress_before_terminating_owned_
             .expect("owned child must be killed without trusting reported identity");
         let revoke = events
             .iter()
-            .position(|event| event == "route:revoke")
+            .position(|event| event == "route:cancel-reservation")
             .expect("route must be revoked");
         assert!(revoke < kill);
         assert!(events[kill + 1].starts_with("remove:/var/lib/browserd/shards/"));
@@ -2748,7 +3779,7 @@ async fn missing_inherited_cgroup_membership_revokes_route_and_terminates_spawne
         .expect("child should be killed");
     let revoke = events
         .iter()
-        .position(|event| event == "route:revoke")
+        .position(|event| event == "route:cancel-reservation")
         .expect("route should be revoked");
     assert!(revoke < kill);
     assert!(events[kill + 1].starts_with("remove:/var/lib/browserd/shards/"));
@@ -3109,6 +4140,7 @@ fn std_process_reused_bootstrap_identity_helper() {
     let bootstrap_pid_path = marker_directory.path().join("bootstrap-pid");
     let bootstrap_exit_path = marker_directory.path().join("bootstrap-exit");
     let script = r#"#!/usr/bin/python3
+import ctypes
 import json
 import os
 import sys
@@ -3124,6 +4156,8 @@ for argument in arguments:
 
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
+    if ctypes.CDLL(None, use_errno=True).unshare(0x40000000) != 0:
+        os._exit(79)
     os.setsid()
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
@@ -3243,7 +4277,8 @@ os._exit(0)
         let identity = process
             .spawn_prepared(&backend_token, &request)
             .await
-            .expect("fake sandbox child should be prepared before its bootstrap exits");
+            .expect("fake sandbox child should be prepared before its bootstrap exits")
+            .identity();
         let bootstrap_pid = std::fs::read_to_string(&bootstrap_pid_path)
             .expect("bootstrap PID should be recorded")
             .parse::<u32>()
@@ -3497,6 +4532,67 @@ fn production_process_info_read_has_an_absolute_timeout() {
 #[test]
 fn production_process_rejects_a_reported_pid_not_parented_by_the_exact_bootstrap() {
     run_process_helper("std_process_unrelated_info_pid_helper");
+}
+
+#[test]
+fn production_process_rejects_a_child_left_in_the_host_network_namespace() {
+    run_process_helper("std_process_host_network_namespace_helper");
+}
+
+#[test]
+#[ignore = "runs only in an isolated descriptor-owning subprocess"]
+fn std_process_host_network_namespace_helper() {
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    let _descriptors = install_required_launch_descriptors();
+    let script = r#"#!/usr/bin/python3
+import json
+import os
+import sys
+import time
+
+info_fd = None
+arguments = iter(sys.argv[1:])
+for argument in arguments:
+    if argument == "--block-fd":
+        raise RuntimeError("legacy block-fd must not be used")
+    elif argument == "--info-fd":
+        info_fd = int(next(arguments))
+
+sandbox_pid = os.fork()
+if sandbox_pid == 0:
+    os.setsid()
+    os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
+    os.close(info_fd)
+    sys.stdin.buffer.read()
+    os._exit(0)
+
+os.close(info_fd)
+time.sleep(30)
+"#;
+    let (_directory, bwrap) = executable_script(script);
+    let (_cgroup_directory, request) = process_request_for(&bwrap);
+    let process = StdLinuxProcessBackend::default();
+    let backend_token = LeaseId::new().to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("helper runtime should build");
+    runtime.block_on(async {
+        let error = process
+            .spawn_prepared(&backend_token, &request)
+            .await
+            .expect_err("a child in browserd's host network namespace must fail closed");
+        assert!(
+            error.to_string().contains("distinct network namespace"),
+            "unexpected namespace rejection: {error}"
+        );
+        process
+            .abort_spawned(&backend_token, None)
+            .await
+            .expect("the rejected exact child should remain abortable");
+    });
 }
 
 #[test]
@@ -3949,17 +5045,17 @@ time.sleep(30)
 
 #[test]
 fn production_abort_confirms_the_exact_sandbox_child_exited_before_forgetting_ownership() {
-    run_process_helper("std_process_exact_abort_helper");
+    run_network_process_helper("std_process_exact_abort_helper");
 }
 
 #[test]
 fn production_release_reaps_the_naturally_exited_bootstrap_before_forgetting_ownership() {
-    run_process_helper("std_process_natural_release_helper");
+    run_network_process_helper("std_process_natural_release_helper");
 }
 
 #[test]
 fn production_cdp_pipes_are_mapped_claimed_and_released_exactly_once() {
-    run_process_helper("std_process_cdp_round_trip_helper");
+    run_network_process_helper("std_process_cdp_round_trip_helper");
 }
 
 #[test]
@@ -4111,6 +5207,7 @@ fn std_process_cdp_round_trip_helper() {
     assert_eq!(reserved, CHROMIUM_CDP_WRITE_FD);
     let _seccomp_descriptor = install_required_launch_descriptors();
     let script = r#"#!/usr/bin/python3
+import ctypes
 import json
 import os
 import sys
@@ -4130,6 +5227,8 @@ cgroup_events_path = os.path.join(os.path.dirname(cgroup_kill_path), "cgroup.eve
 
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
+    if ctypes.CDLL(None, use_errno=True).unshare(0x40000000) != 0:
+        os._exit(79)
     os.close(info_fd)
     approval = sys.stdin.buffer.read()
     if approval != b"browserd-launch-gate/v1 approve\n":
@@ -4179,7 +5278,8 @@ os._exit(0)
         let identity = process
             .spawn_prepared(&backend_token, &request)
             .await
-            .expect("fake sandbox child should be prepared");
+            .expect("fake sandbox child should be prepared")
+            .identity();
         process
             .claim_cdp_pipes(&backend_token, ChildIdentity::new(identity.pid(), 1))
             .await
@@ -4286,7 +5386,8 @@ os._exit(0)
         let second_identity = process
             .spawn_prepared(&second_token, &request)
             .await
-            .expect("second fake sandbox child should be prepared");
+            .expect("second fake sandbox child should be prepared")
+            .identity();
         process
             .release_prepared(&second_token, second_identity)
             .await
@@ -4311,7 +5412,8 @@ os._exit(0)
         let unclaimed_identity = process
             .spawn_prepared(&unclaimed_token, &request)
             .await
-            .expect("unclaimed fake sandbox child should be prepared");
+            .expect("unclaimed fake sandbox child should be prepared")
+            .identity();
         process
             .abort_spawned(&unclaimed_token, Some(unclaimed_identity))
             .await
@@ -4333,6 +5435,7 @@ fn std_process_natural_release_helper() {
     let marker_directory = tempfile::tempdir().expect("marker tempdir should be created");
     let marker = marker_directory.path().join("browser-executed");
     let script = r#"#!/usr/bin/python3
+import ctypes
 import json
 import os
 import sys
@@ -4354,6 +5457,8 @@ cgroup_events_path = os.path.join(os.path.dirname(cgroup_kill_path), "cgroup.eve
 
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
+    if ctypes.CDLL(None, use_errno=True).unshare(0x40000000) != 0:
+        os._exit(79)
     os.close(info_fd)
     approval = sys.stdin.buffer.read()
     if not block_fd_seen and approval == b"browserd-launch-gate/v1 approve\n":
@@ -4393,7 +5498,8 @@ os._exit(0)
         let identity = process
             .spawn_prepared(&backend_token, &request)
             .await
-            .expect("fake sandbox child should be prepared");
+            .expect("fake sandbox child should be prepared")
+            .identity();
         process
             .release_prepared(&backend_token, identity)
             .await
@@ -4447,6 +5553,7 @@ fn std_process_exact_abort_helper() {
     let marker_directory = tempfile::tempdir().expect("marker tempdir should be created");
     let marker = marker_directory.path().join("browser-executed");
     let script = r#"#!/usr/bin/python3
+import ctypes
 import json
 import os
 import sys
@@ -4462,6 +5569,8 @@ for argument in arguments:
 
 sandbox_pid = os.fork()
 if sandbox_pid == 0:
+    if ctypes.CDLL(None, use_errno=True).unshare(0x40000000) != 0:
+        os._exit(79)
     os.setsid()
     os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
     os.close(info_fd)
@@ -4491,7 +5600,8 @@ time.sleep(30)
         let identity = process
             .spawn_prepared(&backend_token, &request)
             .await
-            .expect("fake sandbox child should be prepared");
+            .expect("fake sandbox child should be prepared")
+            .identity();
         assert_eq!(
             std::fs::read(request.cgroup_procs_path())
                 .expect("bootstrap cgroup attachment record should be readable"),
@@ -4631,16 +5741,43 @@ async fn provisioning_rollback_revokes_the_exact_attempted_worker_epoch_fence() 
 
     assert_eq!(
         egress_view
-            .calls
+            .events
             .lock()
-            .expect("egress call lock should work")
+            .expect("egress event lock should work")
             .as_slice(),
         [
-            EgressCall::Prepare(expected.clone()),
-            EgressCall::Revoke(expected.clone()),
-            EgressCall::Release(expected),
+            "route:prepare",
+            "route:cancel-reservation",
+            "route:release-reservation",
         ]
     );
+
+    let calls = egress_view
+        .calls
+        .lock()
+        .expect("egress call lock should work");
+    assert!(
+        matches!(
+            calls.as_slice(),
+            [
+                EgressCall::Prepare(_),
+                EgressCall::CancelReservation(_),
+                EgressCall::ReleaseReservation(_),
+            ]
+        ),
+        "unexpected egress calls: {calls:?}"
+    );
+    let [
+        EgressCall::Prepare(reservation),
+        EgressCall::CancelReservation(cancelled_reservation),
+        EgressCall::ReleaseReservation(released_reservation),
+    ] = calls.as_slice()
+    else {
+        return;
+    };
+    assert_eq!(reservation.fence(), &expected);
+    assert_eq!(cancelled_reservation, reservation);
+    assert_eq!(released_reservation, reservation);
 }
 
 #[tokio::test]
@@ -4696,12 +5833,27 @@ async fn concurrent_cleanup_and_inspect_use_each_runtimes_exact_egress_fence() {
         .calls
         .lock()
         .expect("egress call lock should work");
-    assert!(calls.contains(&EgressCall::IsActive(inspect_fence)));
-    assert!(calls.contains(&EgressCall::Revoke(cleanup_fence)));
+    assert!(calls.iter().any(|call| {
+        matches!(call, EgressCall::IsActive(lease) if lease.reservation().fence() == &inspect_fence)
+    }));
+    assert!(calls.iter().any(|call| {
+        matches!(call, EgressCall::Revoke(lease) if lease.reservation().fence() == &cleanup_fence)
+    }));
+}
+
+#[test]
+fn failed_revoke_retains_the_exact_fence_and_netns_pin_until_release_retry() {
+    run_process_helper(
+        "failed_revoke_retains_the_exact_fence_and_netns_pin_until_release_retry_helper",
+    );
 }
 
 #[tokio::test]
-async fn failed_revoke_retains_the_exact_fence_after_namespace_cleanup_for_retry() {
+#[ignore = "runs only in an isolated descriptor-owning subprocess"]
+async fn failed_revoke_retains_the_exact_fence_and_netns_pin_until_release_retry_helper() {
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
     let filesystem = FakeFilesystem::production_tree();
     let process = FakeProcess {
         events: Arc::new(Mutex::new(Vec::new())),
@@ -4709,7 +5861,7 @@ async fn failed_revoke_retains_the_exact_fence_after_namespace_cleanup_for_retry
         identity_matches: true,
     };
     let egress = FakeEgress {
-        fail_revoke: true,
+        fail_revoke_once: Arc::new(AtomicUsize::new(1)),
         ..FakeEgress::default()
     };
     let egress_view = egress.clone();
@@ -4724,6 +5876,15 @@ async fn failed_revoke_retains_the_exact_fence_after_namespace_cleanup_for_retry
         ))
         .await
         .expect("runtime should provision");
+    let (reservation, network_namespace_fd) = egress_view
+        .attached_descriptors
+        .lock()
+        .expect("attached descriptor lock should work")
+        .iter()
+        .next()
+        .map(|(reservation, descriptor)| (reservation.clone(), *descriptor))
+        .expect("the exact namespace descriptor should be attached");
+    assert_eq!(reservation.fence(), &expected);
     filesystem
         .files
         .lock()
@@ -4743,10 +5904,26 @@ async fn failed_revoke_retains_the_exact_fence_after_namespace_cleanup_for_retry
         .cleanup_namespaces(&handle)
         .await
         .expect("namespace cleanup should still make progress");
+    // SAFETY: the recorded descriptor is only queried; the runtime tombstone must still own it.
+    assert_ne!(
+        unsafe { nix::libc::fcntl(network_namespace_fd, nix::libc::F_GETFD) },
+        -1,
+        "the pinned namespace must survive until exact route release"
+    );
     backend
         .revoke_egress(&handle, CleanupReason::Administrative)
         .await
-        .expect_err("retry should reach the still-failing egress backend");
+        .expect("the retry should revoke and release the exact ingress lease");
+    // SAFETY: the recorded numeric descriptor is queried immediately after terminal runtime drop.
+    assert_eq!(
+        unsafe { nix::libc::fcntl(network_namespace_fd, nix::libc::F_GETFD) },
+        -1,
+        "the namespace pin must close after route release"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(nix::libc::EBADF)
+    );
 
     let calls = egress_view
         .calls
@@ -4755,10 +5932,25 @@ async fn failed_revoke_retains_the_exact_fence_after_namespace_cleanup_for_retry
     assert_eq!(
         calls
             .iter()
-            .filter(|call| **call == EgressCall::Revoke(expected.clone()))
+            .filter(|call| {
+                matches!(call, EgressCall::Revoke(lease) if lease.reservation() == &reservation)
+            })
             .count(),
         2
     );
+    assert!(calls.iter().any(|call| {
+        matches!(call, EgressCall::Release(lease) if lease.reservation() == &reservation)
+    }));
+    drop(calls);
+
+    let state = egress_view
+        .state
+        .lock()
+        .expect("route state lock should work");
+    assert!(matches!(
+        state.routes.get(&reservation),
+        Some(FakeRouteLifecycle::LeaseReleased(_))
+    ));
 }
 
 #[tokio::test]
@@ -4799,7 +5991,10 @@ async fn namespace_cleanup_releases_the_exact_fence_only_after_cgroup_is_empty()
             .calls
             .lock()
             .expect("egress call lock should work")
-            .contains(&EgressCall::Release(expected.clone()))
+            .iter()
+            .any(|call| {
+                matches!(call, EgressCall::Release(lease) if lease.reservation().fence() == &expected)
+            })
     );
 
     filesystem
@@ -4818,11 +6013,15 @@ async fn namespace_cleanup_releases_the_exact_fence_only_after_cgroup_is_empty()
         .expect("egress call lock should work");
     let revoke = calls
         .iter()
-        .position(|call| *call == EgressCall::Revoke(expected.clone()))
+        .position(|call| {
+            matches!(call, EgressCall::Revoke(lease) if lease.reservation().fence() == &expected)
+        })
         .expect("route revoke should be recorded");
     let release = calls
         .iter()
-        .position(|call| *call == EgressCall::Release(expected.clone()))
+        .position(|call| {
+            matches!(call, EgressCall::Release(lease) if lease.reservation().fence() == &expected)
+        })
         .expect("shard release should be recorded");
     assert!(revoke < release);
     let trace = trace.lock().expect("cleanup trace lock should work");
