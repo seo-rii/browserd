@@ -5,13 +5,18 @@ use browserd_core::{ShardId, WorkerId};
 
 use crate::ResourceVector;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CompatibilityKey(String);
 
 impl CompatibilityKey {
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
