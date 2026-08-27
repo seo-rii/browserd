@@ -142,6 +142,16 @@ fn shard_taint_drains_and_hard_failure_terminates_immediately() {
     assert_eq!(tainted.lifecycle(), ShardLifecycle::Draining);
     assert_eq!(tainted.health(), ShardHealth::Tainted);
     assert_eq!(tainted.admission(), ShardAdmission::Closed);
+    let tainted_again = tainted.transition(ShardEvent::TaintDetected).ok();
+    assert!(tainted_again.is_some());
+    assert_eq!(
+        tainted_again.as_ref().map(ShardState::lifecycle),
+        Some(ShardLifecycle::Draining)
+    );
+    assert_eq!(
+        tainted_again.as_ref().map(ShardState::health),
+        Some(ShardHealth::Tainted)
+    );
 
     let terminated = active.transition(ShardEvent::ImmediateTermination).ok();
     assert!(terminated.is_some());

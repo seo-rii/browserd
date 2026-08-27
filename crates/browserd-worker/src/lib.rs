@@ -2,6 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+mod shard_actor;
+
+pub use shard_actor::{
+    AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
+    BrowserShardSnapshot, DetachSessionOutcome, ShardActorError, ShardRuntimeError,
+};
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};

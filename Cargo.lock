@@ -438,6 +438,7 @@ dependencies = [
 name = "browserd-worker"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "browserd-actions",
  "browserd-artifacts",
  "browserd-core",
@@ -452,6 +453,8 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 

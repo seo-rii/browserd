@@ -168,7 +168,10 @@ impl ShardState {
                 self.lifecycle = Lifecycle::Draining;
                 self.admission = ShardAdmission::Closed;
             }
-            (Lifecycle::Starting | Lifecycle::Active, Event::TaintDetected) => {
+            (
+                Lifecycle::Starting | Lifecycle::Active | Lifecycle::Draining,
+                Event::TaintDetected,
+            ) => {
                 self.lifecycle = Lifecycle::Draining;
                 self.health = ShardHealth::Tainted;
                 self.admission = ShardAdmission::Closed;

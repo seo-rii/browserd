@@ -10,6 +10,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 browserd-actions = { path = "../browserd-actions" }
 browserd-artifacts = { path = "../browserd-artifacts" }
 browserd-core = { path = "../browserd-core" }
@@ -23,6 +24,8 @@ browserd-targets = { path = "../browserd-targets" }
 browserd-viewer = { path = "../browserd-viewer" }
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
