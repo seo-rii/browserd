@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use crate::{
     ActiveInstallResponse, ClientInstallError, InstallRequest, MAX_CONTROL_FRAME_BYTES,
     PendingInstall, ReceiveInstallError, ResponseMismatch, ServerCommitError, WireValidationError,
-    read_json_frame, receive_listener, send_listener, write_json_frame,
+    read_json_frame, receive_install_request, receive_listener, send_listener, write_json_frame,
 };
 
 const HANDOFF_FRAME_BYTES: usize = 33;
@@ -225,6 +225,28 @@ async fn wrong_peer_uid_is_rejected_before_receiver_ready_and_no_fd_is_sent() {
 }
 
 #[tokio::test]
+async fn domain_metadata_can_be_rejected_before_the_client_sends_its_fd() {
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair must be created");
+    let request = request();
+    let expected_request = request.clone();
+    let (listener, observer) = capability();
+    let client = tokio::spawn(send_listener(client_stream, request, listener));
+
+    let offer = receive_install_request(server_stream, current_uid())
+        .await
+        .expect("authenticated metadata must arrive");
+    assert_eq!(offer.request(), &expected_request);
+    drop(offer);
+
+    let error = client
+        .await
+        .expect("client task must finish")
+        .expect_err("domain rejection must happen before commit");
+    assert!(!error.commit_was_observed());
+    assert_capability_closed(observer).await;
+}
+
+#[tokio::test]
 async fn malformed_unknown_and_oversized_metadata_are_rejected_before_ready() {
     let (mut malformed_peer, malformed_server) =
         UnixStream::pair().expect("control pair must be created");
@@ -378,6 +400,29 @@ async fn dropping_pending_install_closes_receiver_clones_and_client_fails_precom
         .expect("client task must finish")
         .expect_err("cancelled install must fail");
     assert!(!error.commit_was_observed());
+    assert_capability_closed(observer).await;
+}
+
+#[tokio::test]
+async fn server_distinguishes_a_failed_commit_announcement_from_response_loss() {
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair must be created");
+    let request = request();
+    let expected = active(&request);
+    let (listener, observer) = capability();
+    let client = tokio::spawn(send_listener(client_stream, request, listener));
+    let pending = receive_listener(server_stream, current_uid())
+        .await
+        .expect("pending install must arrive");
+
+    client.abort();
+    let _ = client.await;
+    let error = pending
+        .commit(expected)
+        .await
+        .expect_err("a disconnected follower cannot observe commit");
+
+    assert!(matches!(error, ServerCommitError::BeforeAnnouncement(_)));
+    assert!(!error.commit_was_announced());
     assert_capability_closed(observer).await;
 }
 

@@ -295,6 +295,8 @@ pub enum ServerCommitError {
     InvalidResponse(#[from] WireValidationError),
     #[error("active response does not match the pending install: {0}")]
     ResponseMismatch(#[from] ResponseMismatch),
+    #[error("the listener install commit could not be announced: {0}")]
+    BeforeAnnouncement(#[source] HandoffError),
     #[error("the install was committed, but the peer did not complete the handoff: {0}")]
     CommittedButUnconfirmed(#[source] HandoffError),
     #[error("the install was committed, but the active response was lost: {0}")]
@@ -321,6 +323,47 @@ pub struct PendingInstall {
     request: InstallRequest,
     listener: Option<OwnedFd>,
     receiver: Receiver<CoordinatorAccepted>,
+}
+
+/// Authenticated, syntactically valid metadata awaiting domain authorization.
+///
+/// Dropping this value rejects the request before the receiver announces that
+/// it is ready for the listener capability.
+#[derive(Debug)]
+pub struct PendingListenerOffer {
+    request: InstallRequest,
+    stream: UnixStream,
+}
+
+impl PendingListenerOffer {
+    #[must_use]
+    pub const fn request(&self) -> &InstallRequest {
+        &self.request
+    }
+
+    /// Accepts exactly one listener after the caller has authorized the full
+    /// immutable request against its domain state.
+    pub async fn receive_listener(self) -> Result<PendingInstall, ReceiveInstallError> {
+        let expected_count = DescriptorCount::new(1)?;
+        let receiver = Receiver::new(
+            self.stream,
+            self.request.transfer_id.clone(),
+            expected_count,
+        );
+        let ready = receiver.ready().await?;
+        let offered = ready.receive().await?;
+        let mut listener_clones = offered
+            .try_clone_descriptors()
+            .map_err(ReceiveInstallError::Clone)?;
+        let listener = listener_clones.pop();
+        let accepted = offered.accept().await?;
+        let receiver = accepted.into_coordinator().await?;
+        Ok(PendingInstall {
+            request: self.request,
+            listener,
+            receiver,
+        })
+    }
 }
 
 impl PendingInstall {
@@ -353,7 +396,7 @@ impl PendingInstall {
             .receiver
             .commit()
             .await
-            .map_err(ServerCommitError::CommittedButUnconfirmed)?;
+            .map_err(ServerCommitError::BeforeAnnouncement)?;
         let receipted = committed
             .await_receipt()
             .await
@@ -444,9 +487,21 @@ pub async fn send_listener(
 
 /// Authenticates and receives exactly one listener capability.
 pub async fn receive_listener(
-    mut stream: UnixStream,
+    stream: UnixStream,
     expected_peer_uid: u32,
 ) -> Result<PendingInstall, ReceiveInstallError> {
+    receive_install_request(stream, expected_peer_uid)
+        .await?
+        .receive_listener()
+        .await
+}
+
+/// Authenticates the Unix peer and validates the bounded metadata frame
+/// without announcing readiness for any descriptor.
+pub async fn receive_install_request(
+    mut stream: UnixStream,
+    expected_peer_uid: u32,
+) -> Result<PendingListenerOffer, ReceiveInstallError> {
     let peer = stream
         .peer_cred()
         .map_err(ReceiveInstallError::PeerCredentials)?;
@@ -459,21 +514,7 @@ pub async fn receive_listener(
 
     let request: InstallRequest = read_json_frame(&mut stream).await?;
     request.validate()?;
-    let expected_count = DescriptorCount::new(1)?;
-    let receiver = Receiver::new(stream, request.transfer_id.clone(), expected_count);
-    let ready = receiver.ready().await?;
-    let offered = ready.receive().await?;
-    let mut listener_clones = offered
-        .try_clone_descriptors()
-        .map_err(ReceiveInstallError::Clone)?;
-    let listener = listener_clones.pop();
-    let accepted = offered.accept().await?;
-    let receiver = accepted.into_coordinator().await?;
-    Ok(PendingInstall {
-        request,
-        listener,
-        receiver,
-    })
+    Ok(PendingListenerOffer { request, stream })
 }
 
 async fn write_json_frame<T: Serialize>(
