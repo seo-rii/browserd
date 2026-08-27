@@ -13,14 +13,18 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use browserd_core::{LeaseId, ShardId, WorkerId};
+use browserd_core::{
+    EgressFence, LaunchGeneration, LeaseId, OwnerFence, RouteGeneration, SessionId,
+    SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+};
 use browserd_sandbox::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
-    CleanupReason, EgressRouteBackend, LaunchGateRuntime, LaunchSpec, LinuxProcessBackend,
-    LinuxSandboxBackend, LinuxSandboxConfig, NetworkNamespaceIdentity, PinnedNetworkNamespace,
-    PreparedLinuxChild, ProcessSignal, ReadOnlyMount, SandboxBackend, SandboxError,
-    SandboxFilesystem, ShardEgressFence, ShardEgressReservation, ShardIngressLease,
-    ShardIngressReceipt, SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
+    CleanupReason, DedicatedEgressSpec, EgressPolicyBinding, EgressRouteBackend, LaunchGateRuntime,
+    LaunchSpec, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
+    NetworkNamespaceIdentity, PinnedNetworkNamespace, PreparedLinuxChild, ProcessSignal,
+    ReadOnlyMount, SandboxBackend, SandboxError, SandboxFilesystem, ShardEgressFence,
+    ShardEgressReservation, ShardIngressLease, ShardIngressReceipt, SpawnRequest,
+    StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 
 fn current_network_namespace() -> Result<PinnedNetworkNamespace, SandboxError> {
@@ -1492,11 +1496,31 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
 }
 
 fn launch_spec(shard_id: ShardId) -> LaunchSpec {
-    LaunchSpec::production(
+    launch_spec_for(
         shard_id,
         WorkerId::new("worker-1").expect("worker should be valid"),
         7,
     )
+}
+
+fn launch_spec_for(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> LaunchSpec {
+    let worker_epoch = WorkerEpoch::new(worker_epoch).expect("worker epoch is positive");
+    let egress_fence = EgressFence::new(
+        ShardFence::new(
+            OwnerFence::new(worker_id, worker_epoch),
+            shard_id,
+            LaunchGeneration::new(1).expect("launch generation is positive"),
+        ),
+        RouteGeneration::new(1).expect("route generation is positive"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("session incarnation is positive"),
+    );
+    let policy_binding =
+        EgressPolicyBinding::new("test-public-web", [1; 32]).expect("policy binding is valid");
+    let dedicated_egress =
+        DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_secs(5))
+            .expect("dedicated egress spec is valid");
+    LaunchSpec::production(TenantId::new(), dedicated_egress)
 }
 
 #[test]
@@ -5731,7 +5755,7 @@ async fn provisioning_rollback_revokes_the_exact_attempted_worker_epoch_fence() 
     let expected = ShardEgressFence::new(shard_id.clone(), 47);
 
     LinuxSandboxBackend::new(config(), filesystem, process, egress)
-        .provision(&LaunchSpec::production(
+        .provision(&launch_spec_for(
             shard_id,
             WorkerId::new("worker-rollback").expect("worker should be valid"),
             47,
@@ -5796,7 +5820,7 @@ async fn concurrent_cleanup_and_inspect_use_each_runtimes_exact_egress_fence() {
     let inspect_fence = ShardEgressFence::new(inspect_shard.clone(), 101);
     let cleanup_fence = ShardEgressFence::new(cleanup_shard.clone(), 202);
     let inspect_handle = backend
-        .provision(&LaunchSpec::production(
+        .provision(&launch_spec_for(
             inspect_shard.clone(),
             WorkerId::new("worker-inspect").expect("worker should be valid"),
             101,
@@ -5804,7 +5828,7 @@ async fn concurrent_cleanup_and_inspect_use_each_runtimes_exact_egress_fence() {
         .await
         .expect("inspect runtime should provision");
     let cleanup_handle = backend
-        .provision(&LaunchSpec::production(
+        .provision(&launch_spec_for(
             cleanup_shard,
             WorkerId::new("worker-cleanup").expect("worker should be valid"),
             202,
@@ -5869,7 +5893,7 @@ async fn failed_revoke_retains_the_exact_fence_and_netns_pin_until_release_retry
     let shard_id = ShardId::new();
     let expected = ShardEgressFence::new(shard_id.clone(), 303);
     let handle = backend
-        .provision(&LaunchSpec::production(
+        .provision(&launch_spec_for(
             shard_id.clone(),
             WorkerId::new("worker-retry").expect("worker should be valid"),
             303,

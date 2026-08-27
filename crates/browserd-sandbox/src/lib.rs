@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{LeaseId, ShardId, WorkerId};
+use browserd_core::{EgressFence, LeaseId, ShardId, TenantId, WorkerId};
 use futures::{FutureExt, future::join_all};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -151,28 +151,172 @@ impl SupervisorConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub const MAX_DEDICATED_EGRESS_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressPolicyBinding {
+    profile: String,
+    snapshot_digest: [u8; 32],
+}
+
+impl EgressPolicyBinding {
+    pub fn new(
+        profile: impl Into<String>,
+        snapshot_digest: [u8; 32],
+    ) -> Result<Self, SandboxError> {
+        let binding = Self {
+            profile: profile.into(),
+            snapshot_digest,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), SandboxError> {
+        if self.profile.is_empty()
+            || self.profile.len() > 128
+            || self.snapshot_digest == [0; 32]
+            || !self.profile.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.')
+            })
+        {
+            return Err(SandboxError::InvalidEgressPolicyBinding);
+        }
+        Ok(())
+    }
+
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
+    pub const fn snapshot_digest(&self) -> &[u8; 32] {
+        &self.snapshot_digest
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedEgressSpec {
+    egress_fence: EgressFence,
+    policy_binding: EgressPolicyBinding,
+    initial_lease_ttl_ms: u64,
+}
+
+impl DedicatedEgressSpec {
+    pub fn new(
+        egress_fence: EgressFence,
+        policy_binding: EgressPolicyBinding,
+        initial_lease_ttl: Duration,
+    ) -> Result<Self, SandboxError> {
+        let initial_lease_ttl_ms = u64::try_from(initial_lease_ttl.as_millis())
+            .map_err(|_| SandboxError::InvalidEgressLease)?;
+        let spec = Self {
+            egress_fence,
+            policy_binding,
+            initial_lease_ttl_ms,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    fn validate(&self) -> Result<(), SandboxError> {
+        self.policy_binding.validate()?;
+        if self.initial_lease_ttl_ms == 0
+            || self.initial_lease_ttl_ms
+                > u64::try_from(MAX_DEDICATED_EGRESS_LEASE_TTL.as_millis())
+                    .map_err(|_| SandboxError::InvalidEgressLease)?
+        {
+            return Err(SandboxError::InvalidEgressLease);
+        }
+        Ok(())
+    }
+
+    pub const fn egress_fence(&self) -> &EgressFence {
+        &self.egress_fence
+    }
+
+    pub const fn policy_binding(&self) -> &EgressPolicyBinding {
+        &self.policy_binding
+    }
+
+    pub const fn initial_lease_ttl(&self) -> Duration {
+        Duration::from_millis(self.initial_lease_ttl_ms)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchSpec {
+    tenant_id: TenantId,
     shard_id: ShardId,
     worker_id: WorkerId,
     worker_epoch: u64,
+    dedicated_egress: DedicatedEgressSpec,
 }
 
 impl LaunchSpec {
-    pub const fn production(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> Self {
+    pub fn production(tenant_id: TenantId, dedicated_egress: DedicatedEgressSpec) -> Self {
+        let shard_fence = dedicated_egress.egress_fence().shard();
         Self {
+            tenant_id,
+            shard_id: shard_fence.shard_id().clone(),
+            worker_id: shard_fence.owner().worker_id().clone(),
+            worker_epoch: shard_fence.owner().worker_epoch().get(),
+            dedicated_egress,
+        }
+    }
+
+    pub(crate) fn from_wire(
+        tenant_id: TenantId,
+        shard_id: ShardId,
+        worker_id: WorkerId,
+        worker_epoch: u64,
+        dedicated_egress: DedicatedEgressSpec,
+    ) -> Result<Self, SandboxError> {
+        let spec = Self {
+            tenant_id,
             shard_id,
             worker_id,
             worker_epoch,
+            dedicated_egress,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    fn validate(&self) -> Result<(), SandboxError> {
+        self.dedicated_egress.validate()?;
+        let shard_fence = self.dedicated_egress.egress_fence().shard();
+        if &self.shard_id != shard_fence.shard_id()
+            || &self.worker_id != shard_fence.owner().worker_id()
+            || self.worker_epoch != shard_fence.owner().worker_epoch().get()
+        {
+            return Err(SandboxError::LaunchFenceMismatch);
         }
+        Ok(())
+    }
+
+    pub const fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
     }
 
     pub const fn shard_id(&self) -> &ShardId {
         &self.shard_id
     }
 
+    pub const fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+
     pub const fn worker_epoch(&self) -> u64 {
         self.worker_epoch
+    }
+
+    pub const fn dedicated_egress(&self) -> &DedicatedEgressSpec {
+        &self.dedicated_egress
     }
 }
 
@@ -296,6 +440,7 @@ pub trait SandboxBackend: Send + Sync + 'static {
 
 #[derive(Debug)]
 struct ActiveShard {
+    launch_spec: LaunchSpec,
     ownership: WorkerOwnership,
     handle: SandboxHandle,
     cdp_claim: CdpClaimState,
@@ -320,12 +465,14 @@ enum CdpClaimReceipt {
 
 #[derive(Debug)]
 struct ProvisioningShard {
+    launch_spec: LaunchSpec,
     ownership: WorkerOwnership,
     cancellation: Option<CleanupReason>,
 }
 
 #[derive(Debug)]
 struct CleaningShard {
+    launch_spec: LaunchSpec,
     worker_id: WorkerId,
     worker_epoch: u64,
     handle: SandboxHandle,
@@ -338,6 +485,7 @@ struct CleaningShard {
 
 #[derive(Debug)]
 struct TerminatedShard {
+    launch_spec: LaunchSpec,
     worker_id: WorkerId,
     worker_epoch: u64,
 }
@@ -553,6 +701,7 @@ where
         spec: LaunchSpec,
         ownership: WorkerOwnership,
     ) -> Result<CreateShardOutcome, SandboxError> {
+        spec.validate()?;
         let now = Instant::now();
         if ownership.expires_at <= now
             || ownership.expires_at.saturating_duration_since(now)
@@ -592,6 +741,7 @@ where
                     (
                         active.ownership.worker_id.clone(),
                         active.ownership.worker_epoch,
+                        active.launch_spec.clone(),
                     )
                 })
                 .or_else(|| {
@@ -599,16 +749,21 @@ where
                         (
                             provisioning.ownership.worker_id.clone(),
                             provisioning.ownership.worker_epoch,
+                            provisioning.launch_spec.clone(),
                         )
                     })
                 })
                 .or_else(|| {
-                    state
-                        .cleaning
-                        .get(&spec.shard_id)
-                        .map(|cleaning| (cleaning.worker_id.clone(), cleaning.worker_epoch))
+                    state.cleaning.get(&spec.shard_id).map(|cleaning| {
+                        (
+                            cleaning.worker_id.clone(),
+                            cleaning.worker_epoch,
+                            cleaning.launch_spec.clone(),
+                        )
+                    })
                 });
-            if let Some((existing_worker_id, existing_worker_epoch)) = existing_owner {
+            if let Some((existing_worker_id, existing_worker_epoch, existing_spec)) = existing_owner
+            {
                 if existing_worker_id != spec.worker_id {
                     return Err(SandboxError::OwnershipMismatch);
                 }
@@ -617,6 +772,13 @@ where
                         expected: existing_worker_epoch,
                         actual: spec.worker_epoch,
                     });
+                }
+                if existing_spec.dedicated_egress.egress_fence != spec.dedicated_egress.egress_fence
+                {
+                    return Err(SandboxError::LaunchFenceMismatch);
+                }
+                if existing_spec != spec {
+                    return Err(SandboxError::LaunchBindingMismatch);
                 }
                 return Ok(CreateShardOutcome::AlreadyExists);
             }
@@ -630,11 +792,20 @@ where
                         actual: spec.worker_epoch,
                     });
                 }
+                if terminated.launch_spec.dedicated_egress.egress_fence
+                    != spec.dedicated_egress.egress_fence
+                {
+                    return Err(SandboxError::LaunchFenceMismatch);
+                }
+                if terminated.launch_spec != spec {
+                    return Err(SandboxError::LaunchBindingMismatch);
+                }
                 return Ok(CreateShardOutcome::AlreadyExists);
             }
             state.provisioning.insert(
                 spec.shard_id.clone(),
                 ProvisioningShard {
+                    launch_spec: spec.clone(),
                     ownership: ownership.clone(),
                     cancellation: None,
                 },
@@ -654,6 +825,7 @@ where
                     state.cleaning.insert(
                         spec.shard_id.clone(),
                         CleaningShard {
+                            launch_spec: provisioning.launch_spec,
                             worker_id: ownership.worker_id.clone(),
                             worker_epoch: ownership.worker_epoch,
                             handle,
@@ -684,8 +856,9 @@ where
                     }
                 } else {
                     state.active.insert(
-                        spec.shard_id,
+                        spec.shard_id.clone(),
                         ActiveShard {
+                            launch_spec: spec,
                             ownership,
                             handle,
                             cdp_claim: CdpClaimState::Available,
@@ -832,6 +1005,7 @@ where
                 state.cleaning.insert(
                     shard_id.clone(),
                     CleaningShard {
+                        launch_spec: active.launch_spec,
                         worker_id: active.ownership.worker_id,
                         worker_epoch: active.ownership.worker_epoch,
                         handle: active.handle,
@@ -980,6 +1154,7 @@ where
                             state.terminated.insert(
                                 shard_id,
                                 TerminatedShard {
+                                    launch_spec: cleaning.launch_spec,
                                     worker_id: cleaning.worker_id,
                                     worker_epoch: cleaning.worker_epoch,
                                 },
@@ -1366,6 +1541,14 @@ pub enum SandboxError {
     ZeroCleanupTimeout,
     #[error("supervisor lease TTL cannot exceed directory lease TTL")]
     InvalidLeaseOrdering,
+    #[error("dedicated egress policy binding is invalid")]
+    InvalidEgressPolicyBinding,
+    #[error("dedicated egress lease TTL must be nonzero and at most five minutes")]
+    InvalidEgressLease,
+    #[error("launch identity does not match the dedicated egress fence")]
+    LaunchFenceMismatch,
+    #[error("launch immutable binding conflicts with the existing shard")]
+    LaunchBindingMismatch,
     #[error("production sandbox capability is missing: {name}")]
     MissingCapability { name: &'static str },
     #[error("launch spec and owner lease do not identify the same worker epoch")]
@@ -1485,9 +1668,25 @@ mod tests {
         let supervisor = SandboxSupervisor::new(config, backend);
         let shard_id = ShardId::new();
         let worker_id = WorkerId::new("receipt-test-worker").expect("test worker ID is valid");
+        let worker_epoch = browserd_core::WorkerEpoch::new(1).expect("worker epoch is positive");
+        let egress_fence = EgressFence::new(
+            browserd_core::ShardFence::new(
+                browserd_core::OwnerFence::new(worker_id.clone(), worker_epoch),
+                shard_id.clone(),
+                browserd_core::LaunchGeneration::new(1).expect("launch generation is positive"),
+            ),
+            browserd_core::RouteGeneration::new(1).expect("route generation is positive"),
+            browserd_core::SessionId::new(),
+            browserd_core::SessionIncarnation::new(1).expect("session incarnation is positive"),
+        );
+        let policy_binding = EgressPolicyBinding::new("test-public-web", [1; 32])
+            .expect("test policy binding is valid");
+        let dedicated_egress =
+            DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_millis(500))
+                .expect("test egress spec is valid");
         supervisor
             .create_shard(
-                LaunchSpec::production(shard_id.clone(), worker_id.clone(), 1),
+                LaunchSpec::production(TenantId::new(), dedicated_egress),
                 WorkerOwnership::new(
                     worker_id.clone(),
                     1,

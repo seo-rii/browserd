@@ -6,11 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{ShardId, WorkerId};
+use browserd_core::{
+    EgressFence, LaunchGeneration, OwnerFence, RouteGeneration, SessionId, SessionIncarnation,
+    ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+};
 use browserd_sandbox::{
-    ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome, InspectResources,
-    KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxCapabilities,
-    SandboxError, SandboxHandle, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
+    ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome, DedicatedEgressSpec,
+    EgressPolicyBinding, InspectResources, KillShardOutcome, LaunchSpec, RenewLeaseError,
+    SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle, SandboxSupervisor,
+    SupervisorConfig, WorkerOwnership,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -101,7 +105,23 @@ fn config() -> SupervisorConfig {
 }
 
 fn launch_spec(shard_id: ShardId) -> LaunchSpec {
-    LaunchSpec::production(shard_id, worker(), 17)
+    let worker_epoch = WorkerEpoch::new(17).expect("worker epoch is positive");
+    let egress_fence = EgressFence::new(
+        ShardFence::new(
+            OwnerFence::new(worker(), worker_epoch),
+            shard_id,
+            LaunchGeneration::new(1).expect("launch generation is positive"),
+        ),
+        RouteGeneration::new(1).expect("route generation is positive"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("session incarnation is positive"),
+    );
+    let policy_binding =
+        EgressPolicyBinding::new("test-public-web", [1; 32]).expect("policy binding is valid");
+    let dedicated_egress =
+        DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_secs(5))
+            .expect("dedicated egress spec is valid");
+    LaunchSpec::production(TenantId::new(), dedicated_egress)
 }
 
 #[derive(Clone)]

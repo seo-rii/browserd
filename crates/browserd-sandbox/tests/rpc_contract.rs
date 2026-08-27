@@ -6,12 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{LeaseId, ShardId, WorkerId};
+use browserd_core::{
+    EgressFence, LaunchGeneration, LeaseId, OwnerFence, RouteGeneration, SessionId,
+    SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+};
 use browserd_sandbox::{
-    ChromiumCdpPipes, CleanupReason, CreateShardOutcome, InspectResources, KillShardOutcome,
-    LaunchSpec, RpcFailureCode, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
-    SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer, SandboxSupervisor,
-    SupervisorConfig, WorkerOwnership,
+    ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec, EgressPolicyBinding,
+    InspectResources, KillShardOutcome, LaunchSpec, RpcFailureCode, SandboxBackend,
+    SandboxCapabilities, SandboxError, SandboxHandle, SandboxRpcClient, SandboxRpcConfig,
+    SandboxRpcError, SandboxRpcServer, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use serde_json::json;
@@ -207,6 +210,26 @@ fn worker() -> WorkerId {
     WorkerId::new("worker-rpc-1").expect("worker ID is valid")
 }
 
+fn launch_spec(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> LaunchSpec {
+    let worker_epoch = WorkerEpoch::new(worker_epoch).expect("worker epoch is positive");
+    let egress_fence = EgressFence::new(
+        ShardFence::new(
+            OwnerFence::new(worker_id, worker_epoch),
+            shard_id,
+            LaunchGeneration::new(1).expect("launch generation is positive"),
+        ),
+        RouteGeneration::new(1).expect("route generation is positive"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("session incarnation is positive"),
+    );
+    let policy_binding =
+        EgressPolicyBinding::new("test-public-web", [1; 32]).expect("policy binding is valid");
+    let dedicated_egress =
+        DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_millis(50))
+            .expect("dedicated egress spec is valid");
+    LaunchSpec::production(TenantId::new(), dedicated_egress)
+}
+
 fn supervisor(backend: RecordingBackend) -> Arc<SandboxSupervisor<RecordingBackend>> {
     let config = SupervisorConfig::new(Duration::from_millis(100), Duration::from_secs(1))
         .expect("lease ordering is valid");
@@ -354,7 +377,7 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
     )
     .expect("client config is valid");
     let shard_id = ShardId::new();
-    let spec = LaunchSpec::production(shard_id.clone(), worker(), 9);
+    let spec = launch_spec(shard_id.clone(), worker(), 9);
 
     assert_eq!(
         client.create_shard(spec, Duration::from_millis(80)).await,
@@ -363,7 +386,7 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
     assert!(matches!(
         client
             .create_shard(
-                LaunchSpec::production(shard_id.clone(), worker(), 8),
+                launch_spec(shard_id.clone(), worker(), 8),
                 Duration::from_millis(80),
             )
             .await,
@@ -430,7 +453,7 @@ async fn claim_cdp_pipes_transfers_exact_capabilities_once() {
     assert_eq!(
         client
             .create_shard(
-                LaunchSpec::production(shard_id.clone(), worker(), 12),
+                launch_spec(shard_id.clone(), worker(), 12),
                 Duration::from_millis(90),
             )
             .await,
@@ -763,7 +786,7 @@ async fn expired_owner_claim_is_typed_separately_from_an_invalid_lease() {
     let owner = worker();
     supervisor
         .create_shard(
-            LaunchSpec::production(shard_id.clone(), owner.clone(), 15),
+            launch_spec(shard_id.clone(), owner.clone(), 15),
             WorkerOwnership::new(
                 owner.clone(),
                 15,
@@ -830,7 +853,7 @@ async fn abandoning_a_ready_descriptor_handoff_kills_the_shard_and_closes_origin
     assert_eq!(
         client
             .create_shard(
-                LaunchSpec::production(shard_id.clone(), owner.clone(), 13),
+                launch_spec(shard_id.clone(), owner.clone(), 13),
                 Duration::from_millis(900),
             )
             .await,
@@ -922,7 +945,7 @@ async fn abandoning_after_commit_before_final_receipt_kills_and_closes_every_pip
     assert_eq!(
         client
             .create_shard(
-                LaunchSpec::production(shard_id.clone(), owner.clone(), 17),
+                launch_spec(shard_id.clone(), owner.clone(), 17),
                 Duration::from_millis(900),
             )
             .await,
@@ -1182,7 +1205,7 @@ async fn supervisor_sweeps_expired_rpc_leases_without_worker_cooperation() {
     assert_eq!(
         client
             .create_shard(
-                LaunchSpec::production(shard_id.clone(), worker(), 10),
+                launch_spec(shard_id.clone(), worker(), 10),
                 Duration::from_millis(20),
             )
             .await,
@@ -1240,7 +1263,7 @@ async fn client_timeout_does_not_cancel_an_inflight_provision_and_skip_rollback_
         tokio::spawn(async move {
             client
                 .create_shard(
-                    LaunchSpec::production(shard_id, worker(), 11),
+                    launch_spec(shard_id, worker(), 11),
                     Duration::from_millis(90),
                 )
                 .await

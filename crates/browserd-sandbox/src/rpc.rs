@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use browserd_core::{LeaseId, ShardId, WorkerId};
+use browserd_core::{LeaseId, ShardId, TenantId, WorkerId};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
@@ -19,8 +19,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChromiumCdpPipes, CleanupReason, CreateShardOutcome, InspectResources, KillShardOutcome,
-    LaunchSpec, RenewLeaseError, SandboxBackend, SandboxError, SandboxSupervisor, WorkerOwnership,
+    ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec, InspectResources,
+    KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxError, SandboxSupervisor,
+    WorkerOwnership,
 };
 
 const CLIENT_DESCRIPTOR_READY: u8 = 0x51;
@@ -78,6 +79,9 @@ impl SandboxRpcConfig {
 #[serde(rename_all = "snake_case")]
 pub enum RpcFailureCode {
     InvalidLease,
+    InvalidEgressPolicyBinding,
+    LaunchFenceMismatch,
+    LaunchBindingMismatch,
     MissingCapability,
     OwnershipMismatch,
     ShardNotFound,
@@ -101,7 +105,11 @@ impl From<SandboxError> for RpcFailure {
             SandboxError::ZeroLeaseTtl
             | SandboxError::ZeroCleanupTimeout
             | SandboxError::InvalidLeaseOrdering
-            | SandboxError::InvalidOwnerLease => RpcFailureCode::InvalidLease,
+            | SandboxError::InvalidOwnerLease
+            | SandboxError::InvalidEgressLease => RpcFailureCode::InvalidLease,
+            SandboxError::InvalidEgressPolicyBinding => RpcFailureCode::InvalidEgressPolicyBinding,
+            SandboxError::LaunchFenceMismatch => RpcFailureCode::LaunchFenceMismatch,
+            SandboxError::LaunchBindingMismatch => RpcFailureCode::LaunchBindingMismatch,
             SandboxError::MissingCapability { .. } => RpcFailureCode::MissingCapability,
             SandboxError::OwnershipMismatch => RpcFailureCode::OwnershipMismatch,
             SandboxError::ShardNotFound => RpcFailureCode::ShardNotFound,
@@ -140,6 +148,8 @@ enum RpcRequest {
         shard_id: ShardId,
         worker_id: WorkerId,
         worker_epoch: u64,
+        tenant_id: TenantId,
+        dedicated_egress: DedicatedEgressSpec,
         lease_ttl_ms: u64,
     },
     RenewOwnerLease {
@@ -216,9 +226,11 @@ impl SandboxRpcClient {
         }
         let response = self
             .exchange(RpcRequest::CreateShard {
-                shard_id: spec.shard_id,
-                worker_id: spec.worker_id,
-                worker_epoch: spec.worker_epoch,
+                shard_id: spec.shard_id().clone(),
+                worker_id: spec.worker_id().clone(),
+                worker_epoch: spec.worker_epoch(),
+                tenant_id: spec.tenant_id().clone(),
+                dedicated_egress: spec.dedicated_egress().clone(),
                 lease_ttl_ms,
             })
             .await?;
@@ -878,6 +890,8 @@ where
                                     shard_id,
                                     worker_id,
                                     worker_epoch,
+                                    tenant_id,
+                                    dedicated_egress,
                                     lease_ttl_ms,
                                 } => {
                                     let lease_ttl = Duration::from_millis(lease_ttl_ms);
@@ -890,25 +904,31 @@ where
                                         })
                                     } else {
                                         let now = Instant::now();
-                                        let spec = LaunchSpec::production(
+                                        match LaunchSpec::from_wire(
+                                            tenant_id,
                                             shard_id,
                                             worker_id.clone(),
                                             worker_epoch,
-                                        );
-                                        match supervisor
-                                            .create_shard(
-                                                spec,
-                                                WorkerOwnership::new(
-                                                    worker_id,
-                                                    worker_epoch,
-                                                    now + lease_ttl,
+                                            dedicated_egress,
+                                        ) {
+                                            Ok(spec) => match supervisor
+                                                .create_shard(
+                                                    spec,
+                                                    WorkerOwnership::new(
+                                                        worker_id,
+                                                        worker_epoch,
+                                                        now + lease_ttl,
+                                                    ),
+                                                )
+                                                .await
+                                            {
+                                                Ok(outcome) => RpcResponse::Success(
+                                                    RpcSuccess::CreateShard(outcome),
                                                 ),
-                                            )
-                                            .await
-                                        {
-                                            Ok(outcome) => RpcResponse::Success(
-                                                RpcSuccess::CreateShard(outcome),
-                                            ),
+                                                Err(error) => {
+                                                    RpcResponse::Failure(error.into())
+                                                }
+                                            },
                                             Err(error) => RpcResponse::Failure(error.into()),
                                         }
                                     }

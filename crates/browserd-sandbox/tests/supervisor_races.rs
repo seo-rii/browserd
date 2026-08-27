@@ -4,11 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{ShardId, WorkerId};
+use browserd_core::{
+    EgressFence, LaunchGeneration, OwnerFence, RouteGeneration, SessionId, SessionIncarnation,
+    ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+};
 use browserd_sandbox::{
-    CleanupReason, CreateShardOutcome, InspectResources, KillShardOutcome, LaunchSpec,
-    RenewLeaseError, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
-    SandboxSupervisor, SupervisorConfig, WorkerOwnership,
+    CleanupReason, CreateShardOutcome, DedicatedEgressSpec, EgressPolicyBinding, InspectResources,
+    KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxCapabilities,
+    SandboxError, SandboxHandle, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -89,6 +92,26 @@ fn worker() -> WorkerId {
     WorkerId::new("race-worker").expect("worker should be valid")
 }
 
+fn launch_spec(shard_id: ShardId) -> LaunchSpec {
+    let worker_epoch = WorkerEpoch::new(7).expect("worker epoch is positive");
+    let egress_fence = EgressFence::new(
+        ShardFence::new(
+            OwnerFence::new(worker(), worker_epoch),
+            shard_id,
+            LaunchGeneration::new(1).expect("launch generation is positive"),
+        ),
+        RouteGeneration::new(1).expect("route generation is positive"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("session incarnation is positive"),
+    );
+    let policy_binding =
+        EgressPolicyBinding::new("test-public-web", [1; 32]).expect("policy binding is valid");
+    let dedicated_egress =
+        DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_secs(5))
+            .expect("dedicated egress spec is valid");
+    LaunchSpec::production(TenantId::new(), dedicated_egress)
+}
+
 #[tokio::test]
 async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard() {
     let backend = GatedBackend {
@@ -112,7 +135,7 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
         tokio::spawn(async move {
             supervisor
                 .create_shard(
-                    LaunchSpec::production(shard_id, worker(), 7),
+                    launch_spec(shard_id),
                     WorkerOwnership::new(worker(), 7, now + Duration::from_secs(10)),
                 )
                 .await
@@ -194,7 +217,7 @@ async fn cancellation_or_expiry_during_provision_surfaces_incomplete_cleanup() {
             tokio::spawn(async move {
                 supervisor
                     .create_shard(
-                        LaunchSpec::production(shard_id, worker(), 7),
+                        launch_spec(shard_id),
                         WorkerOwnership::new(worker(), 7, now + Duration::from_secs(10)),
                     )
                     .await
@@ -254,7 +277,7 @@ async fn concurrent_renew_and_duplicate_kill_have_one_cleanup_owner() {
     let now = Instant::now();
     supervisor
         .create_shard(
-            LaunchSpec::production(shard_id.clone(), worker(), 7),
+            launch_spec(shard_id.clone()),
             WorkerOwnership::new(worker(), 7, now + Duration::from_secs(10)),
         )
         .await
