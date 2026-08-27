@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use browserd_core::{
-    ActionId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId, ShardId,
-    SnapshotId, TenantId, WorkerId,
+    ActionId, ApprovalId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId,
+    ShardId, SnapshotId, TenantId, WorkerId,
 };
 use uuid::{Uuid, Version};
 
@@ -52,6 +52,7 @@ fn externally_persisted_ids_are_uuid_v7_and_round_trip() {
     assert_uuid_v7_id_contract!(SessionId);
     assert_uuid_v7_id_contract!(ShardId);
     assert_uuid_v7_id_contract!(ActionId);
+    assert_uuid_v7_id_contract!(ApprovalId);
     assert_uuid_v7_id_contract!(ArtifactId);
 }
 
@@ -93,6 +94,7 @@ fn parsing_and_deserialization_reject_the_wrong_uuid_version() {
     let time_ordered = Uuid::now_v7();
 
     assert!(random.to_string().parse::<TenantId>().is_err());
+    assert!(random.to_string().parse::<ApprovalId>().is_err());
     assert!(time_ordered.to_string().parse::<PageId>().is_err());
 
     let random_json = serde_json::to_string(&random).unwrap_or_default();

@@ -11,8 +11,8 @@ mod state;
 
 pub use error::{ErrorCode, ErrorSemantics, ResponseRepresentation, RetryClass};
 pub use identifiers::{
-    ActionId, ArtifactId, IdParseError, InvalidWorkerId, LeaseId, OperationId, PageId, PrincipalId,
-    SessionId, ShardId, SnapshotId, TenantId, WorkerId,
+    ActionId, ApprovalId, ArtifactId, IdParseError, InvalidWorkerId, LeaseId, OperationId, PageId,
+    PrincipalId, SessionId, ShardId, SnapshotId, TenantId, WorkerId,
 };
 pub use isolation::{IsolationDecision, IsolationEscalation, IsolationPolicy, IsolationProfile};
 pub use placement::{

@@ -128,6 +128,7 @@ uuid_id!(
 uuid_id!(SessionId, "session ID", Version::SortRand, Uuid::now_v7());
 uuid_id!(ShardId, "shard ID", Version::SortRand, Uuid::now_v7());
 uuid_id!(ActionId, "action ID", Version::SortRand, Uuid::now_v7());
+uuid_id!(ApprovalId, "approval ID", Version::SortRand, Uuid::now_v7());
 uuid_id!(ArtifactId, "artifact ID", Version::SortRand, Uuid::now_v7());
 
 uuid_id!(PageId, "page ID", Version::Random, Uuid::new_v4());
