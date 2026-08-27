@@ -12,8 +12,8 @@ use browserd_egress::{
     TcpConnector, TokioResolver,
 };
 use browserd_egress_control::{
-    ActiveInstallResponse, PendingInstall, ReceiveInstallError, ServerCommitError,
-    receive_install_request,
+    ActiveInstallResponse, ControlRequest, EpochProbeError, PendingInstall, ReceiveInstallError,
+    ServerCommitError, receive_control_request, receive_install_request,
 };
 use tokio::net::UnixStream;
 
@@ -313,6 +313,33 @@ impl EgressDaemon {
         self.install_pending(pending).await
     }
 
+    pub async fn handle_control_stream(
+        &self,
+        stream: UnixStream,
+        expected_peer_uid: u32,
+    ) -> Result<Option<ActiveInstallResponse>, DaemonControlError> {
+        match receive_control_request(stream, expected_peer_uid)
+            .await
+            .map_err(DaemonControlError::Receive)?
+        {
+            ControlRequest::EpochProbe(probe) => {
+                probe
+                    .respond(self.daemon_epoch.get())
+                    .await
+                    .map_err(DaemonControlError::EpochProbe)?;
+                Ok(None)
+            }
+            ControlRequest::Install(offer) => {
+                self.validate_install_metadata(offer.request())?;
+                let pending = offer
+                    .receive_listener()
+                    .await
+                    .map_err(DaemonControlError::Receive)?;
+                self.install_pending(pending).await.map(Some)
+            }
+        }
+    }
+
     pub async fn install_pending(
         &self,
         pending: PendingInstall,
@@ -509,6 +536,7 @@ pub enum DaemonControlError {
     InconsistentReceipt,
     Manager(AttachmentManagerError),
     Receive(ReceiveInstallError),
+    EpochProbe(EpochProbeError),
     Commit(ServerCommitError),
     TransactionTask(tokio::task::JoinError),
 }
@@ -533,6 +561,7 @@ impl fmt::Display for DaemonControlError {
             Self::InconsistentReceipt => formatter.write_str("egress receipt is inconsistent"),
             Self::Manager(error) => write!(formatter, "attachment manager failed: {error}"),
             Self::Receive(error) => write!(formatter, "listener receipt failed: {error}"),
+            Self::EpochProbe(error) => write!(formatter, "epoch probe failed: {error}"),
             Self::Commit(error) => write!(formatter, "listener commit failed: {error}"),
             Self::TransactionTask(error) => {
                 write!(formatter, "listener transaction task failed: {error}")
@@ -546,6 +575,7 @@ impl Error for DaemonControlError {
         match self {
             Self::Manager(error) => Some(error),
             Self::Receive(error) => Some(error),
+            Self::EpochProbe(error) => Some(error),
             Self::Commit(error) => Some(error),
             Self::TransactionTask(error) => Some(error),
             _ => None,

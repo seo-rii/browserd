@@ -457,7 +457,9 @@ async fn run_install_server(
                 let daemon = Arc::clone(&daemon);
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let _ = daemon.install_stream(stream, expected_peer_uid).await;
+                    let _ = daemon
+                        .handle_control_stream(stream, expected_peer_uid)
+                        .await;
                 });
             }
         }

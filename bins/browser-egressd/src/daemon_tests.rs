@@ -15,8 +15,10 @@ use browserd_egress::{
     IngressHandlerError, QuotaLimits,
 };
 use browserd_egress_control::{
-    ClientInstallError, InstallRequest, ServerCommitError, receive_listener, send_listener,
+    ClientInstallError, EpochProbeRequest, InstallRequest, ServerCommitError, receive_listener,
+    send_epoch_probe, send_listener,
 };
+use nix::sys::stat::fstat;
 use nix::unistd::Uid;
 use tokio::net::{TcpStream, UnixStream};
 
@@ -113,18 +115,50 @@ fn install_request(prepared: &super::PreparedRouteResponse) -> InstallRequest {
 }
 
 #[tokio::test]
+async fn unix_control_probe_returns_the_nonce_bound_current_daemon_epoch() {
+    let daemon = Arc::new(daemon(8));
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair must open");
+    let server = tokio::spawn({
+        let daemon = Arc::clone(&daemon);
+        async move {
+            daemon
+                .handle_control_stream(server_stream, Uid::current().as_raw())
+                .await
+        }
+    });
+    let request = EpochProbeRequest::new(LeaseId::new());
+    let response = send_epoch_probe(client_stream, request.clone())
+        .await
+        .expect("authenticated epoch proof should succeed");
+
+    assert_eq!(response.protocol_version(), request.protocol_version());
+    assert_eq!(response.nonce(), request.nonce());
+    assert_eq!(response.current_daemon_epoch(), epoch().get());
+    assert_eq!(
+        server
+            .await
+            .expect("server task must join")
+            .expect("control request should succeed"),
+        None
+    );
+}
+
+#[tokio::test]
 async fn prepare_install_status_and_revoke_are_one_full_fence_transaction() {
     let _listener_test = LISTENER_TEST_LOCK.lock().await;
     let daemon = Arc::new(daemon(8));
     let route_fence = fence(1);
     let prepared = prepare(&daemon, route_fence.clone(), [7; 32]);
     let (expected_address, listener) = listener();
+    let listener_inode = fstat(&listener)
+        .expect("listener identity must be readable")
+        .st_ino;
     let (client_stream, server_stream) = UnixStream::pair().expect("control pair must open");
     let server = tokio::spawn({
         let daemon = Arc::clone(&daemon);
         async move {
             daemon
-                .install_stream(server_stream, Uid::current().as_raw())
+                .handle_control_stream(server_stream, Uid::current().as_raw())
                 .await
         }
     });
@@ -138,7 +172,7 @@ async fn prepare_install_status_and_revoke_are_one_full_fence_transaction() {
             .await
             .expect("server task must join")
             .expect("install succeeds"),
-        active
+        Some(active.clone())
     );
 
     let status = daemon
@@ -146,7 +180,7 @@ async fn prepare_install_status_and_revoke_are_one_full_fence_transaction() {
         .expect("status must resolve");
     assert_eq!(status.state(), AttachmentState::Active);
     assert_eq!(status.active(), Some(&active));
-    TcpStream::connect(expected_address)
+    let client = TcpStream::connect(expected_address)
         .await
         .expect("active listener must accept inside its namespace");
 
@@ -155,7 +189,18 @@ async fn prepare_install_status_and_revoke_are_one_full_fence_transaction() {
         .await
         .expect("revoke must drain and release");
     assert_eq!(released.state(), AttachmentState::Released);
-    StdTcpListener::bind(expected_address).expect("released listener address must be reusable");
+    drop(client);
+    let listener_descriptor = format!("socket:[{listener_inode}]");
+    let open_listener_copies = std::fs::read_dir("/proc/self/fd")
+        .expect("process descriptor directory must be readable")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter(|target| target.to_string_lossy() == listener_descriptor)
+        .count();
+    assert_eq!(
+        open_listener_copies, 0,
+        "released attachment must close every listener capability copy"
+    );
 }
 
 #[tokio::test]
