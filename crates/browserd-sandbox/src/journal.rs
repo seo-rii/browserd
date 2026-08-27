@@ -303,6 +303,7 @@ impl PreparedShardCleanupPermit {
 #[serde(deny_unknown_fields)]
 pub enum PreparedShardEffect {
     CreateFilesystemCgroup,
+    PrepareEgress(EgressFence),
     SpawnGatedChild,
     ProveProcessIdentity,
     AttachCgroup,
@@ -353,6 +354,8 @@ pub struct PreparedShardRecoveryLocators {
     backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
+    egress_daemon_epoch: Option<u64>,
+    egress_fence: Option<EgressFence>,
 }
 
 impl PreparedShardRecoveryLocators {
@@ -385,7 +388,22 @@ impl PreparedShardRecoveryLocators {
             backend_token,
             cgroup_path,
             runtime_path,
+            egress_daemon_epoch: None,
+            egress_fence: None,
         })
+    }
+
+    pub fn with_egress_binding(
+        mut self,
+        daemon_epoch: u64,
+        egress_fence: EgressFence,
+    ) -> Result<Self, PreparedShardJournalError> {
+        if daemon_epoch == 0 {
+            return Err(PreparedShardJournalError::InvalidLocators);
+        }
+        self.egress_daemon_epoch = Some(daemon_epoch);
+        self.egress_fence = Some(egress_fence);
+        Ok(self)
     }
 
     #[must_use]
@@ -402,6 +420,16 @@ impl PreparedShardRecoveryLocators {
     pub fn runtime_path(&self) -> &Path {
         &self.runtime_path
     }
+
+    #[must_use]
+    pub const fn egress_daemon_epoch(&self) -> Option<u64> {
+        self.egress_daemon_epoch
+    }
+
+    #[must_use]
+    pub const fn egress_fence(&self) -> Option<&EgressFence> {
+        self.egress_fence.as_ref()
+    }
 }
 
 impl fmt::Debug for PreparedShardRecoveryLocators {
@@ -411,6 +439,10 @@ impl fmt::Debug for PreparedShardRecoveryLocators {
             .field("backend_token", &"[REDACTED]")
             .field("cgroup_path", &self.cgroup_path)
             .field("runtime_path", &self.runtime_path)
+            .field(
+                "egress_binding",
+                &self.egress_fence.as_ref().map(|_| "[REDACTED]"),
+            )
             .finish()
     }
 }
@@ -421,6 +453,10 @@ struct StoredPreparedShardRecoveryLocators {
     backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
+    #[serde(default)]
+    egress_daemon_epoch: Option<u64>,
+    #[serde(default)]
+    egress_fence: Option<EgressFence>,
 }
 
 impl From<&PreparedShardRecoveryLocators> for StoredPreparedShardRecoveryLocators {
@@ -429,6 +465,8 @@ impl From<&PreparedShardRecoveryLocators> for StoredPreparedShardRecoveryLocator
             backend_token: locators.backend_token.clone(),
             cgroup_path: locators.cgroup_path.clone(),
             runtime_path: locators.runtime_path.clone(),
+            egress_daemon_epoch: locators.egress_daemon_epoch,
+            egress_fence: locators.egress_fence.clone(),
         }
     }
 }
@@ -437,11 +475,16 @@ impl TryFrom<StoredPreparedShardRecoveryLocators> for PreparedShardRecoveryLocat
     type Error = PreparedShardJournalError;
 
     fn try_from(stored: StoredPreparedShardRecoveryLocators) -> Result<Self, Self::Error> {
-        Self::new(
+        let locators = Self::new(
             stored.backend_token,
             stored.cgroup_path,
             stored.runtime_path,
-        )
+        )?;
+        match (stored.egress_daemon_epoch, stored.egress_fence) {
+            (None, None) => Ok(locators),
+            (Some(epoch), Some(fence)) => locators.with_egress_binding(epoch, fence),
+            _ => Err(PreparedShardJournalError::InvalidLocators),
+        }
     }
 }
 
@@ -584,7 +627,7 @@ pub struct FilePreparedShardJournal {
     records: Mutex<BTreeMap<String, PreparedShardJournalRecord>>,
     limits: PreparedShardJournalLimits,
     recovery_roots: PreparedShardRecoveryRoots,
-    reclaimable_cleanup: Mutex<BTreeMap<String, (PreparedShardCleanupStage, u64)>>,
+    reclaimable_cleanup: Mutex<BTreeMap<(String, PreparedShardCleanupStage), u64>>,
     reconciliation_active: AtomicBool,
     poisoned: AtomicBool,
     fail_after_rename: AtomicBool,
@@ -753,8 +796,8 @@ impl FilePreparedShardJournal {
         let records = read_all_records(&directory, limits, &recovery_roots)?;
         let mut reclaimable_cleanup = BTreeMap::new();
         for (key, record) in &records {
-            if let Some(pending_cleanup) = validate_record(record)?.pending_cleanup {
-                reclaimable_cleanup.insert(key.clone(), pending_cleanup);
+            for (stage, attempt) in validate_record(record)?.pending_cleanup {
+                reclaimable_cleanup.insert((key.clone(), stage), attempt);
             }
         }
         Ok(Self {
@@ -776,6 +819,7 @@ impl FilePreparedShardJournal {
         locators: PreparedShardRecoveryLocators,
     ) -> Result<PreparedShardJournalRecord, PreparedShardJournalError> {
         validate_locator_roots(&locators, &self.recovery_roots)?;
+        validate_recovery_binding(&fence, &locators)?;
         let key = record_key(&fence)?;
         let mut records = self.lock_records()?;
         if let Some(record) = records.get(&key) {
@@ -826,7 +870,7 @@ impl FilePreparedShardJournal {
         }
         let replay = validate_record(record)?;
         if replay.pending_effect.is_some()
-            || replay.pending_cleanup.is_some()
+            || !replay.pending_cleanup.is_empty()
             || record.cleanup.iter().any(|progress| progress.attempts > 0)
         {
             return Err(PreparedShardJournalError::EffectInProgress);
@@ -917,18 +961,27 @@ impl FilePreparedShardJournal {
         }
         let replay = validate_record(record)?;
         let mut reclaimable_cleanup = None;
-        if let Some((pending_stage, pending_attempt)) = replay.pending_cleanup {
-            if pending_stage != stage {
-                return Err(PreparedShardJournalError::CleanupStageInProgress);
-            }
+        if let Some((_, pending_attempt)) = replay
+            .pending_cleanup
+            .iter()
+            .find(|(pending_stage, _)| *pending_stage == stage)
+        {
+            let pending_attempt = *pending_attempt;
+            let reclaimable_key = (key.clone(), stage);
             let reclaimable = self
                 .reclaimable_cleanup
                 .lock()
                 .map_err(|_| PreparedShardJournalError::LockPoisoned)?;
-            if reclaimable.get(&key) != Some(&(pending_stage, pending_attempt)) {
+            if reclaimable.get(&reclaimable_key) != Some(&pending_attempt) {
                 return Err(PreparedShardJournalError::CleanupStageInProgress);
             }
-            reclaimable_cleanup = Some(reclaimable);
+            reclaimable_cleanup = Some((reclaimable, reclaimable_key));
+        } else if replay
+            .pending_cleanup
+            .iter()
+            .any(|(pending_stage, _)| !cleanup_stages_can_overlap(*pending_stage, stage))
+        {
+            return Err(PreparedShardJournalError::CleanupStageInProgress);
         }
         if replay.pending_effect.is_some() && stage != PreparedShardCleanupStage::RevokeEgress {
             return Err(PreparedShardJournalError::CleanupStageOutOfOrder);
@@ -958,8 +1011,8 @@ impl FilePreparedShardJournal {
         validate_record(&updated)?;
         self.ensure_capacity(&records, Some(&key), &updated)?;
         self.persist_record(&key, &updated)?;
-        if let Some(mut reclaimable) = reclaimable_cleanup {
-            reclaimable.remove(&key);
+        if let Some((mut reclaimable, reclaimable_key)) = reclaimable_cleanup {
+            reclaimable.remove(&reclaimable_key);
         }
         records.insert(key, updated.clone());
         Ok(PreparedShardCleanupPermit {
@@ -986,6 +1039,32 @@ impl FilePreparedShardJournal {
         self.finish_cleanup_stage(permit, Some(failure))
     }
 
+    pub(crate) fn abandon_cleanup_stage(
+        &self,
+        permit: &PreparedShardCleanupPermit,
+    ) -> Result<(), PreparedShardJournalError> {
+        let key = record_key(&permit.fence)?;
+        let records = self.lock_records()?;
+        let record = records
+            .get(&key)
+            .ok_or(PreparedShardJournalError::RecordNotFound)?;
+        if record.fence != permit.fence {
+            return Err(PreparedShardJournalError::FenceMismatch);
+        }
+        let replay = validate_record(record)?;
+        if !replay
+            .pending_cleanup
+            .contains(&(permit.stage, permit.attempt))
+        {
+            return Err(PreparedShardJournalError::CleanupPermitMismatch);
+        }
+        self.reclaimable_cleanup
+            .lock()
+            .map_err(|_| PreparedShardJournalError::LockPoisoned)?
+            .insert((key, permit.stage), permit.attempt);
+        Ok(())
+    }
+
     fn finish_cleanup_stage(
         &self,
         permit: &PreparedShardCleanupPermit,
@@ -999,14 +1078,11 @@ impl FilePreparedShardJournal {
         if record.fence != permit.fence {
             return Err(PreparedShardJournalError::FenceMismatch);
         }
-        if record.sequence != permit.sequence {
-            return Err(PreparedShardJournalError::StaleSequence {
-                expected: record.sequence,
-                received: permit.sequence,
-            });
-        }
         let replay = validate_record(record)?;
-        if replay.pending_cleanup != Some((permit.stage, permit.attempt)) {
+        if !replay
+            .pending_cleanup
+            .contains(&(permit.stage, permit.attempt))
+        {
             return Err(PreparedShardJournalError::CleanupPermitMismatch);
         }
         let sequence = next_sequence(record.sequence)?;
@@ -1272,10 +1348,9 @@ where
                     {
                         continue;
                     }
-                    if replay
-                        .pending_cleanup
-                        .is_some_and(|(pending, _)| pending != stage)
-                    {
+                    if replay.pending_cleanup.iter().any(|(pending, _)| {
+                        *pending != stage && !cleanup_stages_can_overlap(*pending, stage)
+                    }) {
                         continue;
                     }
                     let journal_operation = Arc::clone(&journal);
@@ -1763,7 +1838,7 @@ fn next_sequence(current: JournalSequence) -> Result<JournalSequence, PreparedSh
 struct PreparedShardRecordReplay {
     lifecycle: PreparedShardLifecycle,
     pending_effect: Option<PreparedShardEffect>,
-    pending_cleanup: Option<(PreparedShardCleanupStage, u64)>,
+    pending_cleanup: Vec<(PreparedShardCleanupStage, u64)>,
     cleanup: [PreparedShardCleanupProgress; 10],
 }
 
@@ -1773,9 +1848,10 @@ fn validate_record(
     if record.schema_version != SCHEMA_VERSION || record.events.len() > MAX_EVENTS {
         return Err(PreparedShardJournalError::InvalidHistory);
     }
+    validate_recovery_binding(&record.fence, &record.locators)?;
     let mut lifecycle = PreparedShardLifecycle::new(record.fence.clone());
     let mut pending_effect: Option<PreparedShardEffect> = None;
-    let mut pending_cleanup: Option<(PreparedShardCleanupStage, u64)> = None;
+    let mut pending_cleanup = Vec::new();
     let mut expected_sequence = JournalSequence(NonZeroU64::MIN);
     for event in &record.events {
         expected_sequence = next_sequence(expected_sequence)?;
@@ -1838,10 +1914,13 @@ fn validate_record(
                 apply_cleanup_completion(&mut lifecycle, &record.fence, stage)?;
             }
             if progress.status == PreparedShardCleanupStageStatus::InProgress {
-                if pending_cleanup.is_some() {
+                if pending_cleanup
+                    .iter()
+                    .any(|(pending, _)| !cleanup_stages_can_overlap(*pending, stage))
+                {
                     return Err(PreparedShardJournalError::InvalidHistory);
                 }
-                pending_cleanup = Some((stage, progress.attempts));
+                pending_cleanup.push((stage, progress.attempts));
             }
         }
         let attempts = progress.attempts;
@@ -1861,9 +1940,12 @@ fn validate_record(
             )
             .ok_or(PreparedShardJournalError::InvalidHistory)?;
     }
-    if pending_cleanup.is_some() {
+    if !pending_cleanup.is_empty() {
         maximum_cleanup_writes = maximum_cleanup_writes
-            .checked_sub(1)
+            .checked_sub(
+                u64::try_from(pending_cleanup.len())
+                    .map_err(|_| PreparedShardJournalError::InvalidHistory)?,
+            )
             .ok_or(PreparedShardJournalError::InvalidHistory)?;
     }
     if record.cleanup_writes < minimum_cleanup_writes
@@ -1886,6 +1968,17 @@ fn validate_record(
         pending_cleanup,
         cleanup: record.cleanup,
     })
+}
+
+fn validate_recovery_binding(
+    fence: &ShardFence,
+    locators: &PreparedShardRecoveryLocators,
+) -> Result<(), PreparedShardJournalError> {
+    match (locators.egress_daemon_epoch, locators.egress_fence.as_ref()) {
+        (None, None) => Ok(()),
+        (Some(epoch), Some(egress_fence)) if epoch != 0 && egress_fence.shard() == fence => Ok(()),
+        _ => Err(PreparedShardJournalError::InvalidLocators),
+    }
 }
 
 fn cleanup_stage_is_eligible(
@@ -1926,6 +2019,25 @@ fn cleanup_stage_is_eligible(
             .take(PreparedShardCleanupStage::ReleaseEgressGeneration.index())
             .all(completed),
     }
+}
+
+fn cleanup_stages_can_overlap(
+    left: PreparedShardCleanupStage,
+    right: PreparedShardCleanupStage,
+) -> bool {
+    let branch = |stage| match stage {
+        PreparedShardCleanupStage::RevokeEgress
+        | PreparedShardCleanupStage::ConfirmEgressDrained => Some(false),
+        PreparedShardCleanupStage::AbortGate
+        | PreparedShardCleanupStage::KillCgroup
+        | PreparedShardCleanupStage::ConfirmProcessDeath => Some(true),
+        PreparedShardCleanupStage::CloseCapabilities
+        | PreparedShardCleanupStage::CleanupNetworkNamespace
+        | PreparedShardCleanupStage::CleanupRuntimeFilesystem
+        | PreparedShardCleanupStage::RemoveCgroup
+        | PreparedShardCleanupStage::ReleaseEgressGeneration => None,
+    };
+    matches!((branch(left), branch(right)), (Some(left), Some(right)) if left != right)
 }
 
 fn apply_cleanup_begin(
@@ -1983,11 +2095,18 @@ fn apply_effect_begin(
     fence: &ShardFence,
     effect: &PreparedShardEffect,
 ) -> Result<(), PreparedShardJournalError> {
+    if let PreparedShardEffect::PrepareEgress(egress_fence) = effect
+        && (egress_fence.shard() != fence
+            || lifecycle.state() != browserd_core::PreparedShardState::FilesystemCgroupReady)
+    {
+        return Err(PreparedShardJournalError::InvalidHistory);
+    }
     let transition = match effect {
         PreparedShardEffect::SendReleaseToken { .. } => {
             Some(PreparedShardTransition::ReleaseIntentRecorded)
         }
         PreparedShardEffect::CreateFilesystemCgroup
+        | PreparedShardEffect::PrepareEgress(_)
         | PreparedShardEffect::SpawnGatedChild
         | PreparedShardEffect::ProveProcessIdentity
         | PreparedShardEffect::AttachCgroup
@@ -2013,6 +2132,7 @@ fn apply_effect_completion(
         PreparedShardEffect::CreateFilesystemCgroup => {
             Some(PreparedShardTransition::FilesystemCgroupReady)
         }
+        PreparedShardEffect::PrepareEgress(_) => None,
         PreparedShardEffect::SpawnGatedChild => Some(PreparedShardTransition::ChildGated),
         PreparedShardEffect::ProveProcessIdentity => {
             Some(PreparedShardTransition::ProcessIdentityProven)

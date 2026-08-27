@@ -183,12 +183,20 @@ async fn rpc_round_trip_preserves_the_complete_dedicated_egress_launch_contract(
         Duration::from_millis(5),
         Some(nix::unistd::Uid::effective().as_raw()),
     )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(1)
     .expect("RPC config is valid");
     let server = SandboxRpcServer::new(supervisor, rpc_config);
     let server_shutdown = shutdown.clone();
     let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
-    let client = SandboxRpcClient::new(socket, 8 * 1024, Duration::from_millis(200))
-        .expect("client config is valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        8 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        1,
+    )
+    .expect("client config is valid");
     let spec = launch_spec(ShardId::new(), worker(), 7);
 
     assert_eq!(
@@ -335,6 +343,8 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
         Duration::from_millis(5),
         Some(nix::unistd::Uid::effective().as_raw()),
     )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(1)
     .expect("RPC config is valid");
     let server = SandboxRpcServer::new(supervisor, rpc_config);
     let server_shutdown = shutdown.clone();
@@ -352,6 +362,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
         (
             json!({
                 "operation": "create_shard",
+                "sandboxd_epoch": 1,
                 "shard_id": ShardId::new(),
                 "worker_id": spec.worker_id(),
                 "worker_epoch": spec.worker_epoch(),
@@ -364,6 +375,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
         (
             json!({
                 "operation": "create_shard",
+                "sandboxd_epoch": 1,
                 "shard_id": spec.shard_id(),
                 "worker_id": WorkerId::new("conflicting-worker").expect("worker ID is valid"),
                 "worker_epoch": spec.worker_epoch(),
@@ -376,6 +388,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
         (
             json!({
                 "operation": "create_shard",
+                "sandboxd_epoch": 1,
                 "shard_id": spec.shard_id(),
                 "worker_id": spec.worker_id(),
                 "worker_epoch": spec.worker_epoch() + 1,
@@ -388,6 +401,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
         (
             json!({
                 "operation": "create_shard",
+                "sandboxd_epoch": 1,
                 "shard_id": spec.shard_id(),
                 "worker_id": spec.worker_id(),
                 "worker_epoch": spec.worker_epoch(),
@@ -400,6 +414,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
         (
             json!({
                 "operation": "create_shard",
+                "sandboxd_epoch": 1,
                 "shard_id": spec.shard_id(),
                 "worker_id": spec.worker_id(),
                 "worker_epoch": spec.worker_epoch(),

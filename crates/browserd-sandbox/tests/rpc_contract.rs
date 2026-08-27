@@ -14,7 +14,8 @@ use browserd_sandbox::{
     ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec, EgressPolicyBinding,
     InspectResources, KillShardOutcome, LaunchSpec, RpcFailureCode, SandboxBackend,
     SandboxCapabilities, SandboxError, SandboxHandle, SandboxRpcClient, SandboxRpcConfig,
-    SandboxRpcError, SandboxRpcServer, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
+    SandboxRpcError, SandboxRpcPeerBinding, SandboxRpcServer, SandboxSupervisor, SupervisorConfig,
+    WorkerOwnership,
 };
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use serde_json::json;
@@ -24,6 +25,8 @@ use tokio::net::unix::pipe::{Receiver, Sender};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+const SANDBOXD_EPOCH: u64 = 73;
 
 #[derive(Clone, Default)]
 struct RecordingBackend {
@@ -179,6 +182,11 @@ impl SandboxBackend for ClaimingBackend {
             .ok_or(SandboxError::CdpPipesAlreadyClaimed)
     }
 
+    async fn activate(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        self.inner.record("activate");
+        Ok(())
+    }
+
     async fn revoke_egress(
         &self,
         handle: &SandboxHandle,
@@ -210,13 +218,17 @@ fn worker() -> WorkerId {
     WorkerId::new("worker-rpc-1").expect("worker ID is valid")
 }
 
+fn launch_generation() -> LaunchGeneration {
+    LaunchGeneration::new(1).expect("launch generation is positive")
+}
+
 fn launch_spec(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> LaunchSpec {
     let worker_epoch = WorkerEpoch::new(worker_epoch).expect("worker epoch is positive");
     let egress_fence = EgressFence::new(
         ShardFence::new(
             OwnerFence::new(worker_id, worker_epoch),
             shard_id,
-            LaunchGeneration::new(1).expect("launch generation is positive"),
+            launch_generation(),
         ),
         RouteGeneration::new(1).expect("route generation is positive"),
         SessionId::new(),
@@ -244,6 +256,8 @@ fn rpc_config() -> SandboxRpcConfig {
         Duration::from_millis(5),
         Some(nix::unistd::Uid::effective().as_raw()),
     )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(SANDBOXD_EPOCH)
     .expect("RPC config is valid")
 }
 
@@ -362,6 +376,117 @@ fn rpc_server_requires_an_explicit_local_peer_uid() {
 }
 
 #[tokio::test]
+async fn rpc_client_rejects_an_unexpected_supervisor_uid_before_sending_a_request() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let server = SandboxRpcServer::new(supervisor(backend), rpc_config());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let actual_uid = nix::unistd::Uid::effective().as_raw();
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        actual_uid.wrapping_add(1),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+
+    assert!(matches!(
+        client
+            .inspect_resources(&ShardId::new(), 9, launch_generation())
+            .await,
+        Err(SandboxRpcError::PeerUidMismatch { .. })
+    ));
+    assert!(observed_backend.events().is_empty());
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn stale_sandboxd_incarnation_is_rejected_before_any_backend_effect() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let server = SandboxRpcServer::new(supervisor(backend), rpc_config());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH + 1,
+    )
+    .expect("client config is valid");
+
+    assert!(matches!(
+        client
+            .inspect_resources(&ShardId::new(), 9, launch_generation())
+            .await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(observed_backend.events().is_empty());
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn exact_peer_binding_rejects_a_same_uid_request_for_another_worker() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let uid = nix::unistd::Uid::effective().as_raw();
+    let config = rpc_config()
+        .with_peer_binding(
+            SandboxRpcPeerBinding::new(uid, worker(), 9).expect("peer binding should be valid"),
+        )
+        .expect("peer UID should match the RPC configuration");
+    let server = SandboxRpcServer::new(supervisor(backend), config);
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        uid,
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    let wrong_worker =
+        WorkerId::new("worker-rpc-same-uid-impostor").expect("impostor worker ID should be valid");
+
+    assert!(matches!(
+        client
+            .create_shard(
+                launch_spec(ShardId::new(), wrong_worker, 9),
+                Duration::from_millis(80),
+            )
+            .await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(
+        observed_backend.events().is_empty(),
+        "an unauthorized same-UID request must be rejected before any backend effect"
+    );
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
 async fn local_rpc_round_trips_fenced_lifecycle_operations() {
     let temporary = tempdir().expect("temporary directory is available");
     let socket = temporary.path().join("sandboxd.sock");
@@ -374,6 +499,8 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
         socket,
         rpc_config().max_frame_bytes(),
         Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
     )
     .expect("client config is valid");
     let shard_id = ShardId::new();
@@ -396,7 +523,9 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
         })
     ));
     assert_eq!(
-        client.inspect_resources(&shard_id, 9).await,
+        client
+            .inspect_resources(&shard_id, 9, launch_generation())
+            .await,
         Ok(InspectResources {
             memory_current_bytes: 10,
             memory_peak_bytes: 20,
@@ -405,7 +534,9 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
         })
     );
     assert!(matches!(
-        client.inspect_resources(&shard_id, 8).await,
+        client
+            .inspect_resources(&shard_id, 8, launch_generation())
+            .await,
         Err(SandboxRpcError::Remote {
             code: RpcFailureCode::WorkerEpochMismatch,
             ..
@@ -413,13 +544,18 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
     ));
     assert!(
         client
-            .renew_owner_lease(&shard_id, 9, Duration::from_millis(90))
+            .renew_owner_lease(&shard_id, 9, launch_generation(), Duration::from_millis(90))
             .await
             .is_ok()
     );
     assert!(matches!(
         client
-            .kill_shard(&shard_id, 9, CleanupReason::Administrative)
+            .kill_shard(
+                &shard_id,
+                9,
+                launch_generation(),
+                CleanupReason::Administrative,
+            )
             .await,
         Ok(KillShardOutcome::Terminated(_))
     ));
@@ -435,6 +571,7 @@ async fn claim_cdp_pipes_transfers_exact_capabilities_once() {
     let listener = UnixListener::bind(&socket).expect("Unix socket binds");
     let shutdown = CancellationToken::new();
     let (backend, mut command_reader, mut event_writer) = ClaimingBackend::new();
+    let backend_view = backend.clone();
     let supervisor_config =
         SupervisorConfig::new(Duration::from_millis(100), Duration::from_secs(1))
             .expect("lease ordering is valid");
@@ -446,6 +583,8 @@ async fn claim_cdp_pipes_transfers_exact_capabilities_once() {
         socket,
         rpc_config().max_frame_bytes(),
         Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
     )
     .expect("client config is valid");
     let shard_id = ShardId::new();
@@ -459,25 +598,39 @@ async fn claim_cdp_pipes_transfers_exact_capabilities_once() {
             .await,
         Ok(CreateShardOutcome::Created)
     );
+    assert_eq!(
+        backend_view.inner.events(),
+        ["provision"],
+        "create must leave the launch gate closed until the receipted CDP handoff"
+    );
     let wrong_worker = WorkerId::new("worker-rpc-impostor").expect("worker ID is valid");
     assert!(matches!(
-        client.claim_cdp_pipes(&shard_id, &wrong_worker, 12).await,
+        client
+            .claim_cdp_pipes(&shard_id, &wrong_worker, 12, launch_generation())
+            .await,
         Err(SandboxRpcError::Remote {
             code: RpcFailureCode::OwnershipMismatch,
             ..
         })
     ));
     assert!(matches!(
-        client.claim_cdp_pipes(&shard_id, &worker(), 11).await,
+        client
+            .claim_cdp_pipes(&shard_id, &worker(), 11, launch_generation())
+            .await,
         Err(SandboxRpcError::Remote {
             code: RpcFailureCode::WorkerEpochMismatch,
             ..
         })
     ));
     let pipes = client
-        .claim_cdp_pipes(&shard_id, &worker(), 12)
+        .claim_cdp_pipes(&shard_id, &worker(), 12, launch_generation())
         .await
         .expect("the exact owner should receive the CDP capabilities");
+    assert_eq!(
+        backend_view.inner.events(),
+        ["provision", "activate"],
+        "activation may occur only after the descriptor handoff final receipt"
+    );
     let (command_writer, event_reader) = pipes.into_owned_fds();
     let mut command_writer =
         Sender::from_owned_fd(command_writer).expect("command writer becomes async");
@@ -525,7 +678,9 @@ async fn claim_cdp_pipes_transfers_exact_capabilities_once() {
     );
 
     assert!(matches!(
-        client.claim_cdp_pipes(&shard_id, &worker(), 12).await,
+        client
+            .claim_cdp_pipes(&shard_id, &worker(), 12, launch_generation())
+            .await,
         Err(SandboxRpcError::Remote {
             code: RpcFailureCode::CdpPipesAlreadyClaimed,
             ..
@@ -544,10 +699,18 @@ async fn client_requires_server_completion_ack_before_reporting_claim_success() 
     let fake_server = tokio::spawn(async move {
         drop(accept_fake_claim_through_final_receipt(&listener).await);
     });
-    let client = SandboxRpcClient::new(socket, 4 * 1024, Duration::from_millis(500))
-        .expect("client config is valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(500),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
 
-    let result = client.claim_cdp_pipes(&ShardId::new(), &worker(), 16).await;
+    let result = client
+        .claim_cdp_pipes(&ShardId::new(), &worker(), 16, launch_generation())
+        .await;
     fake_server.await.expect("fake server finishes");
 
     assert!(
@@ -607,13 +770,22 @@ async fn cancelling_claim_while_completion_ack_is_pending_requests_exact_shard_c
         drop(handoff_stream);
         Some(request)
     });
-    let client = SandboxRpcClient::new(socket, 4 * 1024, Duration::from_secs(1))
-        .expect("client config is valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_secs(1),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
     let shard_id = ShardId::new();
     let claim_shard_id = shard_id.clone();
     let owner = worker();
-    let claim =
-        tokio::spawn(async move { client.claim_cdp_pipes(&claim_shard_id, &owner, 18).await });
+    let claim = tokio::spawn(async move {
+        client
+            .claim_cdp_pipes(&claim_shard_id, &owner, 18, launch_generation())
+            .await
+    });
 
     tokio::time::timeout(Duration::from_secs(2), final_receipt_read.notified())
         .await
@@ -632,6 +804,7 @@ async fn cancelling_claim_while_completion_ack_is_pending_requests_exact_shard_c
     assert_eq!(cleanup_request["operation"], "kill_shard");
     assert_eq!(cleanup_request["shard_id"], json!(shard_id));
     assert_eq!(cleanup_request["worker_epoch"], 18);
+    assert_eq!(cleanup_request["launch_generation"], 1);
     assert_eq!(cleanup_request["reason"], "browser_failure");
 }
 
@@ -740,13 +913,22 @@ async fn cancellation_cleanup_retries_until_supervisor_confirms_shard_is_gone() 
         drop(handoff_stream);
         (Some(first_request), Some(second_request))
     });
-    let client = SandboxRpcClient::new(socket, 4 * 1024, Duration::from_secs(1))
-        .expect("client config is valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_secs(1),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
     let shard_id = ShardId::new();
     let claim_shard_id = shard_id.clone();
     let owner = worker();
-    let claim =
-        tokio::spawn(async move { client.claim_cdp_pipes(&claim_shard_id, &owner, 19).await });
+    let claim = tokio::spawn(async move {
+        client
+            .claim_cdp_pipes(&claim_shard_id, &owner, 19, launch_generation())
+            .await
+    });
 
     tokio::time::timeout(Duration::from_secs(2), final_receipt_read.notified())
         .await
@@ -768,6 +950,7 @@ async fn cancellation_cleanup_retries_until_supervisor_confirms_shard_is_gone() 
         assert_eq!(cleanup_request["operation"], "kill_shard");
         assert_eq!(cleanup_request["shard_id"], json!(shard_id));
         assert_eq!(cleanup_request["worker_epoch"], 19);
+        assert_eq!(cleanup_request["launch_generation"], 1);
         assert_eq!(cleanup_request["reason"], "browser_failure");
     }
 }
@@ -805,14 +988,24 @@ async fn expired_owner_claim_is_typed_separately_from_an_invalid_lease() {
         Duration::from_secs(5),
         Some(nix::unistd::Uid::effective().as_raw()),
     )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(SANDBOXD_EPOCH)
     .expect("RPC config is valid");
     let server = SandboxRpcServer::new(supervisor, server_config);
     let server_shutdown = shutdown.clone();
     let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
     tokio::time::sleep(Duration::from_millis(1)).await;
-    let client = SandboxRpcClient::new(socket, 4 * 1024, Duration::from_millis(200))
-        .expect("client config is valid");
-    let claim = client.claim_cdp_pipes(&shard_id, &owner, 15).await;
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    let claim = client
+        .claim_cdp_pipes(&shard_id, &owner, 15, launch_generation())
+        .await;
 
     shutdown.cancel();
     assert!(matches!(task.await, Ok(Ok(()))));
@@ -846,6 +1039,8 @@ async fn abandoning_a_ready_descriptor_handoff_kills_the_shard_and_closes_origin
         socket.clone(),
         rpc_config().max_frame_bytes(),
         Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
     )
     .expect("client config is valid");
     let shard_id = ShardId::new();
@@ -865,9 +1060,11 @@ async fn abandoning_a_ready_descriptor_handoff_kills_the_shard_and_closes_origin
         .expect("raw worker connects");
     let request = serde_json::to_vec(&json!({
         "operation": "claim_cdp_pipes",
+        "sandboxd_epoch": SANDBOXD_EPOCH,
         "shard_id": shard_id,
         "worker_id": owner,
-        "worker_epoch": 13
+        "worker_epoch": 13,
+        "launch_generation": 1
     }))
     .expect("raw request encodes");
     let request_length = u32::try_from(request.len())
@@ -938,6 +1135,8 @@ async fn abandoning_after_commit_before_final_receipt_kills_and_closes_every_pip
         socket.clone(),
         rpc_config().max_frame_bytes(),
         Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
     )
     .expect("client config is valid");
     let shard_id = ShardId::new();
@@ -957,9 +1156,11 @@ async fn abandoning_after_commit_before_final_receipt_kills_and_closes_every_pip
         .expect("raw worker connects");
     let request = serde_json::to_vec(&json!({
         "operation": "claim_cdp_pipes",
+        "sandboxd_epoch": SANDBOXD_EPOCH,
         "shard_id": shard_id,
         "worker_id": owner,
-        "worker_epoch": 17
+        "worker_epoch": 17,
+        "launch_generation": 1
     }))
     .expect("raw request encodes");
     let request_length = u32::try_from(request.len())
@@ -1163,11 +1364,19 @@ async fn client_rejects_excess_descriptors_and_closes_every_received_copy() {
         drop(event_reader);
         drop(extra_writer);
     });
-    let client = SandboxRpcClient::new(socket, 4 * 1024, Duration::from_millis(200))
-        .expect("client config is valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
 
     assert!(matches!(
-        client.claim_cdp_pipes(&ShardId::new(), &worker(), 14).await,
+        client
+            .claim_cdp_pipes(&ShardId::new(), &worker(), 14, launch_generation())
+            .await,
         Err(SandboxRpcError::Protocol)
     ));
     fake_server.await.expect("fake server finishes");
@@ -1198,6 +1407,8 @@ async fn supervisor_sweeps_expired_rpc_leases_without_worker_cooperation() {
         socket,
         rpc_config().max_frame_bytes(),
         Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
     )
     .expect("client config is valid");
     let shard_id = ShardId::new();
@@ -1213,7 +1424,9 @@ async fn supervisor_sweeps_expired_rpc_leases_without_worker_cooperation() {
     );
     tokio::time::sleep(Duration::from_millis(60)).await;
     assert!(matches!(
-        client.inspect_resources(&shard_id, 10).await,
+        client
+            .inspect_resources(&shard_id, 10, launch_generation())
+            .await,
         Err(SandboxRpcError::Remote {
             code: RpcFailureCode::ShardNotFound,
             ..
@@ -1250,12 +1463,20 @@ async fn client_timeout_does_not_cancel_an_inflight_provision_and_skip_rollback_
         Duration::from_millis(5),
         Some(nix::unistd::Uid::effective().as_raw()),
     )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(SANDBOXD_EPOCH)
     .expect("RPC config is valid");
     let server = SandboxRpcServer::new(supervisor, server_config);
     let server_shutdown = shutdown.clone();
     let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
-    let client = SandboxRpcClient::new(socket, 4 * 1024, Duration::from_millis(10))
-        .expect("client config is valid");
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(10),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
     let shard_id = ShardId::new();
     let request = {
         let client = client.clone();
@@ -1275,7 +1496,12 @@ async fn client_timeout_does_not_cancel_an_inflight_provision_and_skip_rollback_
     tokio::time::sleep(Duration::from_millis(20)).await;
     release.notify_one();
     tokio::time::sleep(Duration::from_millis(10)).await;
-    assert!(client.inspect_resources(&shard_id, 11).await.is_ok());
+    assert!(
+        client
+            .inspect_resources(&shard_id, 11, launch_generation())
+            .await
+            .is_ok()
+    );
 
     shutdown.cancel();
     assert!(matches!(task.await, Ok(Ok(()))));

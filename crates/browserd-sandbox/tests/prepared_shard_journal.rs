@@ -126,6 +126,7 @@ fn advance_to_release_intent(
     );
     let preparation = [
         PreparedShardEffect::CreateFilesystemCgroup,
+        PreparedShardEffect::PrepareEgress(egress_fence.clone()),
         PreparedShardEffect::SpawnGatedChild,
         PreparedShardEffect::ProveProcessIdentity,
         PreparedShardEffect::AttachCgroup,
@@ -386,6 +387,39 @@ fn crash_after_cgroup_creation_intent_is_recovered_as_cleanup_only() {
         records[0].recovery_disposition(),
         PreparedShardRecoveryDisposition::CleanupOnly
     );
+}
+
+#[test]
+fn recovery_locators_persist_the_exact_egress_fence_and_daemon_epoch() {
+    let directory = tempfile::tempdir().expect("journal directory must be created");
+    let fence = shard_fence();
+    let egress_fence = EgressFence::new(
+        fence.clone(),
+        RouteGeneration::new(9).expect("route generation must be positive"),
+        SessionId::new(),
+        SessionIncarnation::new(3).expect("session incarnation must be positive"),
+    );
+    let locators = PreparedShardRecoveryLocators::new(
+        "backend-token-exact-egress",
+        PathBuf::from("/sys/fs/cgroup/browserd/shard-exact-egress"),
+        PathBuf::from("/run/browserd/shards/shard-exact-egress"),
+    )
+    .expect("recovery locators must be valid")
+    .with_egress_binding(41, egress_fence.clone())
+    .expect("exact egress recovery binding must be valid");
+    let journal =
+        FilePreparedShardJournal::open(directory.path()).expect("prepared-shard journal must open");
+    journal
+        .reserve(fence, locators)
+        .expect("exact recovery binding must be durable");
+    drop(journal);
+
+    let reopened = FilePreparedShardJournal::open(directory.path())
+        .expect("prepared-shard journal must reopen");
+    let records = reopened.records().expect("records must be readable");
+    let recovered = records[0].locators();
+    assert_eq!(recovered.egress_daemon_epoch(), Some(41));
+    assert_eq!(recovered.egress_fence(), Some(&egress_fence));
 }
 
 #[test]
@@ -1464,6 +1498,51 @@ fn same_instance_cannot_reclaim_an_in_progress_cleanup_attempt() {
         )
         .expect("only a reopened journal may reclaim an abandoned attempt");
     assert_eq!(reclaimed.attempt(), 2);
+}
+
+#[test]
+fn egress_revoke_and_gate_abort_intents_can_be_owned_concurrently() {
+    let directory = tempfile::tempdir().expect("journal directory must be created");
+    let fence = shard_fence();
+    let journal =
+        FilePreparedShardJournal::open(directory.path()).expect("prepared-shard journal must open");
+    let record = journal
+        .reserve(
+            fence.clone(),
+            PreparedShardRecoveryLocators::new(
+                "backend-token-parallel-cleanup",
+                PathBuf::from("/sys/fs/cgroup/browserd/parallel-cleanup"),
+                PathBuf::from("/run/browserd/shards/parallel-cleanup"),
+            )
+            .expect("recovery locators must be valid"),
+        )
+        .expect("fence reservation must be durable");
+    let revoke = journal
+        .begin_cleanup_stage(
+            &fence,
+            record.sequence(),
+            PreparedShardCleanupStage::RevokeEgress,
+        )
+        .expect("revoke intent must be durable");
+    let after_revoke = journal
+        .records()
+        .expect("journal must remain readable")
+        .pop()
+        .expect("record must remain");
+    let abort = journal
+        .begin_cleanup_stage(
+            &fence,
+            after_revoke.sequence(),
+            PreparedShardCleanupStage::AbortGate,
+        )
+        .expect("gate abort intent must not wait behind a stalled revoke");
+
+    journal
+        .complete_cleanup_stage(&abort)
+        .expect("the child-side effect may complete first");
+    journal
+        .complete_cleanup_stage(&revoke)
+        .expect("the exact revoke may complete afterwards");
 }
 
 #[test]

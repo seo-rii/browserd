@@ -147,6 +147,7 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
         .renew_owner_lease(
             &shard_id,
             7,
+            LaunchGeneration::new(1).expect("launch generation is positive"),
             now + Duration::from_secs(1),
             now + Duration::from_secs(9),
         )
@@ -154,7 +155,12 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
         .expect("provisioning lease should renew");
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 7, CleanupReason::Administrative)
+            .kill_shard(
+                &shard_id,
+                7,
+                LaunchGeneration::new(1).expect("launch generation is positive"),
+                CleanupReason::Administrative,
+            )
             .await,
         Ok(KillShardOutcome::CancellationRequested)
     );
@@ -163,6 +169,7 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
             .renew_owner_lease(
                 &shard_id,
                 7,
+                LaunchGeneration::new(1).expect("launch generation is positive"),
                 now + Duration::from_secs(2),
                 now + Duration::from_secs(9),
             )
@@ -187,7 +194,12 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
     );
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 7, CleanupReason::Administrative)
+            .kill_shard(
+                &shard_id,
+                7,
+                LaunchGeneration::new(1).expect("launch generation is positive"),
+                CleanupReason::Administrative,
+            )
             .await,
         Ok(KillShardOutcome::AlreadyTerminated)
     );
@@ -235,7 +247,12 @@ async fn cancellation_or_expiry_during_provision_surfaces_incomplete_cleanup() {
         } else {
             assert_eq!(
                 supervisor
-                    .kill_shard(&shard_id, 7, CleanupReason::Administrative)
+                    .kill_shard(
+                        &shard_id,
+                        7,
+                        LaunchGeneration::new(1).expect("launch generation is positive"),
+                        CleanupReason::Administrative,
+                    )
                     .await,
                 Ok(KillShardOutcome::CancellationRequested)
             );
@@ -293,6 +310,7 @@ async fn concurrent_renew_and_duplicate_kill_have_one_cleanup_owner() {
                 .renew_owner_lease(
                     &shard_id,
                     7,
+                    LaunchGeneration::new(1).expect("launch generation is positive"),
                     now + Duration::from_secs(1),
                     now + Duration::from_secs(9),
                 )
@@ -307,7 +325,12 @@ async fn concurrent_renew_and_duplicate_kill_have_one_cleanup_owner() {
         kills.push(tokio::spawn(async move {
             start.wait().await;
             supervisor
-                .kill_shard(&shard_id, 7, CleanupReason::Administrative)
+                .kill_shard(
+                    &shard_id,
+                    7,
+                    LaunchGeneration::new(1).expect("launch generation is positive"),
+                    CleanupReason::Administrative,
+                )
                 .await
         }));
     }

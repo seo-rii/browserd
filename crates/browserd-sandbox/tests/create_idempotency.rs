@@ -249,6 +249,37 @@ async fn cancelling_an_exact_waiter_does_not_cancel_the_provision_owner() {
 }
 
 #[tokio::test]
+async fn disconnecting_the_first_create_waiter_does_not_cancel_the_provision_owner() {
+    let backend = GatedProvisionBackend::with_outcomes([Ok("created")]);
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let spec = launch_spec(
+        TenantId::new(),
+        ShardId::new(),
+        1,
+        "public-web",
+        [31; 32],
+        Duration::from_secs(5),
+    );
+
+    let mut disconnected = Box::pin(supervisor.create_shard(spec.clone(), ownership()));
+    assert!(futures::poll!(disconnected.as_mut()).is_pending());
+    backend.wait_until_entered(1).await;
+    drop(disconnected);
+    backend.release_one();
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            supervisor.create_shard(spec, ownership()),
+        )
+        .await
+        .expect("the supervisor-owned create must finish after its RPC waiter disconnects"),
+        Ok(CreateShardOutcome::AlreadyExists)
+    );
+    assert_eq!(backend.calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
 async fn in_flight_binding_conflicts_are_typed_without_a_second_backend_effect() {
     let backend = GatedProvisionBackend::with_outcomes([Ok("created")]);
     let supervisor = Arc::new(SandboxSupervisor::new(config(), backend.clone()));
@@ -333,7 +364,13 @@ async fn a_waiting_retry_never_holds_the_supervisor_mutex() {
     let now = Instant::now();
     tokio::time::timeout(
         Duration::from_millis(100),
-        supervisor.renew_owner_lease(&shard_id, 17, now, now + Duration::from_secs(5)),
+        supervisor.renew_owner_lease(
+            &shard_id,
+            17,
+            LaunchGeneration::new(1).expect("launch generation should be positive"),
+            now,
+            now + Duration::from_secs(5),
+        ),
     )
     .await
     .expect("a waiting create retry must not hold the supervisor mutex")

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use browserd_core::{LeaseId, ShardId, TenantId, WorkerId};
+use browserd_core::{LaunchGeneration, LeaseId, ShardId, TenantId, WorkerId};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
@@ -34,13 +34,81 @@ const HANDOFF_FRAME_BYTES: usize = 17;
 const SCM_RIGHTS_MAX_FDS: usize = 253;
 const _: () = assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<nix::libc::cmsghdr>());
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxRpcPeerBinding {
+    uid: u32,
+    worker_id: WorkerId,
+    worker_epoch: u64,
+}
+
+#[cfg(test)]
+mod generation_fencing_tests {
+    use super::*;
+
+    #[test]
+    fn every_stateful_rpc_rejects_a_missing_launch_generation() {
+        let shard_id = ShardId::new();
+        for operation in [
+            "renew_owner_lease",
+            "kill_shard",
+            "inspect_resources",
+            "claim_cdp_pipes",
+        ] {
+            let mut request = serde_json::json!({
+                "operation": operation,
+                "sandboxd_epoch": 1,
+                "shard_id": shard_id,
+                "worker_epoch": 7,
+                "lease_ttl_ms": 100,
+                "reason": "administrative",
+                "worker_id": "worker-generation-fence"
+            });
+            if let Some(request) = request.as_object_mut() {
+                if operation != "renew_owner_lease" {
+                    request.remove("lease_ttl_ms");
+                }
+                if operation != "kill_shard" {
+                    request.remove("reason");
+                }
+                if operation != "claim_cdp_pipes" {
+                    request.remove("worker_id");
+                }
+            }
+            assert!(
+                serde_json::from_value::<RpcRequest>(request).is_err(),
+                "{operation} accepted an unfenced request"
+            );
+        }
+    }
+}
+
+impl SandboxRpcPeerBinding {
+    pub fn new(uid: u32, worker_id: WorkerId, worker_epoch: u64) -> Result<Self, SandboxRpcError> {
+        if worker_epoch == 0 {
+            return Err(SandboxRpcError::InvalidConfig);
+        }
+        Ok(Self {
+            uid,
+            worker_id,
+            worker_epoch,
+        })
+    }
+
+    #[must_use]
+    pub const fn uid(&self) -> u32 {
+        self.uid
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxRpcConfig {
     max_frame_bytes: usize,
     max_connections: usize,
     request_timeout: Duration,
     lease_sweep_interval: Duration,
     allowed_uid: Option<u32>,
+    peer_binding: Option<SandboxRpcPeerBinding>,
+    daemon_epoch: u64,
 }
 
 impl SandboxRpcConfig {
@@ -66,11 +134,32 @@ impl SandboxRpcConfig {
             request_timeout,
             lease_sweep_interval,
             allowed_uid,
+            peer_binding: None,
+            daemon_epoch: 0,
         })
     }
 
+    pub fn with_peer_binding(
+        mut self,
+        binding: SandboxRpcPeerBinding,
+    ) -> Result<Self, SandboxRpcError> {
+        if self.allowed_uid != Some(binding.uid) {
+            return Err(SandboxRpcError::InvalidConfig);
+        }
+        self.peer_binding = Some(binding);
+        Ok(self)
+    }
+
+    pub fn with_daemon_epoch(mut self, daemon_epoch: u64) -> Result<Self, SandboxRpcError> {
+        if daemon_epoch == 0 {
+            return Err(SandboxRpcError::InvalidConfig);
+        }
+        self.daemon_epoch = daemon_epoch;
+        Ok(self)
+    }
+
     #[must_use]
-    pub const fn max_frame_bytes(self) -> usize {
+    pub const fn max_frame_bytes(&self) -> usize {
         self.max_frame_bytes
     }
 }
@@ -83,6 +172,7 @@ pub enum RpcFailureCode {
     LaunchFenceMismatch,
     LaunchBindingMismatch,
     MissingCapability,
+    AdmissionClosed,
     OwnershipMismatch,
     ShardNotFound,
     WorkerEpochMismatch,
@@ -109,8 +199,10 @@ impl From<SandboxError> for RpcFailure {
             | SandboxError::InvalidEgressLease => RpcFailureCode::InvalidLease,
             SandboxError::InvalidEgressPolicyBinding => RpcFailureCode::InvalidEgressPolicyBinding,
             SandboxError::LaunchFenceMismatch => RpcFailureCode::LaunchFenceMismatch,
+            SandboxError::LaunchGenerationMismatch => RpcFailureCode::LaunchFenceMismatch,
             SandboxError::LaunchBindingMismatch => RpcFailureCode::LaunchBindingMismatch,
             SandboxError::MissingCapability { .. } => RpcFailureCode::MissingCapability,
+            SandboxError::AdmissionClosed => RpcFailureCode::AdmissionClosed,
             SandboxError::OwnershipMismatch => RpcFailureCode::OwnershipMismatch,
             SandboxError::ShardNotFound => RpcFailureCode::ShardNotFound,
             SandboxError::WorkerEpochMismatch { .. } => RpcFailureCode::WorkerEpochMismatch,
@@ -131,6 +223,7 @@ impl From<RenewLeaseError> for RpcFailure {
         let code = match error {
             RenewLeaseError::ShardNotFound => RpcFailureCode::ShardNotFound,
             RenewLeaseError::WorkerEpochMismatch { .. } => RpcFailureCode::WorkerEpochMismatch,
+            RenewLeaseError::LaunchGenerationMismatch => RpcFailureCode::LaunchFenceMismatch,
             RenewLeaseError::LeaseExpired => RpcFailureCode::LeaseExpired,
             RenewLeaseError::InvalidNewExpiry => RpcFailureCode::InvalidLease,
         };
@@ -142,9 +235,10 @@ impl From<RenewLeaseError> for RpcFailure {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "operation", rename_all = "snake_case")]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum RpcRequest {
     CreateShard {
+        sandboxd_epoch: u64,
         shard_id: ShardId,
         worker_id: WorkerId,
         worker_epoch: u64,
@@ -153,24 +247,62 @@ enum RpcRequest {
         lease_ttl_ms: u64,
     },
     RenewOwnerLease {
+        sandboxd_epoch: u64,
         shard_id: ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         lease_ttl_ms: u64,
     },
     KillShard {
+        sandboxd_epoch: u64,
         shard_id: ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         reason: CleanupReason,
     },
     InspectResources {
+        sandboxd_epoch: u64,
         shard_id: ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     },
     ClaimCdpPipes {
+        sandboxd_epoch: u64,
         shard_id: ShardId,
         worker_id: WorkerId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     },
+}
+
+impl RpcRequest {
+    const fn sandboxd_epoch(&self) -> u64 {
+        match self {
+            Self::CreateShard { sandboxd_epoch, .. }
+            | Self::RenewOwnerLease { sandboxd_epoch, .. }
+            | Self::KillShard { sandboxd_epoch, .. }
+            | Self::InspectResources { sandboxd_epoch, .. }
+            | Self::ClaimCdpPipes { sandboxd_epoch, .. } => *sandboxd_epoch,
+        }
+    }
+
+    fn is_authorized_for(&self, binding: &SandboxRpcPeerBinding) -> bool {
+        match self {
+            Self::CreateShard {
+                worker_id,
+                worker_epoch,
+                ..
+            }
+            | Self::ClaimCdpPipes {
+                worker_id,
+                worker_epoch,
+                ..
+            } => worker_id == &binding.worker_id && *worker_epoch == binding.worker_epoch,
+            Self::RenewOwnerLease { worker_epoch, .. }
+            | Self::KillShard { worker_epoch, .. }
+            | Self::InspectResources { worker_epoch, .. } => *worker_epoch == binding.worker_epoch,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -195,6 +327,8 @@ pub struct SandboxRpcClient {
     socket_path: PathBuf,
     max_frame_bytes: usize,
     request_timeout: Duration,
+    expected_server_uid: u32,
+    expected_daemon_epoch: u64,
 }
 
 impl SandboxRpcClient {
@@ -202,16 +336,40 @@ impl SandboxRpcClient {
         socket_path: impl Into<PathBuf>,
         max_frame_bytes: usize,
         request_timeout: Duration,
+        expected_server_uid: u32,
+        expected_daemon_epoch: u64,
     ) -> Result<Self, SandboxRpcError> {
         let socket_path = socket_path.into();
-        if !socket_path.is_absolute() || max_frame_bytes == 0 || request_timeout.is_zero() {
+        if !socket_path.is_absolute()
+            || max_frame_bytes == 0
+            || request_timeout.is_zero()
+            || expected_daemon_epoch == 0
+        {
             return Err(SandboxRpcError::InvalidConfig);
         }
         Ok(Self {
             socket_path,
             max_frame_bytes,
             request_timeout,
+            expected_server_uid,
+            expected_daemon_epoch,
         })
+    }
+
+    async fn connect(&self) -> Result<UnixStream, SandboxRpcError> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|error| SandboxRpcError::Io(error.to_string()))?;
+        let peer = stream
+            .peer_cred()
+            .map_err(|error| SandboxRpcError::Io(error.to_string()))?;
+        if peer.uid() != self.expected_server_uid {
+            return Err(SandboxRpcError::PeerUidMismatch {
+                expected: self.expected_server_uid,
+                received: peer.uid(),
+            });
+        }
+        Ok(stream)
     }
 
     pub async fn create_shard(
@@ -226,6 +384,7 @@ impl SandboxRpcClient {
         }
         let response = self
             .exchange(RpcRequest::CreateShard {
+                sandboxd_epoch: self.expected_daemon_epoch,
                 shard_id: spec.shard_id().clone(),
                 worker_id: spec.worker_id().clone(),
                 worker_epoch: spec.worker_epoch(),
@@ -244,6 +403,7 @@ impl SandboxRpcClient {
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         lease_ttl: Duration,
     ) -> Result<(), SandboxRpcError> {
         let lease_ttl_ms =
@@ -253,8 +413,10 @@ impl SandboxRpcClient {
         }
         let response = self
             .exchange(RpcRequest::RenewOwnerLease {
+                sandboxd_epoch: self.expected_daemon_epoch,
                 shard_id: shard_id.clone(),
                 worker_epoch,
+                launch_generation,
                 lease_ttl_ms,
             })
             .await?;
@@ -268,12 +430,15 @@ impl SandboxRpcClient {
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         reason: CleanupReason,
     ) -> Result<KillShardOutcome, SandboxRpcError> {
         let response = self
             .exchange(RpcRequest::KillShard {
+                sandboxd_epoch: self.expected_daemon_epoch,
                 shard_id: shard_id.clone(),
                 worker_epoch,
+                launch_generation,
                 reason,
             })
             .await?;
@@ -287,11 +452,14 @@ impl SandboxRpcClient {
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<InspectResources, SandboxRpcError> {
         let response = self
             .exchange(RpcRequest::InspectResources {
+                sandboxd_epoch: self.expected_daemon_epoch,
                 shard_id: shard_id.clone(),
                 worker_epoch,
+                launch_generation,
             })
             .await?;
         match response {
@@ -305,19 +473,20 @@ impl SandboxRpcClient {
         shard_id: &ShardId,
         worker_id: &WorkerId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<ChromiumCdpPipes, SandboxRpcError> {
         let operation = async {
-            let stream = UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|error| SandboxRpcError::Io(error.to_string()))?;
+            let stream = self.connect().await?;
             let codec = LengthDelimitedCodec::builder()
                 .max_frame_length(self.max_frame_bytes)
                 .new_codec();
             let mut framed = Framed::new(stream, codec);
             let encoded = serde_json::to_vec(&RpcRequest::ClaimCdpPipes {
+                sandboxd_epoch: self.expected_daemon_epoch,
                 shard_id: shard_id.clone(),
                 worker_id: worker_id.clone(),
                 worker_epoch,
+                launch_generation,
             })
             .map_err(|error| SandboxRpcError::Serialization(error.to_string()))?;
             if encoded.len() > self.max_frame_bytes {
@@ -361,6 +530,7 @@ impl SandboxRpcClient {
                         .kill_shard(
                             &cleanup_shard_id,
                             worker_epoch,
+                            launch_generation,
                             CleanupReason::BrowserFailure,
                         )
                         .await
@@ -589,9 +759,7 @@ impl SandboxRpcClient {
 
     async fn exchange(&self, request: RpcRequest) -> Result<RpcSuccess, SandboxRpcError> {
         let operation = async {
-            let stream = UnixStream::connect(&self.socket_path)
-                .await
-                .map_err(|error| SandboxRpcError::Io(error.to_string()))?;
+            let stream = self.connect().await?;
             let codec = LengthDelimitedCodec::builder()
                 .max_frame_length(self.max_frame_bytes)
                 .new_codec();
@@ -690,7 +858,7 @@ where
                         continue;
                     };
                     let supervisor = Arc::clone(&self.supervisor);
-                    let config = self.config;
+                    let config = self.config.clone();
                     connections.spawn(async move {
                         let _permit = permit;
                         let codec = LengthDelimitedCodec::builder()
@@ -709,11 +877,23 @@ where
                         let Ok(request) = serde_json::from_slice::<RpcRequest>(&request) else {
                             return;
                         };
+                        if request.sandboxd_epoch() != config.daemon_epoch {
+                            return;
+                        }
+                        if config
+                            .peer_binding
+                            .as_ref()
+                            .is_some_and(|binding| !request.is_authorized_for(binding))
+                        {
+                            return;
+                        }
                         let request = match request {
                             RpcRequest::ClaimCdpPipes {
+                                sandboxd_epoch: _,
                                 shard_id,
                                 worker_id,
                                 worker_epoch,
+                                launch_generation,
                             } => {
                                 let handoff = async {
                                     let pending = match supervisor
@@ -721,6 +901,7 @@ where
                                             &shard_id,
                                             &worker_id,
                                             worker_epoch,
+                                            launch_generation,
                                         )
                                         .await
                                     {
@@ -755,7 +936,7 @@ where
                                         }
                                     };
                                     let claim_completed = supervisor
-                                        .start_cdp_claim_cleanup_guard(&shard_id, worker_epoch);
+                                        .start_cdp_claim_cleanup_guard(&shard_id, worker_epoch, launch_generation);
                                     let transfer_id = pending.transfer_id().clone();
                                     let response = RpcResponse::Success(
                                         RpcSuccess::CdpPipesReady {
@@ -885,8 +1066,10 @@ where
                             }
                             request => request,
                         };
-                        let response = match request {
+                        let response = tokio::time::timeout(config.request_timeout, async {
+                            match request {
                                 RpcRequest::CreateShard {
+                                    sandboxd_epoch: _,
                                     shard_id,
                                     worker_id,
                                     worker_epoch,
@@ -934,8 +1117,10 @@ where
                                     }
                                 }
                                 RpcRequest::RenewOwnerLease {
+                                    sandboxd_epoch: _,
                                     shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                     lease_ttl_ms,
                                 } => {
                                     let now = Instant::now();
@@ -943,6 +1128,7 @@ where
                                         .renew_owner_lease(
                                             &shard_id,
                                             worker_epoch,
+                                            launch_generation,
                                             now,
                                             now + Duration::from_millis(lease_ttl_ms),
                                         )
@@ -953,11 +1139,13 @@ where
                                     }
                                 }
                                 RpcRequest::KillShard {
+                                    sandboxd_epoch: _,
                                     shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                     reason,
                                 } => match supervisor
-                                    .kill_shard(&shard_id, worker_epoch, reason)
+                                    .kill_shard(&shard_id, worker_epoch, launch_generation, reason)
                                     .await
                                 {
                                     Ok(outcome) => {
@@ -966,10 +1154,12 @@ where
                                     Err(error) => RpcResponse::Failure(error.into()),
                                 },
                                 RpcRequest::InspectResources {
+                                    sandboxd_epoch: _,
                                     shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                 } => match supervisor
-                                    .inspect_resources(&shard_id, worker_epoch)
+                                    .inspect_resources(&shard_id, worker_epoch, launch_generation)
                                     .await
                                 {
                                     Ok(resources) => RpcResponse::Success(
@@ -977,7 +1167,18 @@ where
                                     ),
                                     Err(error) => RpcResponse::Failure(error.into()),
                                 },
-                                RpcRequest::ClaimCdpPipes { .. } => return,
+                                RpcRequest::ClaimCdpPipes { .. } => RpcResponse::Failure(
+                                    SandboxError::Backend(
+                                        "claim request escaped the descriptor handoff branch"
+                                            .to_owned(),
+                                    )
+                                    .into(),
+                                ),
+                            }
+                        })
+                        .await;
+                        let Ok(response) = response else {
+                            return;
                         };
                         let Ok(response) = serde_json::to_vec(&response) else {
                             return;
@@ -995,9 +1196,16 @@ where
             }
         };
 
+        connections.abort_all();
         while connections.join_next().await.is_some() {}
         sweeper_shutdown.cancel();
         let _sweeper_result = sweeper.await;
+        let shutdown_report = self.supervisor.shutdown_fail_closed().await;
+        if !shutdown_report.is_complete() {
+            return Err(SandboxRpcError::ShutdownIncomplete {
+                pending_shards: shutdown_report.pending_shards(),
+            });
+        }
         terminal
     }
 }
@@ -1016,6 +1224,8 @@ pub enum SandboxRpcError {
     ConnectionClosed,
     #[error("sandbox RPC protocol response did not match the request")]
     Protocol,
+    #[error("sandbox RPC server UID mismatch: expected {expected}, received {received}")]
+    PeerUidMismatch { expected: u32, received: u32 },
     #[error("sandbox RPC returned invalid CDP capabilities: {0}")]
     InvalidCapabilities(String),
     #[error("sandbox RPC serialization failed: {0}")]
@@ -1029,4 +1239,6 @@ pub enum SandboxRpcError {
     },
     #[error("sandbox RPC connection task failed")]
     ConnectionTaskFailed,
+    #[error("sandbox shutdown left {pending_shards} shard(s) requiring restart reconciliation")]
+    ShutdownIncomplete { pending_shards: usize },
 }

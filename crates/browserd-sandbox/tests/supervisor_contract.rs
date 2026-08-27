@@ -99,6 +99,10 @@ fn worker() -> WorkerId {
     WorkerId::new("worker-apne2-a-001").expect("test worker ID must be valid")
 }
 
+fn launch_generation() -> LaunchGeneration {
+    LaunchGeneration::new(1).expect("launch generation is positive")
+}
+
 fn config() -> SupervisorConfig {
     SupervisorConfig::new(Duration::from_secs(10), Duration::from_secs(30))
         .expect("lease ordering must be valid")
@@ -110,7 +114,7 @@ fn launch_spec(shard_id: ShardId) -> LaunchSpec {
         ShardFence::new(
             OwnerFence::new(worker(), worker_epoch),
             shard_id,
-            LaunchGeneration::new(1).expect("launch generation is positive"),
+            launch_generation(),
         ),
         RouteGeneration::new(1).expect("route generation is positive"),
         SessionId::new(),
@@ -275,7 +279,9 @@ async fn cdp_capability_claim_is_epoch_fenced_and_one_shot() {
         .expect("sandbox creation should succeed");
 
     assert!(matches!(
-        supervisor.claim_cdp_pipes(&shard_id, &worker(), 16).await,
+        supervisor
+            .claim_cdp_pipes(&shard_id, &worker(), 16, launch_generation())
+            .await,
         Err(SandboxError::WorkerEpochMismatch {
             expected: 17,
             actual: 16,
@@ -285,15 +291,19 @@ async fn cdp_capability_claim_is_epoch_fenced_and_one_shot() {
     let other_worker = WorkerId::new("worker-apne2-a-002").expect("test worker ID must be valid");
     assert!(matches!(
         supervisor
-            .claim_cdp_pipes(&shard_id, &other_worker, 17)
+            .claim_cdp_pipes(&shard_id, &other_worker, 17, launch_generation())
             .await,
         Err(SandboxError::OwnershipMismatch)
     ));
     assert_eq!(backend.claim_calls.load(Ordering::Acquire), 0);
-    let claimed = supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await;
+    let claimed = supervisor
+        .claim_cdp_pipes(&shard_id, &worker(), 17, launch_generation())
+        .await;
     assert!(claimed.is_ok());
     assert_eq!(backend.claim_calls.load(Ordering::Acquire), 1);
-    let duplicate = supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await;
+    let duplicate = supervisor
+        .claim_cdp_pipes(&shard_id, &worker(), 17, launch_generation())
+        .await;
     assert!(matches!(
         duplicate,
         Err(SandboxError::CdpPipesAlreadyClaimed)
@@ -318,7 +328,9 @@ async fn expired_owner_cannot_claim_cdp_capabilities_before_the_sweeper_runs() {
     tokio::time::sleep(Duration::from_millis(75)).await;
 
     assert!(matches!(
-        supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await,
+        supervisor
+            .claim_cdp_pipes(&shard_id, &worker(), 17, launch_generation())
+            .await,
         Err(SandboxError::InvalidOwnerLease)
     ));
     assert_eq!(backend.claim_calls.load(Ordering::Acquire), 0);
@@ -341,14 +353,14 @@ async fn concurrent_cdp_claim_is_rejected_before_a_second_backend_effect() {
     let first_shard_id = shard_id.clone();
     let first = tokio::spawn(async move {
         first_supervisor
-            .claim_cdp_pipes(&first_shard_id, &worker(), 17)
+            .claim_cdp_pipes(&first_shard_id, &worker(), 17, launch_generation())
             .await
     });
     claim_entered.notified().await;
 
     let concurrent = tokio::time::timeout(
         Duration::from_millis(100),
-        supervisor.claim_cdp_pipes(&shard_id, &worker(), 17),
+        supervisor.claim_cdp_pipes(&shard_id, &worker(), 17, launch_generation()),
     )
     .await;
     release_claim.notify_one();
@@ -379,12 +391,17 @@ async fn kill_linearized_during_cdp_claim_prevents_stale_capability_handoff() {
     let claim_shard_id = shard_id.clone();
     let claim = tokio::spawn(async move {
         claim_supervisor
-            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17, launch_generation())
             .await
     });
     claim_entered.notified().await;
     let killed = supervisor
-        .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+        .kill_shard(
+            &shard_id,
+            17,
+            launch_generation(),
+            CleanupReason::SecurityViolation,
+        )
         .await;
     assert!(matches!(killed, Ok(KillShardOutcome::Terminated(_))));
 
@@ -419,7 +436,7 @@ async fn lease_expiry_during_cdp_claim_drops_capabilities_and_starts_cleanup() {
     let claim_shard_id = shard_id.clone();
     let claim = tokio::spawn(async move {
         claim_supervisor
-            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17, launch_generation())
             .await
     });
     claim_entered.notified().await;
@@ -458,7 +475,7 @@ async fn cancelling_cdp_claim_caller_drops_returned_fds_and_fails_closed() {
     let claim_shard_id = shard_id.clone();
     let claim = tokio::spawn(async move {
         claim_supervisor
-            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17, launch_generation())
             .await
     });
     claim_entered.notified().await;
@@ -508,7 +525,7 @@ async fn cancelling_claim_during_backend_retries_incomplete_cleanup_to_terminal(
     let claim_shard_id = shard_id.clone();
     let claim = tokio::spawn(async move {
         claim_supervisor
-            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17, launch_generation())
             .await
     });
     tokio::time::timeout(Duration::from_millis(200), claim_entered.notified())
@@ -539,7 +556,12 @@ async fn cancelling_claim_during_backend_retries_incomplete_cleanup_to_terminal(
     assert_eq!(backend.revoke_calls.load(Ordering::Acquire), 2);
     assert!(matches!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::BrowserFailure)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::BrowserFailure,
+            )
             .await,
         Ok(KillShardOutcome::AlreadyTerminated)
     ));
@@ -570,7 +592,8 @@ async fn dropping_cdp_claim_after_delivery_but_before_receipt_fails_closed() {
         .await
         .expect("sandbox creation should succeed");
 
-    let mut claim = Box::pin(supervisor.claim_cdp_pipes(&shard_id, &owner, 17));
+    let mut claim =
+        Box::pin(supervisor.claim_cdp_pipes(&shard_id, &owner, 17, launch_generation()));
     assert!(futures::poll!(claim.as_mut()).is_pending());
     claim_entered.notified().await;
     release_claim.notify_one();
@@ -603,7 +626,8 @@ async fn kill_after_backend_delivery_is_revalidated_before_caller_receipt() {
         .await
         .expect("sandbox creation should succeed");
 
-    let mut claim = Box::pin(supervisor.claim_cdp_pipes(&shard_id, &owner, 17));
+    let mut claim =
+        Box::pin(supervisor.claim_cdp_pipes(&shard_id, &owner, 17, launch_generation()));
     assert!(futures::poll!(claim.as_mut()).is_pending());
     claim_entered.notified().await;
     release_claim.notify_one();
@@ -611,7 +635,12 @@ async fn kill_after_backend_delivery_is_revalidated_before_caller_receipt() {
     tokio::task::yield_now().await;
     assert!(matches!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await,
         Ok(KillShardOutcome::Terminated(_))
     ));
@@ -639,7 +668,7 @@ async fn hung_cdp_backend_claim_is_bounded_and_fails_closed() {
     let claim_shard_id = shard_id.clone();
     let claim = tokio::spawn(async move {
         claim_supervisor
-            .claim_cdp_pipes(&claim_shard_id, &worker(), 17)
+            .claim_cdp_pipes(&claim_shard_id, &worker(), 17, launch_generation())
             .await
     });
     claim_entered.notified().await;
@@ -669,7 +698,9 @@ async fn panicking_cdp_backend_claim_is_caught_and_fails_closed() {
         .await
         .expect("sandbox creation should succeed");
 
-    let result = supervisor.claim_cdp_pipes(&shard_id, &worker(), 17).await;
+    let result = supervisor
+        .claim_cdp_pipes(&shard_id, &worker(), 17, launch_generation())
+        .await;
 
     assert!(matches!(
         result,
@@ -762,6 +793,7 @@ async fn stale_worker_epoch_cannot_renew_or_control_a_shard() {
             .renew_owner_lease(
                 &shard_id,
                 16,
+                launch_generation(),
                 now + Duration::from_secs(5),
                 now + Duration::from_secs(15)
             )
@@ -776,6 +808,7 @@ async fn stale_worker_epoch_cannot_renew_or_control_a_shard() {
             .renew_owner_lease(
                 &shard_id,
                 17,
+                launch_generation(),
                 now + Duration::from_secs(5),
                 now + Duration::from_secs(15)
             )
@@ -846,7 +879,12 @@ async fn cleanup_continues_to_kill_when_route_revocation_reports_failure() {
 
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await
             .expect("cleanup must return its partial result"),
         KillShardOutcome::CleanupIncomplete(CleanupResult {
@@ -881,7 +919,9 @@ async fn explicit_kill_is_idempotent_and_resource_inspection_is_fenced() {
         .expect("sandbox creation must succeed");
 
     assert_eq!(
-        supervisor.inspect_resources(&shard_id, 17).await,
+        supervisor
+            .inspect_resources(&shard_id, 17, launch_generation())
+            .await,
         Ok(InspectResources {
             memory_current_bytes: 123,
             memory_peak_bytes: 456,
@@ -890,16 +930,28 @@ async fn explicit_kill_is_idempotent_and_resource_inspection_is_fenced() {
         })
     );
     assert!(matches!(
-        supervisor.inspect_resources(&shard_id, 18).await,
+        supervisor
+            .inspect_resources(&shard_id, 18, launch_generation())
+            .await,
         Err(SandboxError::WorkerEpochMismatch { .. })
     ));
 
     let first = supervisor
-        .kill_shard(&shard_id, 17, CleanupReason::Administrative)
+        .kill_shard(
+            &shard_id,
+            17,
+            launch_generation(),
+            CleanupReason::Administrative,
+        )
         .await;
     assert!(matches!(first, Ok(KillShardOutcome::Terminated(_))));
     let second = supervisor
-        .kill_shard(&shard_id, 17, CleanupReason::Administrative)
+        .kill_shard(
+            &shard_id,
+            17,
+            launch_generation(),
+            CleanupReason::Administrative,
+        )
         .await;
     assert_eq!(second, Ok(KillShardOutcome::AlreadyTerminated));
     assert_eq!(
@@ -987,7 +1039,12 @@ async fn partial_cleanup_retries_only_failed_stages_before_claiming_termination(
 
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await,
         Ok(KillShardOutcome::CleanupIncomplete(CleanupResult {
             route_revoked: false,
@@ -997,7 +1054,12 @@ async fn partial_cleanup_retries_only_failed_stages_before_claiming_termination(
     );
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await,
         Ok(KillShardOutcome::Terminated(CleanupResult {
             route_revoked: true,
@@ -1007,7 +1069,12 @@ async fn partial_cleanup_retries_only_failed_stages_before_claiming_termination(
     );
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await,
         Ok(KillShardOutcome::AlreadyTerminated)
     );
@@ -1097,7 +1164,12 @@ async fn cleanup_stage_panic_is_bounded_retryable_and_wakes_a_concurrent_waiter(
     let owner_shard_id = shard_id.clone();
     let owner = tokio::spawn(async move {
         owner_supervisor
-            .kill_shard(&owner_shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &owner_shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await
     });
     backend.revoke_started.notified().await;
@@ -1106,7 +1178,12 @@ async fn cleanup_stage_panic_is_bounded_retryable_and_wakes_a_concurrent_waiter(
     let waiter_shard_id = shard_id.clone();
     let waiter = tokio::spawn(async move {
         waiter_supervisor
-            .kill_shard(&waiter_shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &waiter_shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await
     });
     tokio::task::yield_now().await;
@@ -1140,7 +1217,12 @@ async fn cleanup_stage_panic_is_bounded_retryable_and_wakes_a_concurrent_waiter(
     );
     assert_eq!(
         supervisor
-            .kill_shard(&shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await,
         Ok(KillShardOutcome::AlreadyTerminated)
     );
@@ -1153,6 +1235,7 @@ async fn cleanup_stage_panic_is_bounded_retryable_and_wakes_a_concurrent_waiter(
 #[derive(Clone)]
 struct HangingRevokeBackend {
     never_revoke: Arc<Notify>,
+    kill_started: Arc<Notify>,
     events: Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -1185,6 +1268,7 @@ impl SandboxBackend for HangingRevokeBackend {
         _reason: CleanupReason,
     ) -> Result<(), SandboxError> {
         self.events.lock().unwrap().push("kill");
+        self.kill_started.notify_one();
         Ok(())
     }
 
@@ -1202,6 +1286,7 @@ impl SandboxBackend for HangingRevokeBackend {
 async fn hung_revoke_is_bounded_and_never_prevents_security_cgroup_kill() {
     let backend = HangingRevokeBackend {
         never_revoke: Arc::new(Notify::new()),
+        kill_started: Arc::new(Notify::new()),
         events: Arc::new(Mutex::new(Vec::new())),
     };
     let supervisor_config = config()
@@ -1222,7 +1307,12 @@ async fn hung_revoke_is_bounded_and_never_prevents_security_cgroup_kill() {
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(200),
-        supervisor.kill_shard(&shard_id, 17, CleanupReason::SecurityViolation),
+        supervisor.kill_shard(
+            &shard_id,
+            17,
+            launch_generation(),
+            CleanupReason::SecurityViolation,
+        ),
     )
     .await;
     assert!(outcome.is_ok());
@@ -1238,6 +1328,50 @@ async fn hung_revoke_is_bounded_and_never_prevents_security_cgroup_kill() {
         backend.events.lock().unwrap().as_slice(),
         ["revoke-started", "kill", "namespaces"]
     );
+}
+
+#[tokio::test]
+async fn blocked_revoke_cannot_delay_the_independently_journaled_kill_intent() {
+    let backend = HangingRevokeBackend {
+        never_revoke: Arc::new(Notify::new()),
+        kill_started: Arc::new(Notify::new()),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let supervisor_config = config()
+        .with_cleanup_stage_timeout(Duration::from_secs(30))
+        .expect("cleanup timeout should be valid");
+    let supervisor = Arc::new(SandboxSupervisor::new(supervisor_config, backend.clone()));
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, now + Duration::from_secs(10)),
+        )
+        .await
+        .expect("sandbox creation must succeed");
+
+    let cleanup = {
+        let supervisor = Arc::clone(&supervisor);
+        tokio::spawn(async move {
+            supervisor
+                .kill_shard(
+                    &shard_id,
+                    17,
+                    launch_generation(),
+                    CleanupReason::SecurityViolation,
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_millis(100), backend.kill_started.notified())
+        .await
+        .expect("the cgroup kill must start without waiting for route revoke timeout");
+    backend.never_revoke.notify_one();
+    assert!(matches!(
+        cleanup.await.expect("cleanup task should not panic"),
+        Ok(KillShardOutcome::Terminated(_))
+    ));
 }
 
 #[derive(Clone)]
@@ -1309,7 +1443,12 @@ async fn cancelling_cleanup_caller_never_strands_the_cleanup_owner() {
     let cleanup_shard_id = shard_id.clone();
     let cleanup = tokio::spawn(async move {
         cleanup_supervisor
-            .kill_shard(&cleanup_shard_id, 17, CleanupReason::SecurityViolation)
+            .kill_shard(
+                &cleanup_shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::SecurityViolation,
+            )
             .await
     });
     backend.revoke_started.notified().await;
@@ -1324,7 +1463,12 @@ async fn cancelling_cleanup_caller_never_strands_the_cleanup_owner() {
     backend.release_revoke.notify_waiters();
     let retry = tokio::time::timeout(
         Duration::from_millis(200),
-        supervisor.kill_shard(&shard_id, 17, CleanupReason::SecurityViolation),
+        supervisor.kill_shard(
+            &shard_id,
+            17,
+            launch_generation(),
+            CleanupReason::SecurityViolation,
+        ),
     )
     .await;
     assert!(
@@ -1334,5 +1478,52 @@ async fn cancelling_cleanup_caller_never_strands_the_cleanup_owner() {
     assert!(matches!(
         retry.expect("retry must be bounded"),
         Ok(KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated)
+    ));
+}
+
+#[tokio::test]
+async fn supervisor_shutdown_closes_admission_and_cleans_every_active_shard() {
+    let backend = RecordingBackend::production_capable();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let first = ShardId::new();
+    let second = ShardId::new();
+    for shard_id in [&first, &second] {
+        supervisor
+            .create_shard(
+                launch_spec(shard_id.clone()),
+                WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+            )
+            .await
+            .expect("test shard should be created");
+    }
+
+    let report = supervisor.shutdown_fail_closed().await;
+    assert!(
+        report.is_complete(),
+        "shutdown must prove cleanup of every shard"
+    );
+    assert_eq!(report.cleaned_shards(), 2);
+    assert_eq!(
+        backend.events(),
+        [
+            "provision",
+            "provision",
+            "revoke_egress",
+            "kill_cgroup",
+            "cleanup_namespaces",
+            "revoke_egress",
+            "kill_cgroup",
+            "cleanup_namespaces",
+        ]
+    );
+
+    assert!(matches!(
+        supervisor
+            .create_shard(
+                launch_spec(ShardId::new()),
+                WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+            )
+            .await,
+        Err(SandboxError::AdmissionClosed)
     ));
 }

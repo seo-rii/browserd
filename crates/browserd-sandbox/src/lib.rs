@@ -30,7 +30,8 @@ pub use netns_listener::{
     create_dedicated_egress_listener,
 };
 pub use rpc::{
-    RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer,
+    RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcPeerBinding,
+    SandboxRpcServer,
 };
 
 use std::collections::HashMap;
@@ -39,7 +40,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{EgressFence, LeaseId, ShardId, TenantId, WorkerId};
+use browserd_core::{EgressFence, LaunchGeneration, LeaseId, ShardId, TenantId, WorkerId};
 use futures::{FutureExt, future::join_all};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -323,6 +324,13 @@ impl LaunchSpec {
         self.worker_epoch
     }
 
+    pub const fn launch_generation(&self) -> LaunchGeneration {
+        self.dedicated_egress
+            .egress_fence()
+            .shard()
+            .launch_generation()
+    }
+
     pub const fn dedicated_egress(&self) -> &DedicatedEgressSpec {
         &self.dedicated_egress
     }
@@ -384,6 +392,29 @@ pub struct CleanupResult {
     pub namespaces_cleaned: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShutdownReport {
+    cleaned_shards: usize,
+    pending_shards: usize,
+}
+
+impl ShutdownReport {
+    #[must_use]
+    pub const fn is_complete(self) -> bool {
+        self.pending_shards == 0
+    }
+
+    #[must_use]
+    pub const fn cleaned_shards(self) -> usize {
+        self.cleaned_shards
+    }
+
+    #[must_use]
+    pub const fn pending_shards(self) -> usize {
+        self.pending_shards
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InspectResources {
     pub memory_current_bytes: u64,
@@ -415,6 +446,12 @@ pub trait SandboxBackend: Send + Sync + 'static {
 
     async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError>;
 
+    /// Creates all containment and egress state while keeping the Chromium launch gate closed.
+    /// Backends that do not expose a gate may use the legacy `provision` behavior.
+    async fn provision_gated(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        self.provision(spec).await
+    }
+
     /// Transfers the exact runtime's parent-side CDP capabilities at most once.
     /// Returning `Err` must not newly consume the capabilities during that call. The supervisor
     /// may cancel this future after its bounded claim interval; any uncertain effect must remain
@@ -427,6 +464,16 @@ pub trait SandboxBackend: Send + Sync + 'static {
         Err(SandboxError::Backend(
             "CDP pipe claim is unsupported by this sandbox backend".into(),
         ))
+    }
+
+    /// Durably records that the worker receipted the exact CDP capabilities.
+    async fn commit_cdp_claim(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    /// Releases the one-shot launch gate. This must be idempotent after an uncertain response.
+    async fn activate(&self, _handle: &SandboxHandle) -> Result<(), SandboxError> {
+        Ok(())
     }
 
     async fn revoke_egress(
@@ -509,6 +556,7 @@ struct TerminatedShard {
 
 #[derive(Debug, Default)]
 struct SupervisorState {
+    admission_closed: bool,
     active: HashMap<ShardId, ActiveShard>,
     provisioning: HashMap<ShardId, ProvisioningShard>,
     failed: HashMap<ShardId, FailedProvision>,
@@ -538,6 +586,7 @@ pub(crate) struct PendingCdpClaim<B> {
     shard_id: ShardId,
     worker_id: WorkerId,
     worker_epoch: u64,
+    launch_generation: LaunchGeneration,
     transfer_id: LeaseId,
     pipes: Option<ChromiumCdpPipes>,
     receipt_sender: Option<oneshot::Sender<CdpClaimReceipt>>,
@@ -576,6 +625,14 @@ where
                     },
                     CdpClaimReceipt::AlreadyInactive,
                 )),
+                Some(active)
+                    if active.launch_spec.launch_generation() != self.launch_generation =>
+                {
+                    Err((
+                        SandboxError::LaunchGenerationMismatch,
+                        CdpClaimReceipt::AlreadyInactive,
+                    ))
+                }
                 Some(active)
                     if active.cdp_claim != CdpClaimState::InProgress(self.transfer_id.clone()) =>
                 {
@@ -620,6 +677,7 @@ where
                 .cleanup_cdp_claim_until_terminal(
                     &self.shard_id,
                     self.worker_epoch,
+                    self.launch_generation,
                     CleanupReason::BrowserFailure,
                 )
                 .await;
@@ -632,6 +690,7 @@ where
                 .cleanup_cdp_claim_until_terminal(
                     &self.shard_id,
                     self.worker_epoch,
+                    self.launch_generation,
                     CleanupReason::BrowserFailure,
                 )
                 .await;
@@ -646,6 +705,7 @@ where
             supervisor: self.supervisor.clone(),
             shard_id: self.shard_id.clone(),
             worker_epoch: self.worker_epoch,
+            launch_generation: self.launch_generation,
             pipes: Some(pipes),
             final_receipt_sender: Some(final_receipt_sender),
         })
@@ -656,6 +716,7 @@ pub(crate) struct CommittedCdpClaim<B> {
     supervisor: SandboxSupervisor<B>,
     shard_id: ShardId,
     worker_epoch: u64,
+    launch_generation: LaunchGeneration,
     pipes: Option<ChromiumCdpPipes>,
     final_receipt_sender: Option<oneshot::Sender<oneshot::Sender<()>>>,
 }
@@ -678,6 +739,7 @@ where
                 .cleanup_cdp_claim_until_terminal(
                     &self.shard_id,
                     self.worker_epoch,
+                    self.launch_generation,
                     CleanupReason::BrowserFailure,
                 )
                 .await;
@@ -691,6 +753,7 @@ where
                 .cleanup_cdp_claim_until_terminal(
                     &self.shard_id,
                     self.worker_epoch,
+                    self.launch_generation,
                     CleanupReason::BrowserFailure,
                 )
                 .await;
@@ -750,8 +813,11 @@ where
             return Err(SandboxError::OwnershipMismatch);
         }
 
-        let mut completion = {
+        let (mut completion, owns_provision) = {
             let mut state = self.state.lock().await;
+            if state.admission_closed {
+                return Err(SandboxError::AdmissionClosed);
+            }
             if let Some(provisioning) = state.provisioning.get(&spec.shard_id) {
                 if provisioning.ownership.worker_id != spec.worker_id {
                     return Err(SandboxError::OwnershipMismatch);
@@ -770,7 +836,7 @@ where
                 if provisioning.launch_spec != spec {
                     return Err(SandboxError::LaunchBindingMismatch);
                 }
-                Some(provisioning.completion.subscribe())
+                (provisioning.completion.subscribe(), false)
             } else {
                 let existing_owner = state
                     .active
@@ -870,7 +936,7 @@ where
                     }
                     state.failed.remove(&spec.shard_id);
                 }
-                let (completion, _) = watch::channel(None);
+                let (completion, receiver) = watch::channel(None);
                 state.provisioning.insert(
                     spec.shard_id.clone(),
                     ProvisioningShard {
@@ -880,32 +946,53 @@ where
                         completion,
                     },
                 );
-                None
+                (receiver, true)
             }
         };
 
-        if let Some(completion) = completion.as_mut() {
-            loop {
-                if let Some(result) = completion.borrow().clone() {
-                    return match result {
-                        Ok(CreateShardOutcome::Created) => Ok(CreateShardOutcome::AlreadyExists),
-                        result => result,
-                    };
-                }
-                completion.changed().await.map_err(|_| {
-                    SandboxError::Backend(
-                        "provisioning completion disappeared before publication".to_owned(),
-                    )
-                })?;
-            }
+        if owns_provision {
+            let supervisor = self.clone();
+            let owned_spec = spec.clone();
+            let owned_ownership = ownership.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .run_provision_owner(owned_spec, owned_ownership)
+                    .await;
+            });
         }
 
-        let provisioned = self.backend.provision(&spec).await;
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return if owns_provision {
+                    result
+                } else {
+                    match result {
+                        Ok(CreateShardOutcome::Created) => Ok(CreateShardOutcome::AlreadyExists),
+                        result => result,
+                    }
+                };
+            }
+            completion.changed().await.map_err(|_| {
+                SandboxError::Backend(
+                    "provisioning completion disappeared before publication".to_owned(),
+                )
+            })?;
+        }
+    }
+
+    async fn run_provision_owner(&self, spec: LaunchSpec, ownership: WorkerOwnership) {
+        let provisioned = AssertUnwindSafe(self.backend.provision_gated(&spec))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                Err(SandboxError::Backend(
+                    "sandbox backend panicked while provisioning".to_owned(),
+                ))
+            });
         let mut state = self.state.lock().await;
-        let provisioning = state
-            .provisioning
-            .remove(&spec.shard_id)
-            .ok_or_else(|| SandboxError::Backend("provisioning state disappeared".into()))?;
+        let Some(provisioning) = state.provisioning.remove(&spec.shard_id) else {
+            return;
+        };
         let completion = provisioning.completion.clone();
         match provisioned {
             Ok(handle) => {
@@ -931,7 +1018,11 @@ where
                     );
                     drop(state);
                     let result = match self
-                        .continue_cleanup(&spec.shard_id, ownership.worker_epoch)
+                        .continue_cleanup(
+                            &spec.shard_id,
+                            ownership.worker_epoch,
+                            spec.launch_generation(),
+                        )
                         .await
                     {
                         Ok(
@@ -946,7 +1037,7 @@ where
                         Err(error) => Err(error),
                     };
                     let _ = completion.send(Some(result.clone()));
-                    result
+                    let _ = result;
                 } else {
                     state.active.insert(
                         spec.shard_id.clone(),
@@ -959,7 +1050,7 @@ where
                     );
                     let result = Ok(CreateShardOutcome::Created);
                     let _ = completion.send(Some(result.clone()));
-                    result
+                    let _ = result;
                 }
             }
             Err(error) => {
@@ -974,7 +1065,7 @@ where
                 );
                 let result = Err(error);
                 let _ = completion.send(Some(result.clone()));
-                result
+                let _ = result;
             }
         }
     }
@@ -983,13 +1074,20 @@ where
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         now: Instant,
         new_expires_at: Instant,
     ) -> Result<(), RenewLeaseError> {
         let mut state = self.state.lock().await;
         let ownership = if let Some(active) = state.active.get_mut(shard_id) {
+            if active.launch_spec.launch_generation() != launch_generation {
+                return Err(RenewLeaseError::LaunchGenerationMismatch);
+            }
             &mut active.ownership
         } else if let Some(provisioning) = state.provisioning.get_mut(shard_id) {
+            if provisioning.launch_spec.launch_generation() != launch_generation {
+                return Err(RenewLeaseError::LaunchGenerationMismatch);
+            }
             if provisioning.cancellation.is_some() {
                 return Err(RenewLeaseError::ShardNotFound);
             }
@@ -1020,8 +1118,11 @@ where
                 .active
                 .iter()
                 .filter_map(|(shard_id, active)| {
-                    (active.ownership.expires_at <= now)
-                        .then_some((shard_id.clone(), active.ownership.worker_epoch))
+                    (active.ownership.expires_at <= now).then_some((
+                        shard_id.clone(),
+                        active.ownership.worker_epoch,
+                        active.launch_spec.launch_generation(),
+                    ))
                 })
                 .collect::<Vec<_>>();
             let expired_provisioning = state
@@ -1041,41 +1142,130 @@ where
             expired
         };
 
-        join_all(
-            expired
-                .into_iter()
-                .map(|(shard_id, worker_epoch)| async move {
-                    let outcome = self
-                        .kill_shard(&shard_id, worker_epoch, CleanupReason::WorkerLeaseExpired)
-                        .await;
-                    match outcome {
-                        Ok(
-                            KillShardOutcome::Terminated(result)
-                            | KillShardOutcome::CleanupIncomplete(result),
-                        ) => Some((shard_id, result)),
-                        Ok(
-                            KillShardOutcome::AlreadyTerminated
-                            | KillShardOutcome::CancellationRequested,
-                        )
-                        | Err(_) => None,
-                    }
-                }),
-        )
+        join_all(expired.into_iter().map(
+            |(shard_id, worker_epoch, launch_generation)| async move {
+                let outcome = self
+                    .kill_shard(
+                        &shard_id,
+                        worker_epoch,
+                        launch_generation,
+                        CleanupReason::WorkerLeaseExpired,
+                    )
+                    .await;
+                match outcome {
+                    Ok(
+                        KillShardOutcome::Terminated(result)
+                        | KillShardOutcome::CleanupIncomplete(result),
+                    ) => Some((shard_id, result)),
+                    Ok(
+                        KillShardOutcome::AlreadyTerminated
+                        | KillShardOutcome::CancellationRequested,
+                    )
+                    | Err(_) => None,
+                }
+            },
+        ))
         .await
         .into_iter()
         .flatten()
         .collect()
     }
 
+    /// Permanently closes admission and makes a bounded best effort to revoke and destroy every
+    /// shard owned by this supervisor incarnation. An incomplete report requires process exit so
+    /// the launch-gate EOF and startup reconciler remain the final fail-closed boundary.
+    pub async fn shutdown_fail_closed(&self) -> ShutdownReport {
+        let (initial_targets, provisioning_waiters) = {
+            let mut state = self.state.lock().await;
+            state.admission_closed = true;
+            let initial_targets =
+                state.active.len() + state.cleaning.len() + state.provisioning.len();
+            let mut waiters = Vec::with_capacity(state.provisioning.len());
+            for provisioning in state.provisioning.values_mut() {
+                provisioning
+                    .cancellation
+                    .get_or_insert(CleanupReason::Administrative);
+                waiters.push(provisioning.completion.subscribe());
+            }
+            (initial_targets, waiters)
+        };
+
+        let provision_deadline = self
+            .config
+            .cleanup_stage_timeout
+            .saturating_mul(4)
+            .max(Duration::from_millis(100));
+        for mut completion in provisioning_waiters {
+            let _ = timeout(provision_deadline, async {
+                loop {
+                    if completion.borrow().is_some() {
+                        break;
+                    }
+                    if completion.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await;
+        }
+
+        let mut owned = {
+            let state = self.state.lock().await;
+            state
+                .active
+                .iter()
+                .map(|(shard_id, active)| {
+                    (
+                        shard_id.clone(),
+                        active.ownership.worker_epoch,
+                        active.launch_spec.launch_generation(),
+                    )
+                })
+                .chain(state.cleaning.iter().map(|(shard_id, cleaning)| {
+                    (
+                        shard_id.clone(),
+                        cleaning.worker_epoch,
+                        cleaning.launch_spec.launch_generation(),
+                    )
+                }))
+                .collect::<Vec<_>>()
+        };
+        owned.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        owned.dedup();
+        for (shard_id, worker_epoch, launch_generation) in owned {
+            let _ = self
+                .kill_shard(
+                    &shard_id,
+                    worker_epoch,
+                    launch_generation,
+                    CleanupReason::Administrative,
+                )
+                .await;
+        }
+
+        let pending_shards = {
+            let state = self.state.lock().await;
+            state.active.len() + state.cleaning.len() + state.provisioning.len()
+        };
+        ShutdownReport {
+            cleaned_shards: initial_targets.saturating_sub(pending_shards),
+            pending_shards,
+        }
+    }
+
     pub async fn kill_shard(
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         reason: CleanupReason,
     ) -> Result<KillShardOutcome, SandboxError> {
         {
             let mut state = self.state.lock().await;
             if let Some(terminated) = state.terminated.get(shard_id) {
+                if terminated.launch_spec.launch_generation() != launch_generation {
+                    return Err(SandboxError::LaunchGenerationMismatch);
+                }
                 if terminated.worker_epoch != worker_epoch {
                     return Err(SandboxError::WorkerEpochMismatch {
                         expected: terminated.worker_epoch,
@@ -1085,6 +1275,9 @@ where
                 return Ok(KillShardOutcome::AlreadyTerminated);
             }
             if let Some(provisioning) = state.provisioning.get_mut(shard_id) {
+                if provisioning.launch_spec.launch_generation() != launch_generation {
+                    return Err(SandboxError::LaunchGenerationMismatch);
+                }
                 if provisioning.ownership.worker_epoch != worker_epoch {
                     return Err(SandboxError::WorkerEpochMismatch {
                         expected: provisioning.ownership.worker_epoch,
@@ -1099,6 +1292,9 @@ where
                     .active
                     .get(shard_id)
                     .ok_or(SandboxError::ShardNotFound)?;
+                if active.launch_spec.launch_generation() != launch_generation {
+                    return Err(SandboxError::LaunchGenerationMismatch);
+                }
                 if active.ownership.worker_epoch != worker_epoch {
                     return Err(SandboxError::WorkerEpochMismatch {
                         expected: active.ownership.worker_epoch,
@@ -1131,13 +1327,15 @@ where
             }
         }
 
-        self.continue_cleanup(shard_id, worker_epoch).await
+        self.continue_cleanup(shard_id, worker_epoch, launch_generation)
+            .await
     }
 
     async fn continue_cleanup(
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<KillShardOutcome, SandboxError> {
         enum CleanupStep {
             Run {
@@ -1153,6 +1351,9 @@ where
             let step = {
                 let mut state = self.state.lock().await;
                 if let Some(terminated) = state.terminated.get(shard_id) {
+                    if terminated.launch_spec.launch_generation() != launch_generation {
+                        return Err(SandboxError::LaunchGenerationMismatch);
+                    }
                     if terminated.worker_epoch != worker_epoch {
                         return Err(SandboxError::WorkerEpochMismatch {
                             expected: terminated.worker_epoch,
@@ -1165,6 +1366,9 @@ where
                         .cleaning
                         .get_mut(shard_id)
                         .ok_or(SandboxError::ShardNotFound)?;
+                    if cleaning.launch_spec.launch_generation() != launch_generation {
+                        return Err(SandboxError::LaunchGenerationMismatch);
+                    }
                     if cleaning.worker_epoch != worker_epoch {
                         return Err(SandboxError::WorkerEpochMismatch {
                             expected: cleaning.worker_epoch,
@@ -1203,8 +1407,11 @@ where
                     let shard_id = shard_id.clone();
                     let cleanup = tokio::spawn(async move {
                         let mut result = progress;
-                        if !result.route_revoked {
-                            result.route_revoked = matches!(
+                        let revoke = async {
+                            if result.route_revoked {
+                                return true;
+                            }
+                            matches!(
                                 timeout(
                                     supervisor.config.cleanup_stage_timeout,
                                     AssertUnwindSafe(
@@ -1214,10 +1421,13 @@ where
                                 )
                                 .await,
                                 Ok(Ok(Ok(())))
-                            );
-                        }
-                        if !result.cgroup_killed {
-                            result.cgroup_killed = matches!(
+                            )
+                        };
+                        let kill = async {
+                            if result.cgroup_killed {
+                                return true;
+                            }
+                            matches!(
                                 timeout(
                                     supervisor.config.cleanup_stage_timeout,
                                     AssertUnwindSafe(
@@ -1227,8 +1437,9 @@ where
                                 )
                                 .await,
                                 Ok(Ok(Ok(())))
-                            );
-                        }
+                            )
+                        };
+                        (result.route_revoked, result.cgroup_killed) = tokio::join!(revoke, kill);
                         if !result.namespaces_cleaned {
                             result.namespaces_cleaned = matches!(
                                 timeout(
@@ -1284,6 +1495,7 @@ where
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<InspectResources, SandboxError> {
         let handle = {
             let state = self.state.lock().await;
@@ -1291,6 +1503,9 @@ where
                 .active
                 .get(shard_id)
                 .ok_or(SandboxError::ShardNotFound)?;
+            if active.launch_spec.launch_generation() != launch_generation {
+                return Err(SandboxError::LaunchGenerationMismatch);
+            }
             if active.ownership.worker_epoch != worker_epoch {
                 return Err(SandboxError::WorkerEpochMismatch {
                     expected: active.ownership.worker_epoch,
@@ -1307,6 +1522,7 @@ where
         shard_id: &ShardId,
         worker_id: &WorkerId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<PendingCdpClaim<B>, SandboxError> {
         let transfer_id = LeaseId::new();
         let handle = {
@@ -1315,6 +1531,9 @@ where
                 .active
                 .get_mut(shard_id)
                 .ok_or(SandboxError::ShardNotFound)?;
+            if active.launch_spec.launch_generation() != launch_generation {
+                return Err(SandboxError::LaunchGenerationMismatch);
+            }
             if active.ownership.worker_id != *worker_id {
                 return Err(SandboxError::OwnershipMismatch);
             }
@@ -1352,6 +1571,7 @@ where
                 if let Some(active) = state.active.get_mut(&claim_shard_id)
                     && active.ownership.worker_id == claim_worker_id
                     && active.ownership.worker_epoch == worker_epoch
+                    && active.launch_spec.launch_generation() == launch_generation
                     && active.cdp_claim == CdpClaimState::InProgress(claim_transfer_id.clone())
                 {
                     active.cdp_claim = CdpClaimState::Available;
@@ -1393,6 +1613,9 @@ where
                             actual: worker_epoch,
                         })
                     }
+                    Some(active) if active.launch_spec.launch_generation() != launch_generation => {
+                        Err(SandboxError::LaunchGenerationMismatch)
+                    }
                     Some(active)
                         if active.cdp_claim
                             != CdpClaimState::InProgress(claim_transfer_id.clone()) =>
@@ -1424,7 +1647,12 @@ where
 
             if let Some(reason) = cleanup_reason {
                 supervisor
-                    .cleanup_cdp_claim_until_terminal(&claim_shard_id, worker_epoch, reason)
+                    .cleanup_cdp_claim_until_terminal(
+                        &claim_shard_id,
+                        worker_epoch,
+                        launch_generation,
+                        reason,
+                    )
                     .await;
             }
             let response_contains_capability = response.is_ok();
@@ -1439,6 +1667,7 @@ where
                                 .cleanup_cdp_claim_until_terminal(
                                     &claim_shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                     CleanupReason::BrowserFailure,
                                 )
                                 .await;
@@ -1449,17 +1678,47 @@ where
                                 .cleanup_cdp_claim_until_terminal(
                                     &claim_shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                     CleanupReason::BrowserFailure,
                                 )
                                 .await;
                             return;
                         };
-                        let finalized = {
+                        let activation_handle = {
+                            let state = supervisor.state.lock().await;
+                            state.active.get(&claim_shard_id).and_then(|active| {
+                                (active.ownership.worker_id == claim_worker_id
+                                    && active.ownership.worker_epoch == worker_epoch
+                                    && active.launch_spec.launch_generation() == launch_generation
+                                    && active.cdp_claim
+                                        == CdpClaimState::Committed(claim_transfer_id.clone()))
+                                .then(|| active.handle.clone())
+                            })
+                        };
+                        let activated = if let Some(handle) = activation_handle {
+                            matches!(
+                                timeout(
+                                    supervisor.config.cleanup_stage_timeout.saturating_mul(2),
+                                    AssertUnwindSafe(async {
+                                        supervisor.backend.commit_cdp_claim(&handle).await?;
+                                        supervisor.backend.activate(&handle).await
+                                    })
+                                    .catch_unwind(),
+                                )
+                                .await,
+                                Ok(Ok(Ok(())))
+                            )
+                        } else {
+                            false
+                        };
+                        let finalized = if activated {
                             let mut state = supervisor.state.lock().await;
                             match state.active.get_mut(&claim_shard_id) {
                                 Some(active)
                                     if active.ownership.worker_id == claim_worker_id
                                         && active.ownership.worker_epoch == worker_epoch
+                                        && active.launch_spec.launch_generation()
+                                            == launch_generation
                                         && active.cdp_claim
                                             == CdpClaimState::Committed(
                                                 claim_transfer_id.clone(),
@@ -1470,12 +1729,15 @@ where
                                 }
                                 _ => false,
                             }
+                        } else {
+                            false
                         };
                         if !finalized || completed.send(()).is_err() {
                             supervisor
                                 .cleanup_cdp_claim_until_terminal(
                                     &claim_shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                     CleanupReason::BrowserFailure,
                                 )
                                 .await;
@@ -1484,7 +1746,12 @@ where
                     Ok(CdpClaimReceipt::AlreadyInactive) => {}
                     Ok(CdpClaimReceipt::Reject(reason)) => {
                         supervisor
-                            .cleanup_cdp_claim_until_terminal(&claim_shard_id, worker_epoch, reason)
+                            .cleanup_cdp_claim_until_terminal(
+                                &claim_shard_id,
+                                worker_epoch,
+                                launch_generation,
+                                reason,
+                            )
                             .await;
                     }
                     Err(_) => {
@@ -1493,6 +1760,7 @@ where
                             state.active.get_mut(&claim_shard_id).and_then(|active| {
                                 if active.ownership.worker_id != claim_worker_id
                                     || active.ownership.worker_epoch != worker_epoch
+                                    || active.launch_spec.launch_generation() != launch_generation
                                     || !matches!(
                                         &active.cdp_claim,
                                         CdpClaimState::InProgress(transfer_id)
@@ -1522,6 +1790,7 @@ where
                                 .cleanup_cdp_claim_until_terminal(
                                     &claim_shard_id,
                                     worker_epoch,
+                                    launch_generation,
                                     reason,
                                 )
                                 .await;
@@ -1534,6 +1803,7 @@ where
                         .cleanup_cdp_claim_until_terminal(
                             &claim_shard_id,
                             worker_epoch,
+                            launch_generation,
                             CleanupReason::BrowserFailure,
                         )
                         .await;
@@ -1551,6 +1821,7 @@ where
                 shard_id: shard_id.clone(),
                 worker_id: worker_id.clone(),
                 worker_epoch,
+                launch_generation,
                 transfer_id,
                 pipes: Some(pipes),
                 receipt_sender: Some(receipt_sender),
@@ -1563,6 +1834,7 @@ where
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
         reason: CleanupReason,
     ) {
         let cleanup_window = self
@@ -1572,7 +1844,10 @@ where
             .max(Duration::from_millis(100));
         let cleanup_deadline = Instant::now() + cleanup_window;
         loop {
-            match self.kill_shard(shard_id, worker_epoch, reason).await {
+            match self
+                .kill_shard(shard_id, worker_epoch, launch_generation, reason)
+                .await
+            {
                 Ok(KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated)
                 | Err(SandboxError::ShardNotFound | SandboxError::WorkerEpochMismatch { .. }) => {
                     return;
@@ -1595,6 +1870,7 @@ where
         &self,
         shard_id: &ShardId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> oneshot::Sender<()> {
         let cleanup_supervisor = self.clone();
         let cleanup_shard_id = shard_id.clone();
@@ -1605,6 +1881,7 @@ where
                     .cleanup_cdp_claim_until_terminal(
                         &cleanup_shard_id,
                         worker_epoch,
+                        launch_generation,
                         CleanupReason::BrowserFailure,
                     )
                     .await;
@@ -1618,11 +1895,13 @@ where
         shard_id: &ShardId,
         worker_id: &WorkerId,
         worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<ChromiumCdpPipes, SandboxError> {
         let pending = self
-            .prepare_cdp_pipes(shard_id, worker_id, worker_epoch)
+            .prepare_cdp_pipes(shard_id, worker_id, worker_epoch, launch_generation)
             .await?;
-        let claim_completed = self.start_cdp_claim_cleanup_guard(shard_id, worker_epoch);
+        let claim_completed =
+            self.start_cdp_claim_cleanup_guard(shard_id, worker_epoch, launch_generation);
         let pipes = pending.commit().await?.finish().await?;
         let _ = claim_completed.send(());
         Ok(pipes)
@@ -1635,6 +1914,8 @@ pub enum RenewLeaseError {
     ShardNotFound,
     #[error("worker epoch mismatch: expected {expected}, received {actual}")]
     WorkerEpochMismatch { expected: u64, actual: u64 },
+    #[error("launch generation mismatch")]
+    LaunchGenerationMismatch,
     #[error("the supervisor lease has already expired")]
     LeaseExpired,
     #[error("the renewed supervisor lease exceeds its configured TTL")]
@@ -1643,6 +1924,8 @@ pub enum RenewLeaseError {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SandboxError {
+    #[error("launch generation mismatch")]
+    LaunchGenerationMismatch,
     #[error("supervisor and directory lease TTLs must be nonzero")]
     ZeroLeaseTtl,
     #[error("sandbox cleanup stage timeout must be nonzero")]
@@ -1663,6 +1946,8 @@ pub enum SandboxError {
     OwnershipMismatch,
     #[error("owner lease is expired or exceeds the configured supervisor TTL")]
     InvalidOwnerLease,
+    #[error("sandbox supervisor admission is permanently closed")]
+    AdmissionClosed,
     #[error("sandbox shard does not exist")]
     ShardNotFound,
     #[error("worker epoch mismatch: expected {expected}, received {actual}")]
@@ -1813,7 +2098,12 @@ mod tests {
 
         let _pipes = tokio::time::timeout(Duration::from_millis(200), async {
             let pending = supervisor
-                .prepare_cdp_pipes(&shard_id, &worker_id, 1)
+                .prepare_cdp_pipes(
+                    &shard_id,
+                    &worker_id,
+                    1,
+                    LaunchGeneration::new(1).expect("generation"),
+                )
                 .await
                 .expect("claim is prepared");
             let committed = pending.commit().await.expect("claim is committed");
@@ -1835,7 +2125,12 @@ mod tests {
 
         tokio::time::timeout(Duration::from_millis(500), async {
             let pending = supervisor
-                .prepare_cdp_pipes(&shard_id, &worker_id, 1)
+                .prepare_cdp_pipes(
+                    &shard_id,
+                    &worker_id,
+                    1,
+                    LaunchGeneration::new(1).expect("generation"),
+                )
                 .await
                 .expect("claim is prepared");
             tokio::time::sleep(cleanup_stage_timeout.saturating_mul(3)).await;
@@ -1857,7 +2152,12 @@ mod tests {
     async fn dropping_an_unobserved_completed_claim_fails_closed() {
         let (supervisor, shard_id, worker_id) =
             claim_receipt_test_supervisor(Duration::from_millis(100)).await;
-        let mut claim = Box::pin(supervisor.claim_cdp_pipes(&shard_id, &worker_id, 1));
+        let mut claim = Box::pin(supervisor.claim_cdp_pipes(
+            &shard_id,
+            &worker_id,
+            1,
+            LaunchGeneration::new(1).expect("generation"),
+        ));
 
         tokio::time::timeout(Duration::from_millis(200), async {
             loop {

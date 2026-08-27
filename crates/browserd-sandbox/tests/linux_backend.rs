@@ -14,16 +14,18 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use browserd_core::{
-    EgressFence, LaunchGeneration, LeaseId, OwnerFence, RouteGeneration, SessionId,
-    SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+    EgressFence, LaunchGeneration, LeaseId, OwnerFence, PreparedShardState, RouteGeneration,
+    SessionId, SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
-    CleanupReason, DedicatedEgressSpec, EgressPolicyBinding, EgressRouteBackend, LaunchGateRuntime,
-    LaunchSpec, LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig,
-    NetworkNamespaceIdentity, PinnedNetworkNamespace, PreparedLinuxChild, ProcessSignal,
-    ReadOnlyMount, SandboxBackend, SandboxError, SandboxFilesystem, ShardEgressFence,
-    ShardEgressReservation, ShardIngressLease, ShardIngressReceipt, SpawnRequest,
+    CleanupReason, DedicatedEgressSpec, EgressPolicyBinding, EgressRouteBackend,
+    FilePreparedShardJournal, LaunchGateRuntime, LaunchSpec, LinuxProcessBackend,
+    LinuxSandboxBackend, LinuxSandboxConfig, NetworkNamespaceIdentity, PinnedNetworkNamespace,
+    PreparedLinuxChild, PreparedShardCleanupStage, PreparedShardCleanupStageStatus,
+    PreparedShardJournalLimits, PreparedShardRecoveryDisposition, PreparedShardRecoveryRoots,
+    ProcessSignal, ReadOnlyMount, SandboxBackend, SandboxError, SandboxFilesystem,
+    ShardEgressFence, ShardEgressReservation, ShardIngressLease, ShardIngressReceipt, SpawnRequest,
     StdLinuxProcessBackend, StdSandboxFilesystem,
 };
 
@@ -1460,7 +1462,7 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
         },
         FakeEgress::default(),
     );
-    let request = backend.planned_spawn_request(&ShardId::new());
+    let request = backend.planned_spawn_request(&launch_spec(ShardId::new()));
     let arguments = request.arguments();
 
     assert_eq!(
@@ -1504,12 +1506,37 @@ fn launch_spec(shard_id: ShardId) -> LaunchSpec {
 }
 
 fn launch_spec_for(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> LaunchSpec {
+    launch_spec_for_generation(shard_id, worker_id, worker_epoch, 1)
+}
+
+fn launch_spec_for_generation(
+    shard_id: ShardId,
+    worker_id: WorkerId,
+    worker_epoch: u64,
+    launch_generation: u64,
+) -> LaunchSpec {
+    launch_spec_for_generation_and_tenant(
+        TenantId::new(),
+        shard_id,
+        worker_id,
+        worker_epoch,
+        launch_generation,
+    )
+}
+
+fn launch_spec_for_generation_and_tenant(
+    tenant_id: TenantId,
+    shard_id: ShardId,
+    worker_id: WorkerId,
+    worker_epoch: u64,
+    launch_generation: u64,
+) -> LaunchSpec {
     let worker_epoch = WorkerEpoch::new(worker_epoch).expect("worker epoch is positive");
     let egress_fence = EgressFence::new(
         ShardFence::new(
             OwnerFence::new(worker_id, worker_epoch),
             shard_id,
-            LaunchGeneration::new(1).expect("launch generation is positive"),
+            LaunchGeneration::new(launch_generation).expect("launch generation is positive"),
         ),
         RouteGeneration::new(1).expect("route generation is positive"),
         SessionId::new(),
@@ -1520,7 +1547,7 @@ fn launch_spec_for(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) ->
     let dedicated_egress =
         DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_secs(5))
             .expect("dedicated egress spec is valid");
-    LaunchSpec::production(TenantId::new(), dedicated_egress)
+    LaunchSpec::production(tenant_id, dedicated_egress)
 }
 
 #[test]
@@ -1779,7 +1806,7 @@ fn process_request_for(bwrap: &Path) -> (tempfile::TempDir, SpawnRequest) {
         },
         FakeEgress::default(),
     )
-    .planned_spawn_request(&ShardId::new());
+    .planned_spawn_request(&launch_spec(ShardId::new()));
     std::fs::create_dir_all(
         request
             .cgroup_procs_path()
@@ -1814,10 +1841,11 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
     let egress = FakeEgress::default();
     let backend = backend(filesystem.clone(), process, egress.clone());
     let shard_id = ShardId::new();
-    let planned = backend.planned_spawn_request(&shard_id);
+    let spec = launch_spec(shard_id.clone());
+    let planned = backend.planned_spawn_request(&spec);
     assert_eq!(planned.program(), Path::new("/usr/bin/bwrap"));
     backend
-        .provision(&launch_spec(shard_id.clone()))
+        .provision(&spec)
         .await
         .expect("provision should succeed");
 
@@ -1834,7 +1862,7 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
     assert_eq!(
         planned.cgroup_procs_path(),
         PathBuf::from("/sys/fs/cgroup/browserd")
-            .join(shard_id.to_string())
+            .join(format!("{shard_id}-launch-1"))
             .join("cgroup.procs")
     );
     assert_eq!(
@@ -1894,13 +1922,16 @@ async fn prepared_child_is_released_only_after_exact_network_namespace_route_att
     };
     let egress_view = egress.clone();
     let shard_id = ShardId::new();
+    let spec = launch_spec(shard_id.clone());
+    let expected_egress = spec.dedicated_egress().clone();
+    let expected_tenant = spec.tenant_id().clone();
     let expected_fence = ShardEgressFence::new(shard_id.clone(), 7);
     let expected_namespace = current_network_namespace()
         .expect("the fake child network namespace should be pinnable")
         .identity();
 
     backend(filesystem, process, egress)
-        .provision(&launch_spec(shard_id))
+        .provision(&spec)
         .await
         .expect("validated attachment should release the prepared child");
 
@@ -1919,7 +1950,7 @@ async fn prepared_child_is_released_only_after_exact_network_namespace_route_att
         .expect("the route must attach to the prepared child's exact network namespace");
     let namespace_revalidation = events
         .iter()
-        .position(|event| event == "netns:revalidate")
+        .rposition(|event| event == "netns:revalidate")
         .expect("the exact network namespace must be revalidated after attachment");
     let release = events
         .iter()
@@ -1927,16 +1958,15 @@ async fn prepared_child_is_released_only_after_exact_network_namespace_route_att
         .expect("prepared child should be released");
     let exact_route_check = events
         .iter()
-        .position(|event| event == "route:is-active")
+        .rposition(|event| event == "route:is-active")
         .expect("the exact route fence should be checked");
     assert!(spawn < validate);
     assert!(validate < route_attachment);
     assert!(route_attachment < namespace_revalidation);
     assert!(namespace_revalidation < exact_route_check);
-    assert_eq!(
-        exact_route_check + 1,
-        release,
-        "no awaitable operation may separate the exact fence check from gate release"
+    assert!(
+        exact_route_check < release,
+        "the exact fence check and durable release intent must precede gate release"
     );
     assert_eq!(
         events.iter().filter(|event| *event == "identity").count(),
@@ -1969,11 +1999,421 @@ async fn prepared_child_is_released_only_after_exact_network_namespace_route_att
         return;
     };
     assert_eq!(reservation.fence(), &expected_fence);
+    assert_eq!(reservation.tenant_id(), Some(&expected_tenant));
+    assert_eq!(reservation.dedicated_egress(), Some(&expected_egress));
+    assert_eq!(
+        reservation.egress_fence(),
+        Some(expected_egress.egress_fence())
+    );
     assert_eq!(attached_reservation, reservation);
     assert_eq!(*attached_namespace, expected_namespace);
     assert_eq!(active_lease.reservation(), reservation);
     assert_eq!(active_lease.namespace_identity(), expected_namespace);
     assert_eq!(active_lease.receipt(), attached_receipt);
+}
+
+#[tokio::test]
+async fn gated_provision_requires_cdp_claim_before_explicit_activation() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut filesystem = FakeFilesystem::production_tree();
+    filesystem.events = trace.clone();
+    let process = FakeProcess {
+        events: trace.clone(),
+        alive: Arc::new(Mutex::new(false)),
+        identity_matches: true,
+    };
+    let backend = backend(
+        filesystem,
+        process,
+        FakeEgress {
+            events: trace.clone(),
+            ..FakeEgress::default()
+        },
+    );
+
+    let handle = backend
+        .provision_gated(&launch_spec(ShardId::new()))
+        .await
+        .expect("gated provisioning should stop before Chromium release");
+    assert!(
+        !trace
+            .lock()
+            .expect("trace lock should work")
+            .iter()
+            .any(|event| event == "gate:release")
+    );
+
+    let pipes = backend
+        .claim_cdp_pipes(&handle)
+        .await
+        .expect("the parent CDP capabilities should be claimable while gated");
+    drop(pipes);
+    backend
+        .activate(&handle)
+        .await
+        .expect("activation should release the one-shot launch gate");
+
+    assert_eq!(
+        trace
+            .lock()
+            .expect("trace lock should work")
+            .iter()
+            .filter(|event| *event == "gate:release")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn journaled_linux_effects_commit_in_gate_closed_handoff_order() {
+    let directory = tempfile::tempdir().expect("journal directory should be created");
+    let journal = Arc::new(
+        FilePreparedShardJournal::open_with_limits_and_roots(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::new(
+                PathBuf::from("/sys/fs/cgroup/browserd"),
+                PathBuf::from("/var/lib/browserd/shards"),
+            )
+            .expect("test recovery roots should be safe"),
+        )
+        .expect("journal should open"),
+    );
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut filesystem = FakeFilesystem::production_tree();
+    filesystem.events = trace.clone();
+    let backend = backend(
+        filesystem,
+        FakeProcess {
+            events: trace.clone(),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress {
+            events: trace.clone(),
+            ..FakeEgress::default()
+        },
+    )
+    .with_prepared_journal(Arc::clone(&journal), 41)
+    .expect("journal binding should be valid");
+    let spec = launch_spec(ShardId::new());
+
+    let handle = backend
+        .provision_gated(&spec)
+        .await
+        .expect("the shard should remain gated after ingress activation");
+    assert_eq!(
+        journal.records().expect("record should be readable")[0]
+            .lifecycle_state()
+            .expect("journal lifecycle should validate"),
+        PreparedShardState::IngressRegistered
+    );
+    assert!(
+        !trace
+            .lock()
+            .expect("trace lock should work")
+            .contains(&"gate:release".into())
+    );
+
+    drop(
+        backend
+            .claim_cdp_pipes(&handle)
+            .await
+            .expect("CDP pipes should be claimable while gated"),
+    );
+    backend
+        .commit_cdp_claim(&handle)
+        .await
+        .expect("receipted CDP claim should become durable");
+    backend
+        .activate(&handle)
+        .await
+        .expect("release intent should precede the gate token");
+    assert_eq!(
+        journal.records().expect("record should be readable")[0]
+            .lifecycle_state()
+            .expect("journal lifecycle should validate"),
+        PreparedShardState::Released
+    );
+    assert_eq!(
+        trace
+            .lock()
+            .expect("trace lock should work")
+            .iter()
+            .filter(|event| *event == "gate:release")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn journaled_prepare_failure_records_every_cleanup_before_returning() {
+    let directory = tempfile::tempdir().expect("journal directory should be created");
+    let journal = Arc::new(
+        FilePreparedShardJournal::open_with_limits_and_roots(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::new(
+                PathBuf::from("/sys/fs/cgroup/browserd"),
+                PathBuf::from("/var/lib/browserd/shards"),
+            )
+            .expect("test recovery roots should be safe"),
+        )
+        .expect("journal should open"),
+    );
+    let filesystem = FakeFilesystem::production_tree();
+    let shard_id = ShardId::new();
+    let backend = backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress {
+            fail_prepare: true,
+            ..FakeEgress::default()
+        },
+    )
+    .with_prepared_journal(Arc::clone(&journal), 41)
+    .expect("journal binding should be valid");
+
+    backend
+        .provision_gated(&launch_spec(shard_id.clone()))
+        .await
+        .expect_err("mandatory route preparation should fail closed");
+    let record = journal
+        .records()
+        .expect("journal should remain readable")
+        .pop()
+        .expect("failed preparation should retain a tombstone");
+    assert_eq!(
+        record.recovery_disposition(),
+        PreparedShardRecoveryDisposition::ReleasedTombstone
+    );
+    assert!(!filesystem.has_shard_residue(&shard_id));
+}
+
+#[tokio::test]
+async fn journaled_death_confirmation_error_remains_retryable() {
+    let directory = tempfile::tempdir().expect("journal directory should be created");
+    let journal = Arc::new(
+        FilePreparedShardJournal::open_with_limits_and_roots(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::new(
+                PathBuf::from("/sys/fs/cgroup/browserd"),
+                PathBuf::from("/var/lib/browserd/shards"),
+            )
+            .expect("test recovery roots should be safe"),
+        )
+        .expect("journal should open"),
+    );
+    let backend = backend(
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    )
+    .with_prepared_journal(Arc::clone(&journal), 41)
+    .expect("journal binding should be valid");
+    let handle = backend
+        .provision_gated(&launch_spec(ShardId::new()))
+        .await
+        .expect("the shard should provision with its launch gate closed");
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("route revocation should open the independent process cleanup branch");
+
+    backend
+        .kill_cgroup(&handle, CleanupReason::Administrative)
+        .await
+        .expect_err("an unreadable cgroup.events must fail closed");
+
+    let record = journal
+        .records()
+        .expect("journal should remain readable")
+        .pop()
+        .expect("the shard record should remain durable");
+    assert_eq!(
+        record
+            .cleanup_progress(PreparedShardCleanupStage::ConfirmProcessDeath)
+            .expect("cleanup progress should validate")
+            .status(),
+        PreparedShardCleanupStageStatus::Failed,
+        "an inconclusive death check must stay retryable instead of being marked complete"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_cleanup_attempt_is_reclaimed_by_the_same_daemon() {
+    let directory = tempfile::tempdir().expect("journal directory should be created");
+    let journal = Arc::new(
+        FilePreparedShardJournal::open_with_limits_and_roots(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::new(
+                PathBuf::from("/sys/fs/cgroup/browserd"),
+                PathBuf::from("/var/lib/browserd/shards"),
+            )
+            .expect("test recovery roots should be safe"),
+        )
+        .expect("journal should open"),
+    );
+    let revoke_pause = AsyncPause::new();
+    let backend = Arc::new(
+        backend(
+            FakeFilesystem::production_tree(),
+            FakeProcess {
+                events: Arc::new(Mutex::new(Vec::new())),
+                alive: Arc::new(Mutex::new(false)),
+                identity_matches: true,
+            },
+            FakeEgress {
+                revoke_pause: Some(revoke_pause.clone()),
+                ..FakeEgress::default()
+            },
+        )
+        .with_prepared_journal(Arc::clone(&journal), 41)
+        .expect("journal binding should be valid"),
+    );
+    let handle = backend
+        .provision_gated(&launch_spec(ShardId::new()))
+        .await
+        .expect("the shard should provision with its launch gate closed");
+
+    let first_attempt = {
+        let backend = Arc::clone(&backend);
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                backend.revoke_egress(&handle, CleanupReason::Administrative),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), revoke_pause.entered.notified())
+        .await
+        .expect("the exact revoke effect should start after its durable intent");
+    assert!(
+        first_attempt
+            .await
+            .expect("timed cleanup task should not panic")
+            .is_err(),
+        "the first exact revoke attempt should be cancelled at its stage timeout"
+    );
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("the same daemon must reclaim and converge the cancelled exact attempt");
+    assert_eq!(
+        journal.records().expect("journal should remain readable")[0]
+            .cleanup_progress(PreparedShardCleanupStage::RevokeEgress)
+            .expect("cleanup progress should validate")
+            .status(),
+        PreparedShardCleanupStageStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn released_shard_generation_never_aliases_new_linux_recovery_locators() {
+    let directory = tempfile::tempdir().expect("journal directory should be created");
+    let journal = Arc::new(
+        FilePreparedShardJournal::open_with_limits_and_roots(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::new(
+                PathBuf::from("/sys/fs/cgroup/browserd"),
+                PathBuf::from("/var/lib/browserd/shards"),
+            )
+            .expect("test recovery roots should be safe"),
+        )
+        .expect("journal should open"),
+    );
+    let filesystem = FakeFilesystem::production_tree();
+    let backend = backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    )
+    .with_prepared_journal(Arc::clone(&journal), 41)
+    .expect("journal binding should be valid");
+    let shard_id = ShardId::new();
+    let worker_id = WorkerId::new("generation-locator-worker").expect("worker should be valid");
+    let first_spec = launch_spec_for(shard_id.clone(), worker_id.clone(), 7);
+    let first = backend
+        .provision_gated(&first_spec)
+        .await
+        .expect("first launch generation should provision");
+    let first_record = journal.records().expect("journal should be readable")[0].clone();
+    filesystem
+        .files
+        .lock()
+        .expect("file lock should work")
+        .insert(
+            first_record.locators().cgroup_path().join("cgroup.events"),
+            "populated 0\n".into(),
+        );
+    backend
+        .revoke_egress(&first, CleanupReason::Administrative)
+        .await
+        .expect("first route should revoke");
+    backend
+        .kill_cgroup(&first, CleanupReason::Administrative)
+        .await
+        .expect("first cgroup should die");
+    backend
+        .cleanup_namespaces(&first)
+        .await
+        .expect("first generation should reach its released tombstone");
+
+    let second_fence = EgressFence::new(
+        ShardFence::new(
+            OwnerFence::new(
+                worker_id,
+                WorkerEpoch::new(7).expect("worker epoch should be positive"),
+            ),
+            shard_id,
+            LaunchGeneration::new(2).expect("launch generation should be positive"),
+        ),
+        RouteGeneration::new(2).expect("route generation should be positive"),
+        SessionId::new(),
+        SessionIncarnation::new(2).expect("session incarnation should be positive"),
+    );
+    let second_spec = LaunchSpec::production(
+        TenantId::new(),
+        DedicatedEgressSpec::new(
+            second_fence,
+            EgressPolicyBinding::new("test-public-web", [2; 32])
+                .expect("policy binding should be valid"),
+            Duration::from_secs(5),
+        )
+        .expect("dedicated egress should be valid"),
+    );
+    backend
+        .provision_gated(&second_spec)
+        .await
+        .expect("a newer generation must not collide with the released generation locators");
+
+    let records = journal.records().expect("journal should remain readable");
+    assert_eq!(records.len(), 2);
+    assert_ne!(
+        records[0].locators().cgroup_path(),
+        records[1].locators().cgroup_path()
+    );
+    assert_ne!(
+        records[0].locators().runtime_path(),
+        records[1].locators().runtime_path()
+    );
 }
 
 #[tokio::test]
@@ -2090,7 +2530,7 @@ async fn duplicate_shard_provision_fails_before_spawn_and_preserves_the_runtime(
         events_before_duplicate,
         "a duplicate must fail before prepared spawn or gate release"
     );
-    let cgroup_path = PathBuf::from("/sys/fs/cgroup/browserd").join(shard_id.to_string());
+    let cgroup_path = PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{shard_id}-launch-1"));
     {
         let mut files = filesystem.files.lock().expect("file lock should work");
         files.insert(cgroup_path.join("memory.current"), "1024\n".into());
@@ -2381,7 +2821,7 @@ async fn a_hung_runtime_route_revoke_cannot_delay_bounded_child_termination() {
         .expect("file lock should work")
         .insert(
             PathBuf::from("/sys/fs/cgroup/browserd")
-                .join(shard_id.to_string())
+                .join(format!("{shard_id}-launch-1"))
                 .join("cgroup.events"),
             "populated 0\n".into(),
         );
@@ -2449,7 +2889,7 @@ async fn namespace_cleanup_cannot_release_process_ownership_during_termination()
         .expect("file lock should work")
         .insert(
             PathBuf::from("/sys/fs/cgroup/browserd")
-                .join(shard_id.to_string())
+                .join(format!("{shard_id}-launch-1"))
                 .join("cgroup.events"),
             "populated 0\n".into(),
         );
@@ -2492,8 +2932,8 @@ async fn one_shot_rollback_failures_resume_at_only_the_first_unfinished_stage() 
             .failing_removes_once
             .lock()
             .expect("one-shot failure lock should work");
-        failures.insert(format!("shards/{shard_id}"));
-        failures.insert(format!("browserd/{shard_id}"));
+        failures.insert(format!("shards/{shard_id}-launch-1"));
+        failures.insert(format!("browserd/{shard_id}-launch-1"));
     }
     let alive = Arc::new(Mutex::new(false));
     let process = RetryCleanupProcess {
@@ -2665,7 +3105,8 @@ async fn blocked_gate_release_does_not_hold_the_global_runtime_mutex() {
         .provision(&launch_spec(inspect_shard.clone()))
         .await
         .expect("first runtime should provision");
-    let inspect_cgroup = PathBuf::from("/sys/fs/cgroup/browserd").join(inspect_shard.to_string());
+    let inspect_cgroup =
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{inspect_shard}-launch-1"));
     {
         let mut files = filesystem.files.lock().expect("file lock should work");
         files.insert(inspect_cgroup.join("memory.current"), "4096\n".into());
@@ -2714,8 +3155,10 @@ async fn blocking_cleanup_filesystem_work_does_not_block_an_unrelated_runtime_in
         .provision(&launch_spec(inspect_shard.clone()))
         .await
         .expect("inspection runtime should provision");
-    let cleanup_cgroup = PathBuf::from("/sys/fs/cgroup/browserd").join(cleanup_shard.to_string());
-    let inspect_cgroup = PathBuf::from("/sys/fs/cgroup/browserd").join(inspect_shard.to_string());
+    let cleanup_cgroup =
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{cleanup_shard}-launch-1"));
+    let inspect_cgroup =
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{inspect_shard}-launch-1"));
     {
         let mut files = filesystem.files.lock().expect("file lock should work");
         files.insert(cleanup_cgroup.join("cgroup.events"), "populated 0\n".into());
@@ -2732,7 +3175,7 @@ async fn blocking_cleanup_filesystem_work_does_not_block_an_unrelated_runtime_in
         .remove_barriers
         .lock()
         .expect("remove barrier lock should work") = Some(RemoveBarriers {
-        suffix: PathBuf::from(format!("shards/{cleanup_shard}")),
+        suffix: PathBuf::from(format!("shards/{cleanup_shard}-launch-1")),
         entered: entered.clone(),
         proceed: proceed.clone(),
     });
@@ -2798,7 +3241,7 @@ async fn concurrent_egress_revocations_release_the_route_exactly_once() {
         .expect("file lock should work")
         .insert(
             PathBuf::from("/sys/fs/cgroup/browserd")
-                .join(shard_id.to_string())
+                .join(format!("{shard_id}-launch-1"))
                 .join("cgroup.events"),
             "populated 0\n".into(),
         );
@@ -2939,7 +3382,7 @@ async fn cancelled_runtime_release_after_backend_commit_retries_the_exact_lease(
         .expect("file lock should work")
         .insert(
             PathBuf::from("/sys/fs/cgroup/browserd")
-                .join(shard_id.to_string())
+                .join(format!("{shard_id}-launch-1"))
                 .join("cgroup.events"),
             "populated 0\n".into(),
         );
@@ -3458,6 +3901,89 @@ async fn cancelled_provision_after_spawn_retains_the_unknown_child_token_for_abo
         .provision(&launch_spec(shard_id))
         .await
         .expect("a later retry may spawn after unknown-child cleanup completed");
+}
+
+#[tokio::test]
+async fn stale_generation_cannot_claim_newer_abandoned_provision_cleanup() {
+    let filesystem = FakeFilesystem::production_tree();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let alive = Arc::new(Mutex::new(false));
+    let pause = AsyncPause::new();
+    let process = CancelOnceDuringSpawnProcess {
+        inner: FakeProcess {
+            events: Arc::clone(&events),
+            alive: Arc::clone(&alive),
+            identity_matches: true,
+        },
+        pause: pause.clone(),
+    };
+    let egress = FakeEgress::default();
+    let backend = Arc::new(LinuxSandboxBackend::new(
+        config(),
+        filesystem.clone(),
+        process,
+        egress.clone(),
+    ));
+    let shard_id = ShardId::new();
+    let worker_id = WorkerId::new("generation-aba-worker").expect("worker should be valid");
+    let tenant_id = TenantId::new();
+    let current = launch_spec_for_generation_and_tenant(
+        tenant_id.clone(),
+        shard_id.clone(),
+        worker_id.clone(),
+        7,
+        4,
+    );
+    let stale = launch_spec_for_generation_and_tenant(tenant_id, shard_id.clone(), worker_id, 7, 3);
+
+    let current_owner = tokio::spawn({
+        let backend = Arc::clone(&backend);
+        let current = current.clone();
+        async move { backend.provision_gated(&current).await }
+    });
+    pause.entered.notified().await;
+    current_owner.abort();
+    assert!(
+        current_owner
+            .await
+            .expect_err("current owner should be cancelled")
+            .is_cancelled()
+    );
+
+    let events_before_stale = events.lock().expect("event lock should work").clone();
+    let egress_before_stale = egress
+        .calls
+        .lock()
+        .expect("egress lock should work")
+        .clone();
+    assert!(matches!(
+        backend.provision_gated(&stale).await,
+        Err(SandboxError::LaunchGenerationMismatch)
+    ));
+    assert_eq!(
+        *events.lock().expect("event lock should work"),
+        events_before_stale,
+        "stale generation must be rejected before process cleanup effects"
+    );
+    assert_eq!(
+        *egress.calls.lock().expect("egress lock should work"),
+        egress_before_stale,
+        "stale generation must be rejected before egress cleanup effects"
+    );
+
+    backend
+        .provision_gated(&current)
+        .await
+        .expect_err("current generation must retain and finish its abandoned cleanup");
+    assert!(
+        events
+            .lock()
+            .expect("event lock should work")
+            .iter()
+            .any(|event| event == "signal:Kill"),
+        "the exact current generation must retain cleanup ownership"
+    );
+    assert_no_provisioning_residue(&filesystem, &egress, &alive, &shard_id);
 }
 
 #[tokio::test]
@@ -4017,7 +4543,7 @@ async fn production_process_rejects_missing_required_launch_descriptors_before_e
         },
         FakeEgress::default(),
     )
-    .planned_spawn_request(&ShardId::new());
+    .planned_spawn_request(&launch_spec(ShardId::new()));
 
     let error = StdLinuxProcessBackend::default()
         .spawn_prepared(&LeaseId::new().to_string(), &request)
@@ -5835,7 +6361,8 @@ async fn concurrent_cleanup_and_inspect_use_each_runtimes_exact_egress_fence() {
         ))
         .await
         .expect("cleanup runtime should provision");
-    let inspect_cgroup = PathBuf::from("/sys/fs/cgroup/browserd").join(inspect_shard.to_string());
+    let inspect_cgroup =
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{inspect_shard}-launch-1"));
     {
         let mut files = filesystem.files.lock().expect("file lock should work");
         files.insert(inspect_cgroup.join("memory.current"), "4096\n".into());
@@ -5915,7 +6442,7 @@ async fn failed_revoke_retains_the_exact_fence_and_netns_pin_until_release_retry
         .expect("file lock should work")
         .insert(
             PathBuf::from("/sys/fs/cgroup/browserd")
-                .join(shard_id.to_string())
+                .join(format!("{shard_id}-launch-1"))
                 .join("cgroup.events"),
             "populated 0\n".into(),
         );
@@ -5999,7 +6526,7 @@ async fn namespace_cleanup_releases_the_exact_fence_only_after_cgroup_is_empty()
         .await
         .expect("runtime should provision");
     let cgroup_events = PathBuf::from("/sys/fs/cgroup/browserd")
-        .join(shard_id.to_string())
+        .join(format!("{shard_id}-launch-1"))
         .join("cgroup.events");
 
     backend
@@ -6095,7 +6622,7 @@ async fn partial_namespace_cleanup_retries_only_unfinished_stages_before_release
         .expect("file lock should work")
         .insert(
             PathBuf::from("/sys/fs/cgroup/browserd")
-                .join(shard_id.to_string())
+                .join(format!("{shard_id}-launch-1"))
                 .join("cgroup.events"),
             "populated 0\n".into(),
         );
@@ -6107,7 +6634,7 @@ async fn partial_namespace_cleanup_retries_only_unfinished_stages_before_release
         .failing_removes
         .lock()
         .expect("remove failpoint lock should work")
-        .insert(format!("browserd/{shard_id}"));
+        .insert(format!("browserd/{shard_id}-launch-1"));
 
     assert!(backend.cleanup_namespaces(&handle).await.is_err());
     filesystem

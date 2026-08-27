@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{LeaseId, ShardId};
+use browserd_core::{EgressFence, LeaseId, ShardFence, ShardId, TenantId};
 use browserd_launch_gate::APPROVAL_FRAME;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open, openat};
 use nix::sys::signal::Signal;
@@ -21,9 +21,15 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::journal::{
+    FilePreparedShardJournal, PreparedShardCleanupFailure, PreparedShardCleanupPermit,
+    PreparedShardCleanupStage, PreparedShardCleanupStageStatus, PreparedShardEffect,
+    PreparedShardEffectPermit, PreparedShardJournalRecord, PreparedShardRecoveryDisposition,
+    PreparedShardRecoveryLocators,
+};
 use crate::{
-    CleanupReason, InspectResources, LaunchSpec, SandboxBackend, SandboxCapabilities, SandboxError,
-    SandboxHandle,
+    CleanupReason, DedicatedEgressSpec, InspectResources, LaunchSpec, SandboxBackend,
+    SandboxCapabilities, SandboxError, SandboxHandle,
 };
 
 /// Chromium's fixed command-input descriptor for `--remote-debugging-pipe`.
@@ -1411,10 +1417,9 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                 "prepared child exited before gate release".into(),
             ));
         }
-        let gate = child
-            .execution_gate
-            .as_ref()
-            .ok_or_else(|| SandboxError::Backend("prepared child already released".into()))?;
+        let Some(gate) = child.execution_gate.as_ref() else {
+            return Ok(());
+        };
         let written = write_fd(gate, APPROVAL_FRAME)
             .map_err(|error| SandboxError::Backend(format!("execution gate release: {error}")))?;
         if written != APPROVAL_FRAME.len() {
@@ -1814,10 +1819,12 @@ impl ShardEgressFence {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardEgressReservation {
     fence: ShardEgressFence,
     generation: LeaseId,
+    tenant_id: Option<TenantId>,
+    dedicated_egress: Option<DedicatedEgressSpec>,
 }
 
 impl ShardEgressReservation {
@@ -1826,6 +1833,18 @@ impl ShardEgressReservation {
         Self {
             fence,
             generation: LeaseId::new(),
+            tenant_id: None,
+            dedicated_egress: None,
+        }
+    }
+
+    #[must_use]
+    pub fn from_launch_spec(spec: &LaunchSpec) -> Self {
+        Self {
+            fence: ShardEgressFence::new(spec.shard_id().clone(), spec.worker_epoch()),
+            generation: LeaseId::new(),
+            tenant_id: Some(spec.tenant_id().clone()),
+            dedicated_egress: Some(spec.dedicated_egress().clone()),
         }
     }
 
@@ -1837,6 +1856,30 @@ impl ShardEgressReservation {
     #[must_use]
     pub const fn generation(&self) -> &LeaseId {
         &self.generation
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> Option<&TenantId> {
+        self.tenant_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn dedicated_egress(&self) -> Option<&DedicatedEgressSpec> {
+        self.dedicated_egress.as_ref()
+    }
+
+    #[must_use]
+    pub fn egress_fence(&self) -> Option<&EgressFence> {
+        self.dedicated_egress
+            .as_ref()
+            .map(DedicatedEgressSpec::egress_fence)
+    }
+}
+
+impl std::hash::Hash for ShardEgressReservation {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.fence.hash(state);
+        self.generation.hash(state);
     }
 }
 
@@ -1886,6 +1929,15 @@ impl ShardIngressLease {
     }
 
     #[must_use]
+    pub const fn from_attachment(
+        reservation: ShardEgressReservation,
+        network_namespace: NetworkNamespaceIdentity,
+        receipt: ShardIngressReceipt,
+    ) -> Self {
+        Self::new(reservation, network_namespace, receipt)
+    }
+
+    #[must_use]
     pub const fn reservation(&self) -> &ShardEgressReservation {
         &self.reservation
     }
@@ -1906,8 +1958,9 @@ struct LinuxRuntime {
     backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
-    _network_namespace: PinnedNetworkNamespace,
+    _network_namespace: Option<PinnedNetworkNamespace>,
     ingress_lease: ShardIngressLease,
+    gate_released: bool,
     egress_revoked: bool,
     egress_released: bool,
     process_released: bool,
@@ -1918,6 +1971,42 @@ struct LinuxRuntime {
     process_operation: Arc<AsyncMutex<()>>,
 }
 
+struct PreparedCleanupAttempt {
+    journal: Option<Arc<FilePreparedShardJournal>>,
+    permit: Option<PreparedShardCleanupPermit>,
+}
+
+impl PreparedCleanupAttempt {
+    const fn unjournaled() -> Self {
+        Self {
+            journal: None,
+            permit: None,
+        }
+    }
+
+    fn journaled(
+        journal: Arc<FilePreparedShardJournal>,
+        permit: PreparedShardCleanupPermit,
+    ) -> Self {
+        Self {
+            journal: Some(journal),
+            permit: Some(permit),
+        }
+    }
+
+    fn disarm(mut self) -> Option<(Arc<FilePreparedShardJournal>, PreparedShardCleanupPermit)> {
+        self.journal.take().zip(self.permit.take())
+    }
+}
+
+impl Drop for PreparedCleanupAttempt {
+    fn drop(&mut self) {
+        if let (Some(journal), Some(permit)) = (&self.journal, &self.permit) {
+            let _ = journal.abandon_cleanup_stage(permit);
+        }
+    }
+}
+
 impl Clone for LinuxRuntime {
     fn clone(&self) -> Self {
         Self {
@@ -1925,8 +2014,12 @@ impl Clone for LinuxRuntime {
             backend_token: self.backend_token.clone(),
             cgroup_path: self.cgroup_path.clone(),
             runtime_path: self.runtime_path.clone(),
-            _network_namespace: self._network_namespace.clone_for_owner(),
+            _network_namespace: self
+                ._network_namespace
+                .as_ref()
+                .map(PinnedNetworkNamespace::clone_for_owner),
             ingress_lease: self.ingress_lease.clone(),
+            gate_released: self.gate_released,
             egress_revoked: self.egress_revoked,
             egress_released: self.egress_released,
             process_released: self.process_released,
@@ -1940,6 +2033,7 @@ impl Clone for LinuxRuntime {
 }
 
 struct ProvisionCleanup {
+    shard_fence: ShardFence,
     backend_token: String,
     cgroup_path: PathBuf,
     runtime_path: PathBuf,
@@ -1962,6 +2056,7 @@ struct ProvisionCleanup {
 impl Clone for ProvisionCleanup {
     fn clone(&self) -> Self {
         Self {
+            shard_fence: self.shard_fence.clone(),
             backend_token: self.backend_token.clone(),
             cgroup_path: self.cgroup_path.clone(),
             runtime_path: self.runtime_path.clone(),
@@ -2003,11 +2098,24 @@ impl Drop for ProvisionAttempt<'_> {
     }
 }
 
+fn exact_prepared_record(
+    journal: &FilePreparedShardJournal,
+    fence: &browserd_core::ShardFence,
+) -> Result<PreparedShardJournalRecord, crate::journal::PreparedShardJournalError> {
+    journal
+        .records()?
+        .into_iter()
+        .find(|record| record.fence() == fence)
+        .ok_or(crate::journal::PreparedShardJournalError::RecordNotFound)
+}
+
 pub struct LinuxSandboxBackend<F, P, E> {
     config: LinuxSandboxConfig,
     filesystem: F,
     process: P,
     egress: E,
+    prepared_journal: Option<Arc<FilePreparedShardJournal>>,
+    egress_daemon_epoch: Option<u64>,
     provisioning: StdMutex<HashMap<ShardId, ProvisionCleanup>>,
     runtimes: StdMutex<HashMap<ShardId, LinuxRuntime>>,
 }
@@ -2025,9 +2133,215 @@ where
             filesystem,
             process,
             egress,
+            prepared_journal: None,
+            egress_daemon_epoch: None,
             provisioning: StdMutex::new(HashMap::new()),
             runtimes: StdMutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_prepared_journal(
+        mut self,
+        journal: Arc<FilePreparedShardJournal>,
+        egress_daemon_epoch: u64,
+    ) -> Result<Self, SandboxError> {
+        if egress_daemon_epoch == 0 {
+            return Err(SandboxError::Backend(
+                "egress daemon epoch must be nonzero".into(),
+            ));
+        }
+        self.prepared_journal = Some(journal);
+        self.egress_daemon_epoch = Some(egress_daemon_epoch);
+        Ok(self)
+    }
+
+    async fn reserve_prepared_record(
+        &self,
+        spec: &LaunchSpec,
+        backend_token: &str,
+        cgroup_path: &Path,
+        runtime_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let Some(journal) = self.prepared_journal.as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let daemon_epoch = self.egress_daemon_epoch.ok_or_else(|| {
+            SandboxError::Backend("prepared journal is missing the egress daemon epoch".into())
+        })?;
+        let fence = spec.dedicated_egress().egress_fence().shard().clone();
+        let egress_fence = spec.dedicated_egress().egress_fence().clone();
+        let backend_token = backend_token.to_owned();
+        let cgroup_path = cgroup_path.to_path_buf();
+        let runtime_path = runtime_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let locators =
+                PreparedShardRecoveryLocators::new(backend_token, cgroup_path, runtime_path)?
+                    .with_egress_binding(daemon_epoch, egress_fence)?;
+            journal.reserve(fence, locators).map(|_| ())
+        })
+        .await
+        .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
+        .map_err(|error| SandboxError::Backend(format!("prepared journal reserve: {error}")))
+    }
+
+    async fn begin_prepared_effect(
+        &self,
+        fence: &browserd_core::ShardFence,
+        effect: PreparedShardEffect,
+    ) -> Result<Option<PreparedShardEffectPermit>, SandboxError> {
+        let Some(journal) = self.prepared_journal.as_ref().map(Arc::clone) else {
+            return Ok(None);
+        };
+        let fence = fence.clone();
+        tokio::task::spawn_blocking(move || {
+            let record = exact_prepared_record(&journal, &fence)?;
+            journal
+                .begin_effect(&fence, record.sequence(), effect)
+                .map(Some)
+        })
+        .await
+        .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
+        .map_err(|error| SandboxError::Backend(format!("prepared journal effect intent: {error}")))
+    }
+
+    async fn complete_prepared_effect(
+        &self,
+        permit: Option<PreparedShardEffectPermit>,
+    ) -> Result<(), SandboxError> {
+        let (Some(journal), Some(permit)) =
+            (self.prepared_journal.as_ref().map(Arc::clone), permit)
+        else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || journal.complete_effect(&permit).map(|_| ()))
+            .await
+            .map_err(|error| {
+                SandboxError::Backend(format!("prepared journal task failed: {error}"))
+            })?
+            .map_err(|error| {
+                SandboxError::Backend(format!("prepared journal effect completion: {error}"))
+            })
+    }
+
+    async fn next_release_sequence(
+        &self,
+        fence: &browserd_core::ShardFence,
+    ) -> Result<u64, SandboxError> {
+        let Some(journal) = self.prepared_journal.as_ref().map(Arc::clone) else {
+            return Ok(1);
+        };
+        let fence = fence.clone();
+        tokio::task::spawn_blocking(move || {
+            exact_prepared_record(&journal, &fence)?
+                .sequence()
+                .get()
+                .checked_add(1)
+                .ok_or(crate::journal::PreparedShardJournalError::SequenceExhausted)
+        })
+        .await
+        .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
+        .map_err(|error| SandboxError::Backend(format!("prepared release sequence: {error}")))
+    }
+
+    async fn complete_prepared_cleanup(
+        &self,
+        fence: &browserd_core::ShardFence,
+        stages: &'static [PreparedShardCleanupStage],
+    ) -> Result<(), SandboxError> {
+        let Some(journal) = self.prepared_journal.as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let fence = fence.clone();
+        tokio::task::spawn_blocking(move || {
+            for stage in stages {
+                let record = exact_prepared_record(&journal, &fence)?;
+                if record.recovery_disposition()
+                    == PreparedShardRecoveryDisposition::ReleasedTombstone
+                    || record.cleanup_progress(*stage)?.status()
+                        == PreparedShardCleanupStageStatus::Completed
+                {
+                    continue;
+                }
+                let permit = journal.begin_cleanup_stage(&fence, record.sequence(), *stage)?;
+                journal.complete_cleanup_stage(&permit)?;
+            }
+            Ok::<(), crate::journal::PreparedShardJournalError>(())
+        })
+        .await
+        .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
+        .map_err(|error| SandboxError::Backend(format!("prepared cleanup journal: {error}")))
+    }
+
+    async fn begin_prepared_cleanup_stage(
+        &self,
+        fence: &browserd_core::ShardFence,
+        stage: PreparedShardCleanupStage,
+    ) -> Result<PreparedCleanupAttempt, SandboxError> {
+        let Some(journal) = self.prepared_journal.as_ref().map(Arc::clone) else {
+            return Ok(PreparedCleanupAttempt::unjournaled());
+        };
+        let fence = fence.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..32 {
+                let record = exact_prepared_record(&journal, &fence)?;
+                if record.recovery_disposition()
+                    == PreparedShardRecoveryDisposition::ReleasedTombstone
+                    || record.cleanup_progress(stage)?.status()
+                        == PreparedShardCleanupStageStatus::Completed
+                {
+                    return Ok(PreparedCleanupAttempt::unjournaled());
+                }
+                match journal.begin_cleanup_stage(&fence, record.sequence(), stage) {
+                    Ok(permit) => {
+                        return Ok(PreparedCleanupAttempt::journaled(
+                            Arc::clone(&journal),
+                            permit,
+                        ));
+                    }
+                    Err(crate::journal::PreparedShardJournalError::StaleSequence { .. }) => {}
+                    Err(crate::journal::PreparedShardJournalError::CleanupStageOutOfOrder)
+                        if stage == PreparedShardCleanupStage::AbortGate
+                            && record
+                                .cleanup_progress(PreparedShardCleanupStage::RevokeEgress)?
+                                .attempts()
+                                == 0 =>
+                    {
+                        // Normal cleanup starts the egress and process branches together. The
+                        // abort branch may read the record just before the revoke branch commits
+                        // its intent, so retry that exact transient without allowing an abort to
+                        // bypass the durable revoke intent.
+                        std::thread::yield_now();
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(crate::journal::PreparedShardJournalError::CleanupStageInProgress)
+        })
+        .await
+        .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
+        .map_err(|error| SandboxError::Backend(format!("prepared cleanup intent: {error}")))
+    }
+
+    async fn finish_prepared_cleanup_stage(
+        &self,
+        attempt: PreparedCleanupAttempt,
+        succeeded: bool,
+    ) -> Result<(), SandboxError> {
+        let Some((journal, permit)) = attempt.disarm() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            if succeeded {
+                journal.complete_cleanup_stage(&permit).map(|_| ())
+            } else {
+                journal
+                    .record_cleanup_failure(&permit, PreparedShardCleanupFailure::Backend)
+                    .map(|_| ())
+            }
+        })
+        .await
+        .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
+        .map_err(|error| SandboxError::Backend(format!("prepared cleanup completion: {error}")))
     }
 
     fn validate_handle(runtime: &LinuxRuntime, handle: &SandboxHandle) -> Result<(), SandboxError> {
@@ -2036,6 +2350,19 @@ where
         } else {
             Err(SandboxError::ShardNotFound)
         }
+    }
+
+    fn runtime_shard_fence(
+        runtime: &LinuxRuntime,
+    ) -> Result<browserd_core::ShardFence, SandboxError> {
+        runtime
+            .ingress_lease
+            .reservation()
+            .egress_fence()
+            .map(|fence| fence.shard().clone())
+            .ok_or_else(|| {
+                SandboxError::Backend("runtime is missing its exact egress fence".into())
+            })
     }
 
     fn validate_host_paths(&self) -> Result<(), SandboxError> {
@@ -2176,33 +2503,135 @@ where
         backend_token: &str,
     ) -> Result<(), SandboxError> {
         let state = self.provision_snapshot(shard_id, backend_token)?;
+        let shard_fence = state
+            .egress_reservation
+            .egress_fence()
+            .ok_or_else(|| SandboxError::Backend("missing exact egress cleanup fence".into()))?
+            .shard()
+            .clone();
         let revoke_needed = state.route_may_exist && !state.route_revoked;
         let abort_needed = state.child_may_exist && !state.child_aborted;
+        let revoke_permit = self
+            .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::RevokeEgress)
+            .await?;
         let revoke = async {
-            if !revoke_needed {
-                return Ok(());
-            }
-            if let Some(lease) = &state.ingress_lease {
-                self.egress.revoke(lease).await?;
+            let revoke_result = if !revoke_needed {
+                Ok(())
+            } else if let Some(lease) = &state.ingress_lease {
+                self.egress.revoke(lease).await
             } else {
                 self.egress
                     .cancel_reservation(&state.egress_reservation)
-                    .await?;
+                    .await
+            };
+            self.finish_prepared_cleanup_stage(revoke_permit, revoke_result.is_ok())
+                .await?;
+            revoke_result?;
+            if revoke_needed {
+                self.update_provision(shard_id, backend_token, |provision| {
+                    provision.route_revoked = true;
+                })?;
             }
-            self.update_provision(shard_id, backend_token, |provision| {
-                provision.route_revoked = true;
-            })
+
+            let drained_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::ConfirmEgressDrained,
+                )
+                .await?;
+            let drained_result = if self.prepared_journal.is_none() || !state.route_may_exist {
+                Ok(())
+            } else if let Some(lease) = &state.ingress_lease {
+                match self.egress.is_active(lease).await {
+                    Ok(false) => Ok(()),
+                    Ok(true) => Err(SandboxError::Backend(
+                        "provisioning route remained active after revoke".into(),
+                    )),
+                    Err(error) => Err(error),
+                }
+            } else {
+                // cancel_reservation is the terminal receipt for a generation that never
+                // reached namespace attachment.
+                Ok(())
+            };
+            self.finish_prepared_cleanup_stage(drained_permit, drained_result.is_ok())
+                .await?;
+            drained_result
         };
         let abort = async {
-            if !abort_needed {
-                return Ok(());
-            }
-            self.process
-                .abort_spawned(backend_token, state.identity)
+            let abort_permit = self
+                .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::AbortGate)
                 .await?;
+            let abort_result = if abort_needed {
+                self.process
+                    .abort_spawned(backend_token, state.identity)
+                    .await
+            } else {
+                Ok(())
+            };
+            self.finish_prepared_cleanup_stage(abort_permit, abort_result.is_ok())
+                .await?;
+
+            if self.prepared_journal.is_none() {
+                abort_result?;
+                if abort_needed {
+                    self.update_provision(shard_id, backend_token, |provision| {
+                        provision.child_aborted = true;
+                    })?;
+                }
+                return Ok::<(), SandboxError>(());
+            }
+
+            let kill_permit = self
+                .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::KillCgroup)
+                .await?;
+            let kill_result =
+                if state.child_may_exist && state.cgroup_created && !state.cgroup_removed {
+                    self.filesystem
+                        .write_file(&state.cgroup_path.join("cgroup.kill"), "1")
+                } else {
+                    Ok(())
+                };
+            self.finish_prepared_cleanup_stage(kill_permit, kill_result.is_ok())
+                .await?;
+            kill_result?;
+
+            let death_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::ConfirmProcessDeath,
+                )
+                .await?;
+            let death_result = async {
+                if state.child_may_exist && state.cgroup_created && !state.cgroup_removed {
+                    let mut elapsed = Duration::ZERO;
+                    loop {
+                        let events = self
+                            .filesystem
+                            .read_file(&state.cgroup_path.join("cgroup.events"))?;
+                        if events.lines().any(|line| line.trim() == "populated 0") {
+                            break Ok(());
+                        }
+                        if elapsed >= self.config.termination_grace {
+                            break Err(SandboxError::Backend(
+                                "provisioning cgroup remained populated after kill".into(),
+                            ));
+                        }
+                        self.process.wait(self.config.poll_interval).await;
+                        elapsed = elapsed.saturating_add(self.config.poll_interval);
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            .await;
+            self.finish_prepared_cleanup_stage(death_permit, death_result.is_ok())
+                .await?;
+            death_result?;
             self.update_provision(shard_id, backend_token, |provision| {
                 provision.child_aborted = true;
-            })
+            })?;
+            Ok(())
         };
         let (revoke_result, abort_result) = tokio::join!(revoke, abort);
         let mut cleanup_errors = Vec::new();
@@ -2215,49 +2644,145 @@ where
 
         let mut state = self.provision_snapshot(shard_id, backend_token)?;
         let child_is_dead = !state.child_may_exist || state.child_aborted;
-        if child_is_dead && state.runtime_created && !state.runtime_removed {
-            match self.filesystem.remove_directory(&state.runtime_path) {
+        let route_is_drained = !state.route_may_exist || state.route_revoked;
+        if self.prepared_journal.is_some() && child_is_dead && route_is_drained {
+            let close_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::CloseCapabilities,
+                )
+                .await?;
+            self.finish_prepared_cleanup_stage(close_permit, true)
+                .await?;
+
+            let namespace_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::CleanupNetworkNamespace,
+                )
+                .await?;
+            let namespace = {
+                let mut provisions = self.provisioning.lock().map_err(|_| {
+                    SandboxError::Backend("provision ownership lock poisoned".into())
+                })?;
+                let provision = provisions.get_mut(shard_id).ok_or_else(|| {
+                    SandboxError::Backend("provision cleanup ownership missing".into())
+                })?;
+                if provision.backend_token != backend_token {
+                    return Err(SandboxError::Backend(
+                        "provision cleanup ownership changed".into(),
+                    ));
+                }
+                provision._network_namespace.take()
+            };
+            drop(namespace);
+            state._network_namespace = None;
+            self.finish_prepared_cleanup_stage(namespace_permit, true)
+                .await?;
+
+            let runtime_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::CleanupRuntimeFilesystem,
+                )
+                .await?;
+            let runtime_result = if state.runtime_created && !state.runtime_removed {
+                self.filesystem.remove_directory(&state.runtime_path)
+            } else {
+                Ok(())
+            };
+            self.finish_prepared_cleanup_stage(runtime_permit, runtime_result.is_ok())
+                .await?;
+            match runtime_result {
                 Ok(()) => {
-                    self.update_provision(shard_id, backend_token, |provision| {
-                        provision.runtime_removed = true;
-                    })?;
-                    state.runtime_removed = true;
+                    if state.runtime_created {
+                        self.update_provision(shard_id, backend_token, |provision| {
+                            provision.runtime_removed = true;
+                        })?;
+                        state.runtime_removed = true;
+                    }
                 }
                 Err(error) => cleanup_errors.push(format!("runtime removal: {error}")),
             }
-        }
-        if child_is_dead && state.cgroup_created && !state.cgroup_removed {
-            match self.filesystem.remove_directory(&state.cgroup_path) {
-                Ok(()) => {
-                    self.update_provision(shard_id, backend_token, |provision| {
-                        provision.cgroup_removed = true;
-                    })?;
-                    state.cgroup_removed = true;
+
+            if cleanup_errors.is_empty() {
+                let cgroup_permit = self
+                    .begin_prepared_cleanup_stage(
+                        &shard_fence,
+                        PreparedShardCleanupStage::RemoveCgroup,
+                    )
+                    .await?;
+                let cgroup_result = if state.cgroup_created && !state.cgroup_removed {
+                    self.filesystem.remove_directory(&state.cgroup_path)
+                } else {
+                    Ok(())
+                };
+                self.finish_prepared_cleanup_stage(cgroup_permit, cgroup_result.is_ok())
+                    .await?;
+                match cgroup_result {
+                    Ok(()) => {
+                        if state.cgroup_created {
+                            self.update_provision(shard_id, backend_token, |provision| {
+                                provision.cgroup_removed = true;
+                            })?;
+                            state.cgroup_removed = true;
+                        }
+                    }
+                    Err(error) => cleanup_errors.push(format!("cgroup removal: {error}")),
                 }
-                Err(error) => cleanup_errors.push(format!("cgroup removal: {error}")),
+            }
+        } else if self.prepared_journal.is_none() {
+            if child_is_dead && state.runtime_created && !state.runtime_removed {
+                match self.filesystem.remove_directory(&state.runtime_path) {
+                    Ok(()) => {
+                        self.update_provision(shard_id, backend_token, |provision| {
+                            provision.runtime_removed = true;
+                        })?;
+                        state.runtime_removed = true;
+                    }
+                    Err(error) => cleanup_errors.push(format!("runtime removal: {error}")),
+                }
+            }
+            if child_is_dead && state.cgroup_created && !state.cgroup_removed {
+                match self.filesystem.remove_directory(&state.cgroup_path) {
+                    Ok(()) => {
+                        self.update_provision(shard_id, backend_token, |provision| {
+                            provision.cgroup_removed = true;
+                        })?;
+                        state.cgroup_removed = true;
+                    }
+                    Err(error) => cleanup_errors.push(format!("cgroup removal: {error}")),
+                }
             }
         }
         let resources_removed = (!state.runtime_created || state.runtime_removed)
             && (!state.cgroup_created || state.cgroup_removed);
-        if state.route_may_exist
-            && state.route_revoked
-            && child_is_dead
-            && resources_removed
-            && !state.route_released
-        {
-            let release = if let Some(lease) = &state.ingress_lease {
+        if child_is_dead && route_is_drained && resources_removed {
+            let release_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::ReleaseEgressGeneration,
+                )
+                .await?;
+            let release = if !state.route_may_exist || state.route_released {
+                Ok(())
+            } else if let Some(lease) = &state.ingress_lease {
                 self.egress.release(lease).await
             } else {
                 self.egress
                     .release_reservation(&state.egress_reservation)
                     .await
             };
+            self.finish_prepared_cleanup_stage(release_permit, release.is_ok())
+                .await?;
             match release {
                 Ok(()) => {
-                    self.update_provision(shard_id, backend_token, |provision| {
-                        provision.route_released = true;
-                    })?;
-                    state.route_released = true;
+                    if state.route_may_exist {
+                        self.update_provision(shard_id, backend_token, |provision| {
+                            provision.route_released = true;
+                        })?;
+                        state.route_released = true;
+                    }
                 }
                 Err(error) => cleanup_errors.push(format!("route release: {error}")),
             }
@@ -2291,9 +2816,22 @@ where
         Ok(())
     }
 
+    fn instance_directory_name(spec: &LaunchSpec) -> String {
+        format!(
+            "{}-launch-{}",
+            spec.shard_id(),
+            spec.dedicated_egress()
+                .egress_fence()
+                .shard()
+                .launch_generation()
+                .get()
+        )
+    }
+
     #[must_use]
-    pub fn planned_spawn_request(&self, shard_id: &ShardId) -> SpawnRequest {
-        let runtime_path = self.config.sandbox_root.join(shard_id.to_string());
+    pub fn planned_spawn_request(&self, spec: &LaunchSpec) -> SpawnRequest {
+        let instance_directory = Self::instance_directory_name(spec);
+        let runtime_path = self.config.sandbox_root.join(&instance_directory);
         let profile_path = runtime_path.join("profile");
         let mut arguments = [
             "--die-with-parent",
@@ -2386,7 +2924,7 @@ where
             cgroup_procs_path: self
                 .config
                 .cgroup_root
-                .join(shard_id.to_string())
+                .join(instance_directory)
                 .join("cgroup.procs"),
         }
     }
@@ -2404,10 +2942,120 @@ where
     }
 
     async fn provision(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
-        let cgroup_path = self.config.cgroup_root.join(spec.shard_id().to_string());
-        let runtime_path = self.config.sandbox_root.join(spec.shard_id().to_string());
-        let egress_fence = ShardEgressFence::new(spec.shard_id().clone(), spec.worker_epoch());
-        let egress_reservation = ShardEgressReservation::new(egress_fence);
+        if self.prepared_journal.is_some() {
+            return Err(SandboxError::Backend(
+                "journaled Linux sandboxes require the gated supervisor workflow".into(),
+            ));
+        }
+        let handle = self.provision_gated(spec).await?;
+        let mut runtime = {
+            let mut runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .remove(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(&runtime, &handle)?;
+            runtime
+        };
+        let backend_token = runtime.backend_token.clone();
+        let identity = runtime.identity;
+        let shard_fence = Self::runtime_shard_fence(&runtime)?;
+        {
+            let mut provisions = self
+                .provisioning
+                .lock()
+                .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+            if provisions.contains_key(handle.shard_id()) {
+                return Err(SandboxError::Backend(
+                    "sandbox shard provisioning is already in progress".into(),
+                ));
+            }
+            provisions.insert(
+                handle.shard_id().clone(),
+                ProvisionCleanup {
+                    shard_fence,
+                    backend_token: backend_token.clone(),
+                    cgroup_path: runtime.cgroup_path.clone(),
+                    runtime_path: runtime.runtime_path.clone(),
+                    egress_reservation: runtime.ingress_lease.reservation().clone(),
+                    _network_namespace: runtime._network_namespace.take(),
+                    ingress_lease: Some(runtime.ingress_lease.clone()),
+                    owner_active: true,
+                    cgroup_created: true,
+                    runtime_created: true,
+                    route_may_exist: true,
+                    child_may_exist: true,
+                    identity: Some(identity),
+                    route_revoked: false,
+                    child_aborted: false,
+                    runtime_removed: false,
+                    cgroup_removed: false,
+                    route_released: false,
+                },
+            );
+        }
+        let _attempt = ProvisionAttempt {
+            provisions: &self.provisioning,
+            shard_id: handle.shard_id().clone(),
+            backend_token: backend_token.clone(),
+        };
+        let activation = self
+            .process
+            .release_prepared(&backend_token, identity)
+            .await;
+        if let Err(cause) = activation {
+            let cleanup = self
+                .cleanup_provision(handle.shard_id(), &backend_token)
+                .await;
+            return if cleanup.is_ok() {
+                Err(cause)
+            } else {
+                Err(SandboxError::Backend(format!(
+                    "{cause}; activation rollback incomplete"
+                )))
+            };
+        }
+
+        let provision = {
+            let mut provisions = self
+                .provisioning
+                .lock()
+                .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
+            let provision = provisions
+                .remove(handle.shard_id())
+                .ok_or_else(|| SandboxError::Backend("provision ownership missing".into()))?;
+            if provision.backend_token != backend_token {
+                return Err(SandboxError::Backend(
+                    "provision ownership changed before gate release commit".into(),
+                ));
+            }
+            provision
+        };
+        runtime._network_namespace = provision._network_namespace;
+        runtime.gate_released = true;
+        let mut runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+        if runtimes
+            .insert(handle.shard_id().clone(), runtime)
+            .is_some()
+        {
+            return Err(SandboxError::Backend(
+                "sandbox runtime changed before gate release commit".into(),
+            ));
+        }
+        Ok(handle)
+    }
+
+    async fn provision_gated(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        let instance_directory = Self::instance_directory_name(spec);
+        let cgroup_path = self.config.cgroup_root.join(&instance_directory);
+        let runtime_path = self.config.sandbox_root.join(instance_directory);
+        let egress_reservation = ShardEgressReservation::from_launch_spec(spec);
+        let shard_fence = spec.dedicated_egress().egress_fence().shard().clone();
         let backend_token = LeaseId::new().to_string();
         let cleanup_retry = {
             let mut provisions = self
@@ -2415,6 +3063,9 @@ where
                 .lock()
                 .map_err(|_| SandboxError::Backend("provision ownership lock poisoned".into()))?;
             if let Some(existing) = provisions.get_mut(spec.shard_id()) {
+                if existing.shard_fence != shard_fence {
+                    return Err(SandboxError::LaunchGenerationMismatch);
+                }
                 if existing.owner_active {
                     return Err(SandboxError::Backend(
                         "sandbox shard provisioning is already in progress".into(),
@@ -2434,6 +3085,7 @@ where
                 provisions.insert(
                     spec.shard_id().clone(),
                     ProvisionCleanup {
+                        shard_fence,
                         backend_token: backend_token.clone(),
                         cgroup_path: cgroup_path.clone(),
                         runtime_path: runtime_path.clone(),
@@ -2468,26 +3120,48 @@ where
         if cleanup_retry.is_some() {
             let cleanup = self.cleanup_provision(spec.shard_id(), &owned_token).await;
             return match cleanup {
-                Ok(()) => Err(SandboxError::Backend(
-                    "abandoned sandbox provisioning was cleaned; retry provisioning".into(),
-                )),
+                Ok(()) => {
+                    self.complete_prepared_cleanup(
+                        spec.dedicated_egress().egress_fence().shard(),
+                        &PreparedShardCleanupStage::ALL,
+                    )
+                    .await?;
+                    Err(SandboxError::Backend(
+                        "abandoned sandbox provisioning was cleaned; retry provisioning".into(),
+                    ))
+                }
                 Err(error) => Err(SandboxError::Backend(format!(
                     "abandoned sandbox provisioning cleanup incomplete: {error}"
                 ))),
             };
         }
-        if let Err(cause) = self.validate_host_paths() {
-            return match self
+        let preflight = self
+            .reserve_prepared_record(spec, &backend_token, &cgroup_path, &runtime_path)
+            .await
+            .and_then(|()| self.validate_host_paths());
+        if let Err(cause) = preflight {
+            let cleanup = self
                 .cleanup_provision(spec.shard_id(), &backend_token)
-                .await
-            {
-                Ok(()) => Err(cause),
+                .await;
+            return match cleanup {
+                Ok(()) => {
+                    self.complete_prepared_cleanup(
+                        spec.dedicated_egress().egress_fence().shard(),
+                        &PreparedShardCleanupStage::ALL,
+                    )
+                    .await?;
+                    Err(cause)
+                }
                 Err(cleanup_error) => Err(SandboxError::Backend(format!(
                     "{cause}; empty provisioning rollback incomplete: {cleanup_error}"
                 ))),
             };
         }
         let provisioned = async {
+            let shard_fence = spec.dedicated_egress().egress_fence().shard();
+            let filesystem_effect = self
+                .begin_prepared_effect(shard_fence, PreparedShardEffect::CreateFilesystemCgroup)
+                .await?;
             self.filesystem.create_directory(&cgroup_path)?;
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.cgroup_created = true;
@@ -2534,22 +3208,45 @@ where
             self.filesystem
                 .create_directory(&runtime_path.join("profile"))?;
 
+            self.complete_prepared_effect(filesystem_effect).await?;
+
+            // Reserving the exact egress generation is deliberately completed before
+            // spawning. It does not install ingress in the sandbox namespace, while it
+            // does preserve the fail-closed guarantee that a mandatory route failure
+            // cannot leave a child behind.
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.route_may_exist = true;
             })?;
+            let prepare_egress_effect = self
+                .begin_prepared_effect(
+                    shard_fence,
+                    PreparedShardEffect::PrepareEgress(
+                        spec.dedicated_egress().egress_fence().clone(),
+                    ),
+                )
+                .await?;
             self.egress.prepare(&egress_reservation).await?;
+            self.complete_prepared_effect(prepare_egress_effect).await?;
+
+            let spawn_effect = self
+                .begin_prepared_effect(shard_fence, PreparedShardEffect::SpawnGatedChild)
+                .await?;
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.child_may_exist = true;
             })?;
             let prepared_child = self
                 .process
-                .spawn_prepared(&backend_token, &self.planned_spawn_request(spec.shard_id()))
+                .spawn_prepared(&backend_token, &self.planned_spawn_request(spec))
                 .await?;
             let (identity, network_namespace) = prepared_child.into_parts();
+            self.complete_prepared_effect(spawn_effect).await?;
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.identity = Some(identity);
                 provision._network_namespace = Some(network_namespace.clone_for_owner());
             })?;
+            let identity_effect = self
+                .begin_prepared_effect(shard_fence, PreparedShardEffect::ProveProcessIdentity)
+                .await?;
             if identity.pid == 0 || identity.start_time_ticks == 0 {
                 return Err(SandboxError::Backend("invalid child PID identity".into()));
             }
@@ -2562,6 +3259,11 @@ where
                     "spawned child PID identity mismatch".into(),
                 ));
             }
+            self.complete_prepared_effect(identity_effect).await?;
+
+            let cgroup_effect = self
+                .begin_prepared_effect(shard_fence, PreparedShardEffect::AttachCgroup)
+                .await?;
             let cgroup_members = self
                 .filesystem
                 .read_file(&cgroup_path.join("cgroup.procs"))?
@@ -2586,6 +3288,31 @@ where
                     "sandbox child PID identity changed during cgroup attachment".into(),
                 ));
             }
+            self.complete_prepared_effect(cgroup_effect).await?;
+
+            let namespace_effect = self
+                .begin_prepared_effect(shard_fence, PreparedShardEffect::ProveNetworkNamespace)
+                .await?;
+            if self.prepared_journal.is_some()
+                && !self
+                    .process
+                    .network_namespace_matches(&backend_token, identity, &network_namespace)
+                    .await?
+            {
+                return Err(SandboxError::Backend(
+                    "sandbox child network namespace did not match its pinned capability".into(),
+                ));
+            }
+            self.complete_prepared_effect(namespace_effect).await?;
+
+            let ingress_effect = self
+                .begin_prepared_effect(
+                    shard_fence,
+                    PreparedShardEffect::RegisterIngress(
+                        spec.dedicated_egress().egress_fence().clone(),
+                    ),
+                )
+                .await?;
             let ingress_receipt = self
                 .egress
                 .attach(&egress_reservation, &network_namespace)
@@ -2612,9 +3339,7 @@ where
                     "sandbox ingress lease became inactive before launch".into(),
                 ));
             }
-            self.process
-                .release_prepared(&backend_token, identity)
-                .await?;
+            self.complete_prepared_effect(ingress_effect).await?;
             let mut provisions = self
                 .provisioning
                 .lock()
@@ -2641,8 +3366,9 @@ where
                     backend_token: backend_token.clone(),
                     cgroup_path: cgroup_path.clone(),
                     runtime_path: runtime_path.clone(),
-                    _network_namespace: network_namespace,
+                    _network_namespace: Some(network_namespace),
                     ingress_lease,
+                    gate_released: false,
                     egress_revoked: false,
                     egress_released: false,
                     process_released: false,
@@ -2667,13 +3393,151 @@ where
                     .cleanup_provision(spec.shard_id(), &backend_token)
                     .await
                 {
-                    Ok(()) => Err(cause),
+                    Ok(()) => {
+                        self.complete_prepared_cleanup(
+                            spec.dedicated_egress().egress_fence().shard(),
+                            &PreparedShardCleanupStage::ALL,
+                        )
+                        .await?;
+                        Err(cause)
+                    }
                     Err(cleanup_error) => Err(SandboxError::Backend(format!(
                         "{cause}; provisioning rollback incomplete: {cleanup_error}"
                     ))),
                 }
             }
         }
+    }
+
+    async fn commit_cdp_claim(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        let fence = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            runtime
+                .ingress_lease
+                .reservation()
+                .egress_fence()
+                .ok_or_else(|| {
+                    SandboxError::Backend("runtime is missing its exact egress fence".into())
+                })?
+                .shard()
+                .clone()
+        };
+        let permit = self
+            .begin_prepared_effect(&fence, PreparedShardEffect::ClaimCdp)
+            .await?;
+        self.complete_prepared_effect(permit).await
+    }
+
+    async fn activate(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
+        let operation = self.runtime_process_operation(handle)?;
+        let _operation_guard = operation.lock().await;
+        let (
+            backend_token,
+            identity,
+            already_released,
+            cgroup_path,
+            network_namespace,
+            ingress_lease,
+            shard_fence,
+        ) = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            (
+                runtime.backend_token.clone(),
+                runtime.identity,
+                runtime.gate_released,
+                runtime.cgroup_path.clone(),
+                runtime
+                    ._network_namespace
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SandboxError::Backend("runtime network namespace is closed".into())
+                    })?
+                    .clone_for_owner(),
+                runtime.ingress_lease.clone(),
+                runtime
+                    .ingress_lease
+                    .reservation()
+                    .egress_fence()
+                    .ok_or_else(|| {
+                        SandboxError::Backend("runtime is missing its exact egress fence".into())
+                    })?
+                    .shard()
+                    .clone(),
+            )
+        };
+        if already_released {
+            return Ok(());
+        }
+
+        let containment = self
+            .begin_prepared_effect(&shard_fence, PreparedShardEffect::ProveContainment)
+            .await?;
+        if !self
+            .process
+            .identity_matches(&backend_token, identity)
+            .await?
+            || !self
+                .process
+                .network_namespace_matches(&backend_token, identity, &network_namespace)
+                .await?
+            || !self.egress.is_active(&ingress_lease).await?
+        {
+            return Err(SandboxError::Backend(
+                "sandbox containment changed before activation".into(),
+            ));
+        }
+        let cgroup_members = self
+            .filesystem
+            .read_file(&cgroup_path.join("cgroup.procs"))?
+            .split_whitespace()
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| SandboxError::Backend("invalid cgroup.procs membership".into()))?;
+        if !cgroup_members.contains(&identity.pid()) {
+            return Err(SandboxError::Backend(
+                "sandbox child left its cgroup before activation".into(),
+            ));
+        }
+        self.complete_prepared_effect(containment).await?;
+
+        let release_sequence = self.next_release_sequence(&shard_fence).await?;
+        let release = self
+            .begin_prepared_effect(
+                &shard_fence,
+                PreparedShardEffect::SendReleaseToken { release_sequence },
+            )
+            .await?;
+        self.process
+            .release_prepared(&backend_token, identity)
+            .await?;
+        self.complete_prepared_effect(release).await?;
+        let mut runtimes = self
+            .runtimes
+            .lock()
+            .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+        let runtime = runtimes
+            .get_mut(handle.shard_id())
+            .ok_or(SandboxError::ShardNotFound)?;
+        Self::validate_handle(runtime, handle)?;
+        if runtime.backend_token != backend_token || runtime.identity != identity {
+            return Err(SandboxError::ShardNotFound);
+        }
+        runtime.gate_released = true;
+        Ok(())
     }
 
     async fn claim_cdp_pipes(
@@ -2703,7 +3567,7 @@ where
     ) -> Result<(), SandboxError> {
         let operation = self.runtime_cleanup_operation(handle)?;
         let _operation_guard = operation.lock().await;
-        let (lease, already_revoked) = {
+        let (lease, already_revoked, shard_fence) = {
             let state = self
                 .runtimes
                 .lock()
@@ -2712,11 +3576,44 @@ where
                 .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(runtime, handle)?;
-            (runtime.ingress_lease.clone(), runtime.egress_revoked)
+            (
+                runtime.ingress_lease.clone(),
+                runtime.egress_revoked,
+                Self::runtime_shard_fence(runtime)?,
+            )
         };
-        if !already_revoked {
-            self.egress.revoke(&lease).await?;
-        }
+        let revoke_permit = self
+            .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::RevokeEgress)
+            .await?;
+        let revoke_result = if already_revoked {
+            Ok(())
+        } else {
+            self.egress.revoke(&lease).await
+        };
+        self.finish_prepared_cleanup_stage(revoke_permit, revoke_result.is_ok())
+            .await?;
+        revoke_result?;
+
+        let drained_permit = self
+            .begin_prepared_cleanup_stage(
+                &shard_fence,
+                PreparedShardCleanupStage::ConfirmEgressDrained,
+            )
+            .await?;
+        let drained_result = if self.prepared_journal.is_some() {
+            match self.egress.is_active(&lease).await {
+                Ok(false) => Ok(()),
+                Ok(true) => Err(SandboxError::Backend(
+                    "egress route remained active after revoke".into(),
+                )),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        self.finish_prepared_cleanup_stage(drained_permit, drained_result.is_ok())
+            .await?;
+        drained_result?;
 
         let release_after_cleanup = {
             let mut state = self
@@ -2734,7 +3631,16 @@ where
             runtime.namespaces_cleaned && !runtime.egress_released
         };
         if release_after_cleanup {
-            self.egress.release(&lease).await?;
+            let release_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::ReleaseEgressGeneration,
+                )
+                .await?;
+            let release_result = self.egress.release(&lease).await;
+            self.finish_prepared_cleanup_stage(release_permit, release_result.is_ok())
+                .await?;
+            release_result?;
             let mut state = self
                 .runtimes
                 .lock()
@@ -2762,7 +3668,7 @@ where
     ) -> Result<(), SandboxError> {
         let process_operation = self.runtime_process_operation(handle)?;
         let _process_operation_guard = process_operation.lock().await;
-        let (identity, backend_token, cgroup_path) = {
+        let (identity, backend_token, cgroup_path, shard_fence) = {
             let state = self
                 .runtimes
                 .lock()
@@ -2775,53 +3681,85 @@ where
                 runtime.identity,
                 runtime.backend_token.clone(),
                 runtime.cgroup_path.clone(),
+                Self::runtime_shard_fence(runtime)?,
             )
         };
 
-        if self
-            .process
-            .identity_matches(&backend_token, identity)
-            .await?
-        {
-            self.process
-                .signal(&backend_token, identity, ProcessSignal::Terminate)
-                .await?;
-            let mut elapsed = Duration::ZERO;
-            while elapsed < self.config.termination_grace
-                && self.process.is_alive(&backend_token, identity).await?
+        let abort_permit = self
+            .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::AbortGate)
+            .await?;
+        let abort_result = async {
+            if self
+                .process
+                .identity_matches(&backend_token, identity)
+                .await?
             {
+                self.process
+                    .signal(&backend_token, identity, ProcessSignal::Terminate)
+                    .await?;
+                let mut elapsed = Duration::ZERO;
+                while elapsed < self.config.termination_grace
+                    && self.process.is_alive(&backend_token, identity).await?
+                {
+                    self.process.wait(self.config.poll_interval).await;
+                    elapsed = elapsed.saturating_add(self.config.poll_interval);
+                }
+                if self.process.is_alive(&backend_token, identity).await?
+                    && self
+                        .process
+                        .identity_matches(&backend_token, identity)
+                        .await?
+                {
+                    self.process
+                        .signal(&backend_token, identity, ProcessSignal::Kill)
+                        .await?;
+                }
+            }
+            Ok::<(), SandboxError>(())
+        }
+        .await;
+        self.finish_prepared_cleanup_stage(abort_permit, abort_result.is_ok())
+            .await?;
+        abort_result?;
+
+        let kill_permit = self
+            .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::KillCgroup)
+            .await?;
+        let kill_result = self
+            .filesystem
+            .write_file(&cgroup_path.join("cgroup.kill"), "1");
+        self.finish_prepared_cleanup_stage(kill_permit, kill_result.is_ok())
+            .await?;
+        kill_result?;
+
+        let death_permit = self
+            .begin_prepared_cleanup_stage(
+                &shard_fence,
+                PreparedShardCleanupStage::ConfirmProcessDeath,
+            )
+            .await?;
+        let death_result = async {
+            let mut elapsed = Duration::ZERO;
+            loop {
+                let events = self
+                    .filesystem
+                    .read_file(&cgroup_path.join("cgroup.events"))?;
+                if events.lines().any(|line| line.trim() == "populated 0") {
+                    break Ok(());
+                }
+                if elapsed >= self.config.termination_grace {
+                    break Err(SandboxError::Backend(
+                        "cgroup remained populated after kill".into(),
+                    ));
+                }
                 self.process.wait(self.config.poll_interval).await;
                 elapsed = elapsed.saturating_add(self.config.poll_interval);
             }
-            if self.process.is_alive(&backend_token, identity).await?
-                && self
-                    .process
-                    .identity_matches(&backend_token, identity)
-                    .await?
-            {
-                self.process
-                    .signal(&backend_token, identity, ProcessSignal::Kill)
-                    .await?;
-            }
         }
-        self.filesystem
-            .write_file(&cgroup_path.join("cgroup.kill"), "1")?;
-        let mut elapsed = Duration::ZERO;
-        loop {
-            let events = self
-                .filesystem
-                .read_file(&cgroup_path.join("cgroup.events"))?;
-            if events.lines().any(|line| line.trim() == "populated 0") {
-                return Ok(());
-            }
-            if elapsed >= self.config.termination_grace {
-                return Err(SandboxError::Backend(
-                    "cgroup remained populated after kill".into(),
-                ));
-            }
-            self.process.wait(self.config.poll_interval).await;
-            elapsed = elapsed.saturating_add(self.config.poll_interval);
-        }
+        .await;
+        self.finish_prepared_cleanup_stage(death_permit, death_result.is_ok())
+            .await?;
+        death_result
     }
 
     async fn cleanup_namespaces(&self, handle: &SandboxHandle) -> Result<(), SandboxError> {
@@ -2829,7 +3767,7 @@ where
         let _operation_guard = operation.lock().await;
         let process_operation = self.runtime_process_operation(handle)?;
         let _process_operation_guard = process_operation.lock().await;
-        let runtime = self
+        let mut runtime = self
             .runtimes
             .lock()
             .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?
@@ -2837,33 +3775,78 @@ where
             .cloned()
             .ok_or(SandboxError::ShardNotFound)?;
         Self::validate_handle(&runtime, handle)?;
-        if !runtime.process_released {
-            let events = self
-                .filesystem
-                .read_file(&runtime.cgroup_path.join("cgroup.events"))?;
-            if !events.lines().any(|line| line.trim() == "populated 0") {
-                return Err(SandboxError::Backend(
-                    "refusing cleanup of populated cgroup".into(),
-                ));
+        let shard_fence = Self::runtime_shard_fence(&runtime)?;
+        let close_permit = self
+            .begin_prepared_cleanup_stage(
+                &shard_fence,
+                PreparedShardCleanupStage::CloseCapabilities,
+            )
+            .await?;
+        let close_result = async {
+            if !runtime.process_released {
+                let events = self
+                    .filesystem
+                    .read_file(&runtime.cgroup_path.join("cgroup.events"))?;
+                if !events.lines().any(|line| line.trim() == "populated 0") {
+                    return Err(SandboxError::Backend(
+                        "refusing cleanup of populated cgroup".into(),
+                    ));
+                }
+                self.process
+                    .release_spawned(&runtime.backend_token, runtime.identity)
+                    .await?;
+                let mut state = self
+                    .runtimes
+                    .lock()
+                    .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+                let stored = state
+                    .get_mut(handle.shard_id())
+                    .ok_or(SandboxError::ShardNotFound)?;
+                Self::validate_handle(stored, handle)?;
+                if stored.ingress_lease != runtime.ingress_lease {
+                    return Err(SandboxError::Backend(
+                        "sandbox runtime fence changed during cleanup".into(),
+                    ));
+                }
+                stored.process_released = true;
+                runtime.process_released = true;
             }
-            self.process
-                .release_spawned(&runtime.backend_token, runtime.identity)
-                .await?;
-            let mut state = self
+            Ok::<(), SandboxError>(())
+        }
+        .await;
+        self.finish_prepared_cleanup_stage(close_permit, close_result.is_ok())
+            .await?;
+        close_result?;
+
+        let namespace_permit = self
+            .begin_prepared_cleanup_stage(
+                &shard_fence,
+                PreparedShardCleanupStage::CleanupNetworkNamespace,
+            )
+            .await?;
+        let namespace_result = {
+            let state = self
                 .runtimes
                 .lock()
                 .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
             let stored = state
-                .get_mut(handle.shard_id())
+                .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(stored, handle)?;
             if stored.ingress_lease != runtime.ingress_lease {
-                return Err(SandboxError::Backend(
+                Err(SandboxError::Backend(
                     "sandbox runtime fence changed during cleanup".into(),
-                ));
+                ))
+            } else {
+                // The namespace descriptor is the local proof of which namespace the
+                // exact ingress generation targeted. Keep it pinned in the runtime
+                // tombstone until that generation has been revoked and released.
+                Ok(())
             }
-            stored.process_released = true;
-        }
+        };
+        self.finish_prepared_cleanup_stage(namespace_permit, namespace_result.is_ok())
+            .await?;
+        namespace_result?;
 
         let cleanup = {
             let state = self
@@ -2882,7 +3865,16 @@ where
             stored.clone()
         };
         if !cleanup.runtime_removed {
-            self.filesystem.remove_directory(&cleanup.runtime_path)?;
+            let runtime_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::CleanupRuntimeFilesystem,
+                )
+                .await?;
+            let runtime_result = self.filesystem.remove_directory(&cleanup.runtime_path);
+            self.finish_prepared_cleanup_stage(runtime_permit, runtime_result.is_ok())
+                .await?;
+            runtime_result?;
             let mut state = self
                 .runtimes
                 .lock()
@@ -2907,7 +3899,13 @@ where
                     "refusing cleanup of populated cgroup".into(),
                 ));
             }
-            self.filesystem.remove_directory(&cleanup.cgroup_path)?;
+            let cgroup_permit = self
+                .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::RemoveCgroup)
+                .await?;
+            let cgroup_result = self.filesystem.remove_directory(&cleanup.cgroup_path);
+            self.finish_prepared_cleanup_stage(cgroup_permit, cgroup_result.is_ok())
+                .await?;
+            cgroup_result?;
             let mut state = self
                 .runtimes
                 .lock()
@@ -2949,7 +3947,16 @@ where
                 .then(|| stored.ingress_lease.clone())
         };
         if let Some(lease) = release_lease {
-            self.egress.release(&lease).await?;
+            let release_permit = self
+                .begin_prepared_cleanup_stage(
+                    &shard_fence,
+                    PreparedShardCleanupStage::ReleaseEgressGeneration,
+                )
+                .await?;
+            let release_result = self.egress.release(&lease).await;
+            self.finish_prepared_cleanup_stage(release_permit, release_result.is_ok())
+                .await?;
+            release_result?;
             let mut state = self
                 .runtimes
                 .lock()
