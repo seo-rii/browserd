@@ -10,7 +10,7 @@ use browserd_api::{
     PageActivateRequest, PageCreateBody, PageCreateRequest, PageListRequest, SessionCatalog,
     SessionListQuery, SessionResource, ViewerScopeRequest, ViewerTicketBody, WaitCondition,
     WaitUntil, decode_approval_decision, decode_artifact_upload, decode_page_create,
-    decode_session_create,
+    decode_session_create, public_approval_id,
 };
 use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
@@ -701,4 +701,14 @@ fn extended_requests_apply_endpoint_specific_scopes() -> Result<(), Box<dyn Erro
         .is_ok()
     );
     Ok(())
+}
+
+#[test]
+fn public_approval_uuid_is_validated_as_the_domain_approval_id() {
+    let public = Uuid::now_v7();
+    let approval_id = public_approval_id(public);
+
+    assert!(approval_id.is_ok());
+    assert_eq!(approval_id.ok().map(|id| *id.as_uuid()), Some(public));
+    assert!(public_approval_id(Uuid::new_v4()).is_err());
 }

@@ -23,8 +23,8 @@ use browserd_coordination::{
     OperationMutation, RecoverableCreateIntent,
 };
 use browserd_core::{
-    ActionId, ArtifactId, CreateOperationState, ErrorCode, IsolationProfile, OperationId, PageId,
-    SessionId, SessionLifecycle, TenantId, WorkerId,
+    ActionId, ApprovalId, ArtifactId, CreateOperationState, ErrorCode, IsolationProfile,
+    OperationId, PageId, SessionId, SessionLifecycle, TenantId, WorkerId,
 };
 use browserd_operations::{
     CanonicalRequestHash, CreateSessionOperation, IdempotencyClaim, IdempotencyKey,
@@ -1475,6 +1475,11 @@ pub fn decode_approval_decision(json: &str) -> Result<ApprovalDecisionBody, ApiE
     Ok(body)
 }
 
+pub fn public_approval_id(value: Uuid) -> Result<ApprovalId, ApiError> {
+    ApprovalId::from_uuid(value)
+        .map_err(|_| ApiError::invalid_request("approval ID must be a UUIDv7"))
+}
+
 #[derive(Clone, Debug)]
 pub struct ApprovalDecisionCommand {
     pub approval_id: Uuid,
@@ -1518,7 +1523,7 @@ pub struct ApprovalCatalog {
 
 impl ApprovalCatalog {
     pub fn upsert(&self, approval: ApprovalResource) -> Result<(), ApiError> {
-        if approval.approval_id.get_version() != Some(Version::SortRand)
+        if public_approval_id(approval.approval_id).is_err()
             || approval.proposal.tenant_id() != &approval.tenant_id
             || approval.proposal.session_id() != &approval.session_id
         {
@@ -1794,15 +1799,11 @@ impl ApiRequest {
             Self::CreatePage(command) => command.body.validate()?,
             Self::UploadArtifact(command) => command.body.validate()?,
             Self::ListApprovals(query) => query.validate()?,
-            Self::GetApproval(approval_id)
-                if approval_id.get_version() != Some(Version::SortRand) =>
-            {
+            Self::GetApproval(approval_id) if public_approval_id(*approval_id).is_err() => {
                 return Err(ApiError::invalid_request("approval ID must be a UUIDv7"));
             }
             Self::DecideApproval { approval_id, body } => {
-                if approval_id.get_version() != Some(Version::SortRand) {
-                    return Err(ApiError::invalid_request("approval ID must be a UUIDv7"));
-                }
+                public_approval_id(*approval_id)?;
                 body.validate()?;
             }
             Self::ResolveAction(command) => {
