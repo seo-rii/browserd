@@ -325,6 +325,36 @@ impl WorkerCapacity {
             && self.contexts == 0
             && self.targets == 0
     }
+    pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            memory_bytes: self.memory_bytes.checked_add(other.memory_bytes)?,
+            cpu_millis: self.cpu_millis.checked_add(other.cpu_millis)?,
+            pids: self.pids.checked_add(other.pids)?,
+            disk_bytes: self.disk_bytes.checked_add(other.disk_bytes)?,
+            contexts: self.contexts.checked_add(other.contexts)?,
+            targets: self.targets.checked_add(other.targets)?,
+        })
+    }
+    pub(crate) fn checked_sub(self, other: Self) -> Option<Self> {
+        Some(Self {
+            memory_bytes: self.memory_bytes.checked_sub(other.memory_bytes)?,
+            cpu_millis: self.cpu_millis.checked_sub(other.cpu_millis)?,
+            pids: self.pids.checked_sub(other.pids)?,
+            disk_bytes: self.disk_bytes.checked_sub(other.disk_bytes)?,
+            contexts: self.contexts.checked_sub(other.contexts)?,
+            targets: self.targets.checked_sub(other.targets)?,
+        })
+    }
+    pub(crate) const fn components(self) -> [u64; 6] {
+        [
+            self.memory_bytes,
+            self.cpu_millis,
+            self.pids,
+            self.disk_bytes,
+            self.contexts,
+            self.targets,
+        ]
+    }
 }
 
 #[derive(Deserialize)]
@@ -472,6 +502,7 @@ pub struct WorkerHeartbeat {
 }
 
 impl WorkerHeartbeat {
+    /// `free` is the worker's advertised free resources before coordination reservations.
     pub fn new(
         free: WorkerCapacity,
         queue_depth: usize,
@@ -495,6 +526,14 @@ impl WorkerHeartbeat {
     #[must_use]
     pub const fn readiness(&self) -> WorkerReadiness {
         self.readiness
+    }
+    #[must_use]
+    pub const fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+    #[must_use]
+    pub const fn active_shards(&self) -> usize {
+        self.active_shards
     }
 }
 
@@ -682,6 +721,215 @@ pub trait WorkerLeaseStore: Send + Sync {
         &self,
         query: &WorkerRegistrationQuery,
     ) -> Result<Vec<WorkerRegistrationSnapshot>, EphemeralCoordinationError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerReservationRequest {
+    operation_id: browserd_core::OperationId,
+    tenant_id: TenantId,
+    resources: WorkerCapacity,
+}
+
+impl WorkerReservationRequest {
+    pub fn new(
+        operation_id: browserd_core::OperationId,
+        tenant_id: TenantId,
+        resources: WorkerCapacity,
+    ) -> Result<Self, EphemeralCoordinationError> {
+        if resources.is_zero() {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        Ok(Self {
+            operation_id,
+            tenant_id,
+            resources,
+        })
+    }
+    #[must_use]
+    pub const fn operation_id(&self) -> &browserd_core::OperationId {
+        &self.operation_id
+    }
+    #[must_use]
+    pub const fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+    #[must_use]
+    pub const fn resources(&self) -> WorkerCapacity {
+        self.resources
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerReservationRequestWire {
+    operation_id: browserd_core::OperationId,
+    tenant_id: TenantId,
+    resources: WorkerCapacity,
+}
+
+impl<'de> Deserialize<'de> for WorkerReservationRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = WorkerReservationRequestWire::deserialize(deserializer)?;
+        Self::new(value.operation_id, value.tenant_id, value.resources)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct WorkerReservationSnapshot {
+    request: WorkerReservationRequest,
+    worker: WorkerRegistrationSnapshot,
+    expires_at_millis: u64,
+}
+
+impl WorkerReservationSnapshot {
+    pub fn from_persisted(
+        request: WorkerReservationRequest,
+        worker: WorkerRegistrationSnapshot,
+        expires_at_millis: u64,
+    ) -> Result<Self, EphemeralCoordinationError> {
+        if expires_at_millis == 0 {
+            return Err(EphemeralCoordinationError::InvalidInput);
+        }
+        Ok(Self {
+            request,
+            worker,
+            expires_at_millis,
+        })
+    }
+    #[must_use]
+    pub const fn operation_id(&self) -> &browserd_core::OperationId {
+        self.request.operation_id()
+    }
+    #[must_use]
+    pub const fn resources(&self) -> WorkerCapacity {
+        self.request.resources()
+    }
+    #[must_use]
+    pub const fn request(&self) -> &WorkerReservationRequest {
+        &self.request
+    }
+    #[must_use]
+    pub const fn worker_id(&self) -> &WorkerId {
+        self.worker.registration().worker_id()
+    }
+    #[must_use]
+    pub const fn worker_epoch(&self) -> u64 {
+        self.worker.worker_epoch()
+    }
+    #[must_use]
+    pub const fn worker_revision(&self) -> u64 {
+        self.worker.revision()
+    }
+    #[must_use]
+    pub const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+    #[must_use]
+    pub const fn worker(&self) -> &WorkerRegistrationSnapshot {
+        &self.worker
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerReservationSnapshotWire {
+    request: WorkerReservationRequest,
+    worker: WorkerRegistrationSnapshot,
+    expires_at_millis: u64,
+}
+
+impl<'de> Deserialize<'de> for WorkerReservationSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = WorkerReservationSnapshotWire::deserialize(deserializer)?;
+        Self::from_persisted(value.request, value.worker, value.expires_at_millis)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkerReservationGrant {
+    reservation: WorkerReservationSnapshot,
+    worker: WorkerRegistrationSnapshot,
+}
+
+impl WorkerReservationGrant {
+    pub(crate) const fn new(
+        reservation: WorkerReservationSnapshot,
+        worker: WorkerRegistrationSnapshot,
+    ) -> Self {
+        Self {
+            reservation,
+            worker,
+        }
+    }
+    #[must_use]
+    pub const fn reservation(&self) -> &WorkerReservationSnapshot {
+        &self.reservation
+    }
+    #[must_use]
+    pub const fn worker(&self) -> &WorkerRegistrationSnapshot {
+        &self.worker
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerReservationOutcome {
+    Acquired(Box<WorkerReservationGrant>),
+    Existing(Box<WorkerReservationGrant>),
+    Conflict,
+    FenceMismatch,
+    CasMismatch,
+    CapacityExhausted,
+    WorkerUnavailable,
+    Expired,
+}
+
+impl WorkerReservationOutcome {
+    pub fn into_grant(self) -> Result<WorkerReservationGrant, EphemeralCoordinationError> {
+        match self {
+            Self::Acquired(grant) | Self::Existing(grant) => Ok(*grant),
+            _ => Err(EphemeralCoordinationError::InvalidResponse),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorkerReservationMutation {
+    Released(Box<WorkerRegistrationSnapshot>),
+    AlreadyReleased,
+    FenceMismatch,
+    CasMismatch,
+    Expired,
+}
+
+impl WorkerReservationMutation {
+    pub fn into_worker(self) -> Result<WorkerRegistrationSnapshot, EphemeralCoordinationError> {
+        match self {
+            Self::Released(worker) => Ok(*worker),
+            _ => Err(EphemeralCoordinationError::InvalidResponse),
+        }
+    }
+}
+
+#[async_trait]
+pub trait WorkerReservationStore: Send + Sync {
+    async fn reserve_worker(
+        &self,
+        expected_worker: &WorkerRegistrationSnapshot,
+        request: WorkerReservationRequest,
+        ttl: Duration,
+    ) -> Result<WorkerReservationOutcome, EphemeralCoordinationError>;
+    async fn release_worker_reservation(
+        &self,
+        expected: &WorkerReservationSnapshot,
+    ) -> Result<WorkerReservationMutation, EphemeralCoordinationError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

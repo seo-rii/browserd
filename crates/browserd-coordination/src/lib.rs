@@ -23,6 +23,8 @@ pub use ephemeral::{
     EphemeralCoordinationError, EphemeralCoordinationStore, OneTimeCapability, OneTimeConsume,
     OneTimeIssue, WorkerCapacity, WorkerHeartbeat, WorkerLeaseMutation, WorkerLeaseStore,
     WorkerReadiness, WorkerRegistration, WorkerRegistrationQuery, WorkerRegistrationSnapshot,
+    WorkerReservationGrant, WorkerReservationMutation, WorkerReservationOutcome,
+    WorkerReservationRequest, WorkerReservationSnapshot, WorkerReservationStore,
 };
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
 pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};
