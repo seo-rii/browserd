@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::mpsc::{self, SyncSender};
 
-use browserd_actions::{ActionSequence, BrowserResult, DispatchId, TerminalDetail, TransportLoss};
+use browserd_actions::{
+    ActionSequence, BrowserResult, DispatchId, ResolutionAnnotation, TerminalDetail, TransportLoss,
+};
 use browserd_core::{ActionId, SessionId, TenantId};
 use chrono::{DateTime, Utc};
 
@@ -84,6 +86,16 @@ enum Command {
         action_id: ActionId,
         expected_revision: u64,
         placement: GatewayActionPlacement,
+        now: DateTime<Utc>,
+        response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
+    },
+    ResolveUnknown {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        action_id: ActionId,
+        expected_revision: u64,
+        placement: GatewayActionPlacement,
+        annotation: ResolutionAnnotation,
         now: DateTime<Utc>,
         response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
     },
@@ -299,6 +311,30 @@ impl GatewayActionBlockingClient {
                                             &action_id,
                                             expected_revision,
                                             &placement,
+                                            now,
+                                        )
+                                        .await,
+                                );
+                            }
+                            Command::ResolveUnknown {
+                                tenant_id,
+                                session_id,
+                                action_id,
+                                expected_revision,
+                                placement,
+                                annotation,
+                                now,
+                                response,
+                            } => {
+                                let _ = response.send(
+                                    store
+                                        .resolve_unknown(
+                                            &tenant_id,
+                                            &session_id,
+                                            &action_id,
+                                            expected_revision,
+                                            &placement,
+                                            annotation,
                                             now,
                                         )
                                         .await,
@@ -527,6 +563,32 @@ impl GatewayActionBlockingClient {
                 action_id: action_id.clone(),
                 expected_revision,
                 placement: placement.clone(),
+                now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_unknown(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        annotation: ResolutionAnnotation,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ResolveUnknown {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                action_id: action_id.clone(),
+                expected_revision,
+                placement: placement.clone(),
+                annotation,
                 now,
                 response,
             },

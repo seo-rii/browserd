@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use browserd_actions::{
     ActionDeliveryEvidence, ActionEvidence, ActionEvidenceError, ActionEvidenceMutation,
     ActionKind, ActionSequence, ActionTerminalEvidence, BrowserResult, CanonicalRequestHash,
-    DispatchId, IdempotencyKey, TerminalDetail, TransportLoss,
+    DispatchId, IdempotencyKey, ResolutionAnnotation, TerminalDetail, TransportLoss,
 };
 use browserd_core::{ActionId, ActionState, SessionId, TenantId};
 use chrono::{DateTime, Utc};
@@ -142,6 +142,7 @@ pub struct GatewayActionSnapshot {
     kind: ActionKind,
     placement: GatewayActionPlacement,
     evidence: ActionEvidence,
+    resolution: Option<ResolutionAnnotation>,
     action_sequence: ActionSequence,
     revision: u64,
     created_at: DateTime<Utc>,
@@ -201,6 +202,11 @@ impl GatewayActionSnapshot {
     }
 
     #[must_use]
+    pub const fn resolution(&self) -> Option<&ResolutionAnnotation> {
+        self.resolution.as_ref()
+    }
+
+    #[must_use]
     pub const fn action_sequence(&self) -> ActionSequence {
         self.action_sequence
     }
@@ -228,6 +234,15 @@ impl GatewayActionSnapshot {
     fn derive_worker_loss(&mut self) -> Result<(), GatewayActionCoordinationError> {
         self.evidence.materialize_worker_loss()?;
         Ok(())
+    }
+
+    fn requires_reconciliation(&self) -> bool {
+        self.kind == ActionKind::Mutating
+            && self.resolution.is_none()
+            && matches!(
+                self.terminal().map(|terminal| terminal.detail()),
+                Some(TerminalDetail::OutcomeUnknown(_))
+            )
     }
 }
 
@@ -318,6 +333,10 @@ pub enum GatewayActionCoordinationError {
     ActionIdentityConflict { action_id: ActionId },
     #[error("gateway action placement does not match the session placement")]
     PlacementMismatch,
+    #[error("another mutating action owns the session dispatch lane")]
+    MutationInFlight { action_id: ActionId },
+    #[error("session mutation is blocked until an uncertain action is reconciled")]
+    ReconciliationRequired { action_id: ActionId },
     #[error("session has been fenced as lost")]
     SessionLost,
     #[error("session loss has not been recorded")]
@@ -332,6 +351,10 @@ pub enum GatewayActionCoordinationError {
     ActionSequenceConflict,
     #[error("gateway action sequence must be non-zero")]
     InvalidActionSequence,
+    #[error("only an outcome-unknown action may be explicitly resolved")]
+    ResolutionNotAllowed,
+    #[error("gateway action resolution conflicts with its durable annotation")]
+    ResolutionConflict,
     #[error("gateway action sequence overflowed")]
     ActionSequenceOverflow,
     #[error("session loss materialization limit must be between 1 and 1000")]
@@ -452,6 +475,17 @@ pub trait GatewayActionCoordination: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError>;
 
+    async fn resolve_unknown(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        annotation: ResolutionAnnotation,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError>;
+
     async fn mark_session_lost(
         &self,
         claim: &SessionLossClaim,
@@ -475,6 +509,8 @@ struct RecordedSessionLoss {
 struct GatewayActionSessionState {
     placement: GatewayActionPlacement,
     loss: Option<RecordedSessionLoss>,
+    active_mutation: Option<ActionId>,
+    unresolved_mutation: Option<ActionId>,
     last_action_sequence: u64,
     idempotency: HashMap<IdempotencyKey, ActionId>,
     actions: HashMap<ActionId, GatewayActionSnapshot>,
@@ -485,6 +521,8 @@ impl GatewayActionSessionState {
         Self {
             placement,
             loss: None,
+            active_mutation: None,
+            unresolved_mutation: None,
             last_action_sequence: 0,
             idempotency: HashMap::new(),
             actions: HashMap::new(),
@@ -519,6 +557,7 @@ impl MemoryGatewayActionStore {
         expected_revision: u64,
         placement: &GatewayActionPlacement,
         now: DateTime<Utc>,
+        allow_session_loss: bool,
         mutation: impl FnOnce(
             &mut GatewayActionSnapshot,
         ) -> Result<ActionEvidenceMutation, GatewayActionCoordinationError>,
@@ -535,7 +574,8 @@ impl MemoryGatewayActionStore {
         if session.placement != *placement {
             return Err(GatewayActionCoordinationError::PlacementMismatch);
         }
-        if session.loss.is_some() {
+        let session_lost = session.loss.is_some();
+        if session_lost && !allow_session_loss {
             return Err(GatewayActionCoordinationError::SessionLost);
         }
         let current = session
@@ -555,12 +595,74 @@ impl MemoryGatewayActionStore {
                         current.clone(),
                     )));
                 }
+                let arms_mutation = current.kind == ActionKind::Mutating
+                    && matches!(current.delivery(), ActionDeliveryEvidence::NotAttempted)
+                    && matches!(
+                        candidate.delivery(),
+                        ActionDeliveryEvidence::DispatchArmed(_)
+                    );
+                if arms_mutation {
+                    if let Some(unresolved) = &session.unresolved_mutation {
+                        return Err(GatewayActionCoordinationError::ReconciliationRequired {
+                            action_id: unresolved.clone(),
+                        });
+                    }
+                    if let Some(active) = &session.active_mutation
+                        && active != action_id
+                    {
+                        return Err(GatewayActionCoordinationError::MutationInFlight {
+                            action_id: active.clone(),
+                        });
+                    }
+                }
+                let finishes_dispatched_mutation = current.kind == ActionKind::Mutating
+                    && !matches!(current.delivery(), ActionDeliveryEvidence::NotAttempted)
+                    && current.terminal().is_none()
+                    && candidate.terminal().is_some();
+                let resolves_mutation = current.kind == ActionKind::Mutating
+                    && current.resolution.is_none()
+                    && candidate.resolution.is_some();
+                let invalid_resolution_lane = if session_lost {
+                    session
+                        .active_mutation
+                        .as_ref()
+                        .is_some_and(|active| active != action_id)
+                        || session
+                            .unresolved_mutation
+                            .as_ref()
+                            .is_some_and(|unresolved| unresolved != action_id)
+                } else {
+                    session.unresolved_mutation.as_ref() != Some(action_id)
+                };
+                if (finishes_dispatched_mutation
+                    && session.active_mutation.as_ref() != Some(action_id))
+                    || (resolves_mutation && invalid_resolution_lane)
+                {
+                    return Err(GatewayActionCoordinationError::CorruptState);
+                }
                 candidate.revision = candidate
                     .revision
                     .checked_add(1)
                     .ok_or(GatewayActionCoordinationError::RevisionOverflow)?;
                 candidate.updated_at = now;
                 *current = candidate.clone();
+                if arms_mutation {
+                    session.active_mutation = Some(action_id.clone());
+                }
+                if finishes_dispatched_mutation {
+                    session.active_mutation = None;
+                    if candidate.requires_reconciliation() {
+                        session.unresolved_mutation = Some(action_id.clone());
+                    }
+                }
+                if resolves_mutation {
+                    if session.unresolved_mutation.as_ref() == Some(action_id) {
+                        session.unresolved_mutation = None;
+                    }
+                    if session_lost && session.active_mutation.as_ref() == Some(action_id) {
+                        session.active_mutation = None;
+                    }
+                }
                 Ok(candidate)
             }
             Err(_) if current.revision != expected_revision => Err(
@@ -625,6 +727,13 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             if session.loss.is_some() {
                 return Err(GatewayActionCoordinationError::SessionLost);
             }
+            if claim.kind == ActionKind::Mutating
+                && let Some(action_id) = &session.unresolved_mutation
+            {
+                return Err(GatewayActionCoordinationError::ReconciliationRequired {
+                    action_id: action_id.clone(),
+                });
+            }
         }
 
         if state.action_owners.contains_key(&claim.proposed_action_id) {
@@ -653,6 +762,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             kind: claim.kind,
             placement: claim.placement.clone(),
             evidence: ActionEvidence::new(),
+            resolution: None,
             action_sequence: ActionSequence::new(action_sequence),
             revision: 0,
             created_at: now,
@@ -721,6 +831,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             expected_revision,
             placement,
             now,
+            false,
             move |snapshot| Ok(snapshot.evidence.arm_dispatch(dispatch_id)?),
         )
     }
@@ -742,6 +853,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             expected_revision,
             placement,
             now,
+            false,
             |snapshot| Ok(snapshot.evidence.mark_exposure_possible(dispatch_id)?),
         )
     }
@@ -765,6 +877,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             expected_revision,
             placement,
             now,
+            false,
             |snapshot| {
                 if action_sequence.get() == 0 {
                     return Err(GatewayActionCoordinationError::InvalidActionSequence);
@@ -799,6 +912,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             expected_revision,
             placement,
             now,
+            false,
             |snapshot| {
                 if action_sequence.get() == 0 {
                     return Err(GatewayActionCoordinationError::InvalidActionSequence);
@@ -831,6 +945,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             expected_revision,
             placement,
             now,
+            false,
             |snapshot| Ok(snapshot.evidence.record_transport_loss(dispatch_id, loss)?),
         )
     }
@@ -851,7 +966,46 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             expected_revision,
             placement,
             now,
+            false,
             |snapshot| Ok(snapshot.evidence.cancel_before_dispatch()?),
+        )
+    }
+
+    async fn resolve_unknown(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        annotation: ResolutionAnnotation,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.mutate_action(
+            tenant_id,
+            session_id,
+            action_id,
+            expected_revision,
+            placement,
+            now,
+            true,
+            |snapshot| {
+                if let Some(existing) = &snapshot.resolution {
+                    return if existing == &annotation {
+                        Ok(ActionEvidenceMutation::AlreadyRecorded)
+                    } else {
+                        Err(GatewayActionCoordinationError::ResolutionConflict)
+                    };
+                }
+                if !matches!(
+                    snapshot.terminal().map(|terminal| terminal.detail()),
+                    Some(TerminalDetail::OutcomeUnknown(_))
+                ) {
+                    return Err(GatewayActionCoordinationError::ResolutionNotAllowed);
+                }
+                snapshot.resolution = Some(annotation);
+                Ok(ActionEvidenceMutation::Recorded)
+            },
         )
     }
 

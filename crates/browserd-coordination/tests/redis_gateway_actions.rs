@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use browserd_actions::{
     ActionKind, ActionSequence, BrowserResult, CanonicalRequestHash, DispatchId,
-    KnownFailureReason, OutcomeUnknownReason, ResultDigest, TerminalDetail,
+    KnownFailureReason, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind, ResultDigest,
+    TerminalDetail, TransportLoss,
 };
 use browserd_coordination::{
     ClaimGatewayAction, DirectoryFence, GatewayActionClaimOutcome, GatewayActionCoordination,
@@ -14,7 +15,7 @@ use browserd_coordination::{
     RedisGatewayActionConfig, RedisGatewayActionStore, SessionLossClaim, SessionLossOutcome,
     StoreConfig,
 };
-use browserd_core::{ActionId, SessionId, TenantId, WorkerId};
+use browserd_core::{ActionId, PrincipalId, SessionId, TenantId, WorkerId};
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
@@ -53,13 +54,33 @@ fn claim(
     request_byte: u8,
     placement: GatewayActionPlacement,
 ) -> ClaimGatewayAction {
+    claim_with_kind(
+        tenant_id,
+        session_id,
+        proposed_action_id,
+        idempotency_key,
+        request_byte,
+        ActionKind::Mutating,
+        placement,
+    )
+}
+
+fn claim_with_kind(
+    tenant_id: TenantId,
+    session_id: SessionId,
+    proposed_action_id: ActionId,
+    idempotency_key: impl Into<String>,
+    request_byte: u8,
+    kind: ActionKind,
+    placement: GatewayActionPlacement,
+) -> ClaimGatewayAction {
     ClaimGatewayAction::new(
         tenant_id,
         session_id,
         proposed_action_id,
         idempotency_key,
         CanonicalRequestHash::new([request_byte; 32]),
-        ActionKind::Mutating,
+        kind,
         placement,
     )
     .expect("gateway action claim should be valid")
@@ -676,5 +697,497 @@ async fn redis_session_action_keys_share_hash_tag_and_live_loss_fence_has_no_ttl
         1,
         "one non-expiring session hash must own the durable loss fence"
     );
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_unknown_resolution_does_not_require_terminal_action_in_pending_index() {
+    let Some(fixture) = redis_fixture("unknown-resolution").await else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let placement = placement(29, 83);
+    let action_id = ActionId::new();
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim(
+                tenant_id.clone(),
+                session_id.clone(),
+                action_id.clone(),
+                "unknown-resolution",
+                13,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("action should be claimed");
+    let dispatch_id = DispatchId::new();
+    let armed = fixture
+        .store
+        .arm_dispatch(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            claimed.snapshot().revision(),
+            &placement,
+            dispatch_id.clone(),
+            at(2),
+        )
+        .await
+        .expect("action should own the mutation lane");
+    let unknown = fixture
+        .store
+        .record_transport_loss(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            armed.revision(),
+            &placement,
+            &dispatch_id,
+            TransportLoss::Ambiguous(OutcomeUnknownReason::TimeoutAfterDispatch),
+            at(3),
+        )
+        .await
+        .expect("transport loss should become terminal unknown");
+    let annotation = ResolutionAnnotation::new(
+        ResolutionKind::ConfirmedNotExecuted,
+        PrincipalId::new(),
+        4_000,
+        "verified by a post-loss read",
+    );
+    let resolved = fixture
+        .store
+        .resolve_unknown(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            unknown.revision(),
+            &placement,
+            annotation.clone(),
+            at(4),
+        )
+        .await
+        .expect("terminal unknown should resolve without pending membership");
+    assert_eq!(resolved.resolution(), Some(&annotation));
+
+    let next = fixture
+        .store
+        .claim_action(
+            claim(
+                tenant_id,
+                session_id,
+                ActionId::new(),
+                "mutation-after-resolution",
+                14,
+                placement,
+            ),
+            at(5),
+        )
+        .await
+        .expect("resolution should reopen mutation admission");
+    assert!(matches!(next, GatewayActionClaimOutcome::Created(_)));
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_materialized_worker_loss_unknown_can_be_resolved_and_annotation_persists() {
+    let Some(fixture) = redis_fixture("materialized-loss-resolution").await else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let placement = placement(31, 89);
+    let action_id = ActionId::new();
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim(
+                tenant_id.clone(),
+                session_id.clone(),
+                action_id.clone(),
+                "materialized-loss-resolution",
+                15,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("action should be claimed");
+    let armed = fixture
+        .store
+        .arm_dispatch(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            claimed.snapshot().revision(),
+            &placement,
+            DispatchId::new(),
+            at(2),
+        )
+        .await
+        .expect("mutation should be dispatch-armed before session loss");
+    assert!(armed.terminal().is_none());
+
+    let loss = SessionLossClaim::new(
+        tenant_id.clone(),
+        session_id.clone(),
+        placement.clone(),
+        Uuid::now_v7(),
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mark_session_lost(&loss, at(3))
+            .await
+            .expect("session loss should linearize"),
+        SessionLossOutcome::Recorded
+    );
+    assert_eq!(
+        fixture
+            .store
+            .materialize_session_loss(&loss, 100, at(4))
+            .await
+            .expect("dispatch-armed mutation should materialize after loss"),
+        1
+    );
+    let materialized = fixture
+        .store
+        .get_effective_action(&tenant_id, &session_id, &action_id)
+        .await
+        .expect("materialized action lookup should succeed")
+        .expect("materialized action should remain queryable");
+    assert_eq!(
+        materialized.terminal().map(|terminal| terminal.detail()),
+        Some(TerminalDetail::OutcomeUnknown(
+            OutcomeUnknownReason::WorkerLost
+        ))
+    );
+
+    let annotation = ResolutionAnnotation::new(
+        ResolutionKind::ConfirmedNotExecuted,
+        PrincipalId::new(),
+        5_000,
+        "confirmed from external state after worker loss",
+    );
+    let resolved = fixture
+        .store
+        .resolve_unknown(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            materialized.revision(),
+            &placement,
+            annotation.clone(),
+            at(5),
+        )
+        .await
+        .expect("materialized worker-loss unknown should accept caller resolution");
+    assert_eq!(resolved.resolution(), Some(&annotation));
+    assert_eq!(
+        resolved.terminal().map(|terminal| terminal.detail()),
+        Some(TerminalDetail::OutcomeUnknown(
+            OutcomeUnknownReason::WorkerLost
+        ))
+    );
+
+    let restarted = RedisGatewayActionStore::connect(fixture.config.clone())
+        .await
+        .expect("separate Redis action store should reconnect");
+    let persisted = restarted
+        .get_effective_action(&tenant_id, &session_id, &action_id)
+        .await
+        .expect("resolved action should be readable after reconnect")
+        .expect("resolved action should remain retained");
+    assert_eq!(persisted.resolution(), Some(&annotation));
+    assert_eq!(
+        persisted.terminal().map(|terminal| terminal.detail()),
+        Some(TerminalDetail::OutcomeUnknown(
+            OutcomeUnknownReason::WorkerLost
+        ))
+    );
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_unknown_mutation_holds_action_keys_persistent_until_resolution() {
+    let Some(fixture) = redis_fixture("unknown-mutation-retention-hold").await else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let placement = placement(37, 97);
+    let action_id = ActionId::new();
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim(
+                tenant_id.clone(),
+                session_id.clone(),
+                action_id.clone(),
+                "retention-hold-mutation",
+                17,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("mutation should be claimed");
+    let dispatch_id = DispatchId::new();
+    let armed = fixture
+        .store
+        .arm_dispatch(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            claimed.snapshot().revision(),
+            &placement,
+            dispatch_id.clone(),
+            at(2),
+        )
+        .await
+        .expect("live mutation should arm its dispatch");
+
+    let client = redis::Client::open(fixture.endpoint.as_str())
+        .expect("Redis endpoint should validate for TTL inspection");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("Redis TTL inspection connection should open");
+    let keys = keys_with_prefix(&fixture.endpoint, &fixture.prefix).await;
+    let mut session_keys = Vec::new();
+    let mut retained_keys = Vec::new();
+    let mut retained_types = Vec::new();
+    for key in keys {
+        let key_type: String = redis::cmd("TYPE")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("coordination key type should be readable");
+        let stored_placement: Option<String> = if key_type == "hash" {
+            redis::cmd("HGET")
+                .arg(&key)
+                .arg("placement")
+                .query_async(&mut connection)
+                .await
+                .expect("coordination hash should expose its placement field")
+        } else {
+            None
+        };
+        if stored_placement.is_some() {
+            session_keys.push(key);
+        } else {
+            let ttl: i64 = redis::cmd("PTTL")
+                .arg(&key)
+                .query_async(&mut connection)
+                .await
+                .expect("armed coordination key TTL should be readable");
+            assert_eq!(
+                ttl, -1,
+                "an armed mutation must hold every non-session coordination key persistent"
+            );
+            retained_keys.push(key);
+            retained_types.push(key_type);
+        }
+    }
+    assert_eq!(
+        session_keys.len(),
+        1,
+        "one hash carrying placement must be the persistent session key"
+    );
+    retained_types.sort_unstable();
+    assert_eq!(
+        retained_types,
+        ["hash".to_owned(), "hash".to_owned(), "zset".to_owned()]
+    );
+
+    let unknown = fixture
+        .store
+        .record_transport_loss(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            armed.revision(),
+            &placement,
+            &dispatch_id,
+            TransportLoss::Ambiguous(OutcomeUnknownReason::TimeoutAfterDispatch),
+            at(3),
+        )
+        .await
+        .expect("ambiguous transport loss should require reconciliation");
+    let mut persistent_hashes = 0;
+    let mut missing_keys = 0;
+    for key in &retained_keys {
+        let key_type: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("unknown coordination key type should be readable");
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("unknown coordination key TTL should be readable");
+        match key_type.as_str() {
+            "hash" => {
+                assert_eq!(
+                    ttl, -1,
+                    "OutcomeUnknown must retain its action and idempotency hashes indefinitely"
+                );
+                persistent_hashes += 1;
+            }
+            "none" => {
+                assert_eq!(ttl, -2);
+                missing_keys += 1;
+            }
+            other => panic!("unexpected key type after terminal unknown: {other}"),
+        }
+    }
+    assert_eq!(persistent_hashes, 2);
+    assert_eq!(
+        missing_keys, 1,
+        "the terminal mutation should be removed from the pending index"
+    );
+
+    let read_only = fixture
+        .store
+        .claim_action(
+            claim_with_kind(
+                tenant_id.clone(),
+                session_id.clone(),
+                ActionId::new(),
+                "read-during-retention-hold",
+                18,
+                ActionKind::ReadOnly,
+                placement.clone(),
+            ),
+            at(4),
+        )
+        .await
+        .expect("read-only reconciliation should remain available during OutcomeUnknown");
+    assert!(matches!(read_only, GatewayActionClaimOutcome::Created(_)));
+    for key in &retained_keys {
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("held coordination key TTL should be readable after a read-only claim");
+        assert_eq!(
+            ttl, -1,
+            "a read-only claim must not turn the unresolved mutation hold into a finite TTL"
+        );
+    }
+
+    let annotation = ResolutionAnnotation::new(
+        ResolutionKind::ConfirmedNotExecuted,
+        PrincipalId::new(),
+        6_000,
+        "verified by reconciliation read while the Redis hold was active",
+    );
+    fixture
+        .store
+        .resolve_unknown(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            unknown.revision(),
+            &placement,
+            annotation,
+            at(5),
+        )
+        .await
+        .expect("resolving the unknown mutation should release the retention hold");
+
+    let maximum_ttl = i64::try_from(StoreConfig::default().retention().as_millis())
+        .expect("configured retention should fit Redis PTTL");
+    for key in &retained_keys {
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("released coordination key TTL should be readable");
+        assert!(
+            ttl > 0 && ttl <= maximum_ttl,
+            "resolution must restore a positive bounded retention TTL, got {ttl}ms"
+        );
+    }
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_read_only_unknown_can_be_resolved_without_a_mutation_lane() {
+    let Some(fixture) = redis_fixture("read-only-unknown-resolution").await else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let placement = placement(41, 101);
+    let action_id = ActionId::new();
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim_with_kind(
+                tenant_id.clone(),
+                session_id.clone(),
+                action_id.clone(),
+                "read-only-unknown-resolution",
+                19,
+                ActionKind::ReadOnly,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("read-only action should be claimed");
+    let dispatch_id = DispatchId::new();
+    let armed = fixture
+        .store
+        .arm_dispatch(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            claimed.snapshot().revision(),
+            &placement,
+            dispatch_id.clone(),
+            at(2),
+        )
+        .await
+        .expect("read-only dispatch should arm without owning the mutation lane");
+    let unknown = fixture
+        .store
+        .record_transport_loss(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            armed.revision(),
+            &placement,
+            &dispatch_id,
+            TransportLoss::Ambiguous(OutcomeUnknownReason::TimeoutAfterDispatch),
+            at(3),
+        )
+        .await
+        .expect("read-only transport loss should become terminal unknown");
+    let annotation = ResolutionAnnotation::new(
+        ResolutionKind::Abandoned,
+        PrincipalId::new(),
+        4_000,
+        "read-only result was no longer needed",
+    );
+    let resolved = fixture
+        .store
+        .resolve_unknown(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            unknown.revision(),
+            &placement,
+            annotation.clone(),
+            at(4),
+        )
+        .await
+        .expect("read-only unknown should resolve without a mutation lane pointer");
+    assert_eq!(resolved.resolution(), Some(&annotation));
     delete_fixture(&fixture).await;
 }

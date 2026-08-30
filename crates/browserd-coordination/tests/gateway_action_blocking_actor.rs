@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use browserd_actions::{
     ActionKind, ActionSequence, BrowserResult, CanonicalRequestHash, DispatchId,
-    KnownFailureReason, TerminalDetail, TransportLoss,
+    KnownFailureReason, ResolutionAnnotation, TerminalDetail, TransportLoss,
 };
 use browserd_coordination::{
     ClaimGatewayAction, CoordinationActorConfig, DirectoryFence, GatewayActionBlockingClient,
@@ -197,6 +197,29 @@ impl GatewayActionCoordination for SlowClaimStore {
                 action_id,
                 expected_revision,
                 placement,
+                now,
+            )
+            .await
+    }
+
+    async fn resolve_unknown(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        annotation: ResolutionAnnotation,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.inner
+            .resolve_unknown(
+                tenant_id,
+                session_id,
+                action_id,
+                expected_revision,
+                placement,
+                annotation,
                 now,
             )
             .await
