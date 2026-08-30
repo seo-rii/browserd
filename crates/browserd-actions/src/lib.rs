@@ -1,9 +1,14 @@
 //! Durable action ledger and browser side-effect uncertainty boundary.
 
+mod evidence;
 mod file_journal;
 mod ledger;
 mod types;
 
+pub use evidence::{
+    ActionDeliveryEvidence, ActionEvidence, ActionEvidenceError, ActionEvidenceMutation,
+    ActionTerminalEvidence, ActionTerminalSource,
+};
 pub use file_journal::{ActionJournalLimits, FileActionJournal};
 pub use ledger::ActionLedger;
 pub use types::{

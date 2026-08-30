@@ -144,6 +144,19 @@ impl LedgerSession {
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct DispatchId(pub(crate) LeaseId);
 
+impl DispatchId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(LeaseId::new())
+    }
+}
+
+impl Default for DispatchId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DispatchPermit {
     pub(crate) action_id: ActionId,
