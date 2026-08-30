@@ -737,6 +737,7 @@ struct PendingInstall {
 struct ActiveRoute {
     pending: PendingInstall,
     active: ActiveInstallResponse,
+    next_renewal_sequence: u64,
 }
 
 enum LocalRouteState {
@@ -750,6 +751,7 @@ enum LocalRouteState {
 struct LocalRoute {
     reservation: ShardEgressReservation,
     state: LocalRouteState,
+    renewal_operation: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -925,6 +927,7 @@ impl EgressRouteAdapter {
                         LocalRoute {
                             reservation: reservation.clone(),
                             state: LocalRouteState::Terminal,
+                            renewal_operation: Arc::new(Mutex::new(())),
                         },
                     );
                 }
@@ -1016,6 +1019,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
                         LocalRoute {
                             reservation: reservation.clone(),
                             state: LocalRouteState::Preparing,
+                            renewal_operation: Arc::new(Mutex::new(())),
                         },
                     );
                 }
@@ -1178,6 +1182,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
                                         route.state = LocalRouteState::Active(ActiveRoute {
                                             pending: pending_for_task.clone(),
                                             active,
+                                            next_renewal_sequence: 1,
                                         });
                                         Ok(pending_for_task.receipt.clone())
                                     }
@@ -1225,6 +1230,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
         route.state = LocalRouteState::Active(ActiveRoute {
             pending: pending.clone(),
             active,
+            next_renewal_sequence: 1,
         });
         Ok(pending.receipt)
     }
@@ -1241,6 +1247,113 @@ impl EgressRouteBackend for EgressRouteAdapter {
         reservation: &ShardEgressReservation,
     ) -> Result<(), SandboxError> {
         self.revoke_generation(reservation).await
+    }
+
+    async fn renew(
+        &self,
+        lease: &ShardIngressLease,
+        lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        let renewal_operation = {
+            let routes = self.routes.lock().await;
+            let route = routes
+                .get(lease.reservation().generation())
+                .ok_or_else(|| SandboxError::Backend("egress lease is unknown".into()))?;
+            if route.reservation != *lease.reservation() {
+                return Err(SandboxError::Backend(
+                    "egress lease generation conflict".into(),
+                ));
+            }
+            Arc::clone(&route.renewal_operation)
+        };
+        let _renewal_guard = renewal_operation.lock().await;
+        let (request, next_renewal_sequence, installed) = {
+            let routes = self.routes.lock().await;
+            let route = routes
+                .get(lease.reservation().generation())
+                .ok_or_else(|| SandboxError::Backend("egress lease is unknown".into()))?;
+            if route.reservation != *lease.reservation() {
+                return Err(SandboxError::Backend(
+                    "egress lease generation conflict".into(),
+                ));
+            }
+            let LocalRouteState::Active(active) = &route.state else {
+                return Err(SandboxError::Backend("egress lease is not active".into()));
+            };
+            if active.pending.receipt != *lease.receipt()
+                || active.pending.namespace != lease.namespace_identity()
+            {
+                return Err(SandboxError::Backend(
+                    "egress lease receipt mismatch".into(),
+                ));
+            }
+            let next_renewal_sequence = active
+                .next_renewal_sequence
+                .checked_add(1)
+                .ok_or_else(|| SandboxError::Backend("egress renewal sequence exhausted".into()))?;
+            let request = RenewRouteLeaseRequest::new(
+                active.next_renewal_sequence,
+                self.daemon_epoch,
+                active.pending.request.egress_fence().clone(),
+                active.active.attachment_id(),
+                active.active.activation_revision(),
+                lease_ttl,
+            )
+            .map_err(|error| SandboxError::Backend(error.to_string()))?;
+            (request, next_renewal_sequence, active.clone())
+        };
+        let renewed = self
+            .control
+            .renew(request.clone())
+            .await
+            .map_err(|error| SandboxError::Backend(error.to_string()))?;
+        if renewed.renewal_sequence() != request.renewal_sequence
+            || renewed.daemon_epoch() != self.daemon_epoch
+            || renewed.egress_fence() != request.egress_fence()
+            || renewed.attachment_id() != installed.active.attachment_id()
+            || renewed.activation_revision() != installed.active.activation_revision()
+            || renewed.expires_at_millis() < installed.active.expires_at_millis()
+        {
+            return Err(SandboxError::Backend(
+                "renewed egress receipt did not match the active route".into(),
+            ));
+        }
+        let renewed_active = ActiveInstallResponse::new(
+            installed.active.transfer_id().clone(),
+            installed.active.daemon_epoch(),
+            installed.active.egress_fence().clone(),
+            installed.active.attachment_id(),
+            installed.active.proxy_address(),
+            renewed.expires_at_millis(),
+            installed.active.activation_revision(),
+        )
+        .map_err(|error| SandboxError::Backend(error.to_string()))?;
+        let mut routes = self.routes.lock().await;
+        let route = routes
+            .get_mut(lease.reservation().generation())
+            .ok_or_else(|| SandboxError::Backend("egress lease is unknown".into()))?;
+        if route.reservation != *lease.reservation() {
+            return Err(SandboxError::Backend(
+                "egress lease generation conflict".into(),
+            ));
+        }
+        let LocalRouteState::Active(active) = &mut route.state else {
+            return Err(SandboxError::Backend(
+                "egress lease was revoked during renewal".into(),
+            ));
+        };
+        if active.pending.receipt != *lease.receipt()
+            || active.pending.namespace != lease.namespace_identity()
+            || active.active != installed.active
+            || active.next_renewal_sequence != request.renewal_sequence
+        {
+            return Err(SandboxError::Backend(
+                "egress lease changed during renewal".into(),
+            ));
+        }
+        active.active = renewed_active;
+        active.next_renewal_sequence = next_renewal_sequence;
+        Ok(())
     }
 
     async fn revoke(&self, lease: &ShardIngressLease) -> Result<(), SandboxError> {
@@ -1491,6 +1604,10 @@ mod tests {
         prepare_requests: Arc<StdMutex<Vec<PrepareRouteRequest>>>,
         install_requests: Arc<StdMutex<Vec<InstallRequest>>>,
         renew_requests: Arc<StdMutex<Vec<RenewRouteLeaseRequest>>>,
+        renew_attempts: Arc<AtomicUsize>,
+        renew_entered: Arc<Notify>,
+        renew_release: Arc<Notify>,
+        block_first_renew: bool,
         active: Arc<StdMutex<Option<ActiveInstallResponse>>>,
         install_fails_after_commit: bool,
         install_panics: bool,
@@ -1513,6 +1630,10 @@ mod tests {
                 prepare_requests: Arc::new(StdMutex::new(Vec::new())),
                 install_requests: Arc::new(StdMutex::new(Vec::new())),
                 renew_requests: Arc::new(StdMutex::new(Vec::new())),
+                renew_attempts: Arc::new(AtomicUsize::new(0)),
+                renew_entered: Arc::new(Notify::new()),
+                renew_release: Arc::new(Notify::new()),
+                block_first_renew: false,
                 active: Arc::new(StdMutex::new(None)),
                 install_fails_after_commit: false,
                 install_panics: false,
@@ -1598,6 +1719,11 @@ mod tests {
             &self,
             request: RenewRouteLeaseRequest,
         ) -> Result<RenewedRouteLeaseReceipt, EgressControlError> {
+            let attempt = self.renew_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.renew_entered.notify_one();
+            if self.block_first_renew && attempt == 1 {
+                self.renew_release.notified().await;
+            }
             let active = self
                 .active
                 .lock()
@@ -1728,6 +1854,98 @@ mod tests {
         assert_eq!(
             prepares[0].binding_digest,
             *spec.dedicated_egress().policy_binding().snapshot_digest()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_active_lease_renewals_are_serialized_with_monotonic_sequences() {
+        let address = "127.0.0.1:43126".parse().expect("address should parse");
+        let mut control = FakeControl::new(address);
+        control.block_first_renew = true;
+        let adapter = Arc::new(adapter(control.clone()));
+        let reservation = ShardEgressReservation::from_launch_spec(&launch_spec());
+        adapter
+            .prepare(&reservation)
+            .await
+            .expect("route should prepare");
+        let namespace = namespace();
+        let receipt = adapter
+            .attach(&reservation, &namespace)
+            .await
+            .expect("route should attach");
+        let lease = ShardIngressLease::from_attachment(reservation, namespace.identity(), receipt);
+
+        let first = tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            let lease = lease.clone();
+            async move { adapter.renew(&lease, Duration::from_secs(30)).await }
+        });
+        control.renew_entered.notified().await;
+        let second = tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            let lease = lease.clone();
+            async move { adapter.renew(&lease, Duration::from_secs(30)).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(control.renew_attempts.load(Ordering::SeqCst), 1);
+
+        control.renew_release.notify_one();
+        first
+            .await
+            .expect("first renewal task should join")
+            .expect("first renewal should succeed");
+        second
+            .await
+            .expect("second renewal task should join")
+            .expect("second renewal should succeed");
+        let sequences: Vec<_> = control
+            .renew_requests
+            .lock()
+            .expect("renew requests should be readable")
+            .iter()
+            .map(RenewRouteLeaseRequest::renewal_sequence)
+            .collect();
+        assert_eq!(sequences, [1, 2]);
+        assert!(adapter.is_active(&lease).await.expect("status should work"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoke_wins_a_blocked_renewal_without_route_resurrection() {
+        let address = "127.0.0.1:43127".parse().expect("address should parse");
+        let mut control = FakeControl::new(address);
+        control.block_first_renew = true;
+        let adapter = Arc::new(adapter(control.clone()));
+        let reservation = ShardEgressReservation::from_launch_spec(&launch_spec());
+        adapter
+            .prepare(&reservation)
+            .await
+            .expect("route should prepare");
+        let namespace = namespace();
+        let receipt = adapter
+            .attach(&reservation, &namespace)
+            .await
+            .expect("route should attach");
+        let lease = ShardIngressLease::from_attachment(reservation, namespace.identity(), receipt);
+        let renew = tokio::spawn({
+            let adapter = Arc::clone(&adapter);
+            let lease = lease.clone();
+            async move { adapter.renew(&lease, Duration::from_secs(30)).await }
+        });
+        control.renew_entered.notified().await;
+
+        adapter
+            .revoke(&lease)
+            .await
+            .expect("exact revoke should commit while renewal is blocked");
+        control.renew_release.notify_one();
+        assert!(renew.await.expect("renewal task should join").is_err());
+        assert!(!adapter.is_active(&lease).await.expect("status should work"));
+        assert!(
+            control
+                .active
+                .lock()
+                .expect("active state should be readable")
+                .is_none()
         );
     }
 

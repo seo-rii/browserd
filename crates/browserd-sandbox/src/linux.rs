@@ -1783,6 +1783,17 @@ pub trait EgressRouteBackend: Send + Sync + 'static {
         &self,
         reservation: &ShardEgressReservation,
     ) -> Result<(), SandboxError>;
+    /// Extends the exact active route without changing its attachment identity. Implementations
+    /// must serialize renewals for one lease and must not resurrect a concurrent revoke.
+    async fn renew(
+        &self,
+        _lease: &ShardIngressLease,
+        _lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        Err(SandboxError::Backend(
+            "egress route renewal is unsupported".into(),
+        ))
+    }
     /// Revokes this exact reservation, namespace, and attachment receipt. Once committed, retries
     /// with the same lease must succeed, including after its exact release; any different receipt
     /// or namespace must fail closed.
