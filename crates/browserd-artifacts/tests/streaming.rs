@@ -3,6 +3,7 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use browserd_artifacts::{
     ArtifactChecksum, ArtifactMultipartStore, ArtifactQuota, ArtifactStoreError,
@@ -11,6 +12,7 @@ use browserd_artifacts::{
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 use common::artifact_fixture;
 
@@ -90,6 +92,43 @@ impl ArtifactMultipartStore for RecordingStore {
         state.partial_exists = false;
         state.partial_bytes.clear();
         Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+struct PausingAppendStore {
+    inner: RecordingStore,
+    append_reached: Arc<Notify>,
+}
+
+impl ArtifactMultipartStore for PausingAppendStore {
+    async fn begin(
+        &self,
+        key: &browserd_artifacts::ArtifactKey,
+    ) -> Result<MultipartUploadId, ArtifactStoreError> {
+        self.inner.begin(key).await
+    }
+
+    async fn append(
+        &self,
+        upload_id: &MultipartUploadId,
+        chunk: Bytes,
+    ) -> Result<(), ArtifactStoreError> {
+        self.inner.append(upload_id, chunk).await?;
+        self.append_reached.notify_one();
+        std::future::pending().await
+    }
+
+    async fn complete_verified(
+        &self,
+        upload_id: &MultipartUploadId,
+        receipt: &ArtifactWriteReceipt,
+    ) -> Result<(), ArtifactStoreError> {
+        self.inner.complete_verified(upload_id, receipt).await
+    }
+
+    async fn abort(&self, upload_id: &MultipartUploadId) -> Result<(), ArtifactStoreError> {
+        self.inner.abort(upload_id).await
     }
 }
 
@@ -354,6 +393,112 @@ async fn failed_partial_cleanup_remains_retryable_without_holding_quota() {
         .expect("recording store lock should not be poisoned");
     assert!(!state.partial_exists);
     assert_eq!(state.abort_calls, 2);
+}
+
+#[tokio::test]
+async fn cancelling_an_in_flight_chunk_fences_finish_until_explicit_abort() {
+    let fixture = artifact_fixture();
+    let quota = ArtifactQuota::new(
+        fixture.namespace,
+        QuotaLimits {
+            max_committed_bytes: 10,
+            max_in_flight_bytes: 10,
+        },
+    );
+    let reservation = quota
+        .reserve(fixture.key, 10)
+        .await
+        .expect("stream reservation should succeed");
+    let store = PausingAppendStore::default();
+    let mut writer = StreamingArtifactWriter::begin(reservation, store.clone())
+        .await
+        .expect("multipart writer should begin");
+
+    {
+        let write = writer.write_chunk(Bytes::from_static(b"lost"));
+        tokio::pin!(write);
+        tokio::select! {
+            result = &mut write => panic!("injected append should remain pending: {result:?}"),
+            () = store.append_reached.notified() => {}
+        }
+    }
+
+    assert!(
+        matches!(writer.finish().await, Err(ArtifactWriteError::Closed)),
+        "a cancelled chunk must make the writer non-finishable"
+    );
+    assert_eq!(
+        writer
+            .abort()
+            .await
+            .expect("cancelled chunk cleanup should remain available"),
+        WriterAbortOutcome::Aborted
+    );
+    let snapshot = quota.snapshot().await;
+    assert_eq!(snapshot.committed_bytes, 0);
+    assert_eq!(snapshot.reserved_bytes, 0);
+    assert_eq!(snapshot.actual_bytes_in_flight, 0);
+    let state = store
+        .inner
+        .state
+        .lock()
+        .expect("recording store lock should not be poisoned");
+    assert!(!state.partial_exists);
+    assert_eq!(state.complete_calls, 0);
+    assert_eq!(state.abort_calls, 1);
+}
+
+#[tokio::test]
+async fn dropping_a_writer_after_chunk_cancellation_schedules_partial_cleanup() {
+    let fixture = artifact_fixture();
+    let quota = ArtifactQuota::new(
+        fixture.namespace,
+        QuotaLimits {
+            max_committed_bytes: 10,
+            max_in_flight_bytes: 10,
+        },
+    );
+    let reservation = quota
+        .reserve(fixture.key, 10)
+        .await
+        .expect("stream reservation should succeed");
+    let store = PausingAppendStore::default();
+    let mut writer = StreamingArtifactWriter::begin(reservation, store.clone())
+        .await
+        .expect("multipart writer should begin");
+    {
+        let write = writer.write_chunk(Bytes::from_static(b"orphan"));
+        tokio::pin!(write);
+        tokio::select! {
+            result = &mut write => panic!("injected append should remain pending: {result:?}"),
+            () = store.append_reached.notified() => {}
+        }
+    }
+
+    drop(writer);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let cleaned = {
+                let state = store
+                    .inner
+                    .state
+                    .lock()
+                    .expect("recording store lock should not be poisoned");
+                !state.partial_exists && state.abort_calls == 1
+            };
+            if cleaned {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer drop should schedule bounded partial cleanup");
+    let snapshot = quota.snapshot().await;
+    assert_eq!(snapshot.committed_bytes, 0);
+    assert_eq!(snapshot.reserved_bytes, 0);
+    assert_eq!(snapshot.actual_bytes_in_flight, 0);
 }
 
 #[allow(dead_code)]

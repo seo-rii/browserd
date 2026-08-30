@@ -1,9 +1,15 @@
 use std::fmt;
+use std::future::Future;
+use std::time::Duration;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
-use crate::{ArtifactChecksum, ArtifactKey, ArtifactReservation, QuotaError};
+use crate::{
+    ArtifactChecksum, ArtifactKey, ArtifactObjectGeneration, ArtifactReservation, QuotaError,
+};
+
+const OBJECT_GENERATION_DOMAIN: &[u8] = b"browserd:artifact-object-generation:v1\0";
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MultipartUploadId(String);
@@ -23,6 +29,7 @@ impl MultipartUploadId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactStoreError {
     message: String,
+    completion_uncertain: bool,
 }
 
 impl ArtifactStoreError {
@@ -30,7 +37,27 @@ impl ArtifactStoreError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            completion_uncertain: false,
         }
+    }
+
+    /// Reports that completion may already be externally visible but has not
+    /// yet passed the backend's durability/reconciliation barrier.
+    ///
+    /// The streaming writer retries this exact completion without releasing
+    /// its quota reservation. Implementations must use this only when retrying
+    /// the same upload and receipt is safe.
+    #[must_use]
+    pub fn completion_uncertain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            completion_uncertain: true,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_completion_uncertain(&self) -> bool {
+        self.completion_uncertain
     }
 }
 
@@ -79,26 +106,33 @@ impl std::error::Error for ArtifactStoreError {}
 ///     }
 /// }
 /// ```
-#[allow(async_fn_in_trait)]
 pub trait ArtifactMultipartStore: Send + Sync {
-    async fn begin(&self, key: &ArtifactKey) -> Result<MultipartUploadId, ArtifactStoreError>;
+    /// Begins an upload and returns an identifier that must never be reused for
+    /// another object incarnation under the same artifact key.
+    fn begin(
+        &self,
+        key: &ArtifactKey,
+    ) -> impl Future<Output = Result<MultipartUploadId, ArtifactStoreError>> + Send;
 
-    async fn append(
+    fn append(
         &self,
         upload_id: &MultipartUploadId,
         chunk: Bytes,
-    ) -> Result<(), ArtifactStoreError>;
+    ) -> impl Future<Output = Result<(), ArtifactStoreError>> + Send;
 
     /// Atomically commits the multipart object with the expected byte count
     /// and checksum. The implementation must consume the receipt, reject a
     /// mismatch, and persist the verified metadata with the committed object.
-    async fn complete_verified(
+    fn complete_verified(
         &self,
         upload_id: &MultipartUploadId,
         receipt: &ArtifactWriteReceipt,
-    ) -> Result<(), ArtifactStoreError>;
+    ) -> impl Future<Output = Result<(), ArtifactStoreError>> + Send;
 
-    async fn abort(&self, upload_id: &MultipartUploadId) -> Result<(), ArtifactStoreError>;
+    fn abort(
+        &self,
+        upload_id: &MultipartUploadId,
+    ) -> impl Future<Output = Result<(), ArtifactStoreError>> + Send;
 }
 
 #[derive(Debug)]
@@ -145,9 +179,18 @@ impl From<ArtifactStoreError> for ArtifactWriteError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriterState {
     Open,
+    Writing,
+    Finishing,
     CleanupPending,
     Finished,
     Aborted,
+}
+
+struct FinishTaskResult<S> {
+    store: S,
+    reservation: ArtifactReservation,
+    state: WriterState,
+    result: Result<ArtifactWriteReceipt, ArtifactWriteError>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +204,7 @@ pub struct ArtifactWriteReceipt {
     pub(crate) key: ArtifactKey,
     pub(crate) size_bytes: u64,
     pub(crate) checksum: ArtifactChecksum,
+    pub(crate) object_generation: ArtifactObjectGeneration,
 }
 
 impl ArtifactWriteReceipt {
@@ -178,21 +222,57 @@ impl ArtifactWriteReceipt {
     pub const fn checksum(&self) -> &ArtifactChecksum {
         &self.checksum
     }
+
+    #[must_use]
+    pub const fn object_generation(&self) -> ArtifactObjectGeneration {
+        self.object_generation
+    }
 }
 
-pub struct StreamingArtifactWriter<S> {
-    reservation: ArtifactReservation,
-    store: S,
+pub struct StreamingArtifactWriter<S>
+where
+    S: ArtifactMultipartStore + 'static,
+{
+    reservation: Option<ArtifactReservation>,
+    store: Option<S>,
     upload_id: MultipartUploadId,
     state: WriterState,
     hasher: Sha256,
     bytes_written: u64,
     receipt: Option<ArtifactWriteReceipt>,
+    finish_task: Option<tokio::task::JoinHandle<FinishTaskResult<S>>>,
+}
+
+impl<S> Drop for StreamingArtifactWriter<S>
+where
+    S: ArtifactMultipartStore + 'static,
+{
+    fn drop(&mut self) {
+        if matches!(
+            self.state,
+            WriterState::Finishing | WriterState::Finished | WriterState::Aborted
+        ) {
+            return;
+        }
+        let Some(store) = self.store.take() else {
+            return;
+        };
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let upload_id = self.upload_id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            drop(runtime.spawn(async move {
+                let _ = store.abort(&upload_id).await;
+                let _ = reservation.abort().await;
+            }));
+        }
+    }
 }
 
 impl<S> StreamingArtifactWriter<S>
 where
-    S: ArtifactMultipartStore,
+    S: ArtifactMultipartStore + 'static,
 {
     pub async fn begin(
         reservation: ArtifactReservation,
@@ -200,13 +280,14 @@ where
     ) -> Result<Self, ArtifactWriteError> {
         let upload_id = store.begin(reservation.key()).await?;
         Ok(Self {
-            reservation,
-            store,
+            reservation: Some(reservation),
+            store: Some(store),
             upload_id,
             state: WriterState::Open,
             hasher: Sha256::new(),
             bytes_written: 0,
             receipt: None,
+            finish_task: None,
         })
     }
 
@@ -230,7 +311,15 @@ where
             }
         };
 
-        if let Err(quota_error) = self.reservation.add_actual_bytes(bytes).await {
+        if self.reservation.is_none() || self.store.is_none() {
+            return Err(ArtifactWriteError::Closed);
+        }
+        self.state = WriterState::Writing;
+        let quota_result = match self.reservation.as_ref() {
+            Some(reservation) => reservation.add_actual_bytes(bytes).await,
+            None => return Err(ArtifactWriteError::Closed),
+        };
+        if let Err(quota_error) = quota_result {
             match self.abort_after_failure().await {
                 Ok(()) => return Err(ArtifactWriteError::Quota(quota_error)),
                 Err(cleanup_error) => return Err(cleanup_error),
@@ -238,9 +327,19 @@ where
         }
 
         let checksum_chunk = chunk.clone();
-        if let Err(operation) = self.store.append(&self.upload_id, chunk).await {
-            let cleanup = self.store.abort(&self.upload_id).await;
-            let _ = self.reservation.abort().await;
+        let append_result = match self.store.as_ref() {
+            Some(store) => store.append(&self.upload_id, chunk).await,
+            None => return Err(ArtifactWriteError::Closed),
+        };
+        if let Err(operation) = append_result {
+            self.state = WriterState::CleanupPending;
+            let cleanup = match self.store.as_ref() {
+                Some(store) => store.abort(&self.upload_id).await,
+                None => return Err(ArtifactWriteError::Closed),
+            };
+            if let Some(reservation) = self.reservation.as_ref() {
+                let _ = reservation.abort().await;
+            }
             self.state = if cleanup.is_ok() {
                 WriterState::Aborted
             } else {
@@ -254,6 +353,7 @@ where
 
         self.hasher.update(checksum_chunk);
         self.bytes_written = next_size;
+        self.state = WriterState::Open;
 
         Ok(())
     }
@@ -263,58 +363,109 @@ where
             WriterState::Finished => {
                 return self.receipt.clone().ok_or(ArtifactWriteError::Closed);
             }
-            WriterState::CleanupPending | WriterState::Aborted => {
+            WriterState::Finishing => {}
+            WriterState::Writing | WriterState::CleanupPending | WriterState::Aborted => {
                 return Err(ArtifactWriteError::Closed);
             }
-            WriterState::Open => {}
+            WriterState::Open => {
+                let receipt = ArtifactWriteReceipt {
+                    key: self
+                        .reservation
+                        .as_ref()
+                        .ok_or(ArtifactWriteError::Closed)?
+                        .key()
+                        .clone(),
+                    size_bytes: self.bytes_written,
+                    checksum: ArtifactChecksum::new(self.hasher.clone().finalize().into()),
+                    object_generation: object_generation_for_upload_id(self.upload_id.as_str()),
+                };
+                let store = self.store.take().ok_or(ArtifactWriteError::Closed)?;
+                let reservation = self.reservation.take().ok_or(ArtifactWriteError::Closed)?;
+                let upload_id = self.upload_id.clone();
+                let task_receipt = receipt.clone();
+                self.state = WriterState::Finishing;
+                self.finish_task = Some(tokio::spawn(async move {
+                    let mut completion_retry_delay = Duration::from_millis(10);
+                    let completion = loop {
+                        match store.complete_verified(&upload_id, &task_receipt).await {
+                            Ok(()) => break Ok(()),
+                            Err(error) if error.is_completion_uncertain() => {
+                                tokio::time::sleep(completion_retry_delay).await;
+                                completion_retry_delay = completion_retry_delay
+                                    .saturating_mul(2)
+                                    .min(Duration::from_secs(1));
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    let (state, result) = if let Err(operation) = completion {
+                        let cleanup = store.abort(&upload_id).await;
+                        let _ = reservation.abort().await;
+                        let state = if cleanup.is_ok() {
+                            WriterState::Aborted
+                        } else {
+                            WriterState::CleanupPending
+                        };
+                        let result = match cleanup {
+                            Ok(()) => Err(ArtifactWriteError::Store(operation)),
+                            Err(cleanup) => {
+                                Err(ArtifactWriteError::StoreAndCleanup { operation, cleanup })
+                            }
+                        };
+                        (state, result)
+                    } else if let Err(quota_error) = reservation.commit().await {
+                        let cleanup = store.abort(&upload_id).await;
+                        let _ = reservation.abort().await;
+                        let state = if cleanup.is_ok() {
+                            WriterState::Aborted
+                        } else {
+                            WriterState::CleanupPending
+                        };
+                        let result = match cleanup {
+                            Ok(()) => Err(ArtifactWriteError::Quota(quota_error)),
+                            Err(cleanup) => Err(ArtifactWriteError::Store(cleanup)),
+                        };
+                        (state, result)
+                    } else {
+                        (WriterState::Finished, Ok(task_receipt))
+                    };
+                    FinishTaskResult {
+                        store,
+                        reservation,
+                        state,
+                        result,
+                    }
+                }));
+            }
         }
-
-        let receipt = ArtifactWriteReceipt {
-            key: self.reservation.key().clone(),
-            size_bytes: self.bytes_written,
-            checksum: ArtifactChecksum::new(self.hasher.clone().finalize().into()),
-        };
-        if let Err(operation) = self
-            .store
-            .complete_verified(&self.upload_id, &receipt)
-            .await
-        {
-            let cleanup = self.store.abort(&self.upload_id).await;
-            let _ = self.reservation.abort().await;
-            self.state = if cleanup.is_ok() {
-                WriterState::Aborted
-            } else {
-                WriterState::CleanupPending
-            };
-            return match cleanup {
-                Ok(()) => Err(ArtifactWriteError::Store(operation)),
-                Err(cleanup) => Err(ArtifactWriteError::StoreAndCleanup { operation, cleanup }),
-            };
+        let joined = self
+            .finish_task
+            .as_mut()
+            .ok_or(ArtifactWriteError::Closed)?
+            .await;
+        self.finish_task = None;
+        let completed = joined.map_err(|error| {
+            self.state = WriterState::Aborted;
+            ArtifactWriteError::Store(ArtifactStoreError::new(format!(
+                "artifact finish task failed: {error}"
+            )))
+        })?;
+        self.store = Some(completed.store);
+        self.reservation = Some(completed.reservation);
+        self.state = completed.state;
+        if let Ok(receipt) = &completed.result {
+            self.receipt = Some(receipt.clone());
         }
-
-        if let Err(quota_error) = self.reservation.commit().await {
-            let cleanup = self.store.abort(&self.upload_id).await;
-            let _ = self.reservation.abort().await;
-            self.state = if cleanup.is_ok() {
-                WriterState::Aborted
-            } else {
-                WriterState::CleanupPending
-            };
-            return match cleanup {
-                Ok(()) => Err(ArtifactWriteError::Quota(quota_error)),
-                Err(cleanup) => Err(ArtifactWriteError::Store(cleanup)),
-            };
-        }
-        self.state = WriterState::Finished;
-        self.receipt = Some(receipt.clone());
-        Ok(receipt)
+        completed.result
     }
 
     pub async fn abort(&mut self) -> Result<WriterAbortOutcome, ArtifactWriteError> {
         match self.state {
             WriterState::Aborted => return Ok(WriterAbortOutcome::AlreadyAborted),
-            WriterState::Finished => return Err(ArtifactWriteError::Closed),
-            WriterState::Open | WriterState::CleanupPending => {}
+            WriterState::Finishing | WriterState::Finished => {
+                return Err(ArtifactWriteError::Closed);
+            }
+            WriterState::Open | WriterState::Writing | WriterState::CleanupPending => {}
         }
 
         self.abort_after_failure().await?;
@@ -324,12 +475,21 @@ where
     async fn abort_after_failure(&mut self) -> Result<(), ArtifactWriteError> {
         match self.state {
             WriterState::Aborted => return Ok(()),
-            WriterState::Finished => return Err(ArtifactWriteError::Closed),
-            WriterState::Open | WriterState::CleanupPending => {}
+            WriterState::Finishing | WriterState::Finished => {
+                return Err(ArtifactWriteError::Closed);
+            }
+            WriterState::Open | WriterState::Writing | WriterState::CleanupPending => {}
         }
 
-        let store_result = self.store.abort(&self.upload_id).await;
-        let quota_result = self.reservation.abort().await;
+        self.state = WriterState::CleanupPending;
+
+        let store = self.store.as_ref().ok_or(ArtifactWriteError::Closed)?;
+        let reservation = self
+            .reservation
+            .as_ref()
+            .ok_or(ArtifactWriteError::Closed)?;
+        let store_result = store.abort(&self.upload_id).await;
+        let quota_result = reservation.abort().await;
         self.state = if store_result.is_ok() {
             WriterState::Aborted
         } else {
@@ -342,4 +502,11 @@ where
             (Ok(()), Err(error)) => Err(ArtifactWriteError::Quota(error)),
         }
     }
+}
+
+pub(crate) fn object_generation_for_upload_id(upload_id: &str) -> ArtifactObjectGeneration {
+    let mut hasher = Sha256::new();
+    hasher.update(OBJECT_GENERATION_DOMAIN);
+    hasher.update(upload_id.as_bytes());
+    ArtifactObjectGeneration::new(hasher.finalize().into())
 }

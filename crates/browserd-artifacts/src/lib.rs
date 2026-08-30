@@ -5,18 +5,23 @@ mod filesystem;
 mod integrity;
 mod janitor;
 mod namespace;
+mod object_store;
 mod quota;
 mod state;
 mod streaming;
 mod token;
 
-pub use filesystem::{FilesystemArtifactStore, VerifiedArtifact};
+pub use filesystem::{FilesystemArtifactReader, FilesystemArtifactStore, VerifiedArtifact};
 pub use integrity::{ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource};
 pub use janitor::{
     ArtifactJanitor, ArtifactObjectGeneration, AuthorizedCleanupCandidate, CleanupCandidate,
     CleanupKind, CleanupOutcome, JanitorBackend, JanitorError, JanitorReport,
 };
 pub use namespace::{ArtifactError, ArtifactKey, ArtifactNamespace};
+pub use object_store::{
+    ArtifactChunkReader, ArtifactDeleteOutcome, ArtifactObjectError, ArtifactObjectStore,
+    ArtifactReadLimits,
+};
 pub use quota::{
     ArtifactQuota, ArtifactReservation, CommittedReleaseOutcome, QuotaDimension, QuotaError,
     QuotaLimits, QuotaSnapshot, ReservationAbortOutcome, ReservationCommitOutcome,
