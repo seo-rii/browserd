@@ -7,7 +7,24 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+axum.workspace = true
+browser-gateway = { path = "../browser-gateway" }
+browser-worker = { path = "../browser-worker" }
+browserd-api = { path = "../../crates/browserd-api" }
 browserd-core = { path = "../../crates/browserd-core" }
+browserd-http = { path = "../../crates/browserd-http" }
+browserd-policy = { path = "../../crates/browserd-policy" }
+browserd-coordination = { path = "../../crates/browserd-coordination" }
+browserd-session = { path = "../../crates/browserd-session" }
+browserd-worker = { path = "../../crates/browserd-worker" }
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+browserd-auth = { path = "../../crates/browserd-auth" }
+jsonwebtoken.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -325,7 +325,22 @@ dependencies = [
 name = "browserd"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "axum",
+ "browser-gateway",
+ "browser-worker",
+ "browserd-api",
+ "browserd-auth",
+ "browserd-coordination",
  "browserd-core",
+ "browserd-http",
+ "browserd-policy",
+ "browserd-session",
+ "browserd-worker",
+ "jsonwebtoken",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
