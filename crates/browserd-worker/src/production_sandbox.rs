@@ -93,6 +93,14 @@ pub trait SandboxShardRpc: Send + Sync + 'static {
         launch_generation: LaunchGeneration,
     ) -> Result<ChromiumCdpPipes, ShardRuntimeError>;
 
+    async fn renew_owner_lease(
+        &self,
+        shard_id: &ShardId,
+        worker_epoch: u64,
+        launch_generation: LaunchGeneration,
+        lease_ttl: Duration,
+    ) -> Result<(), ShardRuntimeError>;
+
     async fn kill_shard(
         &self,
         shard_id: &ShardId,
@@ -127,6 +135,24 @@ impl SandboxShardRpc for SandboxRpcClient {
             worker_id,
             worker_epoch,
             launch_generation,
+        )
+        .await
+        .map_err(map_rpc_error)
+    }
+
+    async fn renew_owner_lease(
+        &self,
+        shard_id: &ShardId,
+        worker_epoch: u64,
+        launch_generation: LaunchGeneration,
+        lease_ttl: Duration,
+    ) -> Result<(), ShardRuntimeError> {
+        SandboxRpcClient::renew_owner_lease(
+            self,
+            shard_id,
+            worker_epoch,
+            launch_generation,
+            lease_ttl,
         )
         .await
         .map_err(map_rpc_error)
@@ -215,6 +241,25 @@ impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
                 Err(ShardRuntimeError::OutcomeUncertain)
             }
         }
+    }
+
+    pub async fn renew_owner_lease(&self, fence: &ShardFence) -> Result<(), ShardRuntimeError>
+    where
+        B: SandboxShardRpc,
+    {
+        self.validate_fence(fence)?;
+        let state = self.state.lock().await;
+        if *state != ProvisionState::Ready {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        self.rpc
+            .renew_owner_lease(
+                self.descriptor.launch_spec().shard_id(),
+                self.descriptor.launch_spec().worker_epoch(),
+                self.descriptor.launch_spec().launch_generation(),
+                self.lease_ttl,
+            )
+            .await
     }
 }
 

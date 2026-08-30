@@ -55,6 +55,21 @@ impl SandboxShardRpc for FakeRpc {
             .map_err(|_| ShardRuntimeError::Unavailable)
     }
 
+    async fn renew_owner_lease(
+        &self,
+        _shard_id: &ShardId,
+        _worker_epoch: u64,
+        launch_generation: LaunchGeneration,
+        _lease_ttl: Duration,
+    ) -> Result<(), ShardRuntimeError> {
+        self.calls.lock().unwrap().push("renew");
+        self.launch_generations
+            .lock()
+            .unwrap()
+            .push(launch_generation);
+        Ok(())
+    }
+
     async fn kill_shard(
         &self,
         _shard_id: &ShardId,
@@ -186,6 +201,48 @@ async fn sandbox_runtime_claims_cdp_before_inner_readiness_and_terminates_exact_
 }
 
 #[tokio::test]
+async fn ready_sandbox_runtime_renews_the_exact_launch_lease() {
+    let (descriptor, fence) = descriptor();
+    let rpc = Arc::new(FakeRpc {
+        calls: Mutex::new(Vec::new()),
+        launch_generations: Mutex::new(Vec::new()),
+    });
+    let runtime = ProductionSandboxShardRuntime::new(
+        descriptor,
+        Duration::from_secs(20),
+        Arc::clone(&rpc),
+        Arc::new(Sink(Mutex::new(0))),
+        Arc::new(Inner(Mutex::new(Vec::new()))),
+    );
+
+    assert_eq!(
+        runtime
+            .readiness_check(&fence, CancellationToken::new())
+            .await,
+        Ok(())
+    );
+    assert_eq!(runtime.renew_owner_lease(&fence).await, Ok(()));
+    assert_eq!(*rpc.calls.lock().unwrap(), vec!["create", "claim", "renew"]);
+    assert_eq!(
+        *rpc.launch_generations.lock().unwrap(),
+        vec![
+            LaunchGeneration::new(3).unwrap(),
+            LaunchGeneration::new(3).unwrap()
+        ]
+    );
+
+    assert_eq!(runtime.terminate(&fence).await, Ok(()));
+    assert_eq!(
+        runtime.renew_owner_lease(&fence).await,
+        Err(ShardRuntimeError::Rejected)
+    );
+    assert_eq!(
+        *rpc.calls.lock().unwrap(),
+        vec!["create", "claim", "renew", "kill"]
+    );
+}
+
+#[tokio::test]
 async fn stale_shard_fence_is_rejected_before_any_sandbox_rpc_effect() {
     let (descriptor, fence) = descriptor();
     let rpc = Arc::new(FakeRpc {
@@ -208,6 +265,10 @@ async fn stale_shard_fence_is_rejected_before_any_sandbox_rpc_effect() {
         runtime
             .readiness_check(&stale, CancellationToken::new())
             .await,
+        Err(ShardRuntimeError::Rejected)
+    );
+    assert_eq!(
+        runtime.renew_owner_lease(&stale).await,
         Err(ShardRuntimeError::Rejected)
     );
     assert!(rpc.calls.lock().unwrap().is_empty());
