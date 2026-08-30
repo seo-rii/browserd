@@ -32,8 +32,6 @@ fn run() -> Result<(), String> {
     if !epoch_path.is_absolute() {
         return Err("epoch file must be absolute".to_owned());
     }
-    let worker_epoch = DurableWorkerEpoch::increment(epoch_path)
-        .map_err(|_| "durable worker epoch unavailable".to_owned())?;
     let endpoint = parse_endpoint(
         &env::var("BROWSERD_INTERNAL_ENDPOINT")
             .map_err(|_| "BROWSERD_INTERNAL_ENDPOINT is required".to_owned())?,
@@ -54,6 +52,28 @@ fn run() -> Result<(), String> {
         .ok_or_else(|| "BROWSERD_ACTION_JOURNAL_DIR is required".to_owned())?;
     let action_journal = ActionJournalConfig::with_default_limits(action_journal_directory)
         .map_err(|_| "action journal directory must be absolute".to_owned())?;
+    if !matches!(&endpoint, InternalEndpoint::Unix(_)) {
+        return Err("worker RPC endpoint must be unix".to_owned());
+    }
+    let sandbox_socket = env::var_os("BROWSERD_SANDBOX_SOCKET")
+        .map(PathBuf::from)
+        .ok_or_else(|| "BROWSERD_SANDBOX_SOCKET is required".to_owned())?;
+    if !sandbox_socket.is_absolute() || sandbox_socket.as_os_str().is_empty() {
+        return Err("BROWSERD_SANDBOX_SOCKET must be absolute".to_owned());
+    }
+    env::var("BROWSERD_SANDBOX_EXPECTED_SERVER_UID")
+        .map_err(|_| "BROWSERD_SANDBOX_EXPECTED_SERVER_UID is required".to_owned())?
+        .parse::<u32>()
+        .map_err(|_| "BROWSERD_SANDBOX_EXPECTED_SERVER_UID is invalid".to_owned())?;
+    let sandbox_epoch = env::var("BROWSERD_SANDBOXD_EPOCH")
+        .map_err(|_| "BROWSERD_SANDBOXD_EPOCH is required".to_owned())?
+        .parse::<u64>()
+        .map_err(|_| "BROWSERD_SANDBOXD_EPOCH is invalid".to_owned())?;
+    if sandbox_epoch == 0 {
+        return Err("BROWSERD_SANDBOXD_EPOCH is invalid".to_owned());
+    }
+    let worker_epoch = DurableWorkerEpoch::increment(epoch_path)
+        .map_err(|_| "durable worker epoch unavailable".to_owned())?;
     let config = WorkerConfig::new(
         worker_id,
         worker_epoch,
