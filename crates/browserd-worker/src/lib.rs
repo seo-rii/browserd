@@ -19,14 +19,15 @@ pub use production_sandbox::{
     CdpPipeAcceptor, ProductionSandboxShardRuntime, SandboxShardRpc, ShardLaunchDescriptor,
 };
 pub use rpc::{
-    WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionReceipt,
-    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt,
-    WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
-    WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt,
-    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt,
-    WorkerRpcBlockingClient, WorkerRpcClient, WorkerRpcConfig, WorkerRpcError, WorkerRpcFailure,
-    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer,
-    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
+    PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement,
+    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
+    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
+    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler,
+    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
+    WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient, WorkerRpcClient,
+    WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError, WorkerRpcError,
+    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
@@ -1725,6 +1726,118 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         approval: Option<ActionApprovalRequirement>,
         now: SessionTime,
     ) -> Result<ActionId, WorkerError> {
+        self.submit_action_inner(
+            peer,
+            requester_principal_id,
+            session_id,
+            fence,
+            None,
+            idempotency_key,
+            request_hash,
+            kind,
+            feature,
+            page_id,
+            payload,
+            approval,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_action_with_identity(
+        &self,
+        peer: &AuthenticatedPeer,
+        requester_principal_id: PrincipalId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        action_id: ActionId,
+        action_sequence: ActionSequence,
+        idempotency_key: &str,
+        request_hash: [u8; 32],
+        kind: ActionKind,
+        feature: Option<BuiltinFeature>,
+        page_id: Option<PageId>,
+        payload: Vec<u8>,
+        approval: Option<ActionApprovalRequirement>,
+        now: SessionTime,
+    ) -> Result<ActionId, WorkerError> {
+        self.submit_action_inner(
+            peer,
+            requester_principal_id,
+            session_id,
+            fence,
+            Some((action_id, action_sequence)),
+            idempotency_key,
+            request_hash,
+            kind,
+            feature,
+            page_id,
+            payload,
+            approval,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_and_run_action_with_identity(
+        &self,
+        peer: &AuthenticatedPeer,
+        requester_principal_id: PrincipalId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        action_id: ActionId,
+        action_sequence: ActionSequence,
+        idempotency_key: &str,
+        request_hash: [u8; 32],
+        kind: ActionKind,
+        feature: Option<BuiltinFeature>,
+        page_id: Option<PageId>,
+        payload: Vec<u8>,
+        approval: Option<ActionApprovalRequirement>,
+        now: SessionTime,
+    ) -> Result<ActionId, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let _owner = ActionOwner::claim(&executor.action_owner)?;
+        let action_id = self.submit_action_inner(
+            peer,
+            requester_principal_id,
+            session_id,
+            fence,
+            Some((action_id, action_sequence)),
+            idempotency_key,
+            request_hash,
+            kind,
+            feature,
+            page_id,
+            payload,
+            approval,
+            now,
+        )?;
+        while self
+            .run_next_action_owned(session_id, fence, now, &executor)?
+            .is_some()
+        {}
+        Ok(action_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_action_inner(
+        &self,
+        peer: &AuthenticatedPeer,
+        requester_principal_id: PrincipalId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        action_identity: Option<(ActionId, ActionSequence)>,
+        idempotency_key: &str,
+        request_hash: [u8; 32],
+        kind: ActionKind,
+        feature: Option<BuiltinFeature>,
+        page_id: Option<PageId>,
+        payload: Vec<u8>,
+        approval: Option<ActionApprovalRequirement>,
+        now: SessionTime,
+    ) -> Result<ActionId, WorkerError> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
         let mut session = executor
@@ -1746,6 +1859,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 && existing_requester == &requester_principal_id
                 && existing_approval_binding == &approval_binding
             {
+                if let Some((provided_action_id, provided_sequence)) = &action_identity {
+                    let existing = session
+                        .actions
+                        .get(action_id)
+                        .ok_or(WorkerError::StateUnavailable)?;
+                    if action_id != provided_action_id
+                        || existing.snapshot.action_sequence != *provided_sequence
+                    {
+                        return Err(WorkerError::IdempotencyConflict);
+                    }
+                }
                 Ok(action_id.clone())
             } else {
                 Err(WorkerError::IdempotencyConflict)
@@ -1823,10 +1947,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             ActionRequestHash::new(durable_request_hash),
             kind,
         );
-        let acceptance = session
-            .action_ledger
-            .accept(ledger_fence, request)
-            .map_err(map_action_ledger_error)?;
+        let acceptance = match action_identity {
+            Some((action_id, action_sequence)) => session.action_ledger.accept_with_identity(
+                ledger_fence,
+                action_id,
+                action_sequence,
+                request,
+            ),
+            None => session.action_ledger.accept(ledger_fence, request),
+        }
+        .map_err(map_action_ledger_error)?;
         let action_id = acceptance.snapshot().action_id().clone();
         let action_sequence = acceptance.snapshot().action_sequence();
         if matches!(acceptance, AcceptDecision::Existing(_))
@@ -2043,6 +2173,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
         let _owner = ActionOwner::claim(&executor.action_owner)?;
+        self.run_next_action_owned(session_id, fence, now, &executor)
+    }
+
+    fn run_next_action_owned(
+        &self,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        now: SessionTime,
+        executor: &Arc<SessionExecutor>,
+    ) -> Result<Option<WorkerActionSnapshot>, WorkerError> {
         let (action_id, page_id, payload, permit, approval_request) = {
             let mut session = executor
                 .state
@@ -2488,13 +2628,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 action.snapshot.status = ActionStatus::Succeeded;
                 action.snapshot.result = Some(result);
             }
-            ActionExecutionResult::FailedKnown(reason) => {
+            ActionExecutionResult::FailedKnown(_) => {
                 let action = session
                     .actions
                     .get_mut(&action_id)
                     .ok_or(WorkerError::ActionNotFound)?;
                 action.snapshot.status = ActionStatus::FailedKnown;
-                action.snapshot.result = Some(reason.into_bytes());
+                action.snapshot.result = None;
             }
             ActionExecutionResult::OutcomeUnknown => {
                 let action = session
@@ -3071,6 +3211,36 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         approval.state = state.clone();
         approval.request = Some(Arc::clone(&request));
         Ok(worker_approval_snapshot(approval_id, approval))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_approval_and_run_ready_actions(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        approval_id: &ApprovalId,
+        fence: &OwnershipFence,
+        decision: ApprovalDecision,
+        principal_id: PrincipalId,
+        now: SessionTime,
+    ) -> Result<WorkerApprovalSnapshot, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let _owner = ActionOwner::claim(&executor.action_owner)?;
+        let snapshot = self.decide_approval(
+            peer,
+            session_id,
+            approval_id,
+            fence,
+            decision,
+            principal_id,
+            now,
+        )?;
+        while self
+            .run_next_action_owned(session_id, fence, now, &executor)?
+            .is_some()
+        {}
+        Ok(snapshot)
     }
 
     pub fn issue_viewer_ticket(
@@ -3759,7 +3929,9 @@ fn map_action_ledger_error(error: ActionLedgerError) -> WorkerError {
         }
         ActionLedgerError::StateUnavailable => WorkerError::StateUnavailable,
         ActionLedgerError::StaleFence { .. } => WorkerError::StaleFence,
-        ActionLedgerError::IdempotencyConflict { .. } => WorkerError::IdempotencyConflict,
+        ActionLedgerError::IdempotencyConflict { .. }
+        | ActionLedgerError::ActionIdentityConflict { .. } => WorkerError::IdempotencyConflict,
+        ActionLedgerError::ActionSequenceConflict { .. } => WorkerError::InvalidActionTransition,
         ActionLedgerError::ActionNotFound => WorkerError::ActionNotFound,
         ActionLedgerError::ApprovalDecisionConflict { .. } => {
             WorkerError::InvalidApprovalTransition

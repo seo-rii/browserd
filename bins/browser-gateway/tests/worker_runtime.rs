@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use browser_gateway::{GatewayWorkerClient, GatewayWorkerPlacement, GatewayWorkerRuntime};
+use browser_gateway::{
+    GatewayWorkerClient, GatewayWorkerPending, GatewayWorkerPlacement, GatewayWorkerRuntime,
+};
 use browserd_actions::{
     ActionKind, ActionSequence, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
     TerminalDetail,
@@ -26,15 +28,16 @@ use browserd_auth::{
 };
 use browserd_core::{
     ActionId, ActionState, ApprovalId, ArtifactId, CreateOperationState, PageId, PrincipalId,
-    SessionId, TenantId,
+    SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
     WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
     WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
     WorkerArtifactState, WorkerCanonicalActionProposal, WorkerCreateSessionReceipt,
-    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcError,
-    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt,
+    WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailure,
+    WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
+    WorkerSessionLifecycle, WorkerSessionReceipt,
 };
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
@@ -56,6 +59,23 @@ const CREATE_JSON: &str = r#"{
   "metadata":{"agent_run_id":"run_123"}
 }"#;
 
+struct ImmediatePending(Result<WorkerRpcResponse, WorkerRpcError>);
+
+impl GatewayWorkerPending for ImmediatePending {
+    fn wait(self) -> Result<WorkerRpcResponse, WorkerRpcCompletionError> {
+        self.0.map_err(WorkerRpcCompletionError::Exchange)
+    }
+}
+
+fn gateway_placement() -> Result<GatewayWorkerPlacement, Box<dyn Error>> {
+    Ok(GatewayWorkerPlacement::new(
+        WorkerId::new("gateway-worker-test")?,
+        41,
+        7,
+        11,
+    )?)
+}
+
 struct RecordingWorker {
     request: Mutex<Option<WorkerCreateSessionRequest>>,
     session_id: SessionId,
@@ -63,6 +83,8 @@ struct RecordingWorker {
 }
 
 impl GatewayWorkerClient for RecordingWorker {
+    type PendingAction = ImmediatePending;
+
     fn create_session(
         &self,
         request: WorkerCreateSessionRequest,
@@ -115,6 +137,13 @@ impl GatewayWorkerClient for RecordingWorker {
             WorkerRpcResponse::Session(receipt)
         })
     }
+
+    fn enqueue_action(
+        &self,
+        request: WorkerRpcRequest,
+    ) -> Result<Self::PendingAction, WorkerRpcEnqueueError> {
+        Ok(ImmediatePending(self.request(request)))
+    }
 }
 
 struct RacingWorker {
@@ -135,6 +164,8 @@ struct PageWorker {
 }
 
 impl GatewayWorkerClient for PageWorker {
+    type PendingAction = ImmediatePending;
+
     fn create_session(
         &self,
         request: WorkerCreateSessionRequest,
@@ -198,23 +229,41 @@ impl GatewayWorkerClient for PageWorker {
             _ => return Err(WorkerRpcError::Protocol),
         })
     }
+
+    fn enqueue_action(
+        &self,
+        request: WorkerRpcRequest,
+    ) -> Result<Self::PendingAction, WorkerRpcEnqueueError> {
+        Ok(ImmediatePending(self.request(request)))
+    }
+}
+
+#[derive(Clone)]
+struct RecordedActionIdentity {
+    action_id: ActionId,
+    action_sequence: ActionSequence,
+    idempotency_key: String,
+    canonical_request_hash: [u8; 32],
+    kind: ActionKind,
 }
 
 struct ResourceWorker {
     tenant_id: TenantId,
     session_id: SessionId,
     page_id: PageId,
-    action_id: ActionId,
+    approval_action_id: ActionId,
     artifact_id: ArtifactId,
     approval_id: ApprovalId,
     requester_principal_id: PrincipalId,
     create_count: AtomicUsize,
     corrupt_action_hash_on_get: AtomicBool,
-    action_identity: Mutex<Option<(String, [u8; 32], ActionKind)>>,
+    action_identity: Mutex<Option<RecordedActionIdentity>>,
     requests: Mutex<Vec<WorkerRpcRequest>>,
 }
 
 impl GatewayWorkerClient for ResourceWorker {
+    type PendingAction = ImmediatePending;
+
     fn create_session(
         &self,
         request: WorkerCreateSessionRequest,
@@ -255,14 +304,20 @@ impl GatewayWorkerClient for ResourceWorker {
                 .lock()
                 .map_err(|_| WorkerRpcError::Runtime)?
                 .clone()
-                .unwrap_or_else(|| ("action-fallback".to_owned(), [7; 32], ActionKind::ReadOnly));
+                .unwrap_or_else(|| RecordedActionIdentity {
+                    action_id: self.approval_action_id.clone(),
+                    action_sequence: ActionSequence::new(1),
+                    idempotency_key: "action-fallback".to_owned(),
+                    canonical_request_hash: [7; 32],
+                    kind: ActionKind::ReadOnly,
+                });
             Ok(WorkerActionReceipt {
                 fence,
-                action_id: self.action_id.clone(),
-                action_sequence: ActionSequence::new(11),
-                idempotency_key: identity.0,
-                canonical_request_hash: identity.1,
-                kind: identity.2,
+                action_id: identity.action_id,
+                action_sequence: identity.action_sequence,
+                idempotency_key: identity.idempotency_key,
+                canonical_request_hash: identity.canonical_request_hash,
+                kind: identity.kind,
                 status,
                 dispatch_acknowledged: matches!(
                     status,
@@ -300,7 +355,7 @@ impl GatewayWorkerClient for ResourceWorker {
             Ok(WorkerApprovalReceipt {
                 fence,
                 approval_id: self.approval_id.clone(),
-                action_id: self.action_id.clone(),
+                action_id: self.approval_action_id.clone(),
                 state,
                 proposal,
                 proposal_hash,
@@ -309,6 +364,8 @@ impl GatewayWorkerClient for ResourceWorker {
         match request {
             WorkerRpcRequest::SubmitAction {
                 fence,
+                action_id,
+                action_sequence,
                 idempotency_key,
                 canonical_request_hash,
                 kind,
@@ -321,12 +378,26 @@ impl GatewayWorkerClient for ResourceWorker {
                 *self
                     .action_identity
                     .lock()
-                    .map_err(|_| WorkerRpcError::Runtime)? =
-                    Some((idempotency_key, canonical_request_hash, kind));
+                    .map_err(|_| WorkerRpcError::Runtime)? = Some(RecordedActionIdentity {
+                    action_id,
+                    action_sequence,
+                    idempotency_key,
+                    canonical_request_hash,
+                    kind,
+                });
                 action_receipt(fence, WorkerActionStatus::Queued, None, None)
                     .map(WorkerRpcResponse::Action)
             }
-            WorkerRpcRequest::GetAction { fence, action_id } if action_id == self.action_id => {
+            WorkerRpcRequest::GetAction { fence, action_id } => {
+                let known_action = self
+                    .action_identity
+                    .lock()
+                    .map_err(|_| WorkerRpcError::Runtime)?
+                    .as_ref()
+                    .is_some_and(|identity| identity.action_id == action_id);
+                if !known_action {
+                    return Err(WorkerRpcError::InvalidRequest);
+                }
                 let mut receipt = action_receipt(
                     fence,
                     WorkerActionStatus::OutcomeUnknown,
@@ -342,13 +413,24 @@ impl GatewayWorkerClient for ResourceWorker {
             }
             WorkerRpcRequest::CancelAction {
                 fence, action_id, ..
-            } if action_id == self.action_id => action_receipt(
-                fence,
-                WorkerActionStatus::CancelledBeforeDispatch,
-                Some(TerminalDetail::CancelledBeforeDispatch),
-                None,
-            )
-            .map(WorkerRpcResponse::Action),
+            } => {
+                let known_action = self
+                    .action_identity
+                    .lock()
+                    .map_err(|_| WorkerRpcError::Runtime)?
+                    .as_ref()
+                    .is_some_and(|identity| identity.action_id == action_id);
+                if !known_action {
+                    return Err(WorkerRpcError::InvalidRequest);
+                }
+                action_receipt(
+                    fence,
+                    WorkerActionStatus::CancelledBeforeDispatch,
+                    Some(TerminalDetail::CancelledBeforeDispatch),
+                    None,
+                )
+                .map(WorkerRpcResponse::Action)
+            }
             WorkerRpcRequest::ResolveAction {
                 fence,
                 action_id,
@@ -356,20 +438,31 @@ impl GatewayWorkerClient for ResourceWorker {
                 resolved_by,
                 basis,
                 now_unix_millis,
-            } if action_id == self.action_id => action_receipt(
-                fence,
-                WorkerActionStatus::OutcomeUnknown,
-                Some(TerminalDetail::OutcomeUnknown(
-                    OutcomeUnknownReason::AmbiguousTransportLoss,
-                )),
-                Some(ResolutionAnnotation::new(
-                    resolution,
-                    resolved_by,
-                    now_unix_millis,
-                    basis,
-                )),
-            )
-            .map(WorkerRpcResponse::Action),
+            } => {
+                let known_action = self
+                    .action_identity
+                    .lock()
+                    .map_err(|_| WorkerRpcError::Runtime)?
+                    .as_ref()
+                    .is_some_and(|identity| identity.action_id == action_id);
+                if !known_action {
+                    return Err(WorkerRpcError::InvalidRequest);
+                }
+                action_receipt(
+                    fence,
+                    WorkerActionStatus::OutcomeUnknown,
+                    Some(TerminalDetail::OutcomeUnknown(
+                        OutcomeUnknownReason::AmbiguousTransportLoss,
+                    )),
+                    Some(ResolutionAnnotation::new(
+                        resolution,
+                        resolved_by,
+                        now_unix_millis,
+                        basis,
+                    )),
+                )
+                .map(WorkerRpcResponse::Action)
+            }
             WorkerRpcRequest::GetArtifact { fence, artifact_id }
                 if artifact_id == self.artifact_id =>
             {
@@ -415,9 +508,18 @@ impl GatewayWorkerClient for ResourceWorker {
             _ => Err(WorkerRpcError::InvalidRequest),
         }
     }
+
+    fn enqueue_action(
+        &self,
+        request: WorkerRpcRequest,
+    ) -> Result<Self::PendingAction, WorkerRpcEnqueueError> {
+        Ok(ImmediatePending(self.request(request)))
+    }
 }
 
 impl GatewayWorkerClient for RacingWorker {
+    type PendingAction = ImmediatePending;
+
     fn create_session(
         &self,
         request: WorkerCreateSessionRequest,
@@ -485,6 +587,13 @@ impl GatewayWorkerClient for RacingWorker {
             WorkerRpcResponse::Session(receipt)
         })
     }
+
+    fn enqueue_action(
+        &self,
+        request: WorkerRpcRequest,
+    ) -> Result<Self::PendingAction, WorkerRpcEnqueueError> {
+        Ok(ImmediatePending(self.request(request)))
+    }
 }
 
 fn authenticated_principal(tenant_id: TenantId) -> Result<AuthenticatedPrincipal, Box<dyn Error>> {
@@ -535,7 +644,7 @@ fn resource_worker(
         tenant_id,
         session_id: SessionId::new(),
         page_id: PageId::new(),
-        action_id: ActionId::new(),
+        approval_action_id: ActionId::new(),
         artifact_id: ArtifactId::new(),
         approval_id: ApprovalId::new(),
         requester_principal_id,
@@ -552,8 +661,8 @@ fn resource_fixture() -> Result<ResourceFixture, Box<dyn Error>> {
     let worker = resource_worker(tenant_id, principal.principal_id().clone());
     let runtime = Arc::new(GatewayWorkerRuntime::new(
         Arc::clone(&worker),
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+        gateway_placement()?,
+    )?);
     let router = ApiRouter::new(runtime);
     let created = router.execute(
         &principal,
@@ -584,8 +693,8 @@ fn create_dispatch_preserves_idempotency_and_exact_worker_fences() -> Result<(),
         session_id: SessionId::new(),
         corrupt_epoch: false,
     });
-    let placement = GatewayWorkerPlacement::new(41, 7)?;
-    let runtime = Arc::new(GatewayWorkerRuntime::new(Arc::clone(&worker), placement));
+    let placement = gateway_placement()?;
+    let runtime = Arc::new(GatewayWorkerRuntime::new(Arc::clone(&worker), placement)?);
     let router = ApiRouter::new(runtime);
     let idempotency_key = Uuid::new_v4().to_string();
 
@@ -646,8 +755,8 @@ fn a_mismatched_worker_receipt_cannot_complete_the_create_operation() -> Result<
         session_id: SessionId::new(),
         corrupt_epoch: true,
     });
-    let placement = GatewayWorkerPlacement::new(41, 7)?;
-    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement));
+    let placement = gateway_placement()?;
+    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement)?);
     let router = ApiRouter::new(runtime);
 
     let response = router.execute(
@@ -679,8 +788,8 @@ fn created_sessions_are_read_and_closed_through_the_same_exact_worker_fence()
         session_id: SessionId::new(),
         corrupt_epoch: false,
     });
-    let placement = GatewayWorkerPlacement::new(41, 7)?;
-    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement));
+    let placement = gateway_placement()?;
+    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement)?);
     let router = ApiRouter::new(runtime);
 
     let created = router.execute(
@@ -729,8 +838,8 @@ fn a_delayed_read_cannot_regress_a_concurrently_closed_session() -> Result<(), B
         get_entered: get_entered_tx,
         get_release: Mutex::new(get_release_rx),
     });
-    let placement = GatewayWorkerPlacement::new(41, 7)?;
-    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement));
+    let placement = gateway_placement()?;
+    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement)?);
     let router = Arc::new(ApiRouter::new(runtime));
 
     let created = router.execute(
@@ -796,8 +905,8 @@ fn page_endpoints_use_the_exact_tenant_session_and_placement_fence() -> Result<(
     });
     let runtime = Arc::new(GatewayWorkerRuntime::new(
         Arc::clone(&worker),
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+        gateway_placement()?,
+    )?);
     let router = ApiRouter::new(runtime);
     let created = router.execute(
         &principal,
@@ -891,10 +1000,7 @@ fn a_cross_tenant_page_receipt_is_rejected_fail_closed() -> Result<(), Box<dyn E
         corrupt_response_tenant: true,
         failure: None,
     });
-    let runtime = Arc::new(GatewayWorkerRuntime::new(
-        worker,
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, gateway_placement()?)?);
     let router = ApiRouter::new(runtime);
     let created = router.execute(
         &principal,
@@ -936,10 +1042,7 @@ fn worker_page_not_found_is_mapped_to_the_public_page_error() -> Result<(), Box<
         corrupt_response_tenant: false,
         failure: Some(WorkerRpcFailureCode::NotFound),
     });
-    let runtime = Arc::new(GatewayWorkerRuntime::new(
-        worker,
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+    let runtime = Arc::new(GatewayWorkerRuntime::new(worker, gateway_placement()?)?);
     let router = ApiRouter::new(runtime);
     let created = router.execute(
         &principal,
@@ -987,8 +1090,8 @@ fn page_create_rejects_an_initial_url_the_worker_cannot_apply_atomically()
     });
     let runtime = Arc::new(GatewayWorkerRuntime::new(
         Arc::clone(&worker),
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+        gateway_placement()?,
+    )?);
     let router = ApiRouter::new(runtime);
     let created = router.execute(
         &principal,
@@ -1048,14 +1151,14 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
             },
         }),
     )?;
-    assert!(matches!(
-        submitted,
-        ApiResponse::Action(response)
-            if response.data().action_id() == &worker.action_id
-                && response.data().action_sequence() == ActionSequence::new(11)
-                && response.data().state() == ActionState::ReadyToDispatch
-                && response.data().request().kind() == ActionKind::ReadOnly
-    ));
+    let ApiResponse::Action(submitted) = submitted else {
+        return Err("unexpected action submit response".into());
+    };
+    let action_id = submitted.data().action_id().clone();
+    let action_sequence = submitted.data().action_sequence();
+    assert!(action_sequence.get() > 0);
+    assert_eq!(submitted.data().state(), ActionState::ReadyToDispatch);
+    assert_eq!(submitted.data().request().kind(), ActionKind::ReadOnly);
     let requests = worker
         .requests
         .lock()
@@ -1063,6 +1166,8 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
     let submit = requests.iter().find_map(|request| match request {
         WorkerRpcRequest::SubmitAction {
             fence,
+            action_id,
+            action_sequence,
             requester_principal_id,
             idempotency_key,
             canonical_request_hash,
@@ -1072,6 +1177,8 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
             ..
         } => Some((
             fence,
+            action_id,
+            action_sequence,
             requester_principal_id,
             idempotency_key,
             canonical_request_hash,
@@ -1081,11 +1188,24 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
         )),
         _ => None,
     });
-    let Some((fence, requester, key, hash, kind, page_id, payload)) = submit else {
+    let Some((
+        fence,
+        wire_action_id,
+        wire_action_sequence,
+        requester,
+        key,
+        hash,
+        kind,
+        page_id,
+        payload,
+    )) = submit
+    else {
         return Err("submit RPC not recorded".into());
     };
     assert_eq!(fence.tenant_id, worker.tenant_id);
     assert_eq!(fence.session_id, session_id);
+    assert_eq!(wire_action_id, &action_id);
+    assert_eq!(*wire_action_sequence, action_sequence);
     assert_eq!(requester, principal.principal_id());
     assert_eq!(key, &idempotency_key.to_string());
     assert_ne!(hash, &[0; 32]);
@@ -1098,7 +1218,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
         &principal,
         ApiRequest::GetAction(ActionGetRequest {
             session_id: session_id.clone(),
-            action_id: worker.action_id.clone(),
+            action_id: action_id.clone(),
         }),
     )?;
     assert!(matches!(
@@ -1116,19 +1236,23 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
         &principal,
         ApiRequest::CancelAction(ActionGetRequest {
             session_id: session_id.clone(),
-            action_id: worker.action_id.clone(),
+            action_id: action_id.clone(),
         }),
     )?;
     assert!(matches!(
         cancelled,
         ApiResponse::Action(response)
-            if response.data().state() == ActionState::CancelledBeforeDispatch
+            if response.data().state() == ActionState::OutcomeUnknown
+                && response.data().terminal_detail()
+                    == Some(TerminalDetail::OutcomeUnknown(
+                        OutcomeUnknownReason::AmbiguousTransportLoss
+                    ))
     ));
     let resolved = router.execute(
         &principal,
         ApiRequest::ResolveAction(ActionResolveRequest {
             session_id,
-            action_id: worker.action_id.clone(),
+            action_id,
             body: ActionResolveBody {
                 resolution: ResolutionRequestKind::ConfirmedNotExecuted,
                 basis: "operator verified no effect".to_owned(),
@@ -1148,7 +1272,8 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
 }
 
 #[test]
-fn action_lookup_rejects_worker_identity_drift_after_submission() -> Result<(), Box<dyn Error>> {
+fn action_lookup_treats_worker_identity_drift_as_ambiguous_after_dispatch()
+-> Result<(), Box<dyn Error>> {
     let (principal, worker, router, session_id) = resource_fixture()?;
     let submitted = router.execute(
         &principal,
@@ -1163,21 +1288,30 @@ fn action_lookup_rejects_worker_identity_drift_after_submission() -> Result<(), 
             },
         }),
     )?;
-    assert!(matches!(submitted, ApiResponse::Action(_)));
+    let ApiResponse::Action(submitted) = submitted else {
+        return Err("unexpected action submit response".into());
+    };
+    let action_id = submitted.data().action_id().clone();
     worker
         .corrupt_action_hash_on_get
         .store(true, Ordering::Release);
 
-    let Err(error) = router.execute(
+    let response = router.execute(
         &principal,
         ApiRequest::GetAction(ActionGetRequest {
             session_id,
-            action_id: worker.action_id.clone(),
+            action_id,
         }),
-    ) else {
-        return Err("action identity drift must fail closed".into());
-    };
-    assert_eq!(error.code(), browserd_core::ErrorCode::PlacementMismatch);
+    )?;
+    assert!(matches!(
+        response,
+        ApiResponse::Action(response)
+            if response.data().state() == ActionState::OutcomeUnknown
+                && response.data().terminal_detail()
+                    == Some(TerminalDetail::OutcomeUnknown(
+                        OutcomeUnknownReason::AmbiguousTransportLoss
+                    ))
+    ));
     Ok(())
 }
 
@@ -1261,8 +1395,8 @@ fn approval_route_preflight_rejects_duplicate_active_bindings() -> Result<(), Bo
     let worker = resource_worker(tenant_id, principal.principal_id().clone());
     let runtime = Arc::new(GatewayWorkerRuntime::new(
         Arc::clone(&worker),
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+        gateway_placement()?,
+    )?);
     let router = ApiRouter::new(runtime);
     for _ in 0..2 {
         let response = router.execute(
@@ -1305,8 +1439,8 @@ fn approval_route_preflight_fails_closed_when_the_active_route_bound_is_exceeded
     let worker = resource_worker(tenant_id, principal.principal_id().clone());
     let runtime = Arc::new(GatewayWorkerRuntime::new(
         Arc::clone(&worker),
-        GatewayWorkerPlacement::new(41, 7)?,
-    ));
+        gateway_placement()?,
+    )?);
     let router = ApiRouter::new(runtime);
     for _ in 0..257 {
         let response = router.execute(

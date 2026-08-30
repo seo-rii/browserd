@@ -6,9 +6,9 @@ use browserd_core::{
     ActionId, ApprovalId, ArtifactId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
-    WorkerActionApprovalRequirement, WorkerActionReceipt, WorkerActionStatus,
-    WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
-    WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
+    WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionReceipt,
+    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt,
+    WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
     WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcRequest,
     WorkerRpcResponse, WorkerSessionFence,
 };
@@ -36,6 +36,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 4);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -56,13 +57,15 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
         },
         WorkerRpcRequest::SubmitAction {
             fence: fence.clone(),
+            action_id: action_id.clone(),
+            action_sequence: ActionSequence::new(8),
             requester_principal_id: principal_id.clone(),
             idempotency_key: "action-1".to_owned(),
             canonical_request_hash: [4; 32],
             kind: ActionKind::Mutating,
             page_id: Some(page_id.clone()),
             payload: br#"{"type":"click"}"#.to_vec(),
-            approval: Some(WorkerActionApprovalRequirement {
+            approval: Some(Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 4,
                 frame_document_epoch: 9,
                 current_origin: "https://example.test".to_owned(),
@@ -71,7 +74,7 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
                 node_ref: Some("node-opaque".to_owned()),
                 credential_refs: vec!["credential-1".to_owned()],
                 require_four_eyes: true,
-            }),
+            })),
             now_unix_millis: 10,
         },
         WorkerRpcRequest::ResolveAction {

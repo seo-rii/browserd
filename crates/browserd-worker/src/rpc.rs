@@ -36,7 +36,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 2;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -589,13 +589,15 @@ pub enum WorkerRpcRequest {
     },
     SubmitAction {
         fence: WorkerSessionFence,
+        action_id: ActionId,
+        action_sequence: ActionSequence,
         requester_principal_id: PrincipalId,
         idempotency_key: String,
         canonical_request_hash: [u8; 32],
         kind: ActionKind,
         page_id: Option<PageId>,
         payload: Vec<u8>,
-        approval: Option<WorkerActionApprovalRequirement>,
+        approval: Option<Box<WorkerActionApprovalRequirement>>,
         now_unix_millis: u64,
     },
     GetAction {
@@ -1200,6 +1202,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
             }
             WorkerRpcRequest::SubmitAction {
                 fence,
+                action_id,
+                action_sequence,
                 requester_principal_id,
                 idempotency_key,
                 canonical_request_hash,
@@ -1227,7 +1231,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                                     "approval expiry overflows the worker clock",
                                 )
                             })?;
-                        Some(approval.into_requirement(
+                        Some((*approval).into_requirement(
                             fence.tenant_id.clone(),
                             requester_principal_id.clone(),
                             fence.session_id.clone(),
@@ -1241,11 +1245,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 };
                 let action_id = self
                     .worker
-                    .submit_action(
+                    .submit_and_run_action_with_identity(
                         &self.peer,
                         requester_principal_id,
                         &fence.session_id,
                         &ownership,
+                        action_id,
+                        action_sequence,
                         &idempotency_key,
                         canonical_request_hash,
                         kind,
@@ -1255,10 +1261,6 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         approval,
                         now,
                     )
-                    .map_err(worker_failure)?;
-                let _dispatched = self
-                    .worker
-                    .run_next_action(&self.peer, &fence.session_id, &ownership, now)
                     .map_err(worker_failure)?;
                 let snapshot = self
                     .worker
@@ -1409,7 +1411,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 };
                 let snapshot = self
                     .worker
-                    .decide_approval(
+                    .decide_approval_and_run_ready_actions(
                         &self.peer,
                         &fence.session_id,
                         &approval_id,
@@ -1419,17 +1421,6 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         SessionTime::new(now_unix_millis),
                     )
                     .map_err(worker_failure)?;
-                if decision == WorkerApprovalDecision::Approve {
-                    let _dispatched = self
-                        .worker
-                        .run_next_action(
-                            &self.peer,
-                            &fence.session_id,
-                            &ownership,
-                            SessionTime::new(now_unix_millis),
-                        )
-                        .map_err(worker_failure)?;
-                }
                 Ok(WorkerRpcResponse::Approval(approval_receipt(
                     &fence, snapshot,
                 )))
@@ -1704,11 +1695,39 @@ impl WorkerRpcClient {
         &self,
         request: WorkerRpcRequest,
     ) -> Result<WorkerActionReceipt, WorkerRpcError> {
-        if !matches!(request, WorkerRpcRequest::SubmitAction { .. }) {
-            return Err(WorkerRpcError::InvalidRequest);
-        }
+        let expected = match &request {
+            WorkerRpcRequest::SubmitAction {
+                fence,
+                action_id,
+                action_sequence,
+                idempotency_key,
+                canonical_request_hash,
+                kind,
+                ..
+            } => (
+                fence.clone(),
+                action_id.clone(),
+                *action_sequence,
+                idempotency_key.clone(),
+                *canonical_request_hash,
+                *kind,
+            ),
+            _ => return Err(WorkerRpcError::InvalidRequest),
+        };
         match self.exchange(request).await? {
-            WorkerRpcResponse::Action(receipt) => Ok(receipt),
+            WorkerRpcResponse::Action(receipt)
+                if (
+                    receipt.fence.clone(),
+                    receipt.action_id.clone(),
+                    receipt.action_sequence,
+                    receipt.idempotency_key.clone(),
+                    receipt.canonical_request_hash,
+                    receipt.kind,
+                ) == expected =>
+            {
+                Ok(receipt)
+            }
+            WorkerRpcResponse::Action(_) => Err(WorkerRpcError::Protocol),
             WorkerRpcResponse::Failure(failure) => Err(WorkerRpcError::Remote(failure)),
             _ => Err(WorkerRpcError::Protocol),
         }
@@ -1853,6 +1872,39 @@ struct BlockingRequest {
     response: std_mpsc::SyncSender<Result<WorkerRpcResponse, WorkerRpcError>>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum WorkerRpcEnqueueError {
+    Full(Box<WorkerRpcRequest>),
+    Closed(Box<WorkerRpcRequest>),
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum WorkerRpcCompletionError {
+    #[error("worker RPC exchange failed after queue handoff: {0}")]
+    Exchange(WorkerRpcError),
+    #[error("worker RPC response timed out after queue handoff")]
+    Timeout,
+    #[error("worker RPC response channel disconnected after queue handoff")]
+    Disconnected,
+}
+
+pub struct PendingWorkerRpc {
+    receiver: std_mpsc::Receiver<Result<WorkerRpcResponse, WorkerRpcError>>,
+    response_timeout: Duration,
+}
+
+impl PendingWorkerRpc {
+    pub fn wait(self) -> Result<WorkerRpcResponse, WorkerRpcCompletionError> {
+        self.receiver
+            .recv_timeout(self.response_timeout)
+            .map_err(|error| match error {
+                std_mpsc::RecvTimeoutError::Timeout => WorkerRpcCompletionError::Timeout,
+                std_mpsc::RecvTimeoutError::Disconnected => WorkerRpcCompletionError::Disconnected,
+            })?
+            .map_err(WorkerRpcCompletionError::Exchange)
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkerRpcBlockingClient {
     sender: mpsc::Sender<BlockingRequest>,
@@ -1924,19 +1976,36 @@ impl WorkerRpcBlockingClient {
         &self,
         request: WorkerRpcRequest,
     ) -> Result<WorkerRpcResponse, WorkerRpcError> {
+        let pending = self.enqueue(request).map_err(|error| match error {
+            WorkerRpcEnqueueError::Full(_) => WorkerRpcError::QueueFull,
+            WorkerRpcEnqueueError::Closed(_) => WorkerRpcError::Runtime,
+        })?;
+        pending.wait().map_err(|error| match error {
+            WorkerRpcCompletionError::Exchange(error) => error,
+            WorkerRpcCompletionError::Timeout => WorkerRpcError::Timeout,
+            WorkerRpcCompletionError::Disconnected => WorkerRpcError::Runtime,
+        })
+    }
+
+    pub fn enqueue(
+        &self,
+        request: WorkerRpcRequest,
+    ) -> Result<PendingWorkerRpc, WorkerRpcEnqueueError> {
         let (response, receiver) = std_mpsc::sync_channel(1);
         self.sender
             .try_send(BlockingRequest { request, response })
             .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => WorkerRpcError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => WorkerRpcError::Runtime,
+                mpsc::error::TrySendError::Full(request) => {
+                    WorkerRpcEnqueueError::Full(Box::new(request.request))
+                }
+                mpsc::error::TrySendError::Closed(request) => {
+                    WorkerRpcEnqueueError::Closed(Box::new(request.request))
+                }
             })?;
-        receiver
-            .recv_timeout(self.response_timeout)
-            .map_err(|error| match error {
-                std_mpsc::RecvTimeoutError::Timeout => WorkerRpcError::Timeout,
-                std_mpsc::RecvTimeoutError::Disconnected => WorkerRpcError::Runtime,
-            })?
+        Ok(PendingWorkerRpc {
+            receiver,
+            response_timeout: self.response_timeout,
+        })
     }
 
     pub fn create_session(
@@ -2226,4 +2295,27 @@ pub enum WorkerRpcError {
     Serialization(String),
     #[error("worker RPC remote failure: {0:?}")]
     Remote(WorkerRpcFailure),
+}
+
+#[cfg(test)]
+mod blocking_client_tests {
+    use super::*;
+
+    #[test]
+    fn closed_ingress_returns_the_original_unhanded_request() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let client = WorkerRpcBlockingClient {
+            sender,
+            response_timeout: Duration::from_secs(1),
+        };
+        let request = WorkerRpcRequest::Probe {
+            expected_worker_epoch: 41,
+        };
+
+        assert!(matches!(
+            client.enqueue(request.clone()),
+            Err(WorkerRpcEnqueueError::Closed(returned)) if *returned == request
+        ));
+    }
 }

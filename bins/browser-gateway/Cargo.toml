@@ -18,11 +18,13 @@ browserd-api = { path = "../../crates/browserd-api" }
 browserd-artifacts = { path = "../../crates/browserd-artifacts" }
 browserd-auth = { path = "../../crates/browserd-auth" }
 browserd-core = { path = "../../crates/browserd-core" }
+browserd-coordination = { path = "../../crates/browserd-coordination" }
 browserd-http = { path = "../../crates/browserd-http" }
 browserd-operations = { path = "../../crates/browserd-operations" }
 browserd-policy = { path = "../../crates/browserd-policy" }
 browserd-viewer = { path = "../../crates/browserd-viewer" }
 browserd-worker = { path = "../../crates/browserd-worker" }
+chrono.workspace = true
 hex.workspace = true
 jsonwebtoken.workspace = true
 serde_json.workspace = true

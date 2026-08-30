@@ -6,10 +6,12 @@ use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use browserd_core::{OperationId, PageId, SessionId, TenantId, WorkerId};
+use browserd_actions::{ActionKind, ActionSequence};
+use browserd_core::{ActionId, OperationId, PageId, PrincipalId, SessionId, TenantId, WorkerId};
 use browserd_worker::{
-    WORKER_RPC_PROTOCOL_VERSION, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
-    WorkerIsolationProfile, WorkerProbeReceipt, WorkerRpcClient, WorkerRpcConfig, WorkerRpcError,
+    WORKER_RPC_PROTOCOL_VERSION, WorkerActionReceipt, WorkerActionStatus,
+    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
+    WorkerProbeReceipt, WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcError,
     WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
 };
 use tokio::net::UnixStream;
@@ -26,6 +28,39 @@ struct BlockingCreateHandler {
 struct KeyedCreateHandler {
     slow_started: Semaphore,
     slow_release: Semaphore,
+}
+
+struct MismatchedActionHandler;
+
+#[async_trait]
+impl WorkerRpcHandler for MismatchedActionHandler {
+    async fn handle(&self, request: WorkerRpcRequest) -> WorkerRpcResponse {
+        let WorkerRpcRequest::SubmitAction {
+            fence,
+            action_sequence,
+            idempotency_key,
+            canonical_request_hash,
+            kind,
+            ..
+        } = request
+        else {
+            return WorkerRpcResponse::Empty;
+        };
+        WorkerRpcResponse::Action(WorkerActionReceipt {
+            fence,
+            action_id: ActionId::new(),
+            action_sequence,
+            idempotency_key,
+            canonical_request_hash,
+            kind,
+            status: WorkerActionStatus::Queued,
+            dispatch_acknowledged: false,
+            approval_decision: None,
+            terminal_detail: None,
+            result: None,
+            resolution: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -103,6 +138,44 @@ fn create_request(operation_id: OperationId) -> WorkerCreateSessionRequest {
         requested_isolation: WorkerIsolationProfile::SharedContext,
         now_unix_millis: 1234,
     }
+}
+
+#[tokio::test]
+async fn blocking_client_separates_enqueue_acceptance_from_completion_failure() {
+    let Some(uid) = current_uid() else {
+        return;
+    };
+    let missing_socket = std::env::temp_dir().join(format!(
+        "browserd-missing-worker-{}.sock",
+        OperationId::new()
+    ));
+    let client = WorkerRpcClient::new(
+        missing_socket,
+        16 * 1024,
+        Duration::from_millis(100),
+        Some(uid),
+    );
+    assert!(client.is_ok());
+    let Some(client) = client.ok() else {
+        return;
+    };
+    let blocking = client.blocking(1);
+    assert!(blocking.is_ok());
+    let Some(blocking) = blocking.ok() else {
+        return;
+    };
+
+    let pending = blocking.enqueue(WorkerRpcRequest::Probe {
+        expected_worker_epoch: 41,
+    });
+    assert!(pending.is_ok());
+    let Some(pending) = pending.ok() else {
+        return;
+    };
+    assert!(matches!(
+        pending.wait(),
+        Err(WorkerRpcCompletionError::Exchange(WorkerRpcError::Io(_)))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -373,6 +446,73 @@ async fn blocking_client_fails_closed_when_bounded_ingress_is_full() {
     for join in joins {
         assert!(join.join().is_ok());
     }
+    shutdown.cancel();
+    assert!(server_task.await.is_ok_and(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn action_client_rejects_a_receipt_with_a_different_identity() {
+    let Some(uid) = current_uid() else {
+        return;
+    };
+    let directory = tempfile::tempdir();
+    assert!(directory.is_ok());
+    let Some(directory) = directory.ok() else {
+        return;
+    };
+    let socket_path = directory.path().join("action-worker.sock");
+    let config = WorkerRpcConfig::new(
+        socket_path.clone(),
+        16 * 1024,
+        2,
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(config.is_ok());
+    let Some(config) = config.ok() else {
+        return;
+    };
+    let server = WorkerRpcServer::bind(config.clone(), Arc::new(MismatchedActionHandler)).await;
+    assert!(server.is_ok());
+    let Some(server) = server.ok() else {
+        return;
+    };
+    let shutdown = CancellationToken::new();
+    let server_task = tokio::spawn(server.serve(shutdown.clone()));
+    let client = WorkerRpcClient::new(
+        socket_path,
+        config.max_frame_bytes(),
+        Duration::from_secs(2),
+        Some(uid),
+    );
+    assert!(client.is_ok());
+    let Some(client) = client.ok() else {
+        return;
+    };
+    let request = WorkerRpcRequest::SubmitAction {
+        fence: WorkerSessionFence {
+            tenant_id: TenantId::new(),
+            session_id: SessionId::new(),
+            worker_epoch: 41,
+            placement_version: 9,
+            session_incarnation: 1,
+        },
+        action_id: ActionId::new(),
+        action_sequence: ActionSequence::new(1),
+        requester_principal_id: PrincipalId::new(),
+        idempotency_key: "action-correlation".to_owned(),
+        canonical_request_hash: [7; 32],
+        kind: ActionKind::Mutating,
+        page_id: Some(PageId::new()),
+        payload: Vec::new(),
+        approval: None,
+        now_unix_millis: 1,
+    };
+    assert_eq!(
+        client.execute_action(request).await,
+        Err(WorkerRpcError::Protocol)
+    );
+
     shutdown.cancel();
     assert!(server_task.await.is_ok_and(|result| result.is_ok()));
 }
