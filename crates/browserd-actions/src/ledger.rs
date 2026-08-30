@@ -283,28 +283,77 @@ where
     ) -> Result<AcceptDecision, ActionLedgerError> {
         self.check_fence(fence)?;
         let mut state = self.lock_state()?;
+        self.accept_locked(&mut state, ActionId::new(), None, request)
+    }
 
+    pub fn accept_with_identity(
+        &self,
+        fence: PlacementFence,
+        proposed_action_id: ActionId,
+        proposed_action_sequence: ActionSequence,
+        request: ActionRequest,
+    ) -> Result<AcceptDecision, ActionLedgerError> {
+        self.check_fence(fence)?;
+        let mut state = self.lock_state()?;
+        self.accept_locked(
+            &mut state,
+            proposed_action_id,
+            Some(proposed_action_sequence),
+            request,
+        )
+    }
+
+    fn accept_locked(
+        &self,
+        state: &mut LedgerState,
+        proposed_action_id: ActionId,
+        proposed_action_sequence: Option<ActionSequence>,
+        request: ActionRequest,
+    ) -> Result<AcceptDecision, ActionLedgerError> {
         if let Some(action_id) = state.idempotency.get(request.idempotency_key()) {
             let snapshot = state
                 .actions
                 .get(action_id)
                 .ok_or(ActionLedgerError::StateUnavailable)?;
-            if snapshot.request().canonical_request_hash() != request.canonical_request_hash() {
+            if snapshot.request().canonical_request_hash() != request.canonical_request_hash()
+                || snapshot.request().kind() != request.kind()
+            {
                 return Err(ActionLedgerError::IdempotencyConflict {
+                    existing_action_id: action_id.clone(),
+                });
+            }
+            if proposed_action_sequence.is_some_and(|proposed_action_sequence| {
+                action_id != &proposed_action_id
+                    || snapshot.action_sequence() != proposed_action_sequence
+            }) {
+                return Err(ActionLedgerError::ActionIdentityConflict {
                     existing_action_id: action_id.clone(),
                 });
             }
             return Ok(AcceptDecision::Existing(snapshot.clone()));
         }
+        if state.actions.contains_key(&proposed_action_id) {
+            return Err(ActionLedgerError::ActionIdentityConflict {
+                existing_action_id: proposed_action_id,
+            });
+        }
 
-        let sequence = state
+        let expected_sequence = state
             .last_sequence
             .checked_add(1)
             .ok_or(ActionLedgerError::SequenceExhausted)?;
-        let action_id = ActionId::new();
+        let proposed_action_sequence =
+            proposed_action_sequence.unwrap_or_else(|| ActionSequence::new(expected_sequence));
+        if proposed_action_sequence.get() != expected_sequence {
+            return Err(ActionLedgerError::ActionSequenceConflict {
+                expected: ActionSequence::new(expected_sequence),
+                received: proposed_action_sequence,
+            });
+        }
+        let action_id = proposed_action_id;
         let snapshot = ActionSnapshot {
             action_id: action_id.clone(),
-            action_sequence: ActionSequence::new(sequence),
+            action_sequence: proposed_action_sequence,
             request: request.clone(),
             state: ActionState::Accepted,
             dispatch_permit: None,
@@ -324,7 +373,7 @@ where
             },
         ))?;
 
-        state.last_sequence = sequence;
+        state.last_sequence = expected_sequence;
         state
             .idempotency
             .insert(request.idempotency_key().clone(), action_id.clone());
@@ -825,5 +874,53 @@ where
         stored.approval_decision = Some(attempted);
         stored.terminal_detail = Some(detail);
         Ok(RecordOutcome::Recorded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use browserd_core::{PlacementFence, SessionId, TenantId};
+
+    use super::*;
+    use crate::{ActionKind, CanonicalRequestHash};
+
+    struct NoopJournal;
+
+    impl DurableActionJournal for NoopJournal {
+        fn append(&self, _entry: &JournalEntry) -> Result<(), JournalError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exact_retry_precedes_sequence_exhaustion() -> Result<(), Box<dyn Error>> {
+        let fence = PlacementFence::new(7, 11, 1);
+        let ledger = ActionLedger::new(
+            LedgerSession::new(TenantId::new(), SessionId::new(), fence),
+            Arc::new(NoopJournal),
+        );
+        let request = ActionRequest::new(
+            IdempotencyKey::new("sequence-exhausted-retry"),
+            CanonicalRequestHash::new([9; 32]),
+            ActionKind::Mutating,
+        );
+        let created = ledger.accept(fence, request.clone())?;
+        {
+            let mut state = ledger
+                .state
+                .lock()
+                .map_err(|_| std::io::Error::other("ledger state lock poisoned"))?;
+            state.last_sequence = u64::MAX;
+        }
+
+        let retried = ledger.accept(fence, request)?;
+        assert!(matches!(retried, AcceptDecision::Existing(_)));
+        assert_eq!(
+            retried.snapshot().action_id(),
+            created.snapshot().action_id()
+        );
+        Ok(())
     }
 }

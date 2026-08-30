@@ -693,6 +693,13 @@ pub enum ActionLedgerError {
     IdempotencyConflict {
         existing_action_id: ActionId,
     },
+    ActionIdentityConflict {
+        existing_action_id: ActionId,
+    },
+    ActionSequenceConflict {
+        expected: ActionSequence,
+        received: ActionSequence,
+    },
     ActionNotFound,
     InvalidTransition {
         state: ActionState,

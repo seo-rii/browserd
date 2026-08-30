@@ -168,12 +168,20 @@ impl ActionEvidence {
         dispatch_id: &DispatchId,
         result: BrowserResult,
     ) -> Result<ActionEvidenceMutation, ActionEvidenceError> {
-        self.require_dispatch(dispatch_id)?;
         let detail = match result {
             BrowserResult::Succeeded(digest) => TerminalDetail::Succeeded(digest),
             BrowserResult::FailedKnown(reason) => TerminalDetail::FailedKnown(reason),
             BrowserResult::CancellationConfirmed => TerminalDetail::CancelledConfirmed,
         };
+        self.record_worker_terminal(dispatch_id, detail)
+    }
+
+    pub fn record_worker_terminal(
+        &mut self,
+        dispatch_id: &DispatchId,
+        detail: TerminalDetail,
+    ) -> Result<ActionEvidenceMutation, ActionEvidenceError> {
+        self.require_dispatch(dispatch_id)?;
         self.record_terminal(ActionTerminalEvidence::new(
             detail,
             ActionTerminalSource::Worker,

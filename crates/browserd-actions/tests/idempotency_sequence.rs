@@ -6,6 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use browserd_actions::{AcceptDecision, ActionLedgerError, JournalEntryType};
+use browserd_core::ActionId;
 
 use common::{ledger_fixture, request};
 
@@ -66,6 +67,71 @@ fn same_idempotency_key_with_a_different_body_conflicts() {
         Err(ActionLedgerError::IdempotencyConflict { .. })
     ));
     assert_eq!(fixture.journal.count(JournalEntryType::Accepted), 1);
+}
+
+#[test]
+fn gateway_supplied_action_id_is_preserved_and_cannot_be_rebound() {
+    let fixture = ledger_fixture();
+    let proposed = ActionId::new();
+    let created = fixture
+        .ledger
+        .accept_with_identity(
+            fixture.fence,
+            proposed.clone(),
+            browserd_actions::ActionSequence::new(1),
+            request("gateway-owned-action", 9),
+        )
+        .expect("gateway-owned action ID should be accepted");
+    assert!(matches!(created, AcceptDecision::Created(_)));
+    assert_eq!(created.snapshot().action_id(), &proposed);
+
+    let retry = fixture
+        .ledger
+        .accept_with_identity(
+            fixture.fence,
+            proposed.clone(),
+            browserd_actions::ActionSequence::new(1),
+            request("gateway-owned-action", 9),
+        )
+        .expect("an exact idempotent retry should recover the original action");
+    assert!(matches!(retry, AcceptDecision::Existing(_)));
+    assert_eq!(retry.snapshot().action_id(), &proposed);
+
+    let different = ActionId::new();
+    assert_eq!(
+        fixture.ledger.accept_with_identity(
+            fixture.fence,
+            different,
+            browserd_actions::ActionSequence::new(1),
+            request("gateway-owned-action", 9),
+        ),
+        Err(ActionLedgerError::ActionIdentityConflict {
+            existing_action_id: proposed.clone(),
+        })
+    );
+    assert_eq!(
+        fixture.ledger.accept_with_identity(
+            fixture.fence,
+            proposed.clone(),
+            browserd_actions::ActionSequence::new(2),
+            request("different-gateway-action", 10),
+        ),
+        Err(ActionLedgerError::ActionIdentityConflict {
+            existing_action_id: proposed,
+        })
+    );
+    assert_eq!(
+        fixture.ledger.accept_with_identity(
+            fixture.fence,
+            ActionId::new(),
+            browserd_actions::ActionSequence::new(3),
+            request("skipped-gateway-sequence", 11),
+        ),
+        Err(ActionLedgerError::ActionSequenceConflict {
+            expected: browserd_actions::ActionSequence::new(2),
+            received: browserd_actions::ActionSequence::new(3),
+        })
+    );
 }
 
 #[test]

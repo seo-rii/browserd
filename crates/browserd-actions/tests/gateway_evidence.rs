@@ -148,6 +148,36 @@ fn terminal_evidence_is_idempotent_and_conflicting_results_are_rejected() {
 }
 
 #[test]
+fn worker_terminal_evidence_preserves_cancellation_and_worker_uncertainty_sources() {
+    for detail in [
+        TerminalDetail::CancelledBeforeDispatch,
+        TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::TimeoutAfterDispatch),
+    ] {
+        let mut evidence = ActionEvidence::new();
+        let dispatch_id = DispatchId::new();
+        evidence
+            .arm_dispatch(dispatch_id.clone())
+            .expect("dispatch should arm before a worker terminal receipt");
+
+        assert_eq!(
+            evidence.record_worker_terminal(&dispatch_id, detail),
+            Ok(ActionEvidenceMutation::Recorded)
+        );
+        assert_eq!(
+            evidence.terminal(),
+            Some(&ActionTerminalEvidence::new(
+                detail,
+                ActionTerminalSource::Worker,
+            ))
+        );
+        assert_eq!(
+            evidence.record_worker_terminal(&dispatch_id, detail),
+            Ok(ActionEvidenceMutation::AlreadyRecorded)
+        );
+    }
+}
+
+#[test]
 fn materialized_loss_terminal_matches_query_time_derivation() {
     for armed in [false, true] {
         let mut evidence = ActionEvidence::new();
