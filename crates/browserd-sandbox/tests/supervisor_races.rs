@@ -206,6 +206,70 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
 }
 
 #[tokio::test]
+async fn provisioning_lease_renewal_survives_active_publication() {
+    let backend = GatedBackend {
+        provision_started: Arc::new(Notify::new()),
+        allow_provision: Arc::new(Notify::new()),
+        events: Arc::new(Mutex::new(Vec::new())),
+        fail_revoke: false,
+        fail_kill: false,
+        fail_cleanup: false,
+    };
+    let supervisor = Arc::new(SandboxSupervisor::new(
+        SupervisorConfig::new(Duration::from_secs(10), Duration::from_secs(30))
+            .expect("config should work"),
+        backend.clone(),
+    ));
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    let create = {
+        let supervisor = Arc::clone(&supervisor);
+        let shard_id = shard_id.clone();
+        tokio::spawn(async move {
+            supervisor
+                .create_shard(
+                    launch_spec(shard_id),
+                    WorkerOwnership::new(worker(), 7, now + Duration::from_secs(5)),
+                )
+                .await
+        })
+    };
+    backend.provision_started.notified().await;
+
+    supervisor
+        .renew_owner_lease(
+            &shard_id,
+            7,
+            LaunchGeneration::new(1).expect("launch generation is positive"),
+            now + Duration::from_secs(1),
+            now + Duration::from_secs(10),
+        )
+        .await
+        .expect("provisioning lease should renew");
+    backend.allow_provision.notify_one();
+    assert_eq!(
+        create
+            .await
+            .expect("create task should not panic")
+            .expect("renewed provision should complete"),
+        CreateShardOutcome::Created
+    );
+
+    assert_eq!(
+        supervisor
+            .renew_owner_lease(
+                &shard_id,
+                7,
+                LaunchGeneration::new(1).expect("launch generation is positive"),
+                now + Duration::from_secs(6),
+                now + Duration::from_secs(11),
+            )
+            .await,
+        Ok(())
+    );
+}
+
+#[tokio::test]
 async fn cancellation_or_expiry_during_provision_surfaces_incomplete_cleanup() {
     for expire in [false, true] {
         let backend = GatedBackend {

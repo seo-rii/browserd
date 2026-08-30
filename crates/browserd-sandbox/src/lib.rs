@@ -953,11 +953,8 @@ where
         if owns_provision {
             let supervisor = self.clone();
             let owned_spec = spec.clone();
-            let owned_ownership = ownership.clone();
             tokio::spawn(async move {
-                supervisor
-                    .run_provision_owner(owned_spec, owned_ownership)
-                    .await;
+                supervisor.run_provision_owner(owned_spec).await;
             });
         }
 
@@ -980,7 +977,7 @@ where
         }
     }
 
-    async fn run_provision_owner(&self, spec: LaunchSpec, ownership: WorkerOwnership) {
+    async fn run_provision_owner(&self, spec: LaunchSpec) {
         let provisioned = AssertUnwindSafe(self.backend.provision_gated(&spec))
             .catch_unwind()
             .await
@@ -993,6 +990,7 @@ where
         let Some(provisioning) = state.provisioning.remove(&spec.shard_id) else {
             return;
         };
+        let ownership = provisioning.ownership.clone();
         let completion = provisioning.completion.clone();
         match provisioned {
             Ok(handle) => {
