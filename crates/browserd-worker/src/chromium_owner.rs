@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc as std_mpsc};
 use std::time::Duration;
@@ -17,7 +18,8 @@ use browserd_targets::{
     TargetKind,
 };
 use serde_json::{Map, Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::cdp_driver::CdpChromiumDriver;
 use crate::{
@@ -284,6 +286,19 @@ pub struct ChromiumConnectionOwner<D> {
     shard_fence: ShardFence,
     driver_effect_gate: Arc<Mutex<()>>,
     accepted: AtomicBool,
+    shutdown_started: AtomicBool,
+    thread: Arc<OwnerThreadControl>,
+}
+
+struct OwnerThreadControl {
+    completion: watch::Sender<Option<Result<(), ShardRuntimeError>>>,
+    join: Mutex<OwnerJoinState>,
+    shutdown: CancellationToken,
+}
+
+struct OwnerJoinState {
+    handle: Option<std::thread::JoinHandle<()>>,
+    result: Option<Result<(), ShardRuntimeError>>,
 }
 
 impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
@@ -330,6 +345,7 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
         mailbox.bind_failure_sink(Arc::new(IngressFailure {
             ingress: ingress.clone(),
         }))?;
+        let (completion, _completion_receiver) = watch::channel(None);
         let owner = Arc::new(Self {
             expected,
             config,
@@ -340,6 +356,15 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             shard_fence: fence,
             driver_effect_gate: Arc::new(Mutex::new(())),
             accepted: AtomicBool::new(false),
+            shutdown_started: AtomicBool::new(false),
+            thread: Arc::new(OwnerThreadControl {
+                completion,
+                join: Mutex::new(OwnerJoinState {
+                    handle: None,
+                    result: None,
+                }),
+                shutdown: CancellationToken::new(),
+            }),
         });
         Ok((owner, Arc::new(manager)))
     }
@@ -362,6 +387,52 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             isolation,
         )
     }
+
+    pub async fn shutdown_and_join(&self, timeout: Duration) -> Result<(), ShardRuntimeError> {
+        if timeout.is_zero() {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        self.thread.shutdown.cancel();
+        if self
+            .shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.mailbox.begin_shutdown();
+        }
+        let mut completion = self.thread.completion.subscribe();
+        let thread_result = tokio::time::timeout(timeout, async {
+            loop {
+                if let Some(result) = *completion.borrow() {
+                    break result;
+                }
+                completion
+                    .changed()
+                    .await
+                    .map_err(|_| ShardRuntimeError::OutcomeUncertain)?;
+            }
+        })
+        .await
+        .map_err(|_| ShardRuntimeError::OutcomeUncertain)?;
+        let mut join = self
+            .thread
+            .join
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        if let Some(result) = join.result {
+            return result;
+        }
+        let handle = join
+            .handle
+            .take()
+            .ok_or(ShardRuntimeError::OutcomeUncertain)?;
+        let join_result = handle
+            .join()
+            .map_err(|_| ShardRuntimeError::OutcomeUncertain);
+        let result = thread_result.and(join_result);
+        join.result = Some(result);
+        result
+    }
 }
 
 #[async_trait]
@@ -381,11 +452,13 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
         let ingress = self.ingress.clone();
         let mailbox = Arc::downgrade(&self.mailbox);
         let shard_fence = self.shard_fence.clone();
+        let shutdown = self.thread.shutdown.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
+        let completion = self.thread.completion.clone();
         let thread = std::thread::Builder::new()
             .name("browserd-chromium-owner".to_owned())
             .spawn(move || {
-                run_owner_thread(OwnerThreadInput {
+                let input = OwnerThreadInput {
                     pipes,
                     expected,
                     config,
@@ -394,13 +467,25 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
                     mailbox,
                     shard_fence,
                     ready: ready_tx,
-                });
+                    shutdown,
+                };
+                let result = catch_unwind(AssertUnwindSafe(|| run_owner_thread(input)))
+                    .unwrap_or(Err(ShardRuntimeError::OutcomeUncertain));
+                completion.send_replace(Some(result));
             });
-        if thread.is_err() {
-            self.mailbox.mark_terminal();
-            self.ingress.fail_closed(TargetManagerEvent::TransportLost);
-            return Err(ShardRuntimeError::Unavailable);
-        }
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(_) => {
+                self.mailbox.mark_terminal();
+                self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                return Err(ShardRuntimeError::Unavailable);
+            }
+        };
+        self.thread
+            .join
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .handle = Some(thread);
         match ready_rx.await {
             Ok(result) => result,
             Err(_) => {
@@ -421,9 +506,12 @@ struct OwnerThreadInput<D> {
     mailbox: Weak<OwnerMailbox>,
     shard_fence: ShardFence,
     ready: oneshot::Sender<Result<(), ShardRuntimeError>>,
+    shutdown: CancellationToken,
 }
 
-fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
+fn run_owner_thread<D: TargetManagerDrain>(
+    input: OwnerThreadInput<D>,
+) -> Result<(), ShardRuntimeError> {
     let OwnerThreadInput {
         pipes,
         expected,
@@ -433,6 +521,7 @@ fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
         mailbox,
         shard_fence,
         ready,
+        shutdown,
     } = input;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -443,7 +532,7 @@ fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
             mailbox.fail_closed();
         }
         let _ignored = ready.send(Err(ShardRuntimeError::Unavailable));
-        return;
+        return Err(ShardRuntimeError::Unavailable);
     };
     runtime.block_on(async move {
         let connection = ChromiumConnection::connect(pipes, &expected, config.clone()).await;
@@ -454,8 +543,9 @@ fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
                     mailbox.mark_terminal();
                     mailbox.fail_closed();
                 }
-                let _ignored = ready.send(Err(map_connection_error(error)));
-                return;
+                let error = map_connection_error(error);
+                let _ignored = ready.send(Err(error));
+                return Err(error);
             }
         };
         let (client, events, driver) = connection.into_verified_parts();
@@ -463,14 +553,14 @@ fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
         let Some(mailbox_handle) = mailbox.upgrade() else {
             let _ignored = ready.send(Err(ShardRuntimeError::Cancelled));
             driver.shutdown().await;
-            return;
+            return Err(ShardRuntimeError::Cancelled);
         };
         if mailbox_handle.install(commands).is_err() {
             mailbox_handle.mark_terminal();
             mailbox_handle.fail_closed();
             let _ignored = ready.send(Err(ShardRuntimeError::Rejected));
             driver.shutdown().await;
-            return;
+            return Err(ShardRuntimeError::Rejected);
         }
         drop(mailbox_handle);
         if ready.send(Ok(())).is_err() {
@@ -479,7 +569,7 @@ fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
                 mailbox.fail_closed();
             }
             driver.shutdown().await;
-            return;
+            return Err(ShardRuntimeError::Cancelled);
         }
         ChromiumOwnerActor::new(
             client,
@@ -490,9 +580,9 @@ fn run_owner_thread<D: TargetManagerDrain>(input: OwnerThreadInput<D>) {
             shard_fence,
             config.transport.default_command_timeout,
         )
-        .run(receiver)
-        .await;
-    });
+        .run(receiver, shutdown)
+        .await
+    })
 }
 
 trait FailureSink: Send + Sync {
@@ -560,6 +650,30 @@ impl OwnerMailbox {
         }
     }
 
+    fn begin_shutdown(&self) -> Result<(), ShardRuntimeError> {
+        let mut endpoint = self
+            .endpoint
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        let sender = match &*endpoint {
+            OwnerEndpoint::Ready(sender) => sender.clone(),
+            OwnerEndpoint::Pending => return Err(ShardRuntimeError::Unavailable),
+            OwnerEndpoint::Terminal => return Ok(()),
+        };
+        let result = sender
+            .try_send(OwnerRequest::Shutdown)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ShardRuntimeError::OutcomeUncertain,
+                mpsc::error::TrySendError::Closed(_) => ShardRuntimeError::OutcomeUncertain,
+            });
+        *endpoint = OwnerEndpoint::Terminal;
+        drop(endpoint);
+        if result.is_err() {
+            self.fail_closed();
+        }
+        result
+    }
+
     fn fail_closed(&self) {
         if let Ok(failure) = self.failure.lock()
             && let Some(failure) = failure.as_ref()
@@ -606,6 +720,7 @@ impl OwnerMailbox {
 }
 
 enum OwnerRequest {
+    Shutdown,
     Health {
         response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
     },
@@ -806,11 +921,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
     }
 
-    async fn run(mut self, mut requests: mpsc::Receiver<OwnerRequest>) {
+    async fn run(
+        mut self,
+        mut requests: mpsc::Receiver<OwnerRequest>,
+        shutdown: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
         let mut failed = false;
         loop {
             tokio::select! {
                 biased;
+                () = shutdown.cancelled() => break,
                 incoming = self.events.recv() => {
                     match incoming {
                         Some(incoming) => {
@@ -829,9 +949,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     let Some(request) = request else {
                         break;
                     };
-                    if self.handle_request(request).await.is_err() {
-                        failed = true;
-                        break;
+                    match request {
+                        OwnerRequest::Shutdown => break,
+                        request => {
+                            if self.handle_request(request).await.is_err() {
+                                failed = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -846,10 +971,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             self.ingress.fail_closed(TargetManagerEvent::TransportLost);
         }
         self.driver.shutdown().await;
+        if failed {
+            Err(ShardRuntimeError::OutcomeUncertain)
+        } else {
+            Ok(())
+        }
     }
 
     async fn handle_request(&mut self, request: OwnerRequest) -> Result<(), ()> {
         match request {
+            OwnerRequest::Shutdown => return Ok(()),
             OwnerRequest::Health { response } => {
                 if response.send(Ok(())).is_err() {
                     return Err(());
