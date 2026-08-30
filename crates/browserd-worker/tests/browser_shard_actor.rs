@@ -435,6 +435,33 @@ async fn drain_closes_admission_and_exact_detach_retries_are_idempotent() {
 }
 
 #[tokio::test]
+async fn explicit_shutdown_joins_a_dead_actor_while_cloned_handles_remain() {
+    let Some(fence) = shard_fence(24, 3) else {
+        return;
+    };
+    let Some(config) = config(fence.clone(), 8) else {
+        return;
+    };
+    let runtime = Arc::new(FakeRuntime::default());
+    let (actor, task) = BrowserShardActor::spawn(config, runtime.clone());
+    assert_eq!(actor.activate(&fence).await, Ok(()));
+    assert_eq!(actor.begin_draining(&fence).await, Ok(()));
+    assert_eq!(actor.stop_if_empty(&fence).await, Ok(()));
+
+    let retained_handle = actor.clone();
+    assert_eq!(actor.shutdown(&fence).await, Ok(()));
+    let finished = tokio::time::timeout(Duration::from_secs(1), task).await;
+    assert!(matches!(finished, Ok(Ok(Ok(())))));
+    assert_eq!(runtime.terminate_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        retained_handle.snapshot(&fence).await,
+        Err(ShardActorError::ActorStopped)
+    );
+    assert_eq!(retained_handle.shutdown(&fence).await, Ok(()));
+    assert_eq!(runtime.terminate_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn terminate_failure_stays_stopping_and_can_be_retried() {
     let Some(fence) = shard_fence(29, 3) else {
         return;

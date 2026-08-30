@@ -194,7 +194,7 @@ pub struct BrowserShardActor {
     ownership_lost: CancellationToken,
     ownership_gate: Arc<Mutex<OwnershipGate>>,
     termination: watch::Receiver<Option<Result<(), ShardRuntimeError>>>,
-    _handle_lifetime: Arc<ActorHandleLifetime>,
+    handle_lifetime: Arc<ActorHandleLifetime>,
 }
 
 #[derive(Default)]
@@ -229,7 +229,7 @@ impl BrowserShardActor {
             ownership_lost: ownership_lost.clone(),
             ownership_gate: ownership_gate.clone(),
             termination,
-            _handle_lifetime: Arc::new(ActorHandleLifetime {
+            handle_lifetime: Arc::new(ActorHandleLifetime {
                 shutdown: shutdown.clone(),
             }),
         };
@@ -383,6 +383,24 @@ impl BrowserShardActor {
                 .await
                 .map_err(|_| ShardActorError::ActorStopped)?;
         }
+        loop {
+            if let Some(result) = *termination.borrow() {
+                return result.map_err(ShardActorError::Runtime);
+            }
+            if termination.changed().await.is_err() {
+                return Err(ShardActorError::ActorStopped);
+            }
+        }
+    }
+
+    /// Stops the actor even when cloned handles remain alive and waits for the runtime's terminal
+    /// result. The task handle returned by [`Self::spawn`] can then be joined by its owner.
+    pub async fn shutdown(&self, fence: &ShardFence) -> ActorResult<()> {
+        if fence != &self.fence {
+            return Err(ShardActorError::StaleShardFence);
+        }
+        self.handle_lifetime.shutdown.cancel();
+        let mut termination = self.termination.clone();
         loop {
             if let Some(result) = *termination.borrow() {
                 return result.map_err(ShardActorError::Runtime);
