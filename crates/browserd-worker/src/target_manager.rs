@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use browserd_core::{SessionId, ShardFence};
+use browserd_core::{SessionId, ShardFence, TenantId};
 use browserd_session::OwnershipFence;
 use browserd_targets::{
     BootstrapBackend, BootstrapStageFailure, PausedTarget, TargetBootstrapBarrier,
@@ -198,6 +198,21 @@ where
         }
         self.inner
             .create_context(session_id, fence, cancellation)
+            .await
+    }
+
+    async fn create_context_owned(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        if !self.targets.is_ready() {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        self.inner
+            .create_context_owned(tenant_id, session_id, fence, cancellation)
             .await
     }
 

@@ -83,7 +83,7 @@ impl<D> ChromiumDriverShardRuntime<D> {
         }
         .map_err(map_dependency_error)?;
         if cancellation.is_cancelled() {
-            let _ = self.driver.close_context(session_id);
+            let _ = self.driver.close_context_fenced(session_id, fence);
             return Err(ShardRuntimeError::Cancelled);
         }
         contexts.insert(
@@ -149,7 +149,7 @@ impl<D: ChromiumDriver> BrowserShardRuntime for ChromiumDriverShardRuntime<D> {
             None => return Ok(()),
         }
         self.driver
-            .close_context(session_id)
+            .close_context_fenced(session_id, fence)
             .map_err(map_dependency_error)?;
         contexts.remove(session_id);
         Ok(())
@@ -160,10 +160,13 @@ impl<D: ChromiumDriver> BrowserShardRuntime for ChromiumDriverShardRuntime<D> {
             .contexts
             .lock()
             .map_err(|_| ShardRuntimeError::Unavailable)?;
-        let session_ids = contexts.keys().cloned().collect::<Vec<_>>();
-        for session_id in session_ids {
+        let sessions = contexts
+            .iter()
+            .map(|(session_id, context)| (session_id.clone(), context.fence.clone()))
+            .collect::<Vec<_>>();
+        for (session_id, fence) in sessions {
             self.driver
-                .close_context(&session_id)
+                .close_context_fenced(&session_id, &fence)
                 .map_err(map_dependency_error)?;
             contexts.remove(&session_id);
         }

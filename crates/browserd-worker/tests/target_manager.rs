@@ -1,18 +1,23 @@
 #![allow(clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use browserd_core::{LaunchGeneration, OwnerFence, ShardFence, ShardId, WorkerEpoch, WorkerId};
+use browserd_core::{
+    LaunchGeneration, OwnerFence, SessionId, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+};
+use browserd_session::OwnershipFence;
 use browserd_targets::{
     BootstrapBackend, BootstrapStage, BootstrapStageFailure, PausedTarget, ShardTaintReason,
     TargetKind,
 };
 use browserd_worker::{
-    ProductionTargetManager, TargetBootstrapSnapshot, TargetManagerBackend, TargetManagerDrain,
-    TargetManagerEvent, TargetManagerIngressError,
+    BrowserShardRuntime, ProductionTargetManager, ShardRuntimeError, TargetBootstrapSnapshot,
+    TargetManagedShardRuntime, TargetManagerBackend, TargetManagerDrain, TargetManagerEvent,
+    TargetManagerIngressError,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 struct Backend {
     snapshot: Mutex<Option<TargetBootstrapSnapshot>>,
@@ -88,6 +93,60 @@ impl TargetManagerDrain for Drain {
     }
 }
 
+#[derive(Default)]
+struct OwnershipForwardingRuntime {
+    owned_creates: Mutex<Vec<(TenantId, SessionId, OwnershipFence)>>,
+    unfenced_creates: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl BrowserShardRuntime for OwnershipForwardingRuntime {
+    async fn readiness_check(
+        &self,
+        _fence: &ShardFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        Ok(())
+    }
+
+    async fn create_context(
+        &self,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        self.unfenced_creates.fetch_add(1, Ordering::SeqCst);
+        Err(ShardRuntimeError::Rejected)
+    }
+
+    async fn create_context_owned(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        self.owned_creates
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .push((tenant_id.clone(), session_id.clone(), fence.clone()));
+        Ok(())
+    }
+
+    async fn dispose_context(
+        &self,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        Ok(())
+    }
+
+    async fn terminate(&self, _fence: &ShardFence) -> Result<(), ShardRuntimeError> {
+        Ok(())
+    }
+}
+
 fn fence() -> ShardFence {
     ShardFence::new(
         OwnerFence::new(
@@ -97,6 +156,41 @@ fn fence() -> ShardFence {
         ShardId::new(),
         LaunchGeneration::new(1).unwrap(),
     )
+}
+
+#[tokio::test]
+async fn target_managed_runtime_preserves_owned_context_tenant_and_full_fence() {
+    let snapshot = TargetBootstrapSnapshot::new(vec![], vec![]).unwrap();
+    let backend = Backend {
+        snapshot: Mutex::new(Some(snapshot)),
+        stages: Mutex::new(Vec::new()),
+        fail_resume: false,
+    };
+    let drain = Arc::new(Drain(AtomicBool::new(false)));
+    let (manager, _ingress) =
+        ProductionTargetManager::new_bounded(fence(), backend, 2, drain).unwrap();
+    assert_eq!(manager.bootstrap().await, Ok(()));
+    let inner = Arc::new(OwnershipForwardingRuntime::default());
+    let runtime = TargetManagedShardRuntime::new(Arc::clone(&inner), Arc::new(manager));
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let ownership = OwnershipFence::new(WorkerId::new("target-worker").unwrap(), 9, 41, 7);
+
+    let result = runtime
+        .create_context_owned(
+            &tenant_id,
+            &session_id,
+            &ownership,
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(inner.unfenced_creates.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        inner.owned_creates.lock().ok().map(|calls| calls.clone()),
+        Some(vec![(tenant_id, session_id, ownership)])
+    );
 }
 
 #[tokio::test]
