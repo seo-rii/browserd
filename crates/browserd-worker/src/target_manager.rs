@@ -9,6 +9,7 @@ use browserd_targets::{
     BootstrapBackend, BootstrapStageFailure, PausedTarget, TargetBootstrapBarrier,
 };
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::{BrowserShardRuntime, ShardRuntimeError};
@@ -94,8 +95,20 @@ struct ManagerState {
     bootstrap_started: AtomicBool,
     ready: AtomicBool,
     tainted: AtomicBool,
+    drain_started: AtomicBool,
     ready_targets: Mutex<BTreeSet<String>>,
     target_changed: Condvar,
+}
+
+enum EventPumpLifecycle {
+    NotStarted,
+    Running(JoinHandle<()>),
+    Joined(Result<(), ShardRuntimeError>),
+}
+
+struct EventPumpControl {
+    cancellation: CancellationToken,
+    lifecycle: tokio::sync::Mutex<EventPumpLifecycle>,
 }
 
 #[derive(Clone)]
@@ -146,6 +159,7 @@ pub struct ProductionTargetManager<B, D> {
     receiver: Mutex<Option<mpsc::Receiver<TargetManagerEvent>>>,
     drain: Arc<D>,
     state: Arc<ManagerState>,
+    pump: EventPumpControl,
 }
 
 /// Browser shard runtime decorator that withholds readiness and all context admission until the
@@ -228,7 +242,9 @@ where
     }
 
     async fn terminate(&self, fence: &ShardFence) -> Result<(), ShardRuntimeError> {
-        self.inner.terminate(fence).await
+        let target_result = self.targets.shutdown().await;
+        let runtime_result = self.inner.terminate(fence).await;
+        target_result.and(runtime_result)
     }
 }
 
@@ -274,9 +290,14 @@ where
                 bootstrap_started: AtomicBool::new(false),
                 ready: AtomicBool::new(false),
                 tainted: AtomicBool::new(false),
+                drain_started: AtomicBool::new(false),
                 ready_targets: Mutex::new(BTreeSet::new()),
                 target_changed: Condvar::new(),
             }),
+            pump: EventPumpControl {
+                cancellation: CancellationToken::new(),
+                lifecycle: tokio::sync::Mutex::new(EventPumpLifecycle::NotStarted),
+            },
         })
     }
 
@@ -318,8 +339,15 @@ where
             .map_err(|_| ShardRuntimeError::Unavailable)?
             .take()
             .ok_or(ShardRuntimeError::Rejected)?;
-        self.spawn_event_pump(receiver);
+        let mut pump = self.pump.lifecycle.lock().await;
+        if self.pump.cancellation.is_cancelled() || !matches!(*pump, EventPumpLifecycle::NotStarted)
+        {
+            drop(receiver);
+            return Err(ShardRuntimeError::Cancelled);
+        }
+        *pump = EventPumpLifecycle::Running(self.spawn_event_pump(receiver));
         self.state.ready.store(true, Ordering::Release);
+        drop(pump);
         Ok(())
     }
 
@@ -351,17 +379,29 @@ where
         Ok(())
     }
 
-    fn spawn_event_pump(&self, mut receiver: mpsc::Receiver<TargetManagerEvent>) {
+    fn spawn_event_pump(&self, mut receiver: mpsc::Receiver<TargetManagerEvent>) -> JoinHandle<()> {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let drain = self.drain.clone();
+        let cancellation = self.pump.cancellation.clone();
         tokio::spawn(async move {
-            while let Some(event) = receiver.recv().await {
+            'events: loop {
+                let event = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    event = receiver.recv() => {
+                        let Some(event) = event else {
+                            taint_and_drain(&state, &*drain);
+                            return;
+                        };
+                        event
+                    }
+                };
                 match event {
                     TargetManagerEvent::Attached(target) => {
                         let target_id = target.target_id().to_owned();
                         let target_backend = backend.clone();
-                        let result = tokio::task::spawn_blocking(move || {
+                        let mut callback = tokio::task::spawn_blocking(move || {
                             target_backend
                                 .lock()
                                 .map_err(|_| ())
@@ -370,10 +410,17 @@ where
                                         .bootstrap(&target, &mut *backend)
                                         .map_err(|_| ())
                                 })
-                        })
-                        .await
-                        .map_err(|_| ())
-                        .and_then(|result| result);
+                        });
+                        let result = tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => {
+                                let _ = callback.await;
+                                break 'events;
+                            }
+                            result = &mut callback => {
+                                result.map_err(|_| ()).and_then(|result| result)
+                            }
+                        };
                         if result.is_ok() {
                             let inserted = state
                                 .ready_targets
@@ -399,17 +446,41 @@ where
                     }
                     TargetManagerEvent::Overflow | TargetManagerEvent::TransportLost => {}
                 }
-                state.ready.store(false, Ordering::Release);
-                state.tainted.store(true, Ordering::Release);
-                state.target_changed.notify_all();
-                drain.begin_drain();
+                taint_and_drain(&state, &*drain);
                 return;
             }
             state.ready.store(false, Ordering::Release);
-            state.tainted.store(true, Ordering::Release);
             state.target_changed.notify_all();
-            drain.begin_drain();
-        });
+        })
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ShardRuntimeError> {
+        let mut pump = self.pump.lifecycle.lock().await;
+        if let EventPumpLifecycle::Joined(result) = &*pump {
+            return *result;
+        }
+        self.pump.cancellation.cancel();
+        self.taint_and_drain();
+        let receiver_result = self
+            .receiver
+            .lock()
+            .map(|mut receiver| {
+                receiver.take();
+            })
+            .map_err(|_| ShardRuntimeError::Unavailable);
+        let join_result = match std::mem::replace(
+            &mut *pump,
+            EventPumpLifecycle::Joined(Err(ShardRuntimeError::Unavailable)),
+        ) {
+            EventPumpLifecycle::NotStarted => Ok(()),
+            EventPumpLifecycle::Running(handle) => handle
+                .await
+                .map_err(|_| ShardRuntimeError::OutcomeUncertain),
+            EventPumpLifecycle::Joined(result) => result,
+        };
+        let result = receiver_result.and(join_result);
+        *pump = EventPumpLifecycle::Joined(result);
+        result
     }
 
     fn taint_and_drain(&self) {
@@ -464,5 +535,7 @@ fn taint_and_drain<D: TargetManagerDrain>(state: &ManagerState, drain: &D) {
     state.ready.store(false, Ordering::Release);
     state.tainted.store(true, Ordering::Release);
     state.target_changed.notify_all();
-    drain.begin_drain();
+    if !state.drain_started.swap(true, Ordering::AcqRel) {
+        drain.begin_drain();
+    }
 }
