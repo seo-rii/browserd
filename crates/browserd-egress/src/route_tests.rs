@@ -512,6 +512,46 @@ fn lease_renewal_is_bounded_and_cannot_revive_an_expired_route() {
 }
 
 #[test]
+fn out_of_order_renewal_cannot_shorten_an_active_route_lease() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let endpoint = RouteEndpoint::new(11).expect("endpoint should be valid");
+    let shard = ShardId::new();
+    let route_claim = claim(endpoint, shard.clone(), 7);
+    prepare_shard(&registry, &shard, 7);
+    registry
+        .bind(
+            &route_claim,
+            binding(&route_claim, 10_000),
+            MonotonicMillis::new(1_000),
+        )
+        .expect("route should bind");
+
+    assert_eq!(
+        registry.renew(
+            &route_claim,
+            MonotonicMillis::new(1_500),
+            MonotonicMillis::new(9_000),
+        ),
+        Err(RouteError::InvalidLeaseExpiry)
+    );
+    assert_eq!(
+        registry
+            .binding(&route_claim, MonotonicMillis::new(2_000))
+            .expect("route should remain active")
+            .expires_at(),
+        MonotonicMillis::new(10_000)
+    );
+    assert_eq!(
+        registry.renew(
+            &route_claim,
+            MonotonicMillis::new(2_000),
+            MonotonicMillis::new(10_000),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
 fn connection_permit_uses_inspected_sockaddr_and_accounts_bytes() {
     let registry = RouteRegistry::new(Duration::from_secs(30));
     let endpoint = RouteEndpoint::new(12);

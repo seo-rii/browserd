@@ -504,6 +504,9 @@ impl RouteRegistry {
         self.validate_expiry(now, new_expires_at)?;
         let mut state = self.lock_state();
         let entry = Self::active_entry(&mut state, claim, now)?;
+        if new_expires_at < entry.binding.expires_at {
+            return Err(RouteError::InvalidLeaseExpiry);
+        }
         entry.binding.expires_at = new_expires_at;
         Ok(())
     }
