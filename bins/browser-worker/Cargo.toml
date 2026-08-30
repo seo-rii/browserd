@@ -10,9 +10,12 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 browserd-core = { path = "../../crates/browserd-core" }
 browserd-session = { path = "../../crates/browserd-session" }
 browserd-worker = { path = "../../crates/browserd-worker" }
+tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
