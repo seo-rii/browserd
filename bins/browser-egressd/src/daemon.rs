@@ -103,6 +103,91 @@ pub struct PreparedRouteResponse {
     prepare_revision: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenewRouteRequest {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    lease_ttl: Duration,
+}
+
+impl RenewRouteRequest {
+    pub fn new(
+        renewal_sequence: u64,
+        daemon_epoch: u64,
+        egress_fence: EgressFence,
+        attachment_id: u64,
+        activation_revision: u64,
+        lease_ttl: Duration,
+    ) -> Result<Self, DaemonControlError> {
+        if renewal_sequence == 0
+            || daemon_epoch == 0
+            || attachment_id == 0
+            || activation_revision == 0
+            || lease_ttl.is_zero()
+        {
+            return Err(DaemonControlError::InvalidRenewRequest);
+        }
+        Ok(Self {
+            renewal_sequence,
+            daemon_epoch,
+            egress_fence,
+            attachment_id,
+            activation_revision,
+            lease_ttl,
+        })
+    }
+
+    #[must_use]
+    pub const fn renewal_sequence(&self) -> u64 {
+        self.renewal_sequence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenewedRouteResponse {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    expires_at_millis: u64,
+}
+
+impl RenewedRouteResponse {
+    #[must_use]
+    pub const fn renewal_sequence(&self) -> u64 {
+        self.renewal_sequence
+    }
+
+    #[must_use]
+    pub const fn daemon_epoch(&self) -> u64 {
+        self.daemon_epoch
+    }
+
+    #[must_use]
+    pub const fn egress_fence(&self) -> &EgressFence {
+        &self.egress_fence
+    }
+
+    #[must_use]
+    pub const fn attachment_id(&self) -> u64 {
+        self.attachment_id
+    }
+
+    #[must_use]
+    pub const fn activation_revision(&self) -> u64 {
+        self.activation_revision
+    }
+
+    #[must_use]
+    pub const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+}
+
 impl PreparedRouteResponse {
     #[must_use]
     pub const fn daemon_epoch(&self) -> u64 {
@@ -169,6 +254,13 @@ struct PreparedPlan {
     prepared: PreparedAttachmentReceipt,
     binding: Option<RouteBinding>,
     active: Option<ActiveInstallResponse>,
+    last_renewal: Option<CommittedRenewal>,
+}
+
+#[derive(Clone)]
+struct CommittedRenewal {
+    request: RenewRouteRequest,
+    response: RenewedRouteResponse,
 }
 
 impl EgressDaemon {
@@ -260,6 +352,7 @@ impl EgressDaemon {
                 prepared,
                 binding: None,
                 active: None,
+                last_renewal: None,
             },
         );
         Ok(response)
@@ -430,6 +523,104 @@ impl EgressDaemon {
         self.status(daemon_epoch, fence)
     }
 
+    pub fn renew(
+        &self,
+        request: RenewRouteRequest,
+    ) -> Result<RenewedRouteResponse, DaemonControlError> {
+        self.ensure_epoch(request.daemon_epoch)?;
+        if request.lease_ttl > self.limits.max_lease {
+            return Err(DaemonControlError::UnsupportedPolicy);
+        }
+        let lease_ttl_millis = u64::try_from(request.lease_ttl.as_millis())
+            .map_err(|_| DaemonControlError::InvalidRenewRequest)?;
+        let mut plans = self.lock_plans();
+        let plan = plans
+            .get_mut(&request.egress_fence)
+            .ok_or(DaemonControlError::PlanNotFound)?;
+        let wire_active = plan
+            .active
+            .clone()
+            .ok_or(DaemonControlError::RenewalConflict)?;
+        if wire_active.daemon_epoch() != request.daemon_epoch
+            || wire_active.egress_fence() != &request.egress_fence
+            || wire_active.attachment_id() != request.attachment_id
+            || wire_active.activation_revision() != request.activation_revision
+        {
+            return Err(DaemonControlError::RenewalConflict);
+        }
+        let active = match self
+            .manager
+            .status(self.daemon_epoch, &request.egress_fence)
+            .map_err(DaemonControlError::Manager)?
+        {
+            AttachmentStatus::Active(active) => active,
+            _ => return Err(DaemonControlError::RenewalConflict),
+        };
+        if active.attachment_id().get() != request.attachment_id
+            || active.activation_revision() != request.activation_revision
+        {
+            return Err(DaemonControlError::RenewalConflict);
+        }
+
+        if let Some(committed) = &plan.last_renewal {
+            if request.renewal_sequence < committed.request.renewal_sequence {
+                return Err(DaemonControlError::RenewalConflict);
+            }
+            if request.renewal_sequence == committed.request.renewal_sequence {
+                if request != committed.request {
+                    return Err(DaemonControlError::RenewalConflict);
+                }
+                self.manager
+                    .renew(
+                        &active,
+                        MonotonicMillis::new(committed.response.expires_at_millis),
+                    )
+                    .map_err(DaemonControlError::Manager)?;
+                return Ok(committed.response.clone());
+            }
+            if committed.request.renewal_sequence.checked_add(1) != Some(request.renewal_sequence) {
+                return Err(DaemonControlError::RenewalConflict);
+            }
+        } else if request.renewal_sequence != 1 {
+            return Err(DaemonControlError::RenewalConflict);
+        }
+
+        let expires_at_millis = self
+            .manager
+            .now()
+            .value()
+            .checked_add(lease_ttl_millis)
+            .ok_or(DaemonControlError::InvalidRenewRequest)?;
+        self.manager
+            .renew(&active, MonotonicMillis::new(expires_at_millis))
+            .map_err(DaemonControlError::Manager)?;
+        let response = RenewedRouteResponse {
+            renewal_sequence: request.renewal_sequence,
+            daemon_epoch: request.daemon_epoch,
+            egress_fence: request.egress_fence.clone(),
+            attachment_id: request.attachment_id,
+            activation_revision: request.activation_revision,
+            expires_at_millis,
+        };
+        plan.active = Some(
+            ActiveInstallResponse::new(
+                wire_active.transfer_id().clone(),
+                wire_active.daemon_epoch(),
+                wire_active.egress_fence().clone(),
+                wire_active.attachment_id(),
+                wire_active.proxy_address(),
+                expires_at_millis,
+                wire_active.activation_revision(),
+            )
+            .map_err(|_| DaemonControlError::InconsistentReceipt)?,
+        );
+        plan.last_renewal = Some(CommittedRenewal {
+            request,
+            response: response.clone(),
+        });
+        Ok(response)
+    }
+
     pub async fn shutdown(&self) -> Result<(), DaemonControlError> {
         self.manager
             .shutdown()
@@ -526,12 +717,14 @@ fn prepared_response(prepared: &PreparedAttachmentReceipt) -> PreparedRouteRespo
 pub enum DaemonControlError {
     InvalidLimits,
     InvalidPrepareRequest,
+    InvalidRenewRequest,
     UnsupportedPolicy,
     DaemonEpochMismatch { expected: u64, received: u64 },
     PlanConflict,
     PlanCapacityExceeded,
     PlanNotFound,
     InstallMetadataMismatch,
+    RenewalConflict,
     MissingListener,
     InconsistentReceipt,
     Manager(AttachmentManagerError),
@@ -546,6 +739,7 @@ impl fmt::Display for DaemonControlError {
         match self {
             Self::InvalidLimits => formatter.write_str("egress daemon limits are invalid"),
             Self::InvalidPrepareRequest => formatter.write_str("prepare request is invalid"),
+            Self::InvalidRenewRequest => formatter.write_str("renew request is invalid"),
             Self::UnsupportedPolicy => formatter.write_str("egress policy is unsupported"),
             Self::DaemonEpochMismatch { expected, received } => write!(
                 formatter,
@@ -556,6 +750,9 @@ impl fmt::Display for DaemonControlError {
             Self::PlanNotFound => formatter.write_str("prepared route does not exist"),
             Self::InstallMetadataMismatch => {
                 formatter.write_str("install metadata does not match the prepared route")
+            }
+            Self::RenewalConflict => {
+                formatter.write_str("route renewal conflicts with committed state")
             }
             Self::MissingListener => formatter.write_str("listener capability is missing"),
             Self::InconsistentReceipt => formatter.write_str("egress receipt is inconsistent"),

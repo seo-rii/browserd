@@ -22,7 +22,9 @@ use nix::sys::stat::fstat;
 use nix::unistd::Uid;
 use tokio::net::{TcpStream, UnixStream};
 
-use super::{DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest};
+use super::{
+    DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest, RenewRouteRequest,
+};
 
 static LISTENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -114,6 +116,40 @@ fn install_request(prepared: &super::PreparedRouteResponse) -> InstallRequest {
     .expect("install request is valid")
 }
 
+async fn install_active_route(
+    daemon: &Arc<EgressDaemon>,
+    seed: u64,
+    binding_digest: [u8; 32],
+) -> (
+    EgressFence,
+    std::net::SocketAddr,
+    browserd_egress_control::ActiveInstallResponse,
+) {
+    let route_fence = fence(seed);
+    let prepared = prepare(daemon, route_fence.clone(), binding_digest);
+    let (address, listener) = listener();
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair must open");
+    let server = tokio::spawn({
+        let daemon = Arc::clone(daemon);
+        async move {
+            daemon
+                .handle_control_stream(server_stream, Uid::current().as_raw())
+                .await
+        }
+    });
+    let active = send_listener(client_stream, install_request(&prepared), listener)
+        .await
+        .expect("client must receive active receipt");
+    assert_eq!(
+        server
+            .await
+            .expect("server task must join")
+            .expect("install succeeds"),
+        Some(active.clone())
+    );
+    (route_fence, address, active)
+}
+
 #[tokio::test]
 async fn unix_control_probe_returns_the_nonce_bound_current_daemon_epoch() {
     let daemon = Arc::new(daemon(8));
@@ -201,6 +237,114 @@ async fn prepare_install_status_and_revoke_are_one_full_fence_transaction() {
         open_listener_copies, 0,
         "released attachment must close every listener capability copy"
     );
+}
+
+#[tokio::test]
+async fn active_route_renewal_is_exactly_replayable_and_updates_status() {
+    let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    let daemon = Arc::new(daemon(8));
+    let (route_fence, address, active) = install_active_route(&daemon, 8, [18; 32]).await;
+    let renewal = RenewRouteRequest::new(
+        1,
+        epoch().get(),
+        route_fence.clone(),
+        active.attachment_id(),
+        active.activation_revision(),
+        Duration::from_secs(20),
+    )
+    .expect("renewal request should be valid");
+
+    let renewed = daemon
+        .renew(renewal.clone())
+        .expect("active route should renew");
+    assert!(renewed.expires_at_millis() > active.expires_at_millis());
+    assert_eq!(
+        daemon
+            .renew(renewal)
+            .expect("exact renewal replay should return its committed receipt"),
+        renewed
+    );
+    let status = daemon
+        .status(epoch().get(), &route_fence)
+        .expect("renewed status should resolve");
+    assert_eq!(status.state(), AttachmentState::Active);
+    assert_eq!(
+        status
+            .active()
+            .expect("active status should retain its receipt")
+            .expires_at_millis(),
+        renewed.expires_at_millis()
+    );
+    let client = TcpStream::connect(address)
+        .await
+        .expect("renewed listener should remain active");
+    drop(client);
+    daemon
+        .revoke(epoch().get(), &route_fence)
+        .await
+        .expect("renewed route should revoke");
+}
+
+#[tokio::test]
+async fn superseded_or_conflicting_renewal_ids_cannot_change_the_latest_deadline() {
+    let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    let daemon = Arc::new(daemon(8));
+    let (route_fence, _address, active) = install_active_route(&daemon, 9, [19; 32]).await;
+    let first = RenewRouteRequest::new(
+        1,
+        epoch().get(),
+        route_fence.clone(),
+        active.attachment_id(),
+        active.activation_revision(),
+        Duration::from_secs(15),
+    )
+    .expect("first renewal should be valid");
+    let second = RenewRouteRequest::new(
+        2,
+        epoch().get(),
+        route_fence.clone(),
+        active.attachment_id(),
+        active.activation_revision(),
+        Duration::from_secs(20),
+    )
+    .expect("second renewal should be valid");
+
+    daemon
+        .renew(first.clone())
+        .expect("first renewal should commit");
+    let latest = daemon
+        .renew(second.clone())
+        .expect("later renewal should commit");
+    assert!(matches!(
+        daemon.renew(first),
+        Err(DaemonControlError::RenewalConflict)
+    ));
+    let conflicting = RenewRouteRequest::new(
+        second.renewal_sequence(),
+        epoch().get(),
+        route_fence.clone(),
+        active.attachment_id(),
+        active.activation_revision(),
+        Duration::from_secs(25),
+    )
+    .expect("conflicting replay remains structurally valid");
+    assert!(matches!(
+        daemon.renew(conflicting),
+        Err(DaemonControlError::RenewalConflict)
+    ));
+    assert_eq!(
+        daemon
+            .status(epoch().get(), &route_fence)
+            .expect("latest status should resolve")
+            .active()
+            .expect("route should remain active")
+            .expires_at_millis(),
+        latest.expires_at_millis()
+    );
+    daemon
+        .revoke(epoch().get(), &route_fence)
+        .await
+        .expect("route should revoke after renewal conflicts");
 }
 
 #[tokio::test]

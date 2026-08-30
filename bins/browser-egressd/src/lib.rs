@@ -8,6 +8,6 @@ mod daemon_tests;
 
 pub use daemon::{
     AttachmentStatusView, DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest,
-    PreparedRouteResponse,
+    PreparedRouteResponse, RenewRouteRequest, RenewedRouteResponse,
 };
 pub use daemon_epoch::{DaemonEpochStoreError, allocate_daemon_epoch};
