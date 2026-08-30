@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use browserd_core::{PageId, SessionId, TenantId};
 
@@ -147,6 +147,7 @@ pub struct FrameBroadcaster {
     session_id: SessionId,
     session_incarnation: u64,
     policy: FramePolicy,
+    ingest_order: Mutex<()>,
     state: Mutex<FrameState>,
 }
 
@@ -165,6 +166,7 @@ impl FrameBroadcaster {
             session_id,
             session_incarnation,
             policy,
+            ingest_order: Mutex::new(()),
             state: Mutex::new(FrameState {
                 page_id,
                 transform_epoch,
@@ -218,6 +220,31 @@ impl FrameBroadcaster {
         if frame.jpeg_payload.len() > self.policy.max_payload_bytes {
             return Err(FrameError::PayloadTooLarge);
         }
+
+        // This mutex protects only callback ordering, not broadcaster state. A callback panic
+        // therefore leaves no protected data inconsistent and its poison can be safely cleared.
+        let _ingest_order = self
+            .ingest_order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        {
+            let state = self.lock_state()?;
+            if frame.page_id != state.page_id {
+                return Err(FrameError::PageMismatch);
+            }
+            if frame.transform_epoch != state.transform_epoch {
+                return Err(FrameError::StaleTransform);
+            }
+            if state
+                .last_frame_id
+                .is_some_and(|last_frame_id| frame.frame_id <= last_frame_id)
+            {
+                return Err(FrameError::ReplayedFrame);
+            }
+        }
+
+        acknowledge_chromium(frame.frame_id)?;
+
         let mut state = self.lock_state()?;
         if frame.page_id != state.page_id {
             return Err(FrameError::PageMismatch);
@@ -231,9 +258,6 @@ impl FrameBroadcaster {
         {
             return Err(FrameError::ReplayedFrame);
         }
-
-        acknowledge_chromium(frame.frame_id)?;
-
         state.last_frame_id = Some(frame.frame_id);
         let mut dropped_frames = 0;
         for queue in state.queues.values_mut() {
