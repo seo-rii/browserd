@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use browserd_actions::{
     ActionDeliveryEvidence, ActionEvidence, ActionEvidenceError, ActionEvidenceMutation,
     ActionKind, ActionSequence, ActionTerminalEvidence, BrowserResult, CanonicalRequestHash,
-    DispatchId, IdempotencyKey, TransportLoss,
+    DispatchId, IdempotencyKey, TerminalDetail, TransportLoss,
 };
 use browserd_core::{ActionId, ActionState, SessionId, TenantId};
 use chrono::{DateTime, Utc};
@@ -12,6 +12,10 @@ use thiserror::Error;
 use uuid::{Uuid, Version};
 
 use crate::{DirectoryFence, MemoryCoordinationDatabase, StoreConfig};
+
+mod redis;
+
+pub use redis::{RedisGatewayActionConfig, RedisGatewayActionStore};
 
 const MAX_MATERIALIZATION_LIMIT: usize = 1_000;
 
@@ -138,7 +142,7 @@ pub struct GatewayActionSnapshot {
     kind: ActionKind,
     placement: GatewayActionPlacement,
     evidence: ActionEvidence,
-    action_sequence: Option<ActionSequence>,
+    action_sequence: ActionSequence,
     revision: u64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -197,7 +201,7 @@ impl GatewayActionSnapshot {
     }
 
     #[must_use]
-    pub const fn action_sequence(&self) -> Option<ActionSequence> {
+    pub const fn action_sequence(&self) -> ActionSequence {
         self.action_sequence
     }
 
@@ -328,6 +332,8 @@ pub enum GatewayActionCoordinationError {
     ActionSequenceConflict,
     #[error("gateway action sequence must be non-zero")]
     InvalidActionSequence,
+    #[error("gateway action sequence overflowed")]
+    ActionSequenceOverflow,
     #[error("session loss materialization limit must be between 1 and 1000")]
     InvalidMaterializationLimit,
     #[error("gateway action retention timestamp is outside the supported range")]
@@ -338,6 +344,24 @@ pub enum GatewayActionCoordinationError {
     CorruptState,
     #[error("gateway action coordination state lock is unavailable")]
     LockUnavailable,
+    #[error("Redis gateway action configuration is invalid")]
+    InvalidRedisConfig,
+    #[error("Redis gateway action coordination is unavailable")]
+    RedisUnavailable,
+    #[error("Redis gateway action coordination timed out")]
+    RedisTimedOut,
+    #[error("Redis gateway action coordination returned invalid state")]
+    InvalidRedisResponse,
+    #[error("gateway action coordination actor could not start")]
+    ActorSpawn,
+    #[error("gateway action coordination actor queue is full")]
+    ActorQueueFull,
+    #[error("gateway action coordination actor is disconnected")]
+    ActorDisconnected,
+    #[error("gateway action coordination query timed out")]
+    ActorQueryTimedOut,
+    #[error("gateway action coordination mutation timed out after admission")]
+    ActorMutationTimedOut,
     #[error(transparent)]
     Evidence(#[from] ActionEvidenceError),
 }
@@ -393,6 +417,19 @@ pub trait GatewayActionCoordination: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError>;
 
+    async fn record_worker_terminal(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        dispatch_id: &DispatchId,
+        action_sequence: ActionSequence,
+        detail: TerminalDetail,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError>;
+
     async fn record_transport_loss(
         &self,
         tenant_id: &TenantId,
@@ -438,6 +475,7 @@ struct RecordedSessionLoss {
 struct GatewayActionSessionState {
     placement: GatewayActionPlacement,
     loss: Option<RecordedSessionLoss>,
+    last_action_sequence: u64,
     idempotency: HashMap<IdempotencyKey, ActionId>,
     actions: HashMap<ActionId, GatewayActionSnapshot>,
 }
@@ -447,6 +485,7 @@ impl GatewayActionSessionState {
         Self {
             placement,
             loss: None,
+            last_action_sequence: 0,
             idempotency: HashMap::new(),
             actions: HashMap::new(),
         }
@@ -599,6 +638,12 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
         let retain_until = now
             .checked_add_signed(retention)
             .ok_or(GatewayActionCoordinationError::RetentionTimestampOverflow)?;
+        let action_sequence = state.sessions.get(&session_key).map_or(Ok(1), |session| {
+            session
+                .last_action_sequence
+                .checked_add(1)
+                .ok_or(GatewayActionCoordinationError::ActionSequenceOverflow)
+        })?;
         let snapshot = GatewayActionSnapshot {
             tenant_id: claim.tenant_id.clone(),
             session_id: claim.session_id.clone(),
@@ -608,7 +653,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             kind: claim.kind,
             placement: claim.placement.clone(),
             evidence: ActionEvidence::new(),
-            action_sequence: None,
+            action_sequence: ActionSequence::new(action_sequence),
             revision: 0,
             created_at: now,
             updated_at: now,
@@ -626,6 +671,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             .sessions
             .entry(session_key)
             .or_insert_with(|| GatewayActionSessionState::new(claim.placement));
+        session.last_action_sequence = action_sequence;
         session
             .idempotency
             .insert(claim.idempotency_key, claim.proposed_action_id.clone());
@@ -723,23 +769,46 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
                 if action_sequence.get() == 0 {
                     return Err(GatewayActionCoordinationError::InvalidActionSequence);
                 }
+                if snapshot.action_sequence != action_sequence {
+                    return Err(GatewayActionCoordinationError::ActionSequenceConflict);
+                }
                 let mutation = snapshot
                     .evidence
                     .record_worker_result(dispatch_id, result)?;
-                match mutation {
-                    ActionEvidenceMutation::Recorded => {
-                        if snapshot.action_sequence.is_some() {
-                            return Err(GatewayActionCoordinationError::CorruptState);
-                        }
-                        snapshot.action_sequence = Some(action_sequence);
-                    }
-                    ActionEvidenceMutation::AlreadyRecorded => {
-                        if snapshot.action_sequence != Some(action_sequence) {
-                            return Err(GatewayActionCoordinationError::ActionSequenceConflict);
-                        }
-                    }
-                }
                 Ok(mutation)
+            },
+        )
+    }
+
+    async fn record_worker_terminal(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        dispatch_id: &DispatchId,
+        action_sequence: ActionSequence,
+        detail: TerminalDetail,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.mutate_action(
+            tenant_id,
+            session_id,
+            action_id,
+            expected_revision,
+            placement,
+            now,
+            |snapshot| {
+                if action_sequence.get() == 0 {
+                    return Err(GatewayActionCoordinationError::InvalidActionSequence);
+                }
+                if snapshot.action_sequence != action_sequence {
+                    return Err(GatewayActionCoordinationError::ActionSequenceConflict);
+                }
+                Ok(snapshot
+                    .evidence
+                    .record_worker_terminal(dispatch_id, detail)?)
             },
         )
     }

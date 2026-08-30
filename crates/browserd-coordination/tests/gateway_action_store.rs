@@ -110,6 +110,47 @@ async fn concurrent_exact_claims_linearize_to_one_gateway_action_id() {
         .expect("action lookup should succeed")
         .expect("gateway action mapping should survive store reattachment");
     assert_eq!(recovered.state(), ActionState::Accepted);
+    assert_eq!(recovered.action_sequence().get(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_distinct_gateway_claims_allocate_gapless_session_sequences() {
+    const ACTIONS: usize = 64;
+    let store = MemoryGatewayActionStore::default();
+    let barrier = Arc::new(tokio::sync::Barrier::new(ACTIONS + 1));
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let placement = placement(8, 30);
+    let mut tasks = Vec::with_capacity(ACTIONS);
+
+    for index in 0..ACTIONS {
+        let store = store.clone();
+        let barrier = Arc::clone(&barrier);
+        let claim = claim(
+            tenant_id.clone(),
+            session_id.clone(),
+            ActionId::new(),
+            &format!("sequence-{index}"),
+            index as u8,
+            placement.clone(),
+        );
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store.claim_action(claim, at(1)).await
+        }));
+    }
+
+    barrier.wait().await;
+    let mut sequences = Vec::with_capacity(ACTIONS);
+    for task in tasks {
+        let outcome = task
+            .await
+            .expect("sequence claim task should join")
+            .expect("distinct sequence claim should succeed");
+        sequences.push(outcome.snapshot().action_sequence().get());
+    }
+    sequences.sort_unstable();
+    assert_eq!(sequences, (1..=ACTIONS as u64).collect::<Vec<_>>());
 }
 
 #[tokio::test]
@@ -483,5 +524,73 @@ async fn worker_result_and_loss_fence_have_one_stable_linearization_winner() {
             }
             other => assert_eq!(other, Err(GatewayActionCoordinationError::SessionLost)),
         }
+    }
+}
+
+#[tokio::test]
+async fn worker_terminal_receipts_preserve_worker_evidence_source() {
+    for (index, detail) in [
+        TerminalDetail::CancelledBeforeDispatch,
+        TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::TimeoutAfterDispatch),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let store = MemoryGatewayActionStore::default();
+        let tenant_id = TenantId::new();
+        let session_id = SessionId::new();
+        let placement = placement(41, 71);
+        let action_id = ActionId::new();
+        let idempotency_key = format!("worker-terminal-{index}");
+        let claimed = store
+            .claim_action(
+                claim(
+                    tenant_id.clone(),
+                    session_id.clone(),
+                    action_id.clone(),
+                    &idempotency_key,
+                    index as u8,
+                    placement.clone(),
+                ),
+                at(1),
+            )
+            .await
+            .expect("action claim should succeed");
+        let dispatch_id = DispatchId::new();
+        let armed = store
+            .arm_dispatch(
+                &tenant_id,
+                &session_id,
+                &action_id,
+                claimed.snapshot().revision(),
+                &placement,
+                dispatch_id.clone(),
+                at(2),
+            )
+            .await
+            .expect("dispatch should arm");
+
+        let terminal = store
+            .record_worker_terminal(
+                &tenant_id,
+                &session_id,
+                &action_id,
+                armed.revision(),
+                &placement,
+                &dispatch_id,
+                claimed.snapshot().action_sequence(),
+                detail,
+                at(3),
+            )
+            .await
+            .expect("worker terminal should be recorded");
+        assert_eq!(
+            terminal.terminal().map(|evidence| evidence.detail()),
+            Some(detail)
+        );
+        assert_eq!(
+            terminal.terminal().map(|evidence| evidence.source()),
+            Some(ActionTerminalSource::Worker)
+        );
     }
 }

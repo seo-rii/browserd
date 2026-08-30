@@ -1,5 +1,6 @@
 mod actor;
 mod ephemeral;
+mod gateway_action_actor;
 mod gateway_actions;
 mod memory;
 mod memory_ephemeral;
@@ -27,10 +28,12 @@ pub use ephemeral::{
     WorkerReservationGrant, WorkerReservationMutation, WorkerReservationOutcome,
     WorkerReservationRequest, WorkerReservationSnapshot, WorkerReservationStore,
 };
+pub use gateway_action_actor::GatewayActionBlockingClient;
 pub use gateway_actions::{
     ClaimGatewayAction, GatewayActionClaimOutcome, GatewayActionCoordination,
     GatewayActionCoordinationError, GatewayActionPlacement, GatewayActionSnapshot,
-    MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome,
+    MemoryGatewayActionStore, RedisGatewayActionConfig, RedisGatewayActionStore, SessionLossClaim,
+    SessionLossOutcome,
 };
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
 pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};
