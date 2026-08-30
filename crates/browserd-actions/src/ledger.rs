@@ -73,8 +73,8 @@ where
                         .last_sequence
                         .checked_add(1)
                         .ok_or(ActionLedgerError::SequenceExhausted)?;
-                    if action_sequence.get() != expected_sequence {
-                        return Err(invalid("accepted action sequence is not contiguous"));
+                    if action_sequence.get() < expected_sequence {
+                        return Err(invalid("accepted action sequence is not monotonic"));
                     }
                     if state.actions.contains_key(&action_id)
                         || state.idempotency.contains_key(&idempotency_key)
@@ -97,7 +97,7 @@ where
                         terminal_detail: None,
                         resolution: None,
                     };
-                    state.last_sequence = expected_sequence;
+                    state.last_sequence = action_sequence.get();
                     state.idempotency.insert(idempotency_key, action_id.clone());
                     state.actions.insert(action_id, snapshot);
                 }
@@ -344,7 +344,7 @@ where
             .ok_or(ActionLedgerError::SequenceExhausted)?;
         let proposed_action_sequence =
             proposed_action_sequence.unwrap_or_else(|| ActionSequence::new(expected_sequence));
-        if proposed_action_sequence.get() != expected_sequence {
+        if proposed_action_sequence.get() < expected_sequence {
             return Err(ActionLedgerError::ActionSequenceConflict {
                 expected: ActionSequence::new(expected_sequence),
                 received: proposed_action_sequence,
@@ -373,7 +373,7 @@ where
             },
         ))?;
 
-        state.last_sequence = expected_sequence;
+        state.last_sequence = proposed_action_sequence.get();
         state
             .idempotency
             .insert(request.idempotency_key().clone(), action_id.clone());
@@ -894,6 +894,30 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ReplayJournal {
+        entries: Mutex<Vec<JournalEntry>>,
+    }
+
+    impl DurableActionJournal for ReplayJournal {
+        fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
+            self.entries
+                .lock()
+                .map_err(|_| JournalError::new("journal lock poisoned"))?
+                .push(entry.clone());
+            Ok(())
+        }
+    }
+
+    impl ReplayableActionJournal for ReplayJournal {
+        fn replay(&self) -> Result<Vec<JournalEntry>, JournalError> {
+            self.entries
+                .lock()
+                .map_err(|_| JournalError::new("journal lock poisoned"))
+                .map(|entries| entries.clone())
+        }
+    }
+
     #[test]
     fn exact_retry_precedes_sequence_exhaustion() -> Result<(), Box<dyn Error>> {
         let fence = PlacementFence::new(7, 11, 1);
@@ -920,6 +944,37 @@ mod tests {
         assert_eq!(
             retried.snapshot().action_id(),
             created.snapshot().action_id()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gateway_sequence_gaps_survive_recovery() -> Result<(), Box<dyn Error>> {
+        let fence = PlacementFence::new(7, 11, 1);
+        let session = LedgerSession::new(TenantId::new(), SessionId::new(), fence);
+        let journal = Arc::new(ReplayJournal::default());
+        let ledger = ActionLedger::new(session.clone(), Arc::clone(&journal));
+        let accepted = ledger.accept_with_identity(
+            fence,
+            ActionId::new(),
+            ActionSequence::new(4),
+            ActionRequest::new(
+                IdempotencyKey::new("gateway-sequence-after-known-gap"),
+                CanonicalRequestHash::new([7; 32]),
+                ActionKind::Mutating,
+            ),
+        )?;
+        assert_eq!(
+            accepted.snapshot().action_sequence(),
+            ActionSequence::new(4)
+        );
+
+        let recovered = ActionLedger::recover(session, journal)?;
+        assert_eq!(
+            recovered
+                .snapshot(fence, accepted.snapshot().action_id())?
+                .action_sequence(),
+            ActionSequence::new(4)
         );
         Ok(())
     }

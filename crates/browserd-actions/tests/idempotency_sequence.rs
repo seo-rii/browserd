@@ -120,16 +120,29 @@ fn gateway_supplied_action_id_is_preserved_and_cannot_be_rebound() {
             existing_action_id: proposed,
         })
     );
-    assert_eq!(
-        fixture.ledger.accept_with_identity(
+    let after_known_gap = fixture
+        .ledger
+        .accept_with_identity(
             fixture.fence,
             ActionId::new(),
             browserd_actions::ActionSequence::new(3),
             request("skipped-gateway-sequence", 11),
+        )
+        .expect("a gateway sequence gap can represent an action never sent to this worker");
+    assert_eq!(
+        after_known_gap.snapshot().action_sequence(),
+        browserd_actions::ActionSequence::new(3)
+    );
+    assert_eq!(
+        fixture.ledger.accept_with_identity(
+            fixture.fence,
+            ActionId::new(),
+            browserd_actions::ActionSequence::new(2),
+            request("stale-gateway-sequence", 12),
         ),
         Err(ActionLedgerError::ActionSequenceConflict {
-            expected: browserd_actions::ActionSequence::new(2),
-            received: browserd_actions::ActionSequence::new(3),
+            expected: browserd_actions::ActionSequence::new(4),
+            received: browserd_actions::ActionSequence::new(2),
         })
     );
 }

@@ -300,12 +300,12 @@ impl FileActionJournal {
                 let expected = last_action_sequence.checked_add(1).ok_or_else(|| {
                     JournalError::new("action journal accepted sequence overflow")
                 })?;
-                if entry.action_sequence().get() != expected {
+                if entry.action_sequence().get() < expected {
                     return Err(JournalError::new(
-                        "action journal accepted sequences are not contiguous",
+                        "action journal accepted sequences are not monotonic",
                     ));
                 }
-                last_action_sequence = expected;
+                last_action_sequence = entry.action_sequence().get();
                 let reserve = terminal_reserve_frame_bytes(entry, limits)?;
                 if terminal_reserves
                     .insert(entry.action_id().clone(), reserve)
@@ -461,12 +461,12 @@ impl DurableActionJournal for FileActionJournal {
                 .last_action_sequence
                 .checked_add(1)
                 .ok_or_else(|| JournalError::new("action journal accepted sequence overflow"))?;
-            if entry.action_sequence().get() != expected {
+            if entry.action_sequence().get() < expected {
                 return Err(JournalError::new(
                     "action journal recovery is required before appending",
                 ));
             }
-            Some(expected)
+            Some(entry.action_sequence().get())
         } else {
             None
         };
