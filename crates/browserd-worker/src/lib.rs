@@ -576,6 +576,41 @@ pub struct ArtifactStoreRequest {
 }
 
 impl ArtifactStoreRequest {
+    pub fn new(
+        tenant_id: TenantId,
+        session_id: SessionId,
+        artifact_id: ArtifactId,
+        fence: OwnershipFence,
+        bytes: Vec<u8>,
+        declared_content_type: impl Into<String>,
+        max_bytes: u64,
+    ) -> Result<Self, WorkerError> {
+        let declared_content_type = declared_content_type.into();
+        let expected_size_bytes =
+            u64::try_from(bytes.len()).map_err(|_| WorkerError::CapacityExceeded)?;
+        if max_bytes == 0 || expected_size_bytes > max_bytes {
+            return Err(WorkerError::CapacityExceeded);
+        }
+        let expected_checksum = ArtifactChecksum::new(Sha256::digest(&bytes).into());
+        ArtifactContentMetadata::new(
+            expected_size_bytes,
+            expected_checksum,
+            declared_content_type.clone(),
+            ArtifactContentSource::ClientUpload,
+            "browserd-worker-upload",
+        )
+        .map_err(|_| WorkerError::InvalidConfiguration)?;
+        Ok(Self {
+            key: ArtifactKey::new(tenant_id, session_id, artifact_id),
+            fence,
+            bytes,
+            declared_content_type,
+            expected_size_bytes,
+            expected_checksum,
+            max_bytes,
+        })
+    }
+
     #[must_use]
     pub const fn key(&self) -> &ArtifactKey {
         &self.key
@@ -2768,16 +2803,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             session.tenant_id.clone()
         };
         let artifact_id = ArtifactId::new();
-        let key = ArtifactKey::new(tenant_id, session_id.clone(), artifact_id.clone());
-        let request = ArtifactStoreRequest {
-            key: key.clone(),
-            fence: fence.clone(),
-            bytes: upload.bytes,
-            declared_content_type: upload.content_type,
-            expected_size_bytes: size_bytes,
-            expected_checksum: checksum,
-            max_bytes: self.config.artifact_limits.max_file_bytes,
-        };
+        let request = ArtifactStoreRequest::new(
+            tenant_id,
+            session_id.clone(),
+            artifact_id.clone(),
+            fence.clone(),
+            upload.bytes,
+            upload.content_type,
+            self.config.artifact_limits.max_file_bytes,
+        )?;
+        let key = request.key().clone();
         let receipt = self
             .sandbox
             .store_artifact(&request)

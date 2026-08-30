@@ -12,6 +12,8 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 browserd-core = { path = "../../crates/browserd-core" }
+browserd-policy = { path = "../../crates/browserd-policy" }
+browserd-sandbox = { path = "../../crates/browserd-sandbox" }
 browserd-session = { path = "../../crates/browserd-session" }
 browserd-worker = { path = "../../crates/browserd-worker" }
 tokio.workspace = true

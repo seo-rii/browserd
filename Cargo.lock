@@ -308,6 +308,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "browserd-core",
+ "browserd-policy",
+ "browserd-sandbox",
  "browserd-session",
  "browserd-worker",
  "tempfile",
