@@ -1,5 +1,6 @@
 mod actor;
 mod ephemeral;
+mod gateway_actions;
 mod memory;
 mod memory_ephemeral;
 mod postgres;
@@ -25,6 +26,11 @@ pub use ephemeral::{
     WorkerReadiness, WorkerRegistration, WorkerRegistrationQuery, WorkerRegistrationSnapshot,
     WorkerReservationGrant, WorkerReservationMutation, WorkerReservationOutcome,
     WorkerReservationRequest, WorkerReservationSnapshot, WorkerReservationStore,
+};
+pub use gateway_actions::{
+    ClaimGatewayAction, GatewayActionClaimOutcome, GatewayActionCoordination,
+    GatewayActionCoordinationError, GatewayActionPlacement, GatewayActionSnapshot,
+    MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome,
 };
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
 pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};

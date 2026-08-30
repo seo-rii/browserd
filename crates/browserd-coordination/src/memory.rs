@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use browserd_core::{CreateOperationState, OperationId, TenantId};
 use chrono::{DateTime, Utc};
 
+use crate::gateway_actions::GatewayActionMemoryState;
 use crate::{
     ClaimCreateOperation, ClaimOutcome, CoordinationError, CreateOperationSnapshot,
     CreateSessionCoordination, DispatchLease, DispatchLeaseToken, IdempotencyKey,
@@ -15,6 +16,7 @@ use crate::{
 #[derive(Clone, Default)]
 pub struct MemoryCoordinationDatabase {
     rows: Arc<Mutex<HashMap<(TenantId, IdempotencyKey), MemoryRow>>>,
+    pub(crate) gateway_actions: Arc<Mutex<GatewayActionMemoryState>>,
 }
 
 #[derive(Clone)]

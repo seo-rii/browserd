@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+browserd-actions = { path = "../browserd-actions" }
 browserd-core = { path = "../browserd-core" }
 chrono.workspace = true
 serde.workspace = true
