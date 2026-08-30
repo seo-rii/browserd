@@ -11,7 +11,9 @@ mod state;
 mod streaming;
 mod token;
 
-pub use filesystem::{FilesystemArtifactReader, FilesystemArtifactStore, VerifiedArtifact};
+pub use filesystem::{
+    FilesystemArtifactReader, FilesystemArtifactStore, FilesystemMultipartJanitor, VerifiedArtifact,
+};
 pub use integrity::{ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource};
 pub use janitor::{
     ArtifactJanitor, ArtifactObjectGeneration, AuthorizedCleanupCandidate, CleanupCandidate,

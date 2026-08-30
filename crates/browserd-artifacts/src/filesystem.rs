@@ -1,14 +1,19 @@
+use std::collections::HashMap;
 use std::io;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use browserd_core::{ArtifactId, SessionId, TenantId};
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -19,12 +24,14 @@ use crate::{
     ArtifactChecksum, ArtifactChunkReader, ArtifactContentMetadata, ArtifactDeleteOutcome,
     ArtifactKey, ArtifactMultipartStore, ArtifactNamespace, ArtifactObjectError,
     ArtifactObjectGeneration, ArtifactObjectStore, ArtifactReadLimits, ArtifactStoreError,
-    ArtifactWriteReceipt, MultipartUploadId,
+    ArtifactWriteReceipt, AuthorizedCleanupCandidate, CleanupCandidate, CleanupKind,
+    CleanupOutcome, JanitorBackend, JanitorError, MultipartUploadId,
 };
 
 const COMMIT_MAGIC: &[u8; 8] = b"BRDART01";
 const COMMIT_METADATA_BYTES: usize = 64;
 const MAX_VERIFIED_READ_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MULTIPART_SCAN_BATCH: usize = 256;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -41,9 +48,45 @@ pub struct FilesystemArtifactStore {
     test_hooks: Arc<FilesystemTestHooks>,
 }
 
+#[derive(Clone)]
+pub struct FilesystemMultipartJanitor {
+    store: FilesystemArtifactStore,
+    namespace: ArtifactNamespace,
+    abandoned_after: Duration,
+    scan_batch: usize,
+    scan_cursor: Arc<tokio::sync::Mutex<MultipartScanCursor>>,
+    observations: Arc<std::sync::Mutex<HashMap<MultipartObservationKey, MultipartObservation>>>,
+}
+
+#[derive(Default)]
+struct MultipartScanCursor {
+    reader: Option<fs::ReadDir>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MultipartObservationKey {
+    upload_id: String,
+    generation: ArtifactObjectGeneration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MultipartObservation {
+    activity: MultipartActivity,
+    cutoff: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MultipartActivity {
+    last_modified: SystemTime,
+    data_bytes: Option<u64>,
+    receipt_bytes: Option<u64>,
+    pending_receipt_bytes: Option<u64>,
+}
+
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct FilesystemTestHooks {
+    after_begin_stage_created: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_delete_live_read: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_complete_stage_exists: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_complete_data_inspection: std::sync::Mutex<Option<Arc<OneShotPause>>>,
@@ -217,6 +260,11 @@ impl FilesystemArtifactStore {
     }
 
     #[cfg(test)]
+    fn arm_begin_stage_created_pause(&self) -> Arc<OneShotPause> {
+        arm_one_shot_pause(&self.test_hooks.after_begin_stage_created)
+    }
+
+    #[cfg(test)]
     fn arm_delete_live_read_pause(&self) -> Arc<OneShotPause> {
         arm_one_shot_pause(&self.test_hooks.after_delete_live_read)
     }
@@ -251,6 +299,13 @@ impl FilesystemArtifactStore {
     #[cfg(test)]
     async fn pause_after_delete_live_read(&self) {
         if let Some(pause) = take_one_shot_pause(&self.test_hooks.after_delete_live_read) {
+            pause.pause().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_after_begin_stage_created(&self) {
+        if let Some(pause) = take_one_shot_pause(&self.test_hooks.after_begin_stage_created) {
             pause.pause().await;
         }
     }
@@ -544,6 +599,231 @@ impl FilesystemArtifactStore {
     }
 }
 
+impl FilesystemMultipartJanitor {
+    pub fn new(
+        store: FilesystemArtifactStore,
+        namespace: ArtifactNamespace,
+        abandoned_after: Duration,
+        scan_batch: usize,
+    ) -> Result<Self, JanitorError> {
+        if abandoned_after.is_zero() {
+            return Err(JanitorError::new(
+                "multipart abandonment threshold must be positive",
+            ));
+        }
+        if scan_batch == 0 || scan_batch > MAX_MULTIPART_SCAN_BATCH {
+            return Err(JanitorError::new(format!(
+                "multipart scan batch must be between 1 and {MAX_MULTIPART_SCAN_BATCH}"
+            )));
+        }
+        Ok(Self {
+            store,
+            namespace,
+            abandoned_after,
+            scan_batch,
+            scan_cursor: Arc::new(tokio::sync::Mutex::new(MultipartScanCursor::default())),
+            observations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn lock_observations(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<MultipartObservationKey, MultipartObservation>> {
+        match self.observations.lock() {
+            Ok(observations) => observations,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn forget_observation(&self, key: &MultipartObservationKey) {
+        self.lock_observations().remove(key);
+    }
+}
+
+impl JanitorBackend for FilesystemMultipartJanitor {
+    async fn scan(&self, now: DateTime<Utc>) -> Result<Vec<CleanupCandidate>, JanitorError> {
+        let cutoff = SystemTime::from(now)
+            .checked_sub(self.abandoned_after)
+            .ok_or_else(|| JanitorError::new("multipart scan cutoff is outside system time"))?;
+        let mut cursor = self.scan_cursor.lock().await;
+        if cursor.reader.is_none() {
+            cursor.reader = Some(
+                fs::read_dir(self.store.root.join(".multipart"))
+                    .await
+                    .map_err(|error| janitor_error("open multipart scan", error))?,
+            );
+        }
+
+        let mut candidates = Vec::new();
+        for _ in 0..self.scan_batch {
+            let next = match cursor.reader.as_mut() {
+                Some(reader) => reader
+                    .next_entry()
+                    .await
+                    .map_err(|error| janitor_error("read multipart scan entry", error))?,
+                None => None,
+            };
+            let Some(entry) = next else {
+                cursor.reader = None;
+                break;
+            };
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|error| janitor_error("inspect multipart scan entry", error))?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(JanitorError::new(
+                    "multipart scan entry must be a real directory",
+                ));
+            }
+            let upload_id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| JanitorError::new("multipart scan entry is not UTF-8"))?;
+            let multipart_id = MultipartUploadId::new(upload_id.clone());
+            parse_upload_id(&multipart_id)
+                .map_err(|error| JanitorError::new(format!("scan multipart upload: {error}")))?;
+            let stage = entry.path();
+            let _upload_lock = match acquire_upload_file_lock(&stage).await {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(janitor_error("lock multipart scan entry", error)),
+            };
+            if !fs::try_exists(&stage)
+                .await
+                .map_err(|error| janitor_error("reinspect multipart scan entry", error))?
+            {
+                continue;
+            }
+            let binding = match fs::read_to_string(stage.join("key")).await {
+                Ok(binding) => binding,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(janitor_error("read multipart scan binding", error)),
+            };
+            let key = parse_key_binding(&binding)?;
+            if self.namespace.authorize(&key).is_err() {
+                continue;
+            }
+            let activity = multipart_activity(&stage).await?;
+            if activity.last_modified > cutoff {
+                continue;
+            }
+            let generation = object_generation_for_upload_id(&upload_id);
+            self.lock_observations().insert(
+                MultipartObservationKey {
+                    upload_id: upload_id.clone(),
+                    generation,
+                },
+                MultipartObservation { activity, cutoff },
+            );
+            candidates.push(CleanupCandidate::new(
+                key,
+                upload_id,
+                CleanupKind::AbandonedMultipart,
+                generation,
+            ));
+        }
+        Ok(candidates)
+    }
+
+    async fn cleanup(
+        &self,
+        candidate: &AuthorizedCleanupCandidate,
+    ) -> Result<CleanupOutcome, JanitorError> {
+        if candidate.kind() != CleanupKind::AbandonedMultipart {
+            return Err(JanitorError::new(
+                "filesystem multipart janitor received another cleanup kind",
+            ));
+        }
+        let upload_id = MultipartUploadId::new(candidate.id());
+        parse_upload_id(&upload_id)
+            .map_err(|error| JanitorError::new(format!("clean multipart upload: {error}")))?;
+        let generation = object_generation_for_upload_id(upload_id.as_str());
+        if generation != candidate.object_generation() {
+            return Err(JanitorError::new(
+                "multipart cleanup generation does not match upload",
+            ));
+        }
+        let observation_key = MultipartObservationKey {
+            upload_id: upload_id.as_str().to_owned(),
+            generation,
+        };
+        let multipart_directory = self.store.root.join(".multipart");
+        let stage = self
+            .store
+            .stage_path(&upload_id)
+            .map_err(|error| JanitorError::new(format!("resolve multipart cleanup: {error}")))?;
+        if !fs::try_exists(&stage)
+            .await
+            .map_err(|error| janitor_error("inspect multipart cleanup target", error))?
+        {
+            sync_directory(&multipart_directory)
+                .await
+                .map_err(|error| {
+                    JanitorError::new(format!("sync completed multipart cleanup: {error}"))
+                })?;
+            self.forget_observation(&observation_key);
+            return Ok(CleanupOutcome::AlreadyClean);
+        }
+        let upload_lock = match acquire_upload_file_lock(&stage).await {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                sync_directory(&multipart_directory)
+                    .await
+                    .map_err(|sync_error| {
+                        JanitorError::new(format!(
+                            "sync raced multipart cleanup after {error}: {sync_error}"
+                        ))
+                    })?;
+                self.forget_observation(&observation_key);
+                return Ok(CleanupOutcome::AlreadyClean);
+            }
+            Err(error) => return Err(janitor_error("lock multipart cleanup target", error)),
+        };
+        if !fs::try_exists(&stage)
+            .await
+            .map_err(|error| janitor_error("reinspect multipart cleanup target", error))?
+        {
+            sync_directory(&multipart_directory)
+                .await
+                .map_err(|error| {
+                    JanitorError::new(format!("sync raced multipart cleanup: {error}"))
+                })?;
+            self.forget_observation(&observation_key);
+            return Ok(CleanupOutcome::AlreadyClean);
+        }
+        let binding = fs::read_to_string(stage.join("key"))
+            .await
+            .map_err(|error| janitor_error("read multipart cleanup binding", error))?;
+        let current_key = parse_key_binding(&binding)?;
+        if &current_key != candidate.key() {
+            self.forget_observation(&observation_key);
+            return Err(JanitorError::new(
+                "multipart cleanup ownership changed after scan",
+            ));
+        }
+        let observation = self
+            .lock_observations()
+            .get(&observation_key)
+            .copied()
+            .ok_or_else(|| JanitorError::new("multipart cleanup has no scan observation"))?;
+        let current_activity = multipart_activity(&stage).await?;
+        if current_activity != observation.activity
+            || current_activity.last_modified > observation.cutoff
+        {
+            self.forget_observation(&observation_key);
+            return Err(JanitorError::new(
+                "multipart upload became active after the cleanup scan",
+            ));
+        }
+        remove_multipart_stage(&multipart_directory, &stage, upload_lock)
+            .await
+            .map_err(|error| JanitorError::new(format!("clean multipart upload: {error}")))?;
+        self.forget_observation(&observation_key);
+        Ok(CleanupOutcome::Cleaned)
+    }
+}
+
 impl ArtifactObjectStore for FilesystemArtifactStore {
     type Reader = FilesystemArtifactReader;
 
@@ -670,53 +950,94 @@ impl ArtifactObjectStore for FilesystemArtifactStore {
 impl ArtifactMultipartStore for FilesystemArtifactStore {
     async fn begin(&self, key: &ArtifactKey) -> Result<MultipartUploadId, ArtifactStoreError> {
         let upload_id = MultipartUploadId::new(Uuid::now_v7().to_string());
-        let stage = self.stage_path(&upload_id)?;
-        fs::create_dir(&stage)
-            .await
-            .map_err(|error| store_error("create multipart directory", error))?;
-        #[cfg(unix)]
-        fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))
-            .await
-            .map_err(|error| store_error("secure multipart directory", error))?;
-
+        let task_upload_id = upload_id.clone();
+        let store = self.clone();
         let binding = key_binding(key);
-        let mut binding_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(stage.join("key"))
-            .await
-            .map_err(|error| store_error("create multipart key binding", error))?;
-        binding_file
-            .write_all(binding.as_bytes())
-            .await
-            .map_err(|error| store_error("write multipart key binding", error))?;
-        binding_file
-            .sync_all()
-            .await
-            .map_err(|error| store_error("sync multipart key binding", error))?;
-        let data_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(stage.join("data"))
-            .await
-            .map_err(|error| store_error("create multipart data", error))?;
-        data_file
-            .sync_all()
-            .await
-            .map_err(|error| store_error("sync multipart data", error))?;
-        let lock_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(stage.join("lock"))
-            .await
-            .map_err(|error| store_error("create multipart lock", error))?;
-        lock_file
-            .sync_all()
-            .await
-            .map_err(|error| store_error("sync multipart lock", error))?;
-        sync_directory(&stage).await?;
-        sync_directory(&self.root.join(".multipart")).await?;
-        Ok(upload_id)
+        let task = tokio::spawn(async move {
+            let stage = store.stage_path(&task_upload_id)?;
+            let attempt = async {
+                fs::create_dir(&stage)
+                    .await
+                    .map_err(|error| store_error("create multipart directory", error))?;
+                #[cfg(test)]
+                store.pause_after_begin_stage_created().await;
+                #[cfg(unix)]
+                fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700))
+                    .await
+                    .map_err(|error| store_error("secure multipart directory", error))?;
+
+                let mut binding_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(stage.join("key"))
+                    .await
+                    .map_err(|error| store_error("create multipart key binding", error))?;
+                binding_file
+                    .write_all(binding.as_bytes())
+                    .await
+                    .map_err(|error| store_error("write multipart key binding", error))?;
+                binding_file
+                    .sync_all()
+                    .await
+                    .map_err(|error| store_error("sync multipart key binding", error))?;
+                let data_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(stage.join("data"))
+                    .await
+                    .map_err(|error| store_error("create multipart data", error))?;
+                data_file
+                    .sync_all()
+                    .await
+                    .map_err(|error| store_error("sync multipart data", error))?;
+                let lock_file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(stage.join("lock"))
+                    .await
+                    .map_err(|error| store_error("create multipart lock", error))?;
+                lock_file
+                    .sync_all()
+                    .await
+                    .map_err(|error| store_error("sync multipart lock", error))?;
+                sync_directory(&stage).await?;
+                sync_directory(&store.root.join(".multipart")).await
+            }
+            .await;
+            if let Err(operation) = attempt {
+                if fs::try_exists(&stage)
+                    .await
+                    .map_err(|error| store_error("inspect failed multipart begin", error))?
+                {
+                    match acquire_upload_file_lock(&stage).await {
+                        Ok(upload_lock) => {
+                            if let Err(cleanup) = remove_multipart_stage(
+                                &store.root.join(".multipart"),
+                                &stage,
+                                upload_lock,
+                            )
+                            .await
+                            {
+                                return Err(ArtifactStoreError::new(format!(
+                                    "{operation}; failed multipart begin cleanup: {cleanup}"
+                                )));
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(ArtifactStoreError::new(format!(
+                                "{operation}; lock failed multipart begin cleanup: {error}"
+                            )));
+                        }
+                    }
+                }
+                return Err(operation);
+            }
+            Ok(task_upload_id)
+        });
+        task.await.map_err(|error| {
+            ArtifactStoreError::new(format!("multipart begin task failed: {error}"))
+        })?
     }
 
     async fn append(
@@ -957,24 +1278,14 @@ impl ArtifactMultipartStore for FilesystemArtifactStore {
         {
             return sync_directory(&multipart_directory).await;
         }
-        let _upload_lock = match acquire_upload_file_lock(&stage).await {
-            Ok(upload_lock) => Some(upload_lock),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        let upload_lock = match acquire_upload_file_lock(&stage).await {
+            Ok(upload_lock) => upload_lock,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return sync_directory(&multipart_directory).await;
+            }
             Err(error) => return Err(store_error("lock multipart abort", error)),
         };
-        for name in ["data", "key", "receipt", "receipt.pending", "lock"] {
-            match fs::remove_file(stage.join(name)).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(store_error("remove multipart file", error)),
-            }
-        }
-        match fs::remove_dir(stage).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(store_error("remove multipart directory", error)),
-        }
-        sync_directory(&multipart_directory).await
+        remove_multipart_stage(&multipart_directory, &stage, upload_lock).await
     }
 }
 
@@ -996,6 +1307,37 @@ fn key_binding(key: &ArtifactKey) -> String {
         key.session_id(),
         key.artifact_id()
     )
+}
+
+fn parse_key_binding(binding: &str) -> Result<ArtifactKey, JanitorError> {
+    let mut lines = binding.lines();
+    let tenant_id = lines
+        .next()
+        .ok_or_else(|| JanitorError::new("multipart key binding has no tenant"))
+        .and_then(|value| {
+            TenantId::from_str(value)
+                .map_err(|error| JanitorError::new(format!("parse multipart tenant: {error}")))
+        })?;
+    let session_id = lines
+        .next()
+        .ok_or_else(|| JanitorError::new("multipart key binding has no session"))
+        .and_then(|value| {
+            SessionId::from_str(value)
+                .map_err(|error| JanitorError::new(format!("parse multipart session: {error}")))
+        })?;
+    let artifact_id = lines
+        .next()
+        .ok_or_else(|| JanitorError::new("multipart key binding has no artifact"))
+        .and_then(|value| {
+            ArtifactId::from_str(value)
+                .map_err(|error| JanitorError::new(format!("parse multipart artifact: {error}")))
+        })?;
+    if lines.next().is_some() {
+        return Err(JanitorError::new(
+            "multipart key binding has trailing fields",
+        ));
+    }
+    Ok(ArtifactKey::new(tenant_id, session_id, artifact_id))
 }
 
 async fn read_commit_metadata(directory: &Path) -> io::Result<CommitMetadata> {
@@ -1150,16 +1492,72 @@ async fn sync_directory(path: &Path) -> Result<(), ArtifactStoreError> {
         .map_err(|error| store_error("sync artifact directory", error))
 }
 
-async fn acquire_upload_file_lock(stage: &Path) -> io::Result<std::fs::File> {
-    let lock_path = stage.join("lock");
-    let lock_file = tokio::task::spawn_blocking(move || {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(lock_path)
+async fn multipart_activity(stage: &Path) -> Result<MultipartActivity, JanitorError> {
+    let mut last_activity = fs::metadata(stage)
+        .await
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| janitor_error("inspect multipart activity", error))?;
+    let mut data_bytes = None;
+    let mut receipt_bytes = None;
+    let mut pending_receipt_bytes = None;
+    for name in ["data", "key", "receipt", "receipt.pending"] {
+        let metadata = match fs::metadata(stage.join(name)).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(janitor_error("inspect multipart file activity", error)),
+        };
+        let modified = metadata
+            .modified()
+            .map_err(|error| janitor_error("inspect multipart file activity", error))?;
+        match name {
+            "data" => data_bytes = Some(metadata.len()),
+            "receipt" => receipt_bytes = Some(metadata.len()),
+            "receipt.pending" => pending_receipt_bytes = Some(metadata.len()),
+            _ => {}
+        }
+        last_activity = last_activity.max(modified);
+    }
+    Ok(MultipartActivity {
+        last_modified: last_activity,
+        data_bytes,
+        receipt_bytes,
+        pending_receipt_bytes,
+    })
+}
+
+async fn remove_multipart_stage(
+    multipart_directory: &Path,
+    stage: &Path,
+    upload_lock: std::fs::File,
+) -> Result<(), ArtifactStoreError> {
+    let multipart_directory = multipart_directory.to_path_buf();
+    let stage = stage.to_path_buf();
+    let cleanup = tokio::task::spawn_blocking(move || {
+        let _upload_lock = upload_lock;
+        for name in ["data", "key", "receipt", "receipt.pending", "lock"] {
+            match std::fs::remove_file(stage.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        match std::fs::remove_dir(stage) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::File::open(multipart_directory)?.sync_all()
     })
     .await
-    .map_err(io::Error::other)??;
+    .map_err(|error| ArtifactStoreError::new(format!("multipart cleanup task failed: {error}")))?;
+    cleanup.map_err(|error| store_error("remove multipart stage", error))
+}
+
+async fn acquire_upload_file_lock(stage: &Path) -> io::Result<std::fs::File> {
+    let lock_path = stage.to_path_buf();
+    let lock_file = tokio::task::spawn_blocking(move || std::fs::File::open(lock_path))
+        .await
+        .map_err(io::Error::other)??;
     #[cfg(test)]
     if let Ok(Some(pause)) =
         OPTIONAL_UPLOAD_LOCK_OPEN_PAUSE.try_with(|slot| take_one_shot_pause(slot))
@@ -1209,6 +1607,10 @@ fn take_one_shot_pause(
 
 fn store_error(operation: &str, error: io::Error) -> ArtifactStoreError {
     ArtifactStoreError::new(format!("{operation}: {error}"))
+}
+
+fn janitor_error(operation: &str, error: io::Error) -> JanitorError {
+    JanitorError::new(format!("{operation}: {error}"))
 }
 
 #[cfg(test)]
@@ -1733,6 +2135,55 @@ mod tests {
                 .expect("stage existence should be inspectable"),
             "successful retry must not leave a poisoned multipart stage"
         );
+    }
+
+    #[tokio::test]
+    async fn cancelling_begin_after_stage_creation_leaves_a_well_formed_janitor_target() {
+        let (_directory, store, _namespace, key) = test_store();
+        let pause = store.arm_begin_stage_created_pause();
+        let beginning_store = store.clone();
+        let begin = tokio::spawn(async move { beginning_store.begin(&key).await });
+        wait_for_pause(&pause).await;
+        begin.abort();
+        assert!(
+            begin
+                .await
+                .expect_err("outer begin task should be cancelled")
+                .is_cancelled()
+        );
+        let mut entries = fs::read_dir(store.root.join(".multipart"))
+            .await
+            .expect("multipart directory should be readable");
+        let entry = entries
+            .next_entry()
+            .await
+            .expect("multipart entry should be readable")
+            .expect("paused begin should have created a stage");
+        let upload_id = MultipartUploadId::new(
+            entry
+                .file_name()
+                .into_string()
+                .expect("generated upload ID should be UTF-8"),
+        );
+        pause.resume();
+
+        tokio::time::timeout(RACE_TIMEOUT, async {
+            loop {
+                if matches!(fs::try_exists(entry.path().join("key")).await, Ok(true))
+                    && matches!(fs::try_exists(entry.path().join("data")).await, Ok(true))
+                    && matches!(fs::try_exists(entry.path().join("lock")).await, Ok(true))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached begin transaction should finish after caller cancellation");
+        store
+            .abort(&upload_id)
+            .await
+            .expect("well-formed abandoned begin should remain cleanable");
     }
 
     #[tokio::test]
