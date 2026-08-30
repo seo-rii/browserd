@@ -374,6 +374,10 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
         {
             return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
         }
+        let upgrade = match WebSocketUpgrade::from_request(request, &()).await {
+            Ok(value) => value,
+            Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        };
         if let Err(error) = state.viewer.consume_ticket(&session_id, &origin, &ticket) {
             return match error {
                 ViewerGateError::OriginDenied => {
@@ -384,10 +388,6 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
                 }
             };
         }
-        let upgrade = match WebSocketUpgrade::from_request(request, &()).await {
-            Ok(value) => value,
-            Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
-        };
         let viewer = Arc::clone(&state.viewer);
         return upgrade
             .protocols([VIEWER_PROTOCOL])
@@ -982,6 +982,10 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
             if let Ok(cookie) = HeaderValue::from_str(&cookie) {
                 response.headers_mut().insert("set-cookie", cookie);
             }
+            response.headers_mut().insert(
+                HeaderName::from_static("cache-control"),
+                HeaderValue::from_static("no-store"),
+            );
             response
         }
         ApiResponse::ArtifactDownload(envelope) => {

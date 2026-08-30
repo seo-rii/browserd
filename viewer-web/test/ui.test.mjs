@@ -27,14 +27,17 @@ test("ticket fetcher uses a same-origin credentialed POST without a bearer URL",
       calls.push(args);
       return {
         ok: true,
-        json: async () => ({ ticket: "one-time", expires_at: "2099-01-01T00:00:00Z" }),
+        json: async () => ({
+          data: { ticket_issued: true },
+          trace_id: "trace-viewer-ticket",
+        }),
       };
     },
   });
 
-  assert.deepEqual(await fetchTicket("ses_abc"), {
-    ticket: "one-time",
-    expires_at: "2099-01-01T00:00:00Z",
+  assert.deepEqual(await fetchTicket("ses_abc", 7), {
+    data: { ticket_issued: true },
+    trace_id: "trace-viewer-ticket",
   });
   const [url, init] = calls[0];
   assert.equal(url, "https://viewer.example.test/app/v1/sessions/ses_abc/viewer-ticket");
@@ -43,6 +46,7 @@ test("ticket fetcher uses a same-origin credentialed POST without a bearer URL",
   assert.equal(init.headers.Authorization, undefined);
   assert.equal(init.headers["X-Request-Id"], "018f0000-0000-7000-8000-000000000001");
   assert.deepEqual(JSON.parse(init.body), {
+    session_incarnation: 7,
     scopes: { read: true, control: true, admin: false },
     ttl_seconds: 60,
   });
@@ -64,4 +68,5 @@ test("ticket fetcher rejects cross-origin endpoints and unsafe session ids", asy
     fetchImpl: async () => ({ ok: true }),
   });
   await assert.rejects(() => fetchTicket("../escape"), /invalid session id/);
+  await assert.rejects(() => fetchTicket("ses_valid", 0), /session incarnation/);
 });

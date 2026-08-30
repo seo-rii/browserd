@@ -28,6 +28,10 @@
           Session ID
           <input id="session-id" name="session_id" pattern="[A-Za-z0-9_-]+" autocomplete="off" required>
         </label>
+        <label>
+          Session incarnation
+          <input id="session-incarnation" name="session_incarnation" type="number" min="1" step="1" required>
+        </label>
         <button id="connect" type="submit">Connect</button>
         <button id="disconnect" type="button" class="quiet" disabled>Disconnect</button>
         <span class="divider" aria-hidden="true"></span>

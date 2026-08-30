@@ -4,6 +4,7 @@ import { BrowserViewer } from "./viewer.mjs";
 const elements = {
   form: document.querySelector("#connect-form"),
   sessionId: document.querySelector("#session-id"),
+  sessionIncarnation: document.querySelector("#session-incarnation"),
   connect: document.querySelector("#connect"),
   disconnect: document.querySelector("#disconnect"),
   control: document.querySelector("#control"),
@@ -66,9 +67,11 @@ function showFrame(frame) {
 elements.form.addEventListener("submit", async (event) => {
   event.preventDefault();
   const sessionId = elements.sessionId.value.trim();
+  const sessionIncarnation = Number(elements.sessionIncarnation.value);
   try {
     viewer = new BrowserViewer({
       sessionId,
+      sessionIncarnation,
       endpoint: apiBase,
       fetchTicket: createTicketFetcher({
         endpoint: apiBase,
@@ -164,5 +167,11 @@ window.addEventListener("beforeunload", () => {
 const initialSession = new URLSearchParams(window.location.search).get("session_id");
 if (initialSession && /^[A-Za-z0-9_-]+$/.test(initialSession)) {
   elements.sessionId.value = initialSession;
+}
+const initialIncarnation = Number(
+  new URLSearchParams(window.location.search).get("session_incarnation"),
+);
+if (Number.isSafeInteger(initialIncarnation) && initialIncarnation > 0) {
+  elements.sessionIncarnation.value = String(initialIncarnation);
 }
 setStatus({ phase: "disconnected", controlling: false });

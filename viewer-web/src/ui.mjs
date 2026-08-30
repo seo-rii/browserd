@@ -35,9 +35,12 @@ export function createTicketFetcher({
     throw new TypeError("fetch implementation is unavailable");
   }
 
-  return async (sessionId) => {
+  return async (sessionId, sessionIncarnation) => {
     if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
       throw new TypeError("invalid session id");
+    }
+    if (!Number.isSafeInteger(sessionIncarnation) || sessionIncarnation < 1) {
+      throw new TypeError("session incarnation must be a positive integer");
     }
     const path = base.pathname.endsWith("/") ? base.pathname : `${base.pathname}/`;
     const url = new URL(
@@ -52,6 +55,7 @@ export function createTicketFetcher({
         "X-Request-Id": requestId(),
       },
       body: JSON.stringify({
+        session_incarnation: sessionIncarnation,
         scopes: { read: true, control: true, admin: false },
         ttl_seconds: 60,
       }),
@@ -60,7 +64,11 @@ export function createTicketFetcher({
       throw new Error(`viewer ticket request failed (${response.status ?? "unknown"})`);
     }
     const body = await response.json();
-    if (typeof body.ticket !== "string" || body.ticket === "") {
+    if (
+      body?.data?.ticket_issued !== true ||
+      typeof body.trace_id !== "string" ||
+      body.trace_id === ""
+    ) {
       throw new Error("viewer ticket response is invalid");
     }
     return body;

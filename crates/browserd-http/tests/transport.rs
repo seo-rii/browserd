@@ -373,7 +373,7 @@ async fn viewer_websocket_rejects_origin_protocol_and_ticket_before_upgrade()
                 .body(Body::empty())?,
         )
         .await?;
-    assert_eq!(bad_ticket.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(bad_ticket.status(), StatusCode::BAD_REQUEST);
 
     let wrong_protocol = app(Arc::new(InMemoryApiService::default()), principal(&[])?)
         .oneshot(
@@ -432,6 +432,40 @@ async fn malformed_websocket_handshake_cannot_consume_a_one_time_ticket()
             Request::builder()
                 .uri(format!("/v1/sessions/{}/viewer", SessionId::new()))
                 .header("origin", "https://console.example")
+                .header("sec-websocket-protocol", "browser-viewer.v1")
+                .header("cookie", "browserd_viewer_ticket=one-time")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!consumed.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_websocket_upgrade_cannot_consume_a_one_time_ticket()
+-> Result<(), Box<dyn Error>> {
+    let consumed = Arc::new(AtomicBool::new(false));
+    let app = router(
+        HttpConfig::default(),
+        Arc::new(InMemoryApiService::default()),
+        Arc::new(StaticAuth {
+            principal: principal(&[])?,
+        }),
+        Arc::new(CountingViewer {
+            consumed: Arc::clone(&consumed),
+        }),
+        Arc::new(StaticReadiness(true)),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/sessions/{}/viewer", SessionId::new()))
+                .header("origin", "https://console.example")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
                 .header("sec-websocket-protocol", "browser-viewer.v1")
                 .header("cookie", "browserd_viewer_ticket=one-time")
                 .body(Body::empty())?,
@@ -701,7 +735,13 @@ async fn opaque_capabilities_are_presented_only_through_the_injected_adapter()
     assert_eq!(issued.status(), StatusCode::CREATED);
     let cookie = issued.headers()["set-cookie"].to_str()?;
     assert!(cookie.contains("viewer-capability"));
+    assert!(cookie.contains(&format!("Path=/v1/sessions/{session_id}/viewer")));
     assert!(cookie.contains("Secure; HttpOnly; SameSite=Strict"));
+    assert_eq!(issued.headers()["cache-control"], "no-store");
+    let issued_body = body_json(issued).await;
+    assert_eq!(issued_body["data"]["ticket_issued"], true);
+    assert!(issued_body.get("ticket").is_none());
+    assert!(issued_body["data"].get("ticket").is_none());
 
     let download = app
         .oneshot(

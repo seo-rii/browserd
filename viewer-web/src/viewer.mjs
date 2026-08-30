@@ -39,6 +39,7 @@ function viewerUrl(endpoint, sessionId) {
 
 export class BrowserViewer {
   #sessionId;
+  #sessionIncarnation;
   #url;
   #fetchTicket;
   #WebSocketImpl;
@@ -53,6 +54,7 @@ export class BrowserViewer {
 
   constructor({
     sessionId,
+    sessionIncarnation,
     endpoint,
     fetchTicket,
     WebSocketImpl = globalThis.WebSocket,
@@ -66,7 +68,11 @@ export class BrowserViewer {
     if (typeof WebSocketImpl !== "function") {
       throw new ViewerError("WebSocket implementation is unavailable");
     }
+    if (!Number.isSafeInteger(sessionIncarnation) || sessionIncarnation < 1) {
+      throw new ViewerError("session incarnation must be a positive integer");
+    }
     this.#sessionId = sessionId;
+    this.#sessionIncarnation = sessionIncarnation;
     this.#url = viewerUrl(endpoint, sessionId);
     this.#fetchTicket = fetchTicket;
     this.#WebSocketImpl = WebSocketImpl;
@@ -93,31 +99,34 @@ export class BrowserViewer {
 
     let ticketResponse;
     try {
-      ticketResponse = await this.#fetchTicket(this.#sessionId);
+      ticketResponse = await this.#fetchTicket(
+        this.#sessionId,
+        this.#sessionIncarnation,
+      );
     } catch (error) {
       this.#setPhase("disconnected");
       throw error;
     }
-    if (!ticketResponse || typeof ticketResponse.ticket !== "string" || ticketResponse.ticket === "") {
+    if (
+      ticketResponse?.data?.ticket_issued !== true ||
+      typeof ticketResponse.trace_id !== "string" ||
+      ticketResponse.trace_id === ""
+    ) {
       this.#setPhase("disconnected");
       throw new ViewerError("ticket response is invalid");
     }
 
-    let ticket = ticketResponse.ticket;
     const socket = new this.#WebSocketImpl(this.#url, ["browser-viewer.v1"]);
     socket.binaryType = "arraybuffer";
     this.#socket = socket;
     this.#setPhase("connecting");
 
     socket.onopen = () => {
-      socket.send(JSON.stringify({ type: "authenticate", ticket }));
-      ticket = null;
       this.#setPhase("connected");
     };
     socket.onmessage = (event) => this.#receive(event.data);
     socket.onerror = () => this.#setPhase("error");
     socket.onclose = () => {
-      ticket = null;
       this.#control = null;
       this.#inputSequence = 0;
       this.#socket = null;

@@ -41,8 +41,12 @@ function newViewer(overrides = {}) {
   const states = [];
   const viewer = new BrowserViewer({
     sessionId: "ses_example",
+    sessionIncarnation: 7,
     endpoint: "https://gateway.example.test/base/",
-    fetchTicket: async () => ({ ticket: "secret-ticket", expires_at: "2099-01-01T00:00:00Z" }),
+    fetchTicket: async () => ({
+      data: { ticket_issued: true },
+      trace_id: "trace-viewer-ticket",
+    }),
     WebSocketImpl: FakeSocket,
     onFrame: (frame) => frames.push(frame),
     onState: (state) => states.push(state),
@@ -51,7 +55,7 @@ function newViewer(overrides = {}) {
   return { viewer, frames, states };
 }
 
-test("uses a one-time handshake ticket without placing it in the URL", async () => {
+test("uses an HttpOnly cookie handshake without exposing a ticket to JavaScript", async () => {
   const { viewer } = newViewer();
 
   await viewer.connect();
@@ -61,14 +65,12 @@ test("uses a one-time handshake ticket without placing it in the URL", async () 
     socket.url,
     "wss://gateway.example.test/base/v1/sessions/ses_example/viewer",
   );
-  assert.ok(!socket.url.includes("secret-ticket"));
+  assert.equal(new URL(socket.url).search, "");
   assert.deepEqual(socket.protocols, ["browser-viewer.v1"]);
   assert.equal(socket.binaryType, "arraybuffer");
 
   socket.open();
-  assert.deepEqual(socket.sent, [
-    { type: "authenticate", ticket: "secret-ticket" },
-  ]);
+  assert.deepEqual(socket.sent, []);
 });
 
 test("acks every accepted frame immediately and drops stale transforms", async () => {
@@ -95,7 +97,7 @@ test("acks every accepted frame immediately and drops stale transforms", async (
   );
 
   assert.deepEqual(
-    socket.sent.slice(1),
+    socket.sent,
     [
       { type: "ack", frame_id: "10" },
       { type: "ack", frame_id: "11" },
@@ -181,12 +183,14 @@ test("forwards the complete CJK composition lifecycle", async () => {
 });
 
 test("requires a fresh ticket for reconnect and prevents parallel connections", async () => {
-  const issued = [];
+  let issuances = 0;
   const { viewer } = newViewer({
     fetchTicket: async () => {
-      const ticket = `ticket-${issued.length + 1}`;
-      issued.push(ticket);
-      return { ticket, expires_at: "2099-01-01T00:00:00Z" };
+      issuances += 1;
+      return {
+        data: { ticket_issued: true },
+        trace_id: `trace-${issuances}`,
+      };
     },
   });
 
@@ -199,7 +203,7 @@ test("requires a fresh ticket for reconnect and prevents parallel connections", 
   const second = FakeSocket.instances[1];
   second.open();
 
-  assert.deepEqual(issued, ["ticket-1", "ticket-2"]);
-  assert.equal(first.sent[0].ticket, "ticket-1");
-  assert.equal(second.sent[0].ticket, "ticket-2");
+  assert.equal(issuances, 2);
+  assert.deepEqual(first.sent, []);
+  assert.deepEqual(second.sent, []);
 });
