@@ -1063,6 +1063,7 @@ struct FakeEgress {
     release_pause: Option<AsyncPause>,
     cancel_commit_pause: Option<AsyncPause>,
     release_reservation_commit_pause: Option<AsyncPause>,
+    renew_commit_pause: Option<AsyncPause>,
     revoke_commit_pause: Option<AsyncPause>,
     release_commit_pause: Option<AsyncPause>,
     force_inactive: bool,
@@ -1107,6 +1108,7 @@ enum EgressCall {
     ),
     CancelReservation(ShardEgressReservation),
     ReleaseReservation(ShardEgressReservation),
+    Renew(ShardIngressLease, Duration),
     Revoke(ShardIngressLease),
     Release(ShardIngressLease),
     IsActive(ShardIngressLease),
@@ -1303,6 +1305,43 @@ impl EgressRouteBackend for FakeEgress {
             }
         };
         if committed && let Some(pause) = &self.release_reservation_commit_pause {
+            pause.pause_once().await;
+        }
+        Ok(())
+    }
+
+    async fn renew(
+        &self,
+        lease: &ShardIngressLease,
+        lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        self.events
+            .lock()
+            .expect("egress lock should work")
+            .push("route:renew".into());
+        self.calls
+            .lock()
+            .expect("egress call lock should work")
+            .push(EgressCall::Renew(lease.clone(), lease_ttl));
+        if lease_ttl.is_zero() {
+            return Err(SandboxError::InvalidEgressLease);
+        }
+        let expected = FakeIngressAttachment::from_lease(lease);
+        match self
+            .state
+            .lock()
+            .expect("route state lock should work")
+            .routes
+            .get(lease.reservation())
+        {
+            Some(FakeRouteLifecycle::Prepared(Some(attachment))) if *attachment == expected => {}
+            Some(_) | None => {
+                return Err(SandboxError::Backend(
+                    "active ingress lease receipt mismatch".into(),
+                ));
+            }
+        }
+        if let Some(pause) = &self.renew_commit_pause {
             pause.pause_once().await;
         }
         Ok(())
@@ -3227,6 +3266,89 @@ async fn blocking_cleanup_filesystem_work_does_not_block_an_unrelated_runtime_in
         "unrelated inspection must not wait on blocking filesystem cleanup"
     );
     assert_eq!(inspection.memory_current_bytes, 12288);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn egress_renewal_and_revoke_are_serialized_for_the_exact_runtime() {
+    let filesystem = FakeFilesystem::production_tree();
+    let renew_pause = AsyncPause::new();
+    let revoke_pause = AsyncPause::new();
+    let egress = FakeEgress {
+        renew_commit_pause: Some(renew_pause.clone()),
+        revoke_pause: Some(revoke_pause.clone()),
+        ..FakeEgress::default()
+    };
+    let backend = Arc::new(backend(
+        filesystem,
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        egress.clone(),
+    ));
+    let handle = backend
+        .provision(&launch_spec(ShardId::new()))
+        .await
+        .expect("runtime should provision");
+    let lease_ttl = Duration::from_secs(30);
+
+    let renew = tokio::spawn({
+        let backend = Arc::clone(&backend);
+        let handle = handle.clone();
+        async move { backend.renew_egress(&handle, lease_ttl).await }
+    });
+    wait_for_commit_pause(&renew_pause, "runtime egress renewal").await;
+
+    let revoke = tokio::spawn({
+        let backend = Arc::clone(&backend);
+        let handle = handle.clone();
+        async move {
+            backend
+                .revoke_egress(&handle, CleanupReason::Administrative)
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), revoke_pause.entered.notified())
+            .await
+            .is_err(),
+        "revoke must not enter the egress backend while exact-route renewal is pending"
+    );
+
+    renew_pause.proceed.notify_one();
+    renew
+        .await
+        .expect("renew task should join")
+        .expect("renew should succeed");
+    wait_for_commit_pause(&revoke_pause, "runtime egress revoke").await;
+    revoke_pause.proceed.notify_one();
+    revoke
+        .await
+        .expect("revoke task should join")
+        .expect("revoke should succeed");
+
+    let calls = egress.calls.lock().expect("egress call lock should work");
+    let (renew_index, renewed_lease) = calls
+        .iter()
+        .enumerate()
+        .find_map(|(index, call)| match call {
+            EgressCall::Renew(lease, observed_ttl) if *observed_ttl == lease_ttl => {
+                Some((index, lease))
+            }
+            _ => None,
+        })
+        .expect("exact lease renewal should be recorded");
+    let (revoke_index, revoked_lease) = calls
+        .iter()
+        .enumerate()
+        .find_map(|(index, call)| match call {
+            EgressCall::Revoke(lease) => Some((index, lease)),
+            _ => None,
+        })
+        .expect("exact lease revoke should be recorded");
+    assert_eq!(renewed_lease, revoked_lease);
+    assert!(renew_index < revoke_index);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

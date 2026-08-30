@@ -23,6 +23,8 @@ use tokio::time::Instant;
 struct RecordingBackend {
     capabilities: SandboxCapabilities,
     events: Arc<Mutex<Vec<String>>>,
+    renew_gate: Option<(Arc<Notify>, Arc<Notify>)>,
+    fail_renew: bool,
     fail_revoke: bool,
 }
 
@@ -31,6 +33,8 @@ impl RecordingBackend {
         Self {
             capabilities: SandboxCapabilities::production_required(),
             events: Arc::new(Mutex::new(Vec::new())),
+            renew_gate: None,
+            fail_renew: false,
             fail_revoke: false,
         }
     }
@@ -56,6 +60,23 @@ impl SandboxBackend for RecordingBackend {
             spec.shard_id().clone(),
             "backend-handle",
         ))
+    }
+
+    async fn renew_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        self.record("renew_egress");
+        if let Some((entered, proceed)) = &self.renew_gate {
+            entered.notify_one();
+            proceed.notified().await;
+        }
+        if self.fail_renew {
+            Err(SandboxError::Backend("route renewal failed".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     async fn revoke_egress(
@@ -734,6 +755,8 @@ async fn production_creation_fails_closed_when_any_required_capability_is_missin
         let backend = RecordingBackend {
             capabilities,
             events: Arc::new(Mutex::new(Vec::new())),
+            renew_gate: None,
+            fail_renew: false,
             fail_revoke: false,
         };
         let supervisor = SandboxSupervisor::new(config(), backend.clone());
@@ -814,6 +837,183 @@ async fn stale_worker_epoch_cannot_renew_or_control_a_shard() {
             )
             .await
             .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn owner_lease_renewal_extends_egress_before_committing_local_ownership() {
+    let backend = RecordingBackend::production_capable();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, now + Duration::from_secs(5)),
+        )
+        .await
+        .expect("sandbox creation must succeed");
+
+    supervisor
+        .renew_owner_lease(
+            &shard_id,
+            17,
+            launch_generation(),
+            now + Duration::from_secs(1),
+            now + Duration::from_secs(9),
+        )
+        .await
+        .expect("owner and egress leases should renew together");
+
+    assert_eq!(backend.events(), ["provision", "renew_egress"]);
+    assert!(
+        supervisor
+            .expire_leases(now + Duration::from_secs(6))
+            .await
+            .is_empty(),
+        "local ownership must remain live only after egress renewal succeeds"
+    );
+}
+
+#[tokio::test]
+async fn failed_egress_renewal_does_not_extend_local_ownership() {
+    let mut backend = RecordingBackend::production_capable();
+    backend.fail_renew = true;
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, now + Duration::from_secs(5)),
+        )
+        .await
+        .expect("sandbox creation must succeed");
+
+    assert_eq!(
+        supervisor
+            .renew_owner_lease(
+                &shard_id,
+                17,
+                launch_generation(),
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(9),
+            )
+            .await,
+        Err(RenewLeaseError::EgressRenewalFailed)
+    );
+
+    assert_eq!(backend.events(), ["provision", "renew_egress"]);
+    assert_eq!(
+        supervisor
+            .expire_leases(now + Duration::from_secs(6))
+            .await
+            .len(),
+        1,
+        "failed route renewal must leave the original owner expiry intact"
+    );
+}
+
+#[tokio::test]
+async fn owner_lease_renewal_cannot_shorten_an_active_lease() {
+    let backend = RecordingBackend::production_capable();
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, now + Duration::from_secs(8)),
+        )
+        .await
+        .expect("sandbox creation must succeed");
+
+    assert_eq!(
+        supervisor
+            .renew_owner_lease(
+                &shard_id,
+                17,
+                launch_generation(),
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(7),
+            )
+            .await,
+        Err(RenewLeaseError::InvalidNewExpiry)
+    );
+    assert_eq!(backend.events(), ["provision"]);
+}
+
+#[tokio::test]
+async fn concurrent_owner_renewals_are_serialized_without_expiry_regression() {
+    let entered = Arc::new(Notify::new());
+    let proceed = Arc::new(Notify::new());
+    let mut backend = RecordingBackend::production_capable();
+    backend.renew_gate = Some((Arc::clone(&entered), Arc::clone(&proceed)));
+    let supervisor = Arc::new(SandboxSupervisor::new(config(), backend.clone()));
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    supervisor
+        .create_shard(
+            launch_spec(shard_id.clone()),
+            WorkerOwnership::new(worker(), 17, now + Duration::from_secs(5)),
+        )
+        .await
+        .expect("sandbox creation must succeed");
+
+    let longer = tokio::spawn({
+        let supervisor = Arc::clone(&supervisor);
+        let shard_id = shard_id.clone();
+        async move {
+            supervisor
+                .renew_owner_lease(
+                    &shard_id,
+                    17,
+                    launch_generation(),
+                    now + Duration::from_secs(1),
+                    now + Duration::from_secs(9),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .expect("the first route renewal should enter its backend");
+
+    let shorter = tokio::spawn({
+        let supervisor = Arc::clone(&supervisor);
+        let shard_id = shard_id.clone();
+        async move {
+            supervisor
+                .renew_owner_lease(
+                    &shard_id,
+                    17,
+                    launch_generation(),
+                    now + Duration::from_secs(1),
+                    now + Duration::from_secs(7),
+                )
+                .await
+        }
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), entered.notified())
+            .await
+            .is_err(),
+        "one shard must never have two route renewals in flight"
+    );
+
+    proceed.notify_one();
+    assert_eq!(longer.await.expect("longer renew task should join"), Ok(()));
+    assert_eq!(
+        shorter.await.expect("shorter renew task should join"),
+        Err(RenewLeaseError::InvalidNewExpiry)
+    );
+    assert_eq!(backend.events(), ["provision", "renew_egress"]);
+    assert!(
+        supervisor
+            .expire_leases(now + Duration::from_secs(8))
+            .await
+            .is_empty(),
+        "the rejected shorter renewal must not regress local ownership"
     );
 }
 

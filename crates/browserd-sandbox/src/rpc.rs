@@ -226,6 +226,7 @@ impl From<RenewLeaseError> for RpcFailure {
             RenewLeaseError::LaunchGenerationMismatch => RpcFailureCode::LaunchFenceMismatch,
             RenewLeaseError::LeaseExpired => RpcFailureCode::LeaseExpired,
             RenewLeaseError::InvalidNewExpiry => RpcFailureCode::InvalidLease,
+            RenewLeaseError::EgressRenewalFailed => RpcFailureCode::Backend,
         };
         Self {
             code,

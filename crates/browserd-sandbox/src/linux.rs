@@ -28,8 +28,9 @@ use crate::journal::{
     PreparedShardRecoveryLocators,
 };
 use crate::{
-    CleanupReason, DedicatedEgressSpec, InspectResources, LaunchSpec, SandboxBackend,
-    SandboxCapabilities, SandboxError, SandboxHandle,
+    CleanupReason, DedicatedEgressSpec, InspectResources, LaunchSpec,
+    MAX_DEDICATED_EGRESS_LEASE_TTL, SandboxBackend, SandboxCapabilities, SandboxError,
+    SandboxHandle,
 };
 
 /// Chromium's fixed command-input descriptor for `--remote-debugging-pipe`.
@@ -3571,6 +3572,33 @@ where
             (runtime.backend_token.clone(), runtime.identity)
         };
         self.process.claim_cdp_pipes(&backend_token, identity).await
+    }
+
+    async fn renew_egress(
+        &self,
+        handle: &SandboxHandle,
+        lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        if lease_ttl.is_zero() || lease_ttl > MAX_DEDICATED_EGRESS_LEASE_TTL {
+            return Err(SandboxError::InvalidEgressLease);
+        }
+        let operation = self.runtime_cleanup_operation(handle)?;
+        let _operation_guard = operation.lock().await;
+        let lease = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            if runtime.egress_revoked || runtime.egress_released || runtime.namespaces_cleaned {
+                return Err(SandboxError::ShardNotFound);
+            }
+            runtime.ingress_lease.clone()
+        };
+        self.egress.renew(&lease, lease_ttl).await
     }
 
     async fn revoke_egress(

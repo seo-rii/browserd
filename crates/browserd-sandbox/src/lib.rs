@@ -476,6 +476,17 @@ pub trait SandboxBackend: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Extends the exact runtime's dedicated egress route before its local owner lease moves.
+    async fn renew_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        Err(SandboxError::Backend(
+            "egress route renewal is unsupported by this sandbox backend".into(),
+        ))
+    }
+
     async fn revoke_egress(
         &self,
         handle: &SandboxHandle,
@@ -498,6 +509,7 @@ struct ActiveShard {
     launch_spec: LaunchSpec,
     ownership: WorkerOwnership,
     handle: SandboxHandle,
+    renewal_operation: Arc<Mutex<()>>,
     cdp_claim: CdpClaimState,
 }
 
@@ -1043,6 +1055,7 @@ where
                             launch_spec: spec,
                             ownership,
                             handle,
+                            renewal_operation: Arc::new(Mutex::new(())),
                             cdp_claim: CdpClaimState::Available,
                         },
                     );
@@ -1076,36 +1089,108 @@ where
         now: Instant,
         new_expires_at: Instant,
     ) -> Result<(), RenewLeaseError> {
-        let mut state = self.state.lock().await;
-        let ownership = if let Some(active) = state.active.get_mut(shard_id) {
+        let renewal_operation = {
+            let mut state = self.state.lock().await;
+            if let Some(active) = state.active.get(shard_id) {
+                if active.launch_spec.launch_generation() != launch_generation {
+                    return Err(RenewLeaseError::LaunchGenerationMismatch);
+                }
+                if active.ownership.worker_epoch != worker_epoch {
+                    return Err(RenewLeaseError::WorkerEpochMismatch {
+                        expected: active.ownership.worker_epoch,
+                        actual: worker_epoch,
+                    });
+                }
+                if active.ownership.expires_at <= now {
+                    return Err(RenewLeaseError::LeaseExpired);
+                }
+                if new_expires_at <= now
+                    || new_expires_at < active.ownership.expires_at
+                    || new_expires_at > now + self.config.supervisor_lease_ttl
+                {
+                    return Err(RenewLeaseError::InvalidNewExpiry);
+                }
+                Arc::clone(&active.renewal_operation)
+            } else if let Some(provisioning) = state.provisioning.get_mut(shard_id) {
+                if provisioning.launch_spec.launch_generation() != launch_generation {
+                    return Err(RenewLeaseError::LaunchGenerationMismatch);
+                }
+                if provisioning.cancellation.is_some() {
+                    return Err(RenewLeaseError::ShardNotFound);
+                }
+                if provisioning.ownership.worker_epoch != worker_epoch {
+                    return Err(RenewLeaseError::WorkerEpochMismatch {
+                        expected: provisioning.ownership.worker_epoch,
+                        actual: worker_epoch,
+                    });
+                }
+                if provisioning.ownership.expires_at <= now {
+                    return Err(RenewLeaseError::LeaseExpired);
+                }
+                if new_expires_at <= now
+                    || new_expires_at < provisioning.ownership.expires_at
+                    || new_expires_at > now + self.config.supervisor_lease_ttl
+                {
+                    return Err(RenewLeaseError::InvalidNewExpiry);
+                }
+                provisioning.ownership.expires_at = new_expires_at;
+                return Ok(());
+            } else {
+                return Err(RenewLeaseError::ShardNotFound);
+            }
+        };
+
+        let _renewal_guard = renewal_operation.lock().await;
+        let (handle, observed_expires_at) = {
+            let state = self.state.lock().await;
+            let active = state
+                .active
+                .get(shard_id)
+                .ok_or(RenewLeaseError::ShardNotFound)?;
             if active.launch_spec.launch_generation() != launch_generation {
                 return Err(RenewLeaseError::LaunchGenerationMismatch);
             }
-            &mut active.ownership
-        } else if let Some(provisioning) = state.provisioning.get_mut(shard_id) {
-            if provisioning.launch_spec.launch_generation() != launch_generation {
-                return Err(RenewLeaseError::LaunchGenerationMismatch);
+            if active.ownership.worker_epoch != worker_epoch {
+                return Err(RenewLeaseError::WorkerEpochMismatch {
+                    expected: active.ownership.worker_epoch,
+                    actual: worker_epoch,
+                });
             }
-            if provisioning.cancellation.is_some() {
-                return Err(RenewLeaseError::ShardNotFound);
+            if active.ownership.expires_at <= now {
+                return Err(RenewLeaseError::LeaseExpired);
             }
-            &mut provisioning.ownership
-        } else {
-            return Err(RenewLeaseError::ShardNotFound);
+            if new_expires_at <= now
+                || new_expires_at < active.ownership.expires_at
+                || new_expires_at > now + self.config.supervisor_lease_ttl
+            {
+                return Err(RenewLeaseError::InvalidNewExpiry);
+            }
+            (active.handle.clone(), active.ownership.expires_at)
         };
-        if ownership.worker_epoch != worker_epoch {
+
+        self.backend
+            .renew_egress(&handle, new_expires_at.duration_since(now))
+            .await
+            .map_err(|_| RenewLeaseError::EgressRenewalFailed)?;
+
+        let mut state = self.state.lock().await;
+        let active = state
+            .active
+            .get_mut(shard_id)
+            .ok_or(RenewLeaseError::ShardNotFound)?;
+        if active.launch_spec.launch_generation() != launch_generation {
+            return Err(RenewLeaseError::LaunchGenerationMismatch);
+        }
+        if active.ownership.worker_epoch != worker_epoch {
             return Err(RenewLeaseError::WorkerEpochMismatch {
-                expected: ownership.worker_epoch,
+                expected: active.ownership.worker_epoch,
                 actual: worker_epoch,
             });
         }
-        if ownership.expires_at <= now {
-            return Err(RenewLeaseError::LeaseExpired);
+        if active.handle != handle || active.ownership.expires_at != observed_expires_at {
+            return Err(RenewLeaseError::ShardNotFound);
         }
-        if new_expires_at <= now || new_expires_at > now + self.config.supervisor_lease_ttl {
-            return Err(RenewLeaseError::InvalidNewExpiry);
-        }
-        ownership.expires_at = new_expires_at;
+        active.ownership.expires_at = new_expires_at;
         Ok(())
     }
 
@@ -1925,6 +2010,8 @@ pub enum RenewLeaseError {
     LeaseExpired,
     #[error("the renewed supervisor lease exceeds its configured TTL")]
     InvalidNewExpiry,
+    #[error("the dedicated egress lease could not be renewed")]
+    EgressRenewalFailed,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]

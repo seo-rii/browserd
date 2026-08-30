@@ -54,6 +54,14 @@ impl SandboxBackend for RecordingBackend {
         Ok(SandboxHandle::new(spec.shard_id().clone(), "rpc-handle"))
     }
 
+    async fn renew_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     async fn revoke_egress(
         &self,
         _handle: &SandboxHandle,

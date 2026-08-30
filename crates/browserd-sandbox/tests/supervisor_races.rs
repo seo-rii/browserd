@@ -42,6 +42,14 @@ impl SandboxBackend for GatedBackend {
         Ok(SandboxHandle::new(spec.shard_id().clone(), "gated"))
     }
 
+    async fn renew_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _lease_ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
     async fn revoke_egress(
         &self,
         _handle: &SandboxHandle,
@@ -136,7 +144,7 @@ async fn kill_and_renew_during_provision_are_fenced_and_cannot_resurrect_shard()
             supervisor
                 .create_shard(
                     launch_spec(shard_id),
-                    WorkerOwnership::new(worker(), 7, now + Duration::from_secs(10)),
+                    WorkerOwnership::new(worker(), 7, now + Duration::from_secs(5)),
                 )
                 .await
         })
