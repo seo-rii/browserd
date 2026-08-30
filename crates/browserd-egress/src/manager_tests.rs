@@ -421,6 +421,135 @@ async fn authoritative_binding_expiry_revokes_and_releases_the_listener() {
 }
 
 #[tokio::test]
+async fn renewal_extends_the_route_and_listener_beyond_the_original_expiry() {
+    let handler = Arc::new(DropHandler::default());
+    let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(2), handler);
+    let route_fence = fence(13);
+    let (address, descriptor) = listener();
+    let active = install(
+        &manager,
+        route_fence.clone(),
+        digest(13),
+        descriptor,
+        Duration::from_millis(200),
+    )
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    let renewed_expiry = MonotonicMillis::new(manager.now().value() + 350);
+    manager
+        .renew(&active, renewed_expiry)
+        .expect("active listener lease should renew");
+
+    tokio::time::sleep(Duration::from_millis(175)).await;
+    assert_eq!(
+        manager
+            .status(daemon_epoch(), &route_fence)
+            .expect("read renewed status")
+            .state(),
+        AttachmentState::Active
+    );
+    let client = TcpStream::connect(address)
+        .await
+        .expect("renewed listener should accept beyond its original expiry");
+    drop(client);
+
+    let status = wait_for_state(&manager, &route_fence, AttachmentState::Released).await;
+    assert!(matches!(status, AttachmentStatus::Released(_)));
+    StdTcpListener::bind(address).expect("renewed listener closes at the extended expiry");
+}
+
+#[tokio::test]
+async fn renewal_is_idempotent_and_cannot_shorten_the_committed_deadline() {
+    let handler = Arc::new(DropHandler::default());
+    let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(30), handler);
+    let route_fence = fence(14);
+    let (_address, descriptor) = listener();
+    let active = install(
+        &manager,
+        route_fence.clone(),
+        digest(14),
+        descriptor,
+        Duration::from_secs(10),
+    )
+    .await;
+    let renewed_expiry = MonotonicMillis::new(manager.now().value() + 15_000);
+
+    assert!(manager.renew(&active, renewed_expiry).is_ok());
+    assert!(manager.renew(&active, renewed_expiry).is_ok());
+    assert!(matches!(
+        manager.renew(
+            &active,
+            MonotonicMillis::new(renewed_expiry.value() - 1_000)
+        ),
+        Err(AttachmentManagerError::Route(
+            crate::RouteError::InvalidLeaseExpiry
+        ))
+    ));
+    assert_eq!(
+        manager
+            .status(daemon_epoch(), &route_fence)
+            .expect("read active status")
+            .state(),
+        AttachmentState::Active
+    );
+    manager.revoke(&active).await.expect("revoke attachment");
+}
+
+#[tokio::test]
+async fn concurrent_renew_and_revoke_never_resurrect_the_listener() {
+    let handler = Arc::new(DropHandler::default());
+    let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(30), handler);
+    let route_fence = fence(15);
+    let (address, descriptor) = listener();
+    let active = install(
+        &manager,
+        route_fence.clone(),
+        digest(15),
+        descriptor,
+        Duration::from_secs(10),
+    )
+    .await;
+    let renewed_expiry = MonotonicMillis::new(manager.now().value() + 15_000);
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+    let renew = {
+        let manager = manager.clone();
+        let active = active.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            manager.renew(&active, renewed_expiry)
+        })
+    };
+    let revoke = {
+        let manager = manager.clone();
+        let active = active.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            manager.revoke(&active).await
+        })
+    };
+    barrier.wait().await;
+
+    let _renew_result = renew.await.expect("renew task should join");
+    let released = revoke
+        .await
+        .expect("revoke task should join")
+        .expect("revoke should remain authoritative");
+    assert_eq!(released.fence(), &route_fence);
+    assert_eq!(
+        manager
+            .status(daemon_epoch(), &route_fence)
+            .expect("read terminal status")
+            .state(),
+        AttachmentState::Released
+    );
+    StdTcpListener::bind(address).expect("revoked listener must remain closed after renewal race");
+}
+
+#[tokio::test]
 async fn normal_per_connection_handler_errors_do_not_revoke_the_listener() {
     let handler = Arc::new(FailingHandler::default());
     let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(30), handler.clone());

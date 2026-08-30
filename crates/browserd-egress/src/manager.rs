@@ -72,6 +72,7 @@ struct ManagedAttachment {
     released: Option<ReleasedAttachmentReceipt>,
     cancellation: CancellationToken,
     actor: Option<JoinHandle<()>>,
+    lease_deadline: watch::Sender<MonotonicMillis>,
     changed: watch::Sender<u64>,
 }
 
@@ -316,18 +317,16 @@ impl AttachmentManager {
             return Err(AttachmentManagerError::Route(error));
         }
 
-        let ttl = binding
+        let has_remaining_lease = binding
             .expires_at()
             .value()
             .checked_sub(self.now().value())
-            .filter(|ttl| *ttl > 0)
-            .map(Duration::from_millis);
-        if ttl.is_none() {
+            .is_some_and(|ttl| ttl > 0);
+        if !has_remaining_lease {
             drop(listener);
             self.inner.finish_cancelled_install(&fence, &claim);
             return Err(AttachmentManagerError::InstallCancelled);
         }
-        let ttl = ttl.ok_or(AttachmentManagerError::InstallCancelled)?;
         let mut listener = Some(listener);
         let result = {
             let mut state = self.inner.lock_state();
@@ -348,23 +347,26 @@ impl AttachmentManager {
                     .attachments
                     .complete_install(&installing)
                     .map_err(AttachmentManagerError::Attachment)?;
-                let actor = tokio::spawn(run_listener_actor(
-                    Arc::downgrade(&self.inner),
-                    fence.clone(),
-                    active.clone(),
-                    listener
-                        .take()
-                        .ok_or(AttachmentManagerError::InconsistentState)?,
-                    cancellation.clone(),
-                    ttl,
-                ));
+                let listener = listener
+                    .take()
+                    .ok_or(AttachmentManagerError::InconsistentState)?;
                 let record = state
                     .records
                     .get_mut(&fence)
                     .ok_or(AttachmentManagerError::InconsistentState)?;
                 record.active = Some(active.clone());
-                record.actor = Some(actor);
                 record.phase = ManagedPhase::Active;
+                record.lease_deadline.send_replace(binding.expires_at());
+                let lease_deadline = record.lease_deadline.subscribe();
+                let actor = tokio::spawn(run_listener_actor(
+                    Arc::downgrade(&self.inner),
+                    fence.clone(),
+                    active.clone(),
+                    listener,
+                    cancellation.clone(),
+                    lease_deadline,
+                ));
+                record.actor = Some(actor);
                 record.signal();
                 Some(active)
             }
@@ -376,6 +378,53 @@ impl AttachmentManager {
         drop(listener);
         self.inner.finish_cancelled_install(&fence, &claim);
         Err(AttachmentManagerError::InstallCancelled)
+    }
+
+    pub fn renew(
+        &self,
+        active: &ActiveAttachmentReceipt,
+        new_expires_at: MonotonicMillis,
+    ) -> Result<(), AttachmentManagerError> {
+        let fence = active.fence();
+        let mut state = self.inner.lock_state();
+        if state.shutting_down {
+            return Err(AttachmentManagerError::ShuttingDown);
+        }
+        let phase = state
+            .records
+            .get(fence)
+            .filter(|record| record.active.as_ref() == Some(active))
+            .map(|record| record.phase)
+            .ok_or(AttachmentManagerError::Attachment(
+                AttachmentError::StaleReceipt,
+            ))?;
+        if phase != ManagedPhase::Active {
+            return Err(AttachmentManagerError::Attachment(
+                AttachmentError::InvalidTransition {
+                    state: state
+                        .attachments
+                        .state(active.daemon_epoch(), fence)
+                        .map_err(AttachmentManagerError::Attachment)?,
+                    operation: "renew attachment",
+                },
+            ));
+        }
+        let claim = state
+            .records
+            .get(fence)
+            .and_then(|record| record.claim.clone())
+            .ok_or(AttachmentManagerError::InconsistentState)?;
+        self.inner
+            .routes
+            .renew(&claim, self.inner.clock.now(), new_expires_at)
+            .map_err(AttachmentManagerError::Route)?;
+        let record = state
+            .records
+            .get_mut(fence)
+            .ok_or(AttachmentManagerError::InconsistentState)?;
+        record.lease_deadline.send_replace(new_expires_at);
+        record.signal();
+        Ok(())
     }
 
     pub async fn cancel(
@@ -606,6 +655,12 @@ enum RevokeAction {
     Wait(watch::Receiver<u64>),
 }
 
+enum ActorRevokeAction {
+    Own,
+    RetryExpiry,
+    Stop,
+}
+
 impl ManagerInner {
     fn lock_state(&self) -> MutexGuard<'_, ManagerState> {
         self.state
@@ -657,16 +712,27 @@ impl ManagerInner {
         }
     }
 
-    fn start_actor_revoke(&self, fence: &EgressFence, active: &ActiveAttachmentReceipt) -> bool {
+    fn start_actor_revoke(
+        &self,
+        fence: &EgressFence,
+        active: &ActiveAttachmentReceipt,
+        observed_expiry: Option<MonotonicMillis>,
+    ) -> ActorRevokeAction {
         let mut state = self.lock_state();
         let Some(record) = state.records.get(fence) else {
-            return false;
+            return ActorRevokeAction::Stop;
         };
         if record.phase != ManagedPhase::Active || record.active.as_ref() != Some(active) {
-            return false;
+            return ActorRevokeAction::Stop;
+        }
+        if let Some(observed_expiry) = observed_expiry {
+            let current_expiry = *record.lease_deadline.borrow();
+            if current_expiry != observed_expiry || current_expiry > self.clock.now() {
+                return ActorRevokeAction::RetryExpiry;
+            }
         }
         if state.attachments.begin_revoke(active).is_err() {
-            return false;
+            return ActorRevokeAction::Stop;
         }
         if let Some(claim) = state
             .records
@@ -676,13 +742,13 @@ impl ManagerInner {
             let _ = self.routes.revoke(claim);
         }
         let Some(record) = state.records.get_mut(fence) else {
-            return false;
+            return ActorRevokeAction::Stop;
         };
         record.phase = ManagedPhase::Revoking;
         record.cancellation.cancel();
         record.actor.take();
         record.signal();
-        true
+        ActorRevokeAction::Own
     }
 
     fn finish_active_revoke(
@@ -771,6 +837,7 @@ impl ManagedAttachment {
             released: None,
             cancellation: CancellationToken::new(),
             actor: None,
+            lease_deadline: watch::channel(MonotonicMillis::default()).0,
             changed: watch::channel(0).0,
         }
     }
@@ -811,24 +878,41 @@ async fn run_listener_actor(
     active: ActiveAttachmentReceipt,
     listener: RouteIngressListener,
     cancellation: CancellationToken,
-    ttl: Duration,
+    mut lease_deadline: watch::Receiver<MonotonicMillis>,
 ) {
     let Some(manager) = inner.upgrade() else {
         return;
     };
     let mut handlers = JoinSet::new();
-    let expiry = tokio::time::sleep(ttl);
-    tokio::pin!(expiry);
-    let actor_owns_revoke = loop {
+    let actor_owns_revoke = 'actor: loop {
+        let observed_expiry = *lease_deadline.borrow_and_update();
+        let ttl = observed_expiry
+            .value()
+            .saturating_sub(manager.clock.now().value());
+        let expiry = tokio::time::sleep(Duration::from_millis(ttl));
+        tokio::pin!(expiry);
         tokio::select! {
             biased;
             () = cancellation.cancelled() => break false,
+            changed = lease_deadline.changed() => {
+                if changed.is_err() {
+                    break false;
+                }
+                continue;
+            }
             () = &mut expiry => {
-                break manager.start_actor_revoke(&fence, &active);
+                match manager.start_actor_revoke(&fence, &active, Some(observed_expiry)) {
+                    ActorRevokeAction::Own => break true,
+                    ActorRevokeAction::RetryExpiry => continue,
+                    ActorRevokeAction::Stop => break false,
+                }
             }
             completed = handlers.join_next(), if !handlers.is_empty() => {
                 if matches!(completed, Some(Err(_))) {
-                    break manager.start_actor_revoke(&fence, &active);
+                    break 'actor matches!(
+                        manager.start_actor_revoke(&fence, &active, None),
+                        ActorRevokeAction::Own
+                    );
                 }
             }
             accepted = listener.accept(|| manager.clock.now()) => {
@@ -837,7 +921,12 @@ async fn run_listener_actor(
                         let handler = manager.handler.clone();
                         handlers.spawn(async move { handler.handle(ingress).await });
                     }
-                    Err(_) => break manager.start_actor_revoke(&fence, &active),
+                    Err(_) => {
+                        break 'actor matches!(
+                            manager.start_actor_revoke(&fence, &active, None),
+                            ActorRevokeAction::Own
+                        );
+                    }
                 }
             }
         }
