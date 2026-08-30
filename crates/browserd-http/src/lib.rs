@@ -28,8 +28,8 @@ use browserd_api::{
 use browserd_artifacts::DownloadToken;
 use browserd_auth::AuthenticatedPrincipal;
 use browserd_core::{
-    ActionId, ArtifactId, CreateOperationState, ErrorCode, IsolationProfile, OperationId, PageId,
-    RetryClass, SessionId, SessionLifecycle, WorkerId,
+    ActionId, ArtifactId, CreateOperationState, IsolationProfile, OperationId, PageId, RetryClass,
+    SessionId, SessionLifecycle, WorkerId,
 };
 use browserd_session::{ClientBinding, OwnershipFence, ReconnectToken, SessionTime};
 use browserd_viewer::ViewerTicket;
@@ -936,12 +936,6 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
     };
     let response = match result {
         Ok(response) => response,
-        Err(error) if error.code() == ErrorCode::ActionOutcomeUnknown => {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error":{"code":"internal","message":"request failed","retryable":false,"details":{},"trace_id":error.trace_id()},"trace_id":error.trace_id()}),
-            );
-        }
         Err(error) => {
             let status = StatusCode::from_u16(error.mapping().http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1109,6 +1103,50 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                     | browserd_core::ActionState::ReadyToDispatch
                     | browserd_core::ActionState::MayHaveExecuted
             );
+            let mut data = serde_json::Map::from_iter([
+                (
+                    "action_id".to_owned(),
+                    json!(envelope.data().action_id().to_string()),
+                ),
+                ("status".to_owned(), json!(state_name)),
+                (
+                    "session_sequence".to_owned(),
+                    json!(envelope.data().action_sequence().get()),
+                ),
+            ]);
+            match envelope.data().terminal_detail() {
+                Some(browserd_actions::TerminalDetail::FailedKnown(reason)) => {
+                    let reason = match reason {
+                        browserd_actions::KnownFailureReason::NotDispatched => "not_dispatched",
+                        browserd_actions::KnownFailureReason::BrowserRejected => "browser_rejected",
+                        browserd_actions::KnownFailureReason::PolicyDenied => "policy_denied",
+                        browserd_actions::KnownFailureReason::ApprovalDenied => "approval_denied",
+                        browserd_actions::KnownFailureReason::ApprovalTimedOut => {
+                            "approval_timed_out"
+                        }
+                    };
+                    data.insert("reason".to_owned(), json!(reason));
+                }
+                Some(browserd_actions::TerminalDetail::OutcomeUnknown(reason)) => {
+                    let reason = match reason {
+                        browserd_actions::OutcomeUnknownReason::AmbiguousTransportLoss => {
+                            "ambiguous_transport_loss"
+                        }
+                        browserd_actions::OutcomeUnknownReason::WorkerLost => "worker_lost",
+                        browserd_actions::OutcomeUnknownReason::TimeoutAfterDispatch => {
+                            "timeout_after_dispatch"
+                        }
+                    };
+                    data.insert("reason".to_owned(), json!(reason));
+                    data.insert("retryable".to_owned(), json!(false));
+                }
+                Some(
+                    browserd_actions::TerminalDetail::Succeeded(_)
+                    | browserd_actions::TerminalDetail::CancelledBeforeDispatch
+                    | browserd_actions::TerminalDetail::CancelledConfirmed,
+                )
+                | None => {}
+            }
             (
                 if method == Method::POST && pending {
                     StatusCode::ACCEPTED
@@ -1116,7 +1154,7 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                     StatusCode::OK
                 },
                 envelope.trace_id(),
-                json!({"action_id":envelope.data().action_id().to_string(),"status":state_name,"session_sequence":envelope.data().action_sequence().get()}),
+                serde_json::Value::Object(data),
             )
         }
         ApiResponse::Events(envelope) => (

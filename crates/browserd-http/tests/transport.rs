@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
+use browserd_actions::{
+    ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts, CanonicalRequestHash,
+    IdempotencyKey, KnownFailureReason, OutcomeUnknownReason, TerminalDetail,
+};
 use browserd_api::{
     ApiEnvelope, ApiError, ApiRequest, ApiResponse, ApiService, InMemoryApiService,
 };
@@ -15,7 +19,7 @@ use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
     ServiceTokenVerifier, VerificationKeySet,
 };
-use browserd_core::{ErrorCode, PrincipalId, SessionId, TenantId};
+use browserd_core::{ActionId, ErrorCode, PrincipalId, SessionId, TenantId};
 use browserd_http::{
     AuthenticationError, Authenticator, HttpConfig, Readiness, ViewerGateError, ViewerTransport,
     router,
@@ -103,6 +107,38 @@ impl ApiService for ErrorService {
         request.validate()?;
         Err(ApiError::new(self.0, "sensitive backend detail"))
     }
+}
+
+struct ActionSnapshotService(ActionSnapshot);
+
+impl ApiService for ActionSnapshotService {
+    fn execute(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+    ) -> Result<ApiResponse, ApiError> {
+        request.authorize(principal)?;
+        request.validate()?;
+        Ok(ApiResponse::Action(ApiEnvelope::new(self.0.clone())))
+    }
+}
+
+fn terminal_action_snapshot(
+    action_id: ActionId,
+    terminal_detail: TerminalDetail,
+) -> Result<ActionSnapshot, Box<dyn Error>> {
+    Ok(ActionSnapshot::from_facts(ActionSnapshotFacts {
+        action_id,
+        action_sequence: ActionSequence::new(42),
+        idempotency_key: IdempotencyKey::new(Uuid::new_v4().to_string()),
+        canonical_request_hash: CanonicalRequestHash::new([7; 32]),
+        kind: ActionKind::Mutating,
+        state: terminal_detail.state(),
+        dispatch_acknowledged: false,
+        approval_decision: None,
+        terminal_detail: Some(terminal_detail),
+        resolution: None,
+    })?)
 }
 
 struct CapabilityService {
@@ -298,7 +334,7 @@ async fn create_session_is_strict_bounded_and_returns_202() -> Result<(), Box<dy
 }
 
 #[tokio::test]
-async fn scope_errors_and_outcome_unknown_are_non_leaking() -> Result<(), Box<dyn Error>> {
+async fn scope_errors_are_non_leaking() -> Result<(), Box<dyn Error>> {
     let session_id = SessionId::new();
     let action_body = format!(
         r#"{{"page_id":"{}","if_session_incarnation":1,"execution_timeout_ms":30000,"action":{{"type":"evaluate","expression":"1+1"}}}}"#,
@@ -320,22 +356,62 @@ async fn scope_errors_and_outcome_unknown_are_non_leaking() -> Result<(), Box<dy
     )
     .await?;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
 
+#[tokio::test]
+async fn outcome_unknown_is_http_200_with_non_retryable_public_reason() -> Result<(), Box<dyn Error>>
+{
+    let session_id = SessionId::new();
+    let unknown_id = ActionId::new();
     let unknown = app(
-        Arc::new(ErrorService(ErrorCode::ActionOutcomeUnknown)),
+        Arc::new(ActionSnapshotService(terminal_action_snapshot(
+            unknown_id.clone(),
+            TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::WorkerLost),
+        )?)),
         principal(&["session:read"])?,
     )
     .oneshot(
         Request::builder()
-            .uri(format!("/v1/sessions/{session_id}"))
+            .uri(format!("/v1/sessions/{session_id}/actions/{unknown_id}"))
             .header("authorization", "Bearer valid")
             .body(Body::empty())?,
     )
     .await?;
-    assert_eq!(unknown.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(unknown.status(), StatusCode::OK);
     let json = body_json(unknown).await;
-    assert_eq!(json["error"]["code"], "internal");
-    assert!(!json.to_string().contains("sensitive backend detail"));
+    assert_eq!(json["data"]["action_id"], unknown_id.to_string());
+    assert_eq!(json["data"]["status"], "outcome_unknown");
+    assert_eq!(json["data"]["reason"], "worker_lost");
+    assert_eq!(json["data"]["retryable"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_known_exposes_not_dispatched_reason() -> Result<(), Box<dyn Error>> {
+    let session_id = SessionId::new();
+    let not_dispatched_id = ActionId::new();
+    let not_dispatched = app(
+        Arc::new(ActionSnapshotService(terminal_action_snapshot(
+            not_dispatched_id.clone(),
+            TerminalDetail::FailedKnown(KnownFailureReason::NotDispatched),
+        )?)),
+        principal(&["session:read"])?,
+    )
+    .oneshot(
+        Request::builder()
+            .uri(format!(
+                "/v1/sessions/{session_id}/actions/{not_dispatched_id}"
+            ))
+            .header("authorization", "Bearer valid")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(not_dispatched.status(), StatusCode::OK);
+    let json = body_json(not_dispatched).await;
+    assert_eq!(json["data"]["action_id"], not_dispatched_id.to_string());
+    assert_eq!(json["data"]["status"], "failed_known");
+    assert_eq!(json["data"]["reason"], "not_dispatched");
     Ok(())
 }
 
