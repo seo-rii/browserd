@@ -25,6 +25,7 @@ browserd-session = { path = "../browserd-session" }
 browserd-targets = { path = "../browserd-targets" }
 browserd-viewer = { path = "../browserd-viewer" }
 futures.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -34,5 +35,4 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-nix.workspace = true
 tempfile.workspace = true

@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::io;
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -21,6 +24,9 @@ use browserd_policy::{
     CredentialRefsHash, NodeReference, Origin,
 };
 use browserd_session::{OwnershipFence, SessionLifecycle, SessionTime};
+use nix::fcntl::{Flock, FlockArg, OFlag, open};
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
+use nix::unistd::Uid;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -1434,38 +1440,208 @@ pub struct WorkerRpcServer<H> {
     config: WorkerRpcConfig,
     handler: Arc<H>,
     connection_slots: Arc<Semaphore>,
+    _socket_ownership: ServiceSocketOwnership,
+}
+
+struct OwnedSocketPath {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    _path_pin: OwnedFd,
+}
+
+impl Drop for OwnedSocketPath {
+    fn drop(&mut self) {
+        let Ok(metadata) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if metadata.file_type().is_socket()
+            && metadata.dev() == self.dev
+            && metadata.ino() == self.ino
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct ServiceSocketOwnership {
+    _singleton_lock: Flock<OwnedFd>,
+    _socket_path: OwnedSocketPath,
 }
 
 impl<H: WorkerRpcHandler> WorkerRpcServer<H> {
     pub async fn bind(config: WorkerRpcConfig, handler: Arc<H>) -> Result<Self, WorkerRpcError> {
-        let listener = UnixListener::bind(&config.socket_path)
+        let parent = config
+            .socket_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or(WorkerRpcError::InvalidConfig)?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let parent_metadata = canonical_parent
+            .metadata()
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let effective_uid = Uid::effective().as_raw();
+        if canonical_parent != parent
+            || !parent_metadata.is_dir()
+            || parent_metadata.uid() != effective_uid
+            || parent_metadata.mode() & 0o022 != 0
+        {
+            return Err(WorkerRpcError::InvalidConfig);
+        }
+
+        let mut lock_path = config.socket_path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let lock_fd = open(
+            &lock_path,
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let lock_metadata =
+            fstat(&lock_fd).map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        if !SFlag::from_bits_truncate(lock_metadata.st_mode).contains(SFlag::S_IFREG)
+            || lock_metadata.st_uid != effective_uid
+            || lock_metadata.st_nlink != 1
+        {
+            return Err(WorkerRpcError::InvalidConfig);
+        }
+        fchmod(&lock_fd, Mode::from_bits_truncate(0o600))
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let singleton_lock = Flock::lock(lock_fd, FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, error)| WorkerRpcError::Io(error.to_string()))?;
+        let locked_metadata =
+            fstat(&*singleton_lock).map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let lock_path_metadata = std::fs::symlink_metadata(&lock_path)
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        if !lock_path_metadata.file_type().is_file()
+            || lock_path_metadata.uid() != effective_uid
+            || lock_path_metadata.mode() & 0o777 != 0o600
+            || lock_path_metadata.dev() != locked_metadata.st_dev
+            || lock_path_metadata.ino() != locked_metadata.st_ino
+        {
+            return Err(WorkerRpcError::InvalidConfig);
+        }
+
+        match std::fs::symlink_metadata(&config.socket_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(WorkerRpcError::Io(error.to_string())),
+            Ok(metadata) => {
+                if !metadata.file_type().is_socket()
+                    || metadata.uid() != effective_uid
+                    || metadata.mode() & 0o777 != 0o600
+                {
+                    return Err(WorkerRpcError::InvalidConfig);
+                }
+                match std::os::unix::net::UnixStream::connect(&config.socket_path) {
+                    Ok(_) => {
+                        return Err(WorkerRpcError::Io(
+                            "another worker RPC server is already listening".to_owned(),
+                        ));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                        ) => {}
+                    Err(error) => return Err(WorkerRpcError::Io(error.to_string())),
+                }
+                std::fs::remove_file(&config.socket_path)
+                    .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+            }
+        }
+
+        let listener = std::os::unix::net::UnixListener::bind(&config.socket_path)
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let metadata = std::fs::symlink_metadata(&config.socket_path)
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        if !metadata.file_type().is_socket() {
+            return Err(WorkerRpcError::Protocol);
+        }
+        let path_pin = open(
+            &config.socket_path,
+            OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let pinned_metadata =
+            fstat(&path_pin).map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        if pinned_metadata.st_dev != metadata.dev() || pinned_metadata.st_ino != metadata.ino() {
+            return Err(WorkerRpcError::Protocol);
+        }
+        let socket_path = OwnedSocketPath {
+            path: config.socket_path.clone(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            _path_pin: path_pin,
+        };
+        std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let private_metadata = std::fs::symlink_metadata(&config.socket_path)
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        if !private_metadata.file_type().is_socket()
+            || private_metadata.mode() & 0o777 != 0o600
+            || private_metadata.dev() != metadata.dev()
+            || private_metadata.ino() != metadata.ino()
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+        let listener = UnixListener::from_std(listener)
             .map_err(|error| WorkerRpcError::Io(error.to_string()))?;
         Ok(Self {
             listener,
             connection_slots: Arc::new(Semaphore::new(config.max_connections)),
             config,
             handler,
+            _socket_ownership: ServiceSocketOwnership {
+                _singleton_lock: singleton_lock,
+                _socket_path: socket_path,
+            },
         })
     }
 
     pub async fn serve(self, shutdown: CancellationToken) -> Result<(), WorkerRpcError> {
-        loop {
+        let mut connections = JoinSet::new();
+        let primary_error = loop {
             let accepted = tokio::select! {
                 biased;
-                () = shutdown.cancelled() => return Ok(()),
+                () = shutdown.cancelled() => break None,
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    if joined.is_some_and(|result| result.is_err()) {
+                        break Some(WorkerRpcError::Runtime);
+                    }
+                    continue;
+                }
                 accepted = self.listener.accept() => accepted,
             };
-            let (stream, _) = accepted.map_err(|error| WorkerRpcError::Io(error.to_string()))?;
+            let (stream, _) = match accepted {
+                Ok(accepted) => accepted,
+                Err(error) => break Some(WorkerRpcError::Io(error.to_string())),
+            };
             let Ok(slot) = self.connection_slots.clone().try_acquire_owned() else {
                 drop(stream);
                 continue;
             };
             let config = self.config.clone();
             let handler = self.handler.clone();
-            tokio::spawn(async move {
+            connections.spawn(async move {
                 let _slot = slot;
                 let _ = handle_connection(stream, config, handler).await;
             });
+        };
+        let mut drain_failed = false;
+        while let Some(result) = connections.join_next().await {
+            drain_failed |= result.is_err();
+        }
+        match primary_error {
+            Some(error) => Err(error),
+            None if drain_failed => Err(WorkerRpcError::Runtime),
+            None => Ok(()),
         }
     }
 }
@@ -2074,7 +2250,12 @@ async fn handle_connection<H: WorkerRpcHandler>(
         response,
     })
     .map_err(|error| WorkerRpcError::Serialization(error.to_string()))?;
-    write_frame(&mut stream, &encoded, config.max_frame_bytes).await
+    tokio::time::timeout(
+        config.request_timeout,
+        write_frame(&mut stream, &encoded, config.max_frame_bytes),
+    )
+    .await
+    .map_err(|_| WorkerRpcError::Timeout)?
 }
 
 fn authenticate_peer(stream: &UnixStream, expected_uid: u32) -> Result<(), WorkerRpcError> {
