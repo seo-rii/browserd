@@ -1084,6 +1084,63 @@ async fn partial_cleanup_retries_only_failed_stages_before_claiming_termination(
     );
 }
 
+#[tokio::test]
+async fn lease_sweeper_retries_incomplete_cleanup_without_a_live_worker() {
+    let backend = RetryCleanupBackend {
+        revoke_failures_remaining: Arc::new(AtomicUsize::new(1)),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let supervisor = SandboxSupervisor::new(config(), backend.clone());
+    let shard_id = ShardId::new();
+    let now = Instant::now();
+    assert_eq!(
+        supervisor
+            .create_shard(
+                launch_spec(shard_id.clone()),
+                WorkerOwnership::new(worker(), 17, now + Duration::from_secs(10)),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created)
+    );
+
+    assert_eq!(
+        supervisor
+            .expire_leases(now + Duration::from_secs(10))
+            .await,
+        vec![(
+            shard_id.clone(),
+            CleanupResult {
+                route_revoked: false,
+                cgroup_killed: true,
+                namespaces_cleaned: true,
+            }
+        )]
+    );
+    assert_eq!(
+        supervisor
+            .expire_leases(now + Duration::from_secs(11))
+            .await,
+        vec![(
+            shard_id.clone(),
+            CleanupResult {
+                route_revoked: true,
+                cgroup_killed: true,
+                namespaces_cleaned: true,
+            }
+        )]
+    );
+    assert!(
+        supervisor
+            .expire_leases(now + Duration::from_secs(12))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        backend.events.lock().unwrap().as_slice(),
+        ["revoke", "kill", "namespaces", "revoke"]
+    );
+}
+
 #[derive(Clone)]
 struct PanickingFirstRevokeBackend {
     revoke_calls: Arc<AtomicUsize>,

@@ -1114,7 +1114,7 @@ where
     pub async fn expire_leases(&self, now: Instant) -> Vec<(ShardId, CleanupResult)> {
         let expired = {
             let mut state = self.state.lock().await;
-            let expired = state
+            let mut expired = state
                 .active
                 .iter()
                 .filter_map(|(shard_id, active)| {
@@ -1125,6 +1125,13 @@ where
                     ))
                 })
                 .collect::<Vec<_>>();
+            expired.extend(state.cleaning.iter().filter_map(|(shard_id, cleaning)| {
+                (!cleaning.in_progress).then_some((
+                    shard_id.clone(),
+                    cleaning.worker_epoch,
+                    cleaning.launch_spec.launch_generation(),
+                ))
+            }));
             let expired_provisioning = state
                 .provisioning
                 .iter()
