@@ -34,6 +34,11 @@ fn valid_environment() -> HashMap<&'static str, String> {
             "postgresql://browserd:secret@db.internal/browserd".to_owned(),
         ),
         (
+            "BROWSERD_REDIS_URL",
+            "redis://:secret@redis.internal/0".to_owned(),
+        ),
+        ("BROWSERD_REDIS_PREFIX", "browserd-prod".to_owned()),
+        (
             "BROWSERD_VIEWER_ORIGINS",
             "https://viewer.example,https://ops.example".to_owned(),
         ),
@@ -79,6 +84,8 @@ fn parses_a_complete_fail_closed_production_configuration() {
         config.postgres_url(),
         "postgresql://browserd:secret@db.internal/browserd"
     );
+    assert_eq!(config.redis_url(), "redis://:secret@redis.internal/0");
+    assert_eq!(config.redis_prefix(), "browserd-prod");
     assert_eq!(config.viewer_origins().len(), 2);
     assert_eq!(config.worker_rpc_queue(), 64);
     assert_eq!(config.worker_rpc_in_flight(), 8);
@@ -96,6 +103,7 @@ fn parses_a_complete_fail_closed_production_configuration() {
     let debug = format!("{config:?}");
     assert!(!debug.contains("0123456789abcdef"));
     assert!(!debug.contains("browserd:secret"));
+    assert!(!debug.contains(":secret@redis"));
 }
 
 #[test]
@@ -110,6 +118,8 @@ fn rejects_public_bind_without_tls_trust_and_every_missing_security_identity() {
         "BROWSERD_WORKER_EPOCH",
         "BROWSERD_PLACEMENT_VERSION",
         "BROWSERD_POSTGRES_URL",
+        "BROWSERD_REDIS_URL",
+        "BROWSERD_REDIS_PREFIX",
         "BROWSERD_VIEWER_ORIGINS",
     ];
     for name in required {
@@ -138,6 +148,8 @@ fn rejects_weak_ambiguous_or_unbounded_values() {
         ("BROWSERD_WORKER_EPOCH", "0"),
         ("BROWSERD_PLACEMENT_VERSION", "0"),
         ("BROWSERD_POSTGRES_URL", "http://db.internal/browserd"),
+        ("BROWSERD_REDIS_URL", "http://redis.internal/0"),
+        ("BROWSERD_REDIS_PREFIX", "browserd prod"),
         ("BROWSERD_VIEWER_ORIGINS", "https://viewer.example,"),
         ("BROWSERD_WORKER_RPC_QUEUE", "0"),
         ("BROWSERD_WORKER_RPC_IN_FLIGHT", "65"),

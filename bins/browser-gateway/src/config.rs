@@ -48,6 +48,8 @@ pub struct GatewayProcessConfig {
     worker_epoch: u64,
     placement_version: u64,
     postgres_url: String,
+    redis_url: String,
+    redis_prefix: String,
     viewer_origins: Vec<String>,
     worker_rpc_queue: usize,
     worker_rpc_in_flight: usize,
@@ -75,6 +77,8 @@ impl fmt::Debug for GatewayProcessConfig {
             .field("worker_epoch", &self.worker_epoch)
             .field("placement_version", &self.placement_version)
             .field("postgres_url", &"[REDACTED]")
+            .field("redis_url", &"[REDACTED]")
+            .field("redis_prefix", &self.redis_prefix)
             .field("viewer_origins", &self.viewer_origins)
             .field("worker_rpc_queue", &self.worker_rpc_queue)
             .field("worker_rpc_in_flight", &self.worker_rpc_in_flight)
@@ -137,6 +141,21 @@ impl GatewayProcessConfig {
                 || postgres_url.starts_with("postgresql://"))
         {
             return Err(GatewayProcessConfigError::Invalid("BROWSERD_POSTGRES_URL"));
+        }
+        let redis_url = required(&mut lookup, "BROWSERD_REDIS_URL")?;
+        if redis_url.len() > MAX_DATABASE_URL_BYTES
+            || redis_url.chars().any(char::is_whitespace)
+            || !(redis_url.starts_with("redis://") || redis_url.starts_with("rediss://"))
+        {
+            return Err(GatewayProcessConfigError::Invalid("BROWSERD_REDIS_URL"));
+        }
+        let redis_prefix = required_text(&mut lookup, "BROWSERD_REDIS_PREFIX")?;
+        if redis_prefix.len() > 128
+            || !redis_prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_:".contains(&byte))
+        {
+            return Err(GatewayProcessConfigError::Invalid("BROWSERD_REDIS_PREFIX"));
         }
         let viewer_origins = parse_origins(required(&mut lookup, "BROWSERD_VIEWER_ORIGINS")?)?;
 
@@ -217,6 +236,8 @@ impl GatewayProcessConfig {
             worker_epoch,
             placement_version,
             postgres_url,
+            redis_url,
+            redis_prefix,
             viewer_origins,
             worker_rpc_queue,
             worker_rpc_in_flight,
@@ -283,6 +304,16 @@ impl GatewayProcessConfig {
     #[must_use]
     pub fn postgres_url(&self) -> &str {
         &self.postgres_url
+    }
+
+    #[must_use]
+    pub fn redis_url(&self) -> &str {
+        &self.redis_url
+    }
+
+    #[must_use]
+    pub fn redis_prefix(&self) -> &str {
+        &self.redis_prefix
     }
 
     #[must_use]
