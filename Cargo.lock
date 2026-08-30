@@ -259,6 +259,7 @@ name = "browser-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "browserd-actions",
  "browserd-api",
@@ -484,6 +485,7 @@ dependencies = [
 name = "browserd-http"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64",
  "browserd-actions",
@@ -502,6 +504,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tower",
  "url",
  "uuid",

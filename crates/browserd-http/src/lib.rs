@@ -2,12 +2,14 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
-use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade, close_code};
 use axum::extract::{FromRequest, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, COOKIE, ORIGIN};
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
@@ -28,15 +30,16 @@ use browserd_api::{
 use browserd_artifacts::DownloadToken;
 use browserd_auth::AuthenticatedPrincipal;
 use browserd_core::{
-    ActionId, ArtifactId, CreateOperationState, IsolationProfile, OperationId, PageId, RetryClass,
-    SessionId, SessionLifecycle, WorkerId,
+    ActionId, ArtifactId, CreateOperationState, IsolationProfile, OperationId, PageId,
+    PlacementFence, RetryClass, SessionId, SessionLifecycle, WorkerId,
 };
 use browserd_session::{ClientBinding, OwnershipFence, ReconnectToken, SessionTime};
-use browserd_viewer::ViewerTicket;
+use browserd_viewer::{ViewerConnection, ViewerFrame, ViewerTicket};
 use chrono::Utc;
-use futures::SinkExt;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const GLOBAL_BODY_LIMIT: usize = 262_144;
@@ -58,15 +61,152 @@ pub enum ViewerGateError {
     TicketDenied,
 }
 
+impl fmt::Display for ViewerGateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "viewer gate rejected the connection: {self:?}")
+    }
+}
+
+impl std::error::Error for ViewerGateError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewerAttachError {
+    StalePlacement,
+    CapacityExceeded,
+    BackendUnavailable,
+}
+
+impl fmt::Display for ViewerAttachError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "viewer attachment failed: {self:?}")
+    }
+}
+
+impl std::error::Error for ViewerAttachError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewerClientMessageError {
+    Unsupported,
+    Invalid,
+    BackendUnavailable,
+}
+
+impl fmt::Display for ViewerClientMessageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "viewer client message was rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for ViewerClientMessageError {}
+
+pub struct ConsumedViewerGrant {
+    connection: ViewerConnection,
+    placement_fence: PlacementFence,
+}
+
+impl ConsumedViewerGrant {
+    pub fn new(
+        connection: ViewerConnection,
+        placement_fence: PlacementFence,
+    ) -> Result<Self, ViewerGateError> {
+        if placement_fence.worker_epoch == 0
+            || placement_fence.placement_version == 0
+            || placement_fence.session_incarnation == 0
+            || connection.session_incarnation() != placement_fence.session_incarnation
+        {
+            return Err(ViewerGateError::TicketDenied);
+        }
+        Ok(Self {
+            connection,
+            placement_fence,
+        })
+    }
+
+    #[must_use]
+    pub const fn connection(&self) -> &ViewerConnection {
+        &self.connection
+    }
+
+    #[must_use]
+    pub const fn placement_fence(&self) -> PlacementFence {
+        self.placement_fence
+    }
+}
+
+#[async_trait]
+pub trait AttachedViewer: Send + Sync {
+    fn connection(&self) -> &ViewerConnection;
+
+    fn placement_fence(&self) -> PlacementFence;
+
+    fn next_frame(&self) -> Result<Option<ViewerFrame>, ViewerAttachError>;
+
+    fn take_server_messages(&self) -> Result<mpsc::Receiver<Vec<u8>>, ViewerAttachError>;
+
+    async fn receive_text(&self, message: &[u8]) -> Result<(), ViewerClientMessageError>;
+
+    async fn cancelled(&self);
+
+    async fn disconnect(&self);
+
+    fn abort(&self);
+}
+
+struct AttachedViewerGuard {
+    attachment: Box<dyn AttachedViewer>,
+    settled: bool,
+}
+
+impl AttachedViewerGuard {
+    fn new(attachment: Box<dyn AttachedViewer>) -> Self {
+        Self {
+            attachment,
+            settled: false,
+        }
+    }
+
+    fn attachment(&self) -> &dyn AttachedViewer {
+        self.attachment.as_ref()
+    }
+
+    fn abort(&mut self) {
+        if !self.settled {
+            self.attachment.abort();
+            self.settled = true;
+        }
+    }
+
+    async fn shutdown(mut self, timeout_duration: Duration) {
+        if tokio::time::timeout(timeout_duration, self.attachment.disconnect())
+            .await
+            .is_ok()
+        {
+            self.settled = true;
+        } else {
+            self.abort();
+        }
+    }
+}
+
+impl Drop for AttachedViewerGuard {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+#[async_trait]
 pub trait ViewerTransport: Send + Sync {
-    fn consume_ticket(
+    async fn consume_ticket(
         &self,
         session_id: &SessionId,
         origin: &str,
         ticket: &str,
-    ) -> Result<(), ViewerGateError>;
+    ) -> Result<ConsumedViewerGrant, ViewerGateError>;
 
-    fn connected(&self, session_id: SessionId);
+    async fn attach(
+        &self,
+        grant: ConsumedViewerGrant,
+    ) -> Result<Box<dyn AttachedViewer>, ViewerAttachError>;
 
     fn present_viewer_ticket(&self, _ticket: &ViewerTicket) -> Option<String> {
         None
@@ -77,6 +217,36 @@ pub trait ViewerTransport: Send + Sync {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ViewerSocketLimits {
+    max_client_message_bytes: usize,
+    send_timeout: Duration,
+}
+
+impl ViewerSocketLimits {
+    pub fn new(max_client_message_bytes: usize, send_timeout: Duration) -> Result<Self, ApiError> {
+        if !(1..=1_048_576).contains(&max_client_message_bytes)
+            || send_timeout.is_zero()
+            || send_timeout > Duration::from_secs(60)
+        {
+            return Err(ApiError::invalid_request("invalid viewer socket limits"));
+        }
+        Ok(Self {
+            max_client_message_bytes,
+            send_timeout,
+        })
+    }
+}
+
+impl Default for ViewerSocketLimits {
+    fn default() -> Self {
+        Self {
+            max_client_message_bytes: 65_536,
+            send_timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 pub trait Readiness: Send + Sync {
     fn ready(&self) -> bool;
 }
@@ -84,12 +254,14 @@ pub trait Readiness: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct HttpConfig {
     global_body_limit: usize,
+    viewer_socket_limits: ViewerSocketLimits,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             global_body_limit: GLOBAL_BODY_LIMIT,
+            viewer_socket_limits: ViewerSocketLimits::default(),
         }
     }
 }
@@ -99,7 +271,16 @@ impl HttpConfig {
         if !(ACTION_BODY_LIMIT..=1_048_576).contains(&global_body_limit) {
             return Err(ApiError::invalid_request("invalid HTTP body limit"));
         }
-        Ok(Self { global_body_limit })
+        Ok(Self {
+            global_body_limit,
+            viewer_socket_limits: ViewerSocketLimits::default(),
+        })
+    }
+
+    #[must_use]
+    pub const fn with_viewer_socket_limits(mut self, limits: ViewerSocketLimits) -> Self {
+        self.viewer_socket_limits = limits;
+        self
     }
 }
 
@@ -110,6 +291,7 @@ struct HttpState {
     viewer: Arc<dyn ViewerTransport>,
     readiness: Arc<dyn Readiness>,
     global_body_limit: usize,
+    viewer_socket_limits: ViewerSocketLimits,
 }
 
 pub fn router(
@@ -130,6 +312,7 @@ pub fn router(
             viewer,
             readiness,
             global_body_limit: config.global_body_limit,
+            viewer_socket_limits: config.viewer_socket_limits,
         })
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(from_fn(request_id_middleware))
@@ -378,22 +561,245 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
             Ok(value) => value,
             Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
         };
-        if let Err(error) = state.viewer.consume_ticket(&session_id, &origin, &ticket) {
-            return match error {
-                ViewerGateError::OriginDenied => {
-                    transport_error(StatusCode::FORBIDDEN, "permission_denied")
-                }
-                ViewerGateError::TicketDenied => {
-                    transport_error(StatusCode::UNAUTHORIZED, "unauthenticated")
-                }
-            };
-        }
+        let grant = match state
+            .viewer
+            .consume_ticket(&session_id, &origin, &ticket)
+            .await
+        {
+            Ok(grant) => grant,
+            Err(error) => {
+                return match error {
+                    ViewerGateError::OriginDenied => {
+                        transport_error(StatusCode::FORBIDDEN, "permission_denied")
+                    }
+                    ViewerGateError::TicketDenied => {
+                        transport_error(StatusCode::UNAUTHORIZED, "unauthenticated")
+                    }
+                };
+            }
+        };
+        let expected_connection = grant.connection().clone();
+        let expected_fence = grant.placement_fence();
         let viewer = Arc::clone(&state.viewer);
+        let limits = state.viewer_socket_limits;
         return upgrade
+            .max_message_size(limits.max_client_message_bytes)
+            .max_frame_size(limits.max_client_message_bytes)
             .protocols([VIEWER_PROTOCOL])
             .on_upgrade(move |mut socket| async move {
-                viewer.connected(session_id);
-                let _ = socket.close().await;
+                let attachment = match viewer.attach(grant).await {
+                    Ok(attachment)
+                        if attachment.connection() == &expected_connection
+                            && attachment.placement_fence() == expected_fence =>
+                    {
+                        AttachedViewerGuard::new(attachment)
+                    }
+                    Ok(attachment) => {
+                        let attachment = AttachedViewerGuard::new(attachment);
+                        let close = Message::Close(Some(CloseFrame {
+                            code: close_code::ERROR,
+                            reason: "viewer binding mismatch".into(),
+                        }));
+                        let _result =
+                            tokio::time::timeout(limits.send_timeout, socket.send(close)).await;
+                        attachment.shutdown(limits.send_timeout).await;
+                        return;
+                    }
+                    Err(_) => {
+                        let close = Message::Close(Some(CloseFrame {
+                            code: close_code::ERROR,
+                            reason: "viewer attachment failed".into(),
+                        }));
+                        let _result =
+                            tokio::time::timeout(limits.send_timeout, socket.send(close)).await;
+                        return;
+                    }
+                };
+                let mut server_messages = match attachment.attachment().take_server_messages() {
+                    Ok(messages) => messages,
+                    Err(_) => {
+                        let close = Message::Close(Some(CloseFrame {
+                            code: close_code::ERROR,
+                            reason: "viewer message source failed".into(),
+                        }));
+                        let _result =
+                            tokio::time::timeout(limits.send_timeout, socket.send(close)).await;
+                        attachment.shutdown(limits.send_timeout).await;
+                        return;
+                    }
+                };
+                let mut frames = tokio::time::interval(Duration::from_millis(83));
+                frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let closing = {
+                    let attached = attachment.attachment();
+                    let cancellation = attached.cancelled();
+                    tokio::pin!(cancellation);
+                    let mut closing = None;
+                    loop {
+                        tokio::select! {
+                            () = &mut cancellation => {
+                                closing = Some(CloseFrame {
+                                    code: close_code::AWAY,
+                                    reason: "viewer cancelled".into(),
+                                });
+                                break;
+                            }
+                            incoming = socket.next() => {
+                                match incoming {
+                                    Some(Ok(Message::Text(message))) => {
+                                        if message.len() > limits.max_client_message_bytes {
+                                            closing = Some(CloseFrame {
+                                                code: close_code::SIZE,
+                                                reason: "viewer message too large".into(),
+                                            });
+                                            break;
+                                        }
+                                        let delivery = tokio::time::timeout(
+                                            limits.send_timeout,
+                                            attached.receive_text(message.as_bytes()),
+                                        )
+                                        .await;
+                                        match delivery {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(ViewerClientMessageError::Unsupported)) => {
+                                                closing = Some(CloseFrame {
+                                                    code: close_code::UNSUPPORTED,
+                                                    reason: "unsupported viewer message".into(),
+                                                });
+                                                break;
+                                            }
+                                            Ok(Err(ViewerClientMessageError::Invalid)) => {
+                                                closing = Some(CloseFrame {
+                                                    code: close_code::POLICY,
+                                                    reason: "invalid viewer message".into(),
+                                                });
+                                                break;
+                                            }
+                                            Ok(Err(ViewerClientMessageError::BackendUnavailable))
+                                            | Err(_) => {
+                                                closing = Some(CloseFrame {
+                                                    code: close_code::ERROR,
+                                                    reason: "viewer backend unavailable".into(),
+                                                });
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Some(Ok(Message::Binary(message))) => {
+                                        closing = Some(if message.len() > limits.max_client_message_bytes {
+                                            CloseFrame {
+                                                code: close_code::SIZE,
+                                                reason: "viewer message too large".into(),
+                                            }
+                                        } else {
+                                            CloseFrame {
+                                                code: close_code::UNSUPPORTED,
+                                                reason: "binary client messages are unsupported".into(),
+                                            }
+                                        });
+                                        break;
+                                    }
+                                    Some(Ok(Message::Close(_))) | None => break,
+                                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                                    Some(Err(_)) => {
+                                        closing = Some(CloseFrame {
+                                            code: close_code::SIZE,
+                                            reason: "viewer message exceeded parser limits".into(),
+                                        });
+                                        break;
+                                    }
+                                }
+                            }
+                            message = server_messages.recv() => {
+                                let Some(message) = message else {
+                                    closing = Some(CloseFrame {
+                                        code: close_code::ERROR,
+                                        reason: "viewer message source closed".into(),
+                                    });
+                                    break;
+                                };
+                                if message.len() > limits.max_client_message_bytes {
+                                    closing = Some(CloseFrame {
+                                        code: close_code::ERROR,
+                                        reason: "viewer server message is too large".into(),
+                                    });
+                                    break;
+                                }
+                                let Ok(message) = String::from_utf8(message) else {
+                                    closing = Some(CloseFrame {
+                                        code: close_code::ERROR,
+                                        reason: "viewer server message is invalid".into(),
+                                    });
+                                    break;
+                                };
+                                match tokio::time::timeout(
+                                    limits.send_timeout,
+                                    socket.send(Message::Text(message.into())),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) | Err(_) => break,
+                                }
+                            }
+                            _ = frames.tick() => {
+                                let frame = match attached.next_frame() {
+                                    Ok(Some(frame)) => frame,
+                                    Ok(None) => continue,
+                                    Err(_) => {
+                                        closing = Some(CloseFrame {
+                                            code: close_code::ERROR,
+                                            reason: "viewer frame source failed".into(),
+                                        });
+                                        break;
+                                    }
+                                };
+                                let Ok(metadata_len) = u32::try_from(frame.metadata().len()) else {
+                                    closing = Some(CloseFrame {
+                                        code: close_code::ERROR,
+                                        reason: "viewer frame metadata is too large".into(),
+                                    });
+                                    break;
+                                };
+                                let Some(capacity) = 21_usize
+                                    .checked_add(frame.metadata().len())
+                                    .and_then(|length| length.checked_add(frame.jpeg_payload().len()))
+                                else {
+                                    closing = Some(CloseFrame {
+                                        code: close_code::ERROR,
+                                        reason: "viewer frame is too large".into(),
+                                    });
+                                    break;
+                                };
+                                let mut payload = Vec::with_capacity(capacity);
+                                payload.push(1);
+                                payload.extend_from_slice(&frame.frame_id().to_be_bytes());
+                                payload.extend_from_slice(&frame.transform_epoch().to_be_bytes());
+                                payload.extend_from_slice(&metadata_len.to_be_bytes());
+                                payload.extend_from_slice(frame.metadata());
+                                payload.extend_from_slice(frame.jpeg_payload());
+                                match tokio::time::timeout(
+                                    limits.send_timeout,
+                                    socket.send(Message::Binary(payload.into())),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) | Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    closing
+                };
+                if let Some(close) = closing {
+                    let _result = tokio::time::timeout(
+                        limits.send_timeout,
+                        socket.send(Message::Close(Some(close))),
+                    )
+                    .await;
+                }
+                attachment.shutdown(limits.send_timeout).await;
             });
     }
 

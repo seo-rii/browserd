@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use browserd_actions::{
     ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts, CanonicalRequestHash,
@@ -19,10 +20,10 @@ use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
     ServiceTokenVerifier, VerificationKeySet,
 };
-use browserd_core::{ActionId, ErrorCode, PrincipalId, SessionId, TenantId};
+use browserd_core::{ActionId, ErrorCode, PlacementFence, PrincipalId, SessionId, TenantId};
 use browserd_http::{
-    AuthenticationError, Authenticator, HttpConfig, Readiness, ViewerGateError, ViewerTransport,
-    router,
+    AuthenticationError, Authenticator, ConsumedViewerGrant, HttpConfig, Readiness,
+    ViewerAttachError, ViewerGateError, ViewerTransport, router,
 };
 use browserd_viewer::{TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -50,23 +51,54 @@ impl Authenticator for StaticAuth {
 #[derive(Default)]
 struct RejectViewer;
 
+fn viewer_grant(
+    session_id: &SessionId,
+    origin: &str,
+) -> Result<ConsumedViewerGrant, ViewerGateError> {
+    let tenant_id = TenantId::new();
+    let registry = TicketRegistry::new(
+        TicketPolicy::new(Duration::from_secs(30), [origin])
+            .map_err(|_| ViewerGateError::TicketDenied)?,
+    );
+    let ticket = registry
+        .issue(
+            tenant_id.clone(),
+            session_id.clone(),
+            1,
+            ViewerScopes::new(true, false, false),
+            1_000,
+            Duration::from_secs(10),
+        )
+        .map_err(|_| ViewerGateError::TicketDenied)?;
+    let connection = registry
+        .consume(&ticket, &tenant_id, session_id, 1, origin, 1_001)
+        .map_err(|_| ViewerGateError::TicketDenied)?;
+    ConsumedViewerGrant::new(connection, PlacementFence::new(1, 1, 1))
+}
+
+#[async_trait]
 impl ViewerTransport for RejectViewer {
-    fn consume_ticket(
+    async fn consume_ticket(
         &self,
-        _session_id: &SessionId,
+        session_id: &SessionId,
         origin: &str,
         ticket: &str,
-    ) -> Result<(), ViewerGateError> {
+    ) -> Result<ConsumedViewerGrant, ViewerGateError> {
         if origin != "https://console.example" {
             return Err(ViewerGateError::OriginDenied);
         }
         if ticket != "valid-ticket" {
             return Err(ViewerGateError::TicketDenied);
         }
-        Ok(())
+        viewer_grant(session_id, origin)
     }
 
-    fn connected(&self, _session_id: SessionId) {}
+    async fn attach(
+        &self,
+        _grant: ConsumedViewerGrant,
+    ) -> Result<Box<dyn browserd_http::AttachedViewer>, ViewerAttachError> {
+        Err(ViewerAttachError::BackendUnavailable)
+    }
 }
 
 struct StaticReadiness(bool);
@@ -81,18 +113,24 @@ struct CountingViewer {
     consumed: Arc<AtomicBool>,
 }
 
+#[async_trait]
 impl ViewerTransport for CountingViewer {
-    fn consume_ticket(
+    async fn consume_ticket(
         &self,
-        _session_id: &SessionId,
-        _origin: &str,
+        session_id: &SessionId,
+        origin: &str,
         _ticket: &str,
-    ) -> Result<(), ViewerGateError> {
+    ) -> Result<ConsumedViewerGrant, ViewerGateError> {
         self.consumed.store(true, Ordering::SeqCst);
-        Ok(())
+        viewer_grant(session_id, origin)
     }
 
-    fn connected(&self, _session_id: SessionId) {}
+    async fn attach(
+        &self,
+        _grant: ConsumedViewerGrant,
+    ) -> Result<Box<dyn browserd_http::AttachedViewer>, ViewerAttachError> {
+        Err(ViewerAttachError::BackendUnavailable)
+    }
 }
 
 struct ErrorService(ErrorCode);
@@ -171,17 +209,23 @@ struct CapabilityViewer {
     download_token: DownloadToken,
 }
 
+#[async_trait]
 impl ViewerTransport for CapabilityViewer {
-    fn consume_ticket(
+    async fn consume_ticket(
         &self,
-        _session_id: &SessionId,
-        _origin: &str,
+        session_id: &SessionId,
+        origin: &str,
         _ticket: &str,
-    ) -> Result<(), ViewerGateError> {
-        Ok(())
+    ) -> Result<ConsumedViewerGrant, ViewerGateError> {
+        viewer_grant(session_id, origin)
     }
 
-    fn connected(&self, _session_id: SessionId) {}
+    async fn attach(
+        &self,
+        _grant: ConsumedViewerGrant,
+    ) -> Result<Box<dyn browserd_http::AttachedViewer>, ViewerAttachError> {
+        Err(ViewerAttachError::BackendUnavailable)
+    }
 
     fn present_viewer_ticket(&self, ticket: &ViewerTicket) -> Option<String> {
         (ticket == &self.viewer_ticket).then(|| "viewer-capability".to_owned())

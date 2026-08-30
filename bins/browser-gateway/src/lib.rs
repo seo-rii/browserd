@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use browserd_actions::{ActionKind, ActionSnapshot};
 use browserd_api::{
     ActionGetRequest, ActionPayload, ActionResolveRequest, ActionSubmitCommand, ApiEnvelope,
@@ -25,10 +26,11 @@ use browserd_artifacts::{
 };
 use browserd_auth::{AuthConfig, RevocationRegistry, ServiceTokenVerifier, VerificationKeySet};
 use browserd_core::{
-    ApprovalId, ErrorCode, IsolationProfile, SessionId, SessionLifecycle, TenantId,
+    ApprovalId, ErrorCode, IsolationProfile, PlacementFence, SessionId, SessionLifecycle, TenantId,
 };
 use browserd_http::{
-    AuthenticationError, Authenticator, Readiness, ViewerGateError, ViewerTransport,
+    AttachedViewer, AuthenticationError, Authenticator, ConsumedViewerGrant, Readiness,
+    ViewerAttachError, ViewerGateError, ViewerTransport,
 };
 use browserd_viewer::{TicketError, TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use browserd_worker::{
@@ -138,7 +140,7 @@ struct PresentedTicket {
     ticket: ViewerTicket,
     tenant_id: TenantId,
     session_id: SessionId,
-    session_incarnation: u64,
+    placement_fence: PlacementFence,
     expires_at_millis: u64,
 }
 
@@ -180,11 +182,14 @@ impl GatewayViewer {
         &self,
         tenant_id: TenantId,
         session_id: SessionId,
-        session_incarnation: u64,
+        placement_fence: PlacementFence,
         scopes: ViewerScopes,
         ttl: Duration,
     ) -> Result<ViewerTicket, GatewayViewerError> {
-        if session_incarnation == 0 {
+        if placement_fence.worker_epoch == 0
+            || placement_fence.placement_version == 0
+            || placement_fence.session_incarnation == 0
+        {
             return Err(GatewayViewerError::TicketRejected);
         }
         let now_millis = SystemTime::now()
@@ -219,7 +224,7 @@ impl GatewayViewer {
             .issue(
                 tenant_id.clone(),
                 session_id.clone(),
-                session_incarnation,
+                placement_fence.session_incarnation,
                 scopes,
                 now_millis,
                 ttl,
@@ -233,7 +238,7 @@ impl GatewayViewer {
                 ticket: ticket.clone(),
                 tenant_id,
                 session_id,
-                session_incarnation,
+                placement_fence,
                 expires_at_millis,
             },
         );
@@ -241,13 +246,14 @@ impl GatewayViewer {
     }
 }
 
+#[async_trait]
 impl ViewerTransport for GatewayViewer {
-    fn consume_ticket(
+    async fn consume_ticket(
         &self,
         session_id: &SessionId,
         origin: &str,
         presented: &str,
-    ) -> Result<(), ViewerGateError> {
+    ) -> Result<ConsumedViewerGrant, ViewerGateError> {
         let now_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -263,22 +269,23 @@ impl ViewerTransport for GatewayViewer {
             return Err(ViewerGateError::TicketDenied);
         }
         let ticket = record.ticket.clone();
+        let placement_fence = record.placement_fence;
         let result = self.tickets.consume(
             &ticket,
             &record.tenant_id,
             &record.session_id,
-            record.session_incarnation,
+            placement_fence.session_incarnation,
             origin,
             now_millis,
         );
         match result {
-            Ok(_) => {
+            Ok(connection) => {
                 state.by_secret.remove(presented);
                 state.by_ticket.remove(&ticket);
                 self.tickets
                     .discard(&ticket)
                     .map_err(|_| ViewerGateError::TicketDenied)?;
-                Ok(())
+                ConsumedViewerGrant::new(connection, placement_fence)
             }
             Err(TicketError::OriginDenied) => Err(ViewerGateError::OriginDenied),
             Err(_) => {
@@ -292,7 +299,12 @@ impl ViewerTransport for GatewayViewer {
         }
     }
 
-    fn connected(&self, _session_id: SessionId) {}
+    async fn attach(
+        &self,
+        _grant: ConsumedViewerGrant,
+    ) -> Result<Box<dyn AttachedViewer>, ViewerAttachError> {
+        Err(ViewerAttachError::BackendUnavailable)
+    }
 
     fn present_viewer_ticket(&self, ticket: &ViewerTicket) -> Option<String> {
         lock_viewer_state(&self.state)

@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 browserd-actions = { path = "../../crates/browserd-actions" }
 browserd-api = { path = "../../crates/browserd-api" }

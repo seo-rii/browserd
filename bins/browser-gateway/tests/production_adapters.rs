@@ -3,8 +3,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use browser_gateway::{GatewayAuthenticator, GatewayReadiness, GatewayViewer};
 use browserd_auth::{ServiceClaims, ServiceTokenSigner};
-use browserd_core::{PrincipalId, SessionId, TenantId};
-use browserd_http::{Authenticator, Readiness, ViewerGateError, ViewerTransport};
+use browserd_core::{PlacementFence, PrincipalId, SessionId, TenantId};
+use browserd_http::{
+    Authenticator, Readiness, ViewerAttachError, ViewerGateError, ViewerTransport,
+};
 use browserd_viewer::ViewerScopes;
 use jsonwebtoken::Algorithm;
 
@@ -63,8 +65,8 @@ fn hmac_authenticator_verifies_issuer_audience_signature_and_expiry() {
     );
 }
 
-#[test]
-fn viewer_ticket_presentation_is_bounded_origin_bound_and_one_time() {
+#[tokio::test]
+async fn viewer_ticket_presentation_preserves_claims_and_fence_and_is_one_time() {
     let viewer = GatewayViewer::new(Duration::from_secs(30), ["https://viewer.example"], 8);
     assert!(viewer.is_ok());
     let Some(viewer) = viewer.ok() else {
@@ -72,11 +74,13 @@ fn viewer_ticket_presentation_is_bounded_origin_bound_and_one_time() {
     };
     let tenant_id = TenantId::new();
     let session_id = SessionId::new();
+    let placement_fence = PlacementFence::new(3, 5, 7);
+    let scopes = ViewerScopes::new(true, true, false);
     let ticket = viewer.issue(
-        tenant_id,
+        tenant_id.clone(),
         session_id.clone(),
-        1,
-        ViewerScopes::new(true, false, false),
+        placement_fence,
+        scopes,
         Duration::from_secs(5),
     );
     assert!(ticket.is_ok());
@@ -88,18 +92,37 @@ fn viewer_ticket_presentation_is_bounded_origin_bound_and_one_time() {
     let Some(presented) = presented else {
         return;
     };
-    assert_eq!(
-        viewer.consume_ticket(&session_id, "https://wrong.example", &presented),
+    assert!(matches!(
+        viewer
+            .consume_ticket(&session_id, "https://wrong.example", &presented)
+            .await,
         Err(ViewerGateError::OriginDenied)
-    );
+    ));
+    let grant = viewer
+        .consume_ticket(&session_id, "https://viewer.example", &presented)
+        .await;
+    assert!(grant.is_ok());
+    let Some(grant) = grant.ok() else {
+        return;
+    };
+    assert_eq!(grant.connection().tenant_id(), &tenant_id);
+    assert_eq!(grant.connection().session_id(), &session_id);
     assert_eq!(
-        viewer.consume_ticket(&session_id, "https://viewer.example", &presented),
-        Ok(())
+        grant.connection().session_incarnation(),
+        placement_fence.session_incarnation
     );
-    assert_eq!(
-        viewer.consume_ticket(&session_id, "https://viewer.example", &presented),
+    assert_eq!(grant.connection().scopes(), scopes);
+    assert_eq!(grant.placement_fence(), placement_fence);
+    assert!(matches!(
+        viewer
+            .consume_ticket(&session_id, "https://viewer.example", &presented)
+            .await,
         Err(ViewerGateError::TicketDenied)
-    );
+    ));
+    assert!(matches!(
+        viewer.attach(grant).await,
+        Err(ViewerAttachError::BackendUnavailable)
+    ));
 }
 
 #[test]

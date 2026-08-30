@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use browser_gateway::config::GatewayProcessConfig;
 use browserd_api::InMemoryApiService;
 use browserd_auth::AuthenticatedPrincipal;
 use browserd_core::SessionId;
 use browserd_http::{
-    AuthenticationError, Authenticator, HttpConfig, Readiness, ViewerGateError, ViewerTransport,
-    router,
+    AttachedViewer, AuthenticationError, Authenticator, ConsumedViewerGrant, HttpConfig, Readiness,
+    ViewerAttachError, ViewerGateError, ViewerTransport, router,
 };
 
 struct RejectAllAuth;
@@ -20,17 +21,23 @@ impl Authenticator for RejectAllAuth {
 
 struct RejectAllViewer;
 
+#[async_trait]
 impl ViewerTransport for RejectAllViewer {
-    fn consume_ticket(
+    async fn consume_ticket(
         &self,
         _session_id: &SessionId,
         _origin: &str,
         _ticket: &str,
-    ) -> Result<(), ViewerGateError> {
+    ) -> Result<ConsumedViewerGrant, ViewerGateError> {
         Err(ViewerGateError::TicketDenied)
     }
 
-    fn connected(&self, _session_id: SessionId) {}
+    async fn attach(
+        &self,
+        _grant: ConsumedViewerGrant,
+    ) -> Result<Box<dyn AttachedViewer>, ViewerAttachError> {
+        Err(ViewerAttachError::BackendUnavailable)
+    }
 }
 
 struct NotReady;
