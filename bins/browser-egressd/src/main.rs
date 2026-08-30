@@ -13,7 +13,8 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use browser_egressd::{
-    DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest, allocate_daemon_epoch,
+    DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest, RenewRouteRequest,
+    allocate_daemon_epoch,
 };
 use browserd_core::{EgressFence, TenantId, WorkerId};
 use browserd_egress::{AttachmentState, DataPlaneLimits, QuotaLimits};
@@ -250,6 +251,27 @@ struct FenceApiRequest {
     egress_fence: EgressFence,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenewApiRequest {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    lease_ttl_millis: u64,
+}
+
+#[derive(Serialize)]
+struct RenewApiResponse {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    expires_at_millis: u64,
+}
+
 #[derive(Serialize)]
 struct StatusApiResponse {
     daemon_epoch: u64,
@@ -360,6 +382,38 @@ async fn revoke_route(
     Ok(Json(status_response(status)))
 }
 
+async fn renew_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RenewApiRequest>,
+) -> Result<Json<RenewApiResponse>, ApiError> {
+    state
+        .credentials
+        .authorize_worker(&headers, &request.egress_fence)?;
+    let renewed = state
+        .daemon
+        .renew(
+            RenewRouteRequest::new(
+                request.renewal_sequence,
+                request.daemon_epoch,
+                request.egress_fence,
+                request.attachment_id,
+                request.activation_revision,
+                Duration::from_millis(request.lease_ttl_millis),
+            )
+            .map_err(ApiError::from)?,
+        )
+        .map_err(ApiError::from)?;
+    Ok(Json(RenewApiResponse {
+        renewal_sequence: renewed.renewal_sequence(),
+        daemon_epoch: renewed.daemon_epoch(),
+        egress_fence: renewed.egress_fence().clone(),
+        attachment_id: renewed.attachment_id(),
+        activation_revision: renewed.activation_revision(),
+        expires_at_millis: renewed.expires_at_millis(),
+    }))
+}
+
 fn status_response(status: browser_egressd::AttachmentStatusView) -> StatusApiResponse {
     StatusApiResponse {
         daemon_epoch: status.daemon_epoch(),
@@ -405,15 +459,16 @@ impl From<DaemonControlError> for ApiError {
         let (status, code) = match error {
             DaemonControlError::InvalidLimits
             | DaemonControlError::InvalidPrepareRequest
+            | DaemonControlError::InvalidRenewRequest
             | DaemonControlError::UnsupportedPolicy => {
                 (StatusCode::BAD_REQUEST, "invalid_route_request")
             }
             DaemonControlError::DaemonEpochMismatch { .. } => {
                 (StatusCode::CONFLICT, "daemon_epoch_mismatch")
             }
-            DaemonControlError::PlanConflict | DaemonControlError::InstallMetadataMismatch => {
-                (StatusCode::CONFLICT, "route_fence_conflict")
-            }
+            DaemonControlError::PlanConflict
+            | DaemonControlError::InstallMetadataMismatch
+            | DaemonControlError::RenewalConflict => (StatusCode::CONFLICT, "route_fence_conflict"),
             DaemonControlError::PlanCapacityExceeded => {
                 (StatusCode::TOO_MANY_REQUESTS, "route_capacity_exceeded")
             }
@@ -508,6 +563,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
         .route("/v1/routes/prepare", post(prepare_route))
+        .route("/v1/routes/renew", post(renew_route))
         .route("/v1/routes/status", post(route_status))
         .route("/v1/routes/revoke", post(revoke_route))
         .with_state(AppState {
@@ -608,5 +664,12 @@ mod tests {
         .into_iter()
         .collect::<HashSet<_>>();
         assert_eq!(names.len(), 9);
+    }
+
+    #[test]
+    fn router_exposes_the_worker_fenced_route_renewal_endpoint() {
+        let source = include_str!("main.rs");
+        assert!(source.contains(".route(\"/v1/routes/renew\", post(renew_route))"));
+        assert!(source.contains("authorize_worker(&headers, &request.egress_fence)"));
     }
 }

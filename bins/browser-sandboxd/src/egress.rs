@@ -201,6 +201,98 @@ pub struct RouteStatusReceipt {
     active: Option<ActiveInstallResponse>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenewRouteLeaseRequest {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    lease_ttl: Duration,
+}
+
+impl RenewRouteLeaseRequest {
+    pub fn new(
+        renewal_sequence: u64,
+        daemon_epoch: u64,
+        egress_fence: EgressFence,
+        attachment_id: u64,
+        activation_revision: u64,
+        lease_ttl: Duration,
+    ) -> Result<Self, EgressControlError> {
+        if renewal_sequence == 0
+            || daemon_epoch == 0
+            || attachment_id == 0
+            || activation_revision == 0
+            || lease_ttl.is_zero()
+        {
+            return Err(EgressControlError::Protocol(
+                "invalid route renewal request".into(),
+            ));
+        }
+        Ok(Self {
+            renewal_sequence,
+            daemon_epoch,
+            egress_fence,
+            attachment_id,
+            activation_revision,
+            lease_ttl,
+        })
+    }
+
+    #[must_use]
+    pub const fn renewal_sequence(&self) -> u64 {
+        self.renewal_sequence
+    }
+
+    #[must_use]
+    pub const fn egress_fence(&self) -> &EgressFence {
+        &self.egress_fence
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenewedRouteLeaseReceipt {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    expires_at_millis: u64,
+}
+
+impl RenewedRouteLeaseReceipt {
+    #[must_use]
+    pub const fn renewal_sequence(&self) -> u64 {
+        self.renewal_sequence
+    }
+
+    #[must_use]
+    pub const fn daemon_epoch(&self) -> u64 {
+        self.daemon_epoch
+    }
+
+    #[must_use]
+    pub const fn egress_fence(&self) -> &EgressFence {
+        &self.egress_fence
+    }
+
+    #[must_use]
+    pub const fn attachment_id(&self) -> u64 {
+        self.attachment_id
+    }
+
+    #[must_use]
+    pub const fn activation_revision(&self) -> u64 {
+        self.activation_revision
+    }
+
+    #[must_use]
+    pub const fn expires_at_millis(&self) -> u64 {
+        self.expires_at_millis
+    }
+}
+
 impl RouteStatusReceipt {
     #[must_use]
     pub const fn daemon_epoch(&self) -> u64 {
@@ -263,6 +355,15 @@ pub trait EgressControlPlane: Send + Sync + 'static {
         request: InstallRequest,
         listener: OwnedFd,
     ) -> Result<ActiveInstallResponse, EgressControlError>;
+
+    async fn renew(
+        &self,
+        _request: RenewRouteLeaseRequest,
+    ) -> Result<RenewedRouteLeaseReceipt, EgressControlError> {
+        Err(EgressControlError::Protocol(
+            "route renewal is unsupported by this control plane".into(),
+        ))
+    }
 
     async fn status(
         &self,
@@ -412,6 +513,27 @@ struct FenceApiRequest<'a> {
     egress_fence: &'a EgressFence,
 }
 
+#[derive(Serialize)]
+struct RenewApiRequest<'a> {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: &'a EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    lease_ttl_millis: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenewApiResponse {
+    renewal_sequence: u64,
+    daemon_epoch: u64,
+    egress_fence: EgressFence,
+    attachment_id: u64,
+    activation_revision: u64,
+    expires_at_millis: u64,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StatusApiResponse {
@@ -480,6 +602,48 @@ impl EgressControlPlane for HttpEgressControl {
         .await
         .map_err(|_| EgressControlError::InstallUncertain)?
         .map_err(|error| EgressControlError::Protocol(error.to_string()))
+    }
+
+    async fn renew(
+        &self,
+        request: RenewRouteLeaseRequest,
+    ) -> Result<RenewedRouteLeaseReceipt, EgressControlError> {
+        let lease_ttl_millis = u64::try_from(request.lease_ttl.as_millis())
+            .map_err(|_| EgressControlError::Protocol("lease TTL overflow".into()))?;
+        let response: RenewApiResponse = self
+            .post(
+                "/v1/routes/renew",
+                &self.config.worker_token,
+                &RenewApiRequest {
+                    renewal_sequence: request.renewal_sequence,
+                    daemon_epoch: request.daemon_epoch,
+                    egress_fence: &request.egress_fence,
+                    attachment_id: request.attachment_id,
+                    activation_revision: request.activation_revision,
+                    lease_ttl_millis,
+                },
+            )
+            .await?
+            .ok_or_else(|| EgressControlError::Protocol("renew route was not found".into()))?;
+        if response.renewal_sequence != request.renewal_sequence
+            || response.daemon_epoch != request.daemon_epoch
+            || response.egress_fence != request.egress_fence
+            || response.attachment_id != request.attachment_id
+            || response.activation_revision != request.activation_revision
+            || response.expires_at_millis == 0
+        {
+            return Err(EgressControlError::Protocol(
+                "renewed route receipt did not match its request".into(),
+            ));
+        }
+        Ok(RenewedRouteLeaseReceipt {
+            renewal_sequence: response.renewal_sequence,
+            daemon_epoch: response.daemon_epoch,
+            egress_fence: response.egress_fence,
+            attachment_id: response.attachment_id,
+            activation_revision: response.activation_revision,
+            expires_at_millis: response.expires_at_millis,
+        })
     }
 
     async fn status(
@@ -1150,6 +1314,10 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::post;
+    use axum::{Json, Router};
     use browserd_core::{
         EgressFence, LaunchGeneration, OwnerFence, RouteGeneration, SessionId, SessionIncarnation,
         ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
@@ -1200,6 +1368,94 @@ mod tests {
             .expect("current network namespace should be pinnable")
     }
 
+    #[derive(Clone)]
+    struct RenewalHttpFixture {
+        fence: EgressFence,
+        received: Arc<StdMutex<Option<(String, serde_json::Value)>>>,
+    }
+
+    async fn capture_renewal_request(
+        State(fixture): State<RenewalHttpFixture>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> Json<serde_json::Value> {
+        let authorization = headers
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("renewal should include authorization")
+            .to_str()
+            .expect("authorization should be visible ASCII")
+            .to_owned();
+        *fixture.received.lock().expect("capture lock should work") = Some((authorization, body));
+        Json(serde_json::json!({
+            "renewal_sequence": 1,
+            "daemon_epoch": DAEMON_EPOCH,
+            "egress_fence": fixture.fence,
+            "attachment_id": 17,
+            "activation_revision": 19,
+            "expires_at_millis": 234_567,
+        }))
+    }
+
+    #[tokio::test]
+    async fn http_control_renews_with_worker_auth_and_validates_the_exact_receipt() {
+        let route_fence = launch_spec().dedicated_egress().egress_fence().clone();
+        let received = Arc::new(StdMutex::new(None));
+        let fixture = RenewalHttpFixture {
+            fence: route_fence.clone(),
+            received: Arc::clone(&received),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("HTTP fixture should bind");
+        let address = listener
+            .local_addr()
+            .expect("fixture address should resolve");
+        let app = Router::new()
+            .route("/v1/routes/renew", post(capture_renewal_request))
+            .with_state(fixture);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let config = EgressClientConfig::new(
+            Url::parse(&format!("http://{address}/")).expect("fixture URL should parse"),
+            PathBuf::from("/run/browserd/egress-install-test.sock"),
+            DAEMON_EPOCH,
+            0,
+            "w".repeat(32),
+            "s".repeat(32),
+            Duration::from_secs(2),
+            16 * 1024,
+        )
+        .expect("HTTP control configuration should validate");
+        let control = HttpEgressControl::new(config).expect("HTTP control should initialize");
+        let request = RenewRouteLeaseRequest::new(
+            1,
+            DAEMON_EPOCH,
+            route_fence.clone(),
+            17,
+            19,
+            Duration::from_secs(10),
+        )
+        .expect("renewal request should validate");
+
+        let renewed = control
+            .renew(request)
+            .await
+            .expect("renewal response should validate");
+        assert_eq!(renewed.renewal_sequence(), 1);
+        assert_eq!(renewed.egress_fence(), &route_fence);
+        assert_eq!(renewed.expires_at_millis(), 234_567);
+        let (authorization, body) = received
+            .lock()
+            .expect("capture lock should work")
+            .clone()
+            .expect("fixture should capture one renewal");
+        assert_eq!(authorization, format!("Bearer {}", "w".repeat(32)));
+        assert_eq!(body["renewal_sequence"], 1);
+        assert_eq!(body["lease_ttl_millis"], 10_000);
+
+        server.abort();
+        let _ = server.await;
+    }
+
     struct FakeListenerFactory {
         address: std::net::SocketAddr,
         creations: Arc<AtomicUsize>,
@@ -1234,6 +1490,7 @@ mod tests {
         address: std::net::SocketAddr,
         prepare_requests: Arc<StdMutex<Vec<PrepareRouteRequest>>>,
         install_requests: Arc<StdMutex<Vec<InstallRequest>>>,
+        renew_requests: Arc<StdMutex<Vec<RenewRouteLeaseRequest>>>,
         active: Arc<StdMutex<Option<ActiveInstallResponse>>>,
         install_fails_after_commit: bool,
         install_panics: bool,
@@ -1255,6 +1512,7 @@ mod tests {
                 address,
                 prepare_requests: Arc::new(StdMutex::new(Vec::new())),
                 install_requests: Arc::new(StdMutex::new(Vec::new())),
+                renew_requests: Arc::new(StdMutex::new(Vec::new())),
                 active: Arc::new(StdMutex::new(None)),
                 install_fails_after_commit: false,
                 install_panics: false,
@@ -1334,6 +1592,56 @@ mod tests {
             } else {
                 Ok(active)
             }
+        }
+
+        async fn renew(
+            &self,
+            request: RenewRouteLeaseRequest,
+        ) -> Result<RenewedRouteLeaseReceipt, EgressControlError> {
+            let active = self
+                .active
+                .lock()
+                .expect("active lock should work")
+                .clone()
+                .ok_or_else(|| EgressControlError::Protocol("route is not active".into()))?;
+            if active.daemon_epoch() != request.daemon_epoch
+                || active.egress_fence() != &request.egress_fence
+                || active.attachment_id() != request.attachment_id
+                || active.activation_revision() != request.activation_revision
+            {
+                return Err(EgressControlError::Protocol(
+                    "renewal request does not own the active route".into(),
+                ));
+            }
+            let extension = u64::try_from(request.lease_ttl.as_millis())
+                .map_err(|_| EgressControlError::Protocol("renewal TTL overflow".into()))?;
+            let expires_at_millis = active
+                .expires_at_millis()
+                .checked_add(extension)
+                .ok_or_else(|| EgressControlError::Protocol("renewal expiry overflow".into()))?;
+            let renewed_active = ActiveInstallResponse::new(
+                active.transfer_id().clone(),
+                active.daemon_epoch(),
+                active.egress_fence().clone(),
+                active.attachment_id(),
+                active.proxy_address(),
+                expires_at_millis,
+                active.activation_revision(),
+            )
+            .map_err(|error| EgressControlError::Protocol(error.to_string()))?;
+            *self.active.lock().expect("active lock should work") = Some(renewed_active);
+            self.renew_requests
+                .lock()
+                .expect("renew request lock should work")
+                .push(request.clone());
+            Ok(RenewedRouteLeaseReceipt {
+                renewal_sequence: request.renewal_sequence,
+                daemon_epoch: request.daemon_epoch,
+                egress_fence: request.egress_fence,
+                attachment_id: request.attachment_id,
+                activation_revision: request.activation_revision,
+                expires_at_millis,
+            })
         }
 
         async fn status(
