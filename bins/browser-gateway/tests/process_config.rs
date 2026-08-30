@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 #[path = "../src/config.rs"]
@@ -150,5 +152,51 @@ fn rejects_weak_ambiguous_or_unbounded_values() {
         let mut environment = valid_environment();
         environment.insert(name, value.to_owned());
         assert!(parse(&environment).is_err(), "{name}={value} must fail");
+    }
+}
+
+#[test]
+fn production_binary_validates_auth_routing_and_coordination_before_public_bind() {
+    let occupied =
+        TcpListener::bind("0.0.0.0:0").expect("test must reserve a public listener address");
+    let occupied_address = occupied
+        .local_addr()
+        .expect("reserved listener must expose its address");
+
+    for missing in [
+        "BROWSERD_AUTH_ISSUER",
+        "BROWSERD_WORKER_SOCKET",
+        "BROWSERD_POSTGRES_URL",
+        "BROWSERD_VIEWER_ORIGINS",
+    ] {
+        let mut environment = valid_environment();
+        environment.insert("BROWSERD_BIND", occupied_address.to_string());
+        environment.insert("BROWSERD_TRUST_TLS_TERMINATOR", "true".to_owned());
+        environment.remove(missing);
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_browser-gateway"));
+        command.env_clear();
+        for (name, value) in &environment {
+            command.env(name, value);
+        }
+        let output = command
+            .output()
+            .expect("gateway process must return before attempting the occupied bind");
+        assert!(
+            !output.status.success(),
+            "missing {missing} must fail closed"
+        );
+
+        let stderr = String::from_utf8(output.stderr).expect("gateway stderr must be UTF-8");
+        assert!(
+            stderr.contains(&format!(
+                "required environment variable is missing: {missing}"
+            )),
+            "missing {missing} reached listener bind instead of configuration validation: {stderr}"
+        );
+        assert!(
+            !stderr.contains("failed to bind browser gateway"),
+            "missing {missing} must be rejected before the public listener bind: {stderr}"
+        );
     }
 }

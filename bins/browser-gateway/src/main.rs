@@ -1,7 +1,7 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, bail};
+use anyhow::Context;
+use browser_gateway::config::GatewayProcessConfig;
 use browserd_api::InMemoryApiService;
 use browserd_auth::AuthenticatedPrincipal;
 use browserd_core::SessionId;
@@ -9,27 +9,6 @@ use browserd_http::{
     AuthenticationError, Authenticator, HttpConfig, Readiness, ViewerGateError, ViewerTransport,
     router,
 };
-
-struct BindConfig {
-    address: SocketAddr,
-}
-
-impl BindConfig {
-    fn from_parts(value: Option<&str>, trust_tls_terminator: bool) -> anyhow::Result<Self> {
-        let address = value
-            .unwrap_or("127.0.0.1:8080")
-            .parse::<SocketAddr>()
-            .context("BROWSERD_BIND must be an IP socket address")?;
-        if !address.ip().is_loopback() && !trust_tls_terminator {
-            bail!("public bind requires BROWSERD_TRUST_TLS_TERMINATOR=true");
-        }
-        Ok(Self { address })
-    }
-
-    const fn address(&self) -> SocketAddr {
-        self.address
-    }
-}
 
 struct RejectAllAuth;
 
@@ -64,14 +43,14 @@ impl Readiness for NotReady {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let bind_value = std::env::var("BROWSERD_BIND").ok();
-    let trust_tls_terminator = std::env::var("BROWSERD_TRUST_TLS_TERMINATOR")
-        .ok()
-        .is_some_and(|value| value == "true");
-    let bind = BindConfig::from_parts(bind_value.as_deref(), trust_tls_terminator)?;
-    let listener = tokio::net::TcpListener::bind(bind.address())
+    let config = GatewayProcessConfig::from_lookup(|name| std::env::var(name).ok())?;
+    let listener = tokio::net::TcpListener::bind(config.bind_address())
         .await
         .context("failed to bind browser gateway")?;
+
+    // This startup slice stops at validated process configuration. Runtime dependencies remain
+    // explicitly unavailable until durable coordination, authenticated policy, worker routing,
+    // and viewer transport are composed here.
     let app = router(
         HttpConfig::default(),
         Arc::new(InMemoryApiService::default()),
@@ -82,19 +61,4 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .context("browser gateway server failed")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::BindConfig;
-
-    #[test]
-    fn loopback_is_default_and_public_bind_requires_explicit_tls_terminator_trust()
-    -> anyhow::Result<()> {
-        let default = BindConfig::from_parts(None, false)?;
-        assert!(default.address().ip().is_loopback());
-        assert!(BindConfig::from_parts(Some("0.0.0.0:8080"), false).is_err());
-        assert!(BindConfig::from_parts(Some("0.0.0.0:8080"), true).is_ok());
-        Ok(())
-    }
 }

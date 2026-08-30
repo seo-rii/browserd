@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod config;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
