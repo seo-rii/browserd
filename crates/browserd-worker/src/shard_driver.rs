@@ -5,6 +5,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use browserd_core::{ActionId, PageId, SessionId, ShardFence, TenantId};
 use browserd_policy::CanonicalActionProposal;
+use browserd_sandbox::LaunchSpec;
 use browserd_session::OwnershipFence;
 use tokio_util::sync::CancellationToken;
 
@@ -17,6 +18,7 @@ use crate::{
 /// exact session fence and primary page created by the runtime.
 pub struct ChromiumDriverShardRuntime<D> {
     driver: Arc<D>,
+    forced_termination_spec: Option<LaunchSpec>,
     contexts: Mutex<HashMap<SessionId, OwnedContext>>,
 }
 
@@ -31,6 +33,16 @@ impl<D> ChromiumDriverShardRuntime<D> {
     pub fn new(driver: Arc<D>) -> Self {
         Self {
             driver,
+            forced_termination_spec: None,
+            contexts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn new_for_launch(driver: Arc<D>, launch_spec: LaunchSpec) -> Self {
+        Self {
+            driver,
+            forced_termination_spec: Some(launch_spec),
             contexts: Mutex::new(HashMap::new()),
         }
     }
@@ -173,6 +185,26 @@ impl<D: ChromiumDriver> BrowserShardRuntime for ChromiumDriverShardRuntime<D> {
         }
         Ok(())
     }
+
+    async fn force_terminate(
+        &self,
+        fence: &ShardFence,
+        proof: &crate::SandboxTerminationProof,
+    ) -> Result<(), ShardRuntimeError> {
+        if !proof.matches_fence(fence) {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        match self.forced_termination_spec.as_ref() {
+            Some(spec) if proof.matches_launch_spec(spec) => {}
+            Some(_) => return Err(ShardRuntimeError::Rejected),
+            None => return self.terminate(fence).await,
+        }
+        self.contexts
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .clear();
+        Ok(())
+    }
 }
 
 /// Routes session context ownership through the serial shard actor and delegates all page/action
@@ -195,6 +227,38 @@ impl<D> ActorChromiumDriver<D> {
             actor,
             shard_fence,
         }
+    }
+}
+
+impl<D: ChromiumDriver> ActorChromiumDriver<D> {
+    pub async fn create_context_owned_async(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<PageId, DependencyError> {
+        self.actor
+            .attach_session_owned(
+                &self.shard_fence,
+                tenant_id.clone(),
+                session_id.clone(),
+                fence.clone(),
+            )
+            .await
+            .map_err(map_actor_error)?;
+        self.runtime.primary_page(session_id, fence)
+    }
+
+    pub async fn close_context_fenced_async(
+        &self,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        self.actor
+            .detach_session(&self.shard_fence, session_id.clone(), fence.clone())
+            .await
+            .map_err(map_actor_error)?;
+        Ok(())
     }
 }
 
@@ -231,14 +295,7 @@ impl<D: ChromiumDriver> ChromiumDriver for ActorChromiumDriver<D> {
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<PageId, DependencyError> {
-        futures::executor::block_on(self.actor.attach_session_owned(
-            &self.shard_fence,
-            tenant_id.clone(),
-            session_id.clone(),
-            fence.clone(),
-        ))
-        .map_err(map_actor_error)?;
-        self.runtime.primary_page(session_id, fence)
+        futures::executor::block_on(self.create_context_owned_async(tenant_id, session_id, fence))
     }
 
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError> {
@@ -263,13 +320,7 @@ impl<D: ChromiumDriver> ChromiumDriver for ActorChromiumDriver<D> {
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<(), DependencyError> {
-        futures::executor::block_on(self.actor.detach_session(
-            &self.shard_fence,
-            session_id.clone(),
-            fence.clone(),
-        ))
-        .map_err(map_actor_error)?;
-        Ok(())
+        futures::executor::block_on(self.close_context_fenced_async(session_id, fence))
     }
 
     fn create_page(&self, session_id: &SessionId) -> Result<PageId, DependencyError> {

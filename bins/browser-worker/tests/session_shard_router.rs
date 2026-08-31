@@ -184,6 +184,52 @@ struct BlockingLifecycle {
     terminations: AtomicUsize,
 }
 
+struct SignalingLifecycle {
+    terminated: mpsc::SyncSender<()>,
+}
+
+impl SessionShardLifecycle for SignalingLifecycle {
+    fn qualify(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn heartbeat(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn terminate(&self, _fence: &OwnershipFence) -> Result<(), DependencyError> {
+        let _ = self.terminated.send(());
+        Ok(())
+    }
+}
+
+struct FixedProvisionFactory {
+    shard: ProvisionedSessionShard,
+}
+
+impl SessionShardFactory for FixedProvisionFactory {
+    fn qualify_daemon(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn heartbeat_daemon(
+        &self,
+        _worker_id: &WorkerId,
+        _worker_epoch: u64,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        Ok(self.shard.clone())
+    }
+}
+
 impl SessionShardLifecycle for BlockingLifecycle {
     fn qualify(&self) -> Result<(), DependencyError> {
         self.qualification_gate.block()
@@ -239,9 +285,18 @@ impl SessionShardFactory for LockProbeFactory {
 
 struct RejectArtifacts;
 
-#[derive(Default)]
 struct DeadlineDriver {
     observed_deadline: Mutex<Option<Instant>>,
+    close_gate: Option<Arc<CallGate>>,
+}
+
+impl Default for DeadlineDriver {
+    fn default() -> Self {
+        Self {
+            observed_deadline: Mutex::new(None),
+            close_gate: None,
+        }
+    }
 }
 
 impl ChromiumDriver for DeadlineDriver {
@@ -254,7 +309,10 @@ impl ChromiumDriver for DeadlineDriver {
     }
 
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
-        Err(DependencyError::Rejected)
+        match self.close_gate.as_ref() {
+            Some(gate) => gate.block(),
+            None => Err(DependencyError::Rejected),
+        }
     }
 
     fn create_page(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
@@ -788,6 +846,49 @@ fn exact_close_terminalizes_once_and_tombstones_the_session_identity() {
         Err(DependencyError::Rejected)
     );
     assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn blocked_context_cleanup_cannot_delay_terminal_shard_cleanup() {
+    let (close_gate, _close_entered) = CallGate::new();
+    let (terminated, termination_observed) = mpsc::sync_channel(1);
+    let shard = ProvisionedSessionShard::new(
+        PageId::new(),
+        Arc::new(DeadlineDriver {
+            observed_deadline: Mutex::new(None),
+            close_gate: Some(Arc::clone(&close_gate)),
+        }),
+        Arc::new(SignalingLifecycle { terminated }),
+    );
+    let factory = Arc::new(FixedProvisionFactory { shard });
+    let Some(router) = router(factory, Arc::new(RejectArtifacts), 1).map(Arc::new) else {
+        return;
+    };
+    let Some(worker) = worker() else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let ownership = fence(&worker, 44);
+    assert!(
+        router
+            .create_context_owned(&tenant, &session, &ownership)
+            .is_ok()
+    );
+
+    let close_router = Arc::clone(&router);
+    let close_session = session.clone();
+    let close_fence = ownership.clone();
+    let close =
+        std::thread::spawn(move || close_router.close_context_fenced(&close_session, &close_fence));
+    let terminal_cleanup_before_driver_release =
+        termination_observed.recv_timeout(Duration::from_millis(250));
+
+    close_gate.release();
+    let close_result = close.join();
+
+    assert_eq!(terminal_cleanup_before_driver_release, Ok(()));
+    assert!(matches!(close_result, Ok(Ok(()))));
 }
 
 #[test]

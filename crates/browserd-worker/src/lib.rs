@@ -16,7 +16,8 @@ pub use chromium_owner::{
     ChromiumTargetRoute,
 };
 pub use production_sandbox::{
-    CdpPipeAcceptor, ProductionSandboxShardRuntime, SandboxShardRpc, ShardLaunchDescriptor,
+    CdpPipeAcceptor, ExactSandboxTermination, ProductionSandboxShardRuntime, SandboxShardRpc,
+    SandboxTerminationProof, ShardLaunchDescriptor,
 };
 pub use rpc::{
     PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement,

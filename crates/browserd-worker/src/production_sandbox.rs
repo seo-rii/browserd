@@ -1,3 +1,4 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,10 +9,37 @@ use browserd_sandbox::{
     SandboxRpcClient, SandboxRpcError,
 };
 use browserd_session::OwnershipFence;
+use futures::FutureExt;
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{BrowserShardRuntime, ShardRuntimeError};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SandboxTerminationProof {
+    launch_spec: LaunchSpec,
+}
+
+impl SandboxTerminationProof {
+    fn from_exact_terminal(launch_spec: LaunchSpec) -> Self {
+        Self { launch_spec }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_launch_spec(launch_spec: LaunchSpec) -> Self {
+        Self { launch_spec }
+    }
+
+    #[must_use]
+    pub fn matches_fence(&self, fence: &ShardFence) -> bool {
+        self.launch_spec.dedicated_egress().egress_fence().shard() == fence
+    }
+
+    #[must_use]
+    pub fn matches_launch_spec(&self, launch_spec: &LaunchSpec) -> bool {
+        &self.launch_spec == launch_spec
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ShardLaunchDescriptor {
@@ -193,28 +221,115 @@ pub trait CdpPipeAcceptor: Send + Sync + 'static {
     /// Chromium transport has accepted them; they must never be reused.
     async fn accept_cdp_pipes(&self, pipes: ChromiumCdpPipes) -> Result<(), ShardRuntimeError>;
 
+    /// Records a fence-bound proof after exact sandbox terminality has been established.
+    fn confirm_forced_termination(&self, _proof: &SandboxTerminationProof) -> bool {
+        false
+    }
+
+    /// Reports whether the local transport owner has been structurally joined after confirmation.
+    fn is_terminally_joined_after(&self, _proof: &SandboxTerminationProof) -> bool {
+        false
+    }
+
     /// Cancels and joins every execution owner created after accepting the CDP capabilities.
     async fn shutdown_cdp(&self) -> Result<(), ShardRuntimeError>;
 }
 
-async fn cleanup_runtime<B, C, R>(
-    rpc: &B,
+pub struct ExactSandboxTermination {
+    spec: LaunchSpec,
+    rpc: Arc<dyn SandboxShardRpc>,
+    phase: Mutex<ExactTerminationPhase>,
+}
+
+enum ExactTerminationPhase {
+    Idle,
+    Running(watch::Receiver<Option<Result<SandboxTerminationProof, ShardRuntimeError>>>),
+    Proven(Box<SandboxTerminationProof>),
+}
+
+impl ExactSandboxTermination {
+    fn new(spec: LaunchSpec, rpc: Arc<dyn SandboxShardRpc>) -> Self {
+        Self {
+            spec,
+            rpc,
+            phase: Mutex::new(ExactTerminationPhase::Idle),
+        }
+    }
+
+    pub async fn terminate(
+        self: &Arc<Self>,
+        reason: CleanupReason,
+    ) -> Result<SandboxTerminationProof, ShardRuntimeError> {
+        let mut completion = {
+            let mut phase = self.phase.lock().await;
+            match &*phase {
+                ExactTerminationPhase::Proven(proof) => return Ok(proof.as_ref().clone()),
+                ExactTerminationPhase::Running(completion) => completion.clone(),
+                ExactTerminationPhase::Idle => {
+                    let (sender, completion) = watch::channel(None);
+                    *phase = ExactTerminationPhase::Running(completion.clone());
+                    let owner = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let effect = async {
+                            match owner.rpc.cancel_or_kill_shard(&owner.spec, reason).await {
+                                Ok(
+                                    KillShardOutcome::Terminated(_)
+                                    | KillShardOutcome::AlreadyTerminated,
+                                ) => Ok(SandboxTerminationProof::from_exact_terminal(
+                                    owner.spec.clone(),
+                                )),
+                                Ok(
+                                    KillShardOutcome::CleanupIncomplete(_)
+                                    | KillShardOutcome::CancellationRequested,
+                                )
+                                | Err(_) => Err(ShardRuntimeError::OutcomeUncertain),
+                            }
+                        };
+                        let result = AssertUnwindSafe(effect)
+                            .catch_unwind()
+                            .await
+                            .unwrap_or(Err(ShardRuntimeError::OutcomeUncertain));
+                        let mut phase = owner.phase.lock().await;
+                        *phase = match result.as_ref() {
+                            Ok(proof) => ExactTerminationPhase::Proven(Box::new(proof.clone())),
+                            Err(_) => ExactTerminationPhase::Idle,
+                        };
+                        drop(phase);
+                        sender.send_replace(Some(result));
+                    });
+                    completion
+                }
+            }
+        };
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| ShardRuntimeError::OutcomeUncertain)?;
+        }
+    }
+}
+
+async fn cleanup_runtime<C, R>(
+    exact: &Arc<ExactSandboxTermination>,
     cdp: &C,
     inner: &R,
-    spec: &LaunchSpec,
     fence: &ShardFence,
     reason: CleanupReason,
 ) -> Result<(), ShardRuntimeError>
 where
-    B: SandboxShardRpc,
     C: CdpPipeAcceptor,
     R: BrowserShardRuntime,
 {
-    let (local, sandbox) = tokio::join!(
-        cleanup_local(cdp, inner, fence),
-        exact_cleanup(rpc, spec, reason),
-    );
-    sandbox?;
+    let sandbox = exact.terminate(reason).await;
+    if let Ok(proof) = sandbox.as_ref() {
+        cdp.confirm_forced_termination(proof);
+    }
+    let local = cleanup_local(cdp, inner, fence, sandbox.as_ref().ok()).await;
+    sandbox.map(|_| ())?;
     local
 }
 
@@ -222,33 +337,27 @@ async fn cleanup_local<C, R>(
     cdp: &C,
     inner: &R,
     fence: &ShardFence,
+    proof: Option<&SandboxTerminationProof>,
 ) -> Result<(), ShardRuntimeError>
 where
     C: CdpPipeAcceptor,
     R: BrowserShardRuntime,
 {
-    let inner = inner.terminate(fence).await;
+    let inner = match proof {
+        Some(proof) => {
+            if !proof.matches_fence(fence) {
+                return Err(ShardRuntimeError::Rejected);
+            }
+            inner.force_terminate(fence, proof).await
+        }
+        None => inner.terminate(fence).await,
+    };
     let cdp = cdp.shutdown_cdp().await;
     match (inner, cdp) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(ShardRuntimeError::OutcomeUncertain), _)
         | (_, Err(ShardRuntimeError::OutcomeUncertain)) => Err(ShardRuntimeError::OutcomeUncertain),
         (Err(error), _) | (_, Err(error)) => Err(error),
-    }
-}
-
-async fn exact_cleanup<B>(
-    rpc: &B,
-    spec: &LaunchSpec,
-    reason: CleanupReason,
-) -> Result<(), ShardRuntimeError>
-where
-    B: SandboxShardRpc,
-{
-    match rpc.cancel_or_kill_shard(spec, reason).await {
-        Ok(KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated) => Ok(()),
-        Ok(KillShardOutcome::CleanupIncomplete(_) | KillShardOutcome::CancellationRequested)
-        | Err(_) => Err(ShardRuntimeError::OutcomeUncertain),
     }
 }
 
@@ -286,6 +395,7 @@ pub struct ProductionSandboxShardRuntime<B, C, R> {
     descriptor: ShardLaunchDescriptor,
     lease_ttl: Duration,
     rpc: Arc<B>,
+    exact: Arc<ExactSandboxTermination>,
     cdp: Arc<C>,
     inner: Arc<R>,
     state: Arc<Mutex<RuntimeState>>,
@@ -293,7 +403,10 @@ pub struct ProductionSandboxShardRuntime<B, C, R> {
     operation_cancellation: CancellationToken,
 }
 
-impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
+impl<B, C, R> ProductionSandboxShardRuntime<B, C, R>
+where
+    B: SandboxShardRpc,
+{
     #[must_use]
     pub fn new(
         descriptor: ShardLaunchDescriptor,
@@ -302,10 +415,16 @@ impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
         cdp: Arc<C>,
         inner: Arc<R>,
     ) -> Self {
+        let exact_rpc: Arc<dyn SandboxShardRpc> = rpc.clone();
+        let exact = Arc::new(ExactSandboxTermination::new(
+            descriptor.launch_spec().clone(),
+            exact_rpc,
+        ));
         Self {
             descriptor,
             lease_ttl,
             rpc,
+            exact,
             cdp,
             inner,
             state: Arc::new(Mutex::new(RuntimeState {
@@ -316,6 +435,11 @@ impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
             operations: Arc::new(RwLock::new(())),
             operation_cancellation: CancellationToken::new(),
         }
+    }
+
+    #[must_use]
+    pub fn exact_termination(&self) -> Arc<ExactSandboxTermination> {
+        Arc::clone(&self.exact)
     }
 
     fn validate_fence(&self, fence: &ShardFence) -> Result<(), ShardRuntimeError> {
@@ -394,10 +518,9 @@ where
             }
         }
         let (disarm_cleanup, cleanup_disarmed) = oneshot::channel::<()>();
-        let cleanup_rpc = Arc::clone(&self.rpc);
+        let cleanup_exact = Arc::clone(&self.exact);
         let cleanup_cdp = Arc::clone(&self.cdp);
         let cleanup_inner = Arc::clone(&self.inner);
-        let cleanup_spec = self.descriptor.launch_spec().clone();
         let cleanup_fence = fence.clone();
         let cleanup_state = Arc::clone(&self.state);
         let cleanup_completion = attempt.completion.clone();
@@ -416,10 +539,9 @@ where
                         Ok(())
                     } else {
                         cleanup_runtime(
-                            cleanup_rpc.as_ref(),
+                            &cleanup_exact,
                             cleanup_cdp.as_ref(),
                             cleanup_inner.as_ref(),
-                            &cleanup_spec,
                             &cleanup_fence,
                             CleanupReason::BrowserFailure,
                         )
@@ -615,12 +737,11 @@ where
         };
         if let Some((sender, provision)) = start {
             self.operation_cancellation.cancel();
-            let rpc = Arc::clone(&self.rpc);
+            let exact = Arc::clone(&self.exact);
             let cdp = Arc::clone(&self.cdp);
             let inner = Arc::clone(&self.inner);
             let operations = Arc::clone(&self.operations);
             let state = Arc::clone(&self.state);
-            let spec = self.descriptor.launch_spec().clone();
             let fence = fence.clone();
             tokio::spawn(async move {
                 if let Some(provision) = provision.as_ref() {
@@ -632,17 +753,24 @@ where
                     }
                     operations.write_owned().await
                 };
-                let (preemptive, operation_guard) = tokio::join!(
-                    exact_cleanup(rpc.as_ref(), &spec, CleanupReason::WorkerLeaseExpired,),
-                    quiesce,
-                );
-                let local = cleanup_local(cdp.as_ref(), inner.as_ref(), &fence).await;
+                let (preemptive, operation_guard) =
+                    tokio::join!(exact.terminate(CleanupReason::WorkerLeaseExpired), quiesce,);
+                if let Ok(proof) = preemptive.as_ref() {
+                    cdp.confirm_forced_termination(proof);
+                }
+                let local = cleanup_local(
+                    cdp.as_ref(),
+                    inner.as_ref(),
+                    &fence,
+                    preemptive.as_ref().ok(),
+                )
+                .await;
                 let result = match (preemptive, local) {
-                    (Ok(()), Ok(())) => Ok(()),
+                    (Ok(_), Ok(())) => Ok(()),
                     (Err(_), _) | (_, Err(ShardRuntimeError::OutcomeUncertain)) => {
                         Err(ShardRuntimeError::OutcomeUncertain)
                     }
-                    (Ok(()), Err(error)) => Err(error),
+                    (Ok(_), Err(error)) => Err(error),
                 };
                 drop(operation_guard);
                 {

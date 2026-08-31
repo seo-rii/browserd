@@ -157,11 +157,10 @@ fn run(runtime: &tokio::runtime::Runtime) -> Result<(), String> {
         Duration::from_secs(30),
     )
     .map_err(|_| "production shard configuration is invalid".to_owned())?;
-    let factory = Arc::new(ProductionSessionShardFactory::new(
-        shard_config,
-        sandbox,
-        runtime.handle().clone(),
-    ));
+    let factory = Arc::new(
+        ProductionSessionShardFactory::new(shard_config, sandbox, runtime.handle().clone())
+            .map_err(|_| "production shard runtime is unsupported".to_owned())?,
+    );
     let router = Arc::new(
         SessionShardRouter::new(
             worker_id,

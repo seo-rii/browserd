@@ -1,4 +1,4 @@
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +19,7 @@ use tokio::net::unix::pipe::{Receiver, Sender};
 
 // Linux exposes at most 15 bytes of the Rust thread name through `/proc/*/comm`.
 const OWNER_THREAD_COMM: &str = "browserd-chromi";
+static OWNER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Drain(AtomicBool);
 
@@ -72,6 +73,7 @@ fn shard_fence() -> ShardFence {
 
 #[tokio::test]
 async fn shutdown_before_pipe_acceptance_is_immediate_and_idempotent() {
+    let _owner_test = OWNER_TEST_LOCK.lock().await;
     let drain = Arc::new(Drain(AtomicBool::new(false)));
     let (owner, _manager) = ChromiumConnectionOwner::new_bounded(
         identity(),
@@ -96,6 +98,7 @@ async fn shutdown_before_pipe_acceptance_is_immediate_and_idempotent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_shutdown_joins_the_owner_thread_once_for_concurrent_callers() {
+    let _owner_test = OWNER_TEST_LOCK.lock().await;
     let baseline_owner_threads = std::fs::read_dir("/proc/self/task")
         .expect("Linux task directory should be available")
         .filter_map(Result::ok)

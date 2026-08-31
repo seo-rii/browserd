@@ -11,7 +11,7 @@ use browserd_chromium::{
     ChromiumConnectionError, VerifiedChromiumDriverOwner,
 };
 use browserd_core::{IsolationProfile, PageId, SessionId, ShardFence, TenantId};
-use browserd_sandbox::ChromiumCdpPipes;
+use browserd_sandbox::{ChromiumCdpPipes, LaunchSpec};
 use browserd_session::OwnershipFence;
 use browserd_targets::{
     BootstrapBackend, BootstrapStage, BootstrapStageFailure, PausedTarget, ShardTaintReason,
@@ -23,9 +23,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cdp_driver::CdpChromiumDriver;
 use crate::{
-    CdpPipeAcceptor, ProductionTargetManager, ShardRuntimeError, TargetBootstrapSnapshot,
-    TargetManagerBackend, TargetManagerDrain, TargetManagerEvent, TargetManagerIngress,
-    target_manager::TargetReadiness,
+    CdpPipeAcceptor, ProductionTargetManager, SandboxTerminationProof, ShardRuntimeError,
+    TargetBootstrapSnapshot, TargetManagerBackend, TargetManagerDrain, TargetManagerEvent,
+    TargetManagerIngress, target_manager::TargetReadiness,
 };
 
 const MAX_CDP_IDENTIFIER_BYTES: usize = 1_024;
@@ -140,18 +140,45 @@ impl ChromiumTargetManagerBackend {
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<(), ShardRuntimeError> {
-        self.mailbox
-            .request(|response| OwnerRequest::VerifyContextDisposed {
-                tenant_id: tenant_id.clone(),
-                session_id: session_id.clone(),
-                fence: fence.clone(),
-                response,
-            })
-            .map_err(map_actor_runtime_error)?;
+        self.verify_context_disposed_with_deadline(tenant_id, session_id, fence, None)
+    }
+
+    pub fn verify_context_disposed_until(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        deadline: Instant,
+    ) -> Result<(), ShardRuntimeError> {
+        self.verify_context_disposed_with_deadline(tenant_id, session_id, fence, Some(deadline))
+    }
+
+    fn verify_context_disposed_with_deadline(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        deadline: Option<Instant>,
+    ) -> Result<(), ShardRuntimeError> {
+        let request = |response| OwnerRequest::VerifyContextDisposed {
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            fence: fence.clone(),
+            response,
+        };
+        match deadline {
+            Some(deadline) => self.mailbox.request_until(request, deadline),
+            None => self.mailbox.request(request),
+        }
+        .map_err(map_actor_runtime_error)?;
+        let wait_timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(self.target_ready_timeout)
+            .min(self.target_ready_timeout);
         self.readiness
             .get()
             .ok_or(ShardRuntimeError::Unavailable)?
-            .wait_until_empty(self.target_ready_timeout)
+            .wait_until_empty(wait_timeout)
     }
 
     pub(crate) fn create_page(&self, session_id: SessionId) -> Result<PageId, OwnerActorError> {
@@ -372,6 +399,8 @@ pub struct ChromiumConnectionOwner<D> {
     driver_effect_gate: Arc<Mutex<()>>,
     accepted: AtomicBool,
     shutdown_started: AtomicBool,
+    forced_termination_spec: Option<LaunchSpec>,
+    sandbox_termination_confirmed: AtomicBool,
     thread: Arc<OwnerThreadControl>,
 }
 
@@ -384,6 +413,7 @@ struct OwnerThreadControl {
 struct OwnerJoinState {
     handle: Option<std::thread::JoinHandle<()>>,
     result: Option<Result<(), ShardRuntimeError>>,
+    structurally_terminal: bool,
 }
 
 impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
@@ -395,7 +425,41 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
         event_capacity: usize,
         drain: Arc<D>,
     ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
+        Self::new_bounded_with_launch_spec(expected, config, fence, event_capacity, drain, None)
+    }
+
+    pub fn new_bounded_for_launch(
+        expected: ChromiumArtifactIdentity,
+        config: ChromiumConnectionConfig,
+        fence: ShardFence,
+        event_capacity: usize,
+        drain: Arc<D>,
+        launch_spec: LaunchSpec,
+    ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
+        Self::new_bounded_with_launch_spec(
+            expected,
+            config,
+            fence,
+            event_capacity,
+            drain,
+            Some(launch_spec),
+        )
+    }
+
+    fn new_bounded_with_launch_spec(
+        expected: ChromiumArtifactIdentity,
+        config: ChromiumConnectionConfig,
+        fence: ShardFence,
+        event_capacity: usize,
+        drain: Arc<D>,
+        forced_termination_spec: Option<LaunchSpec>,
+    ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
         if !config.is_valid() {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        if forced_termination_spec.as_ref().is_some_and(|launch_spec| {
+            launch_spec.dedicated_egress().egress_fence().shard() != &fence
+        }) {
             return Err(ShardRuntimeError::Rejected);
         }
         let command_capacity = config.transport.command_queue_capacity;
@@ -442,11 +506,14 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             driver_effect_gate: Arc::new(Mutex::new(())),
             accepted: AtomicBool::new(false),
             shutdown_started: AtomicBool::new(false),
+            forced_termination_spec,
+            sandbox_termination_confirmed: AtomicBool::new(false),
             thread: Arc::new(OwnerThreadControl {
                 completion,
                 join: Mutex::new(OwnerJoinState {
                     handle: None,
                     result: None,
+                    structurally_terminal: false,
                 }),
                 shutdown: CancellationToken::new(),
             }),
@@ -484,7 +551,13 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
                 .lock()
                 .map_err(|_| ShardRuntimeError::Unavailable)?;
             if let Some(result) = join.result {
-                return result;
+                return if self.sandbox_termination_confirmed.load(Ordering::Acquire)
+                    && join.structurally_terminal
+                {
+                    Ok(())
+                } else {
+                    result
+                };
             }
             self.thread.shutdown.cancel();
             if self
@@ -496,6 +569,7 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             }
             if !self.accepted.load(Ordering::Acquire) && join.handle.is_none() {
                 join.result = Some(Ok(()));
+                join.structurally_terminal = true;
                 self.thread.completion.send_replace(Some(Ok(())));
                 return Ok(());
             }
@@ -520,7 +594,13 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             .lock()
             .map_err(|_| ShardRuntimeError::Unavailable)?;
         if let Some(result) = join.result {
-            return result;
+            return if self.sandbox_termination_confirmed.load(Ordering::Acquire)
+                && join.structurally_terminal
+            {
+                Ok(())
+            } else {
+                result
+            };
         }
         let handle = join
             .handle
@@ -529,9 +609,45 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
         let join_result = handle
             .join()
             .map_err(|_| ShardRuntimeError::OutcomeUncertain);
+        let structurally_terminal = join_result.is_ok();
         let result = thread_result.and(join_result);
         join.result = Some(result);
-        result
+        join.structurally_terminal = structurally_terminal;
+        if self.sandbox_termination_confirmed.load(Ordering::Acquire) && structurally_terminal {
+            Ok(())
+        } else {
+            result
+        }
+    }
+
+    pub fn confirm_forced_termination(&self, proof: &SandboxTerminationProof) -> bool {
+        if !proof.matches_fence(&self.shard_fence)
+            || !self
+                .forced_termination_spec
+                .as_ref()
+                .is_some_and(|spec| proof.matches_launch_spec(spec))
+        {
+            return false;
+        }
+        self.sandbox_termination_confirmed
+            .store(true, Ordering::Release);
+        true
+    }
+
+    pub fn is_terminally_joined_after(&self, proof: &SandboxTerminationProof) -> bool {
+        if !proof.matches_fence(&self.shard_fence)
+            || !self
+                .forced_termination_spec
+                .as_ref()
+                .is_some_and(|spec| proof.matches_launch_spec(spec))
+            || !self.sandbox_termination_confirmed.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.thread
+            .join
+            .lock()
+            .is_ok_and(|join| join.structurally_terminal)
     }
 }
 
@@ -565,6 +681,7 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
             let (ready_tx, ready_rx) = oneshot::channel();
             let completion = self.thread.completion.clone();
             let failed_completion = completion.clone();
+            let failure_mailbox = mailbox.clone();
             let thread = std::thread::Builder::new()
                 .name("browserd-chromium-owner".to_owned())
                 .spawn(move || {
@@ -581,7 +698,7 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
                     };
                     let result = catch_unwind(AssertUnwindSafe(|| run_owner_thread(input)))
                         .unwrap_or(Err(ShardRuntimeError::OutcomeUncertain));
-                    completion.send_replace(Some(result));
+                    publish_owner_thread_result(&failure_mailbox, &completion, result);
                 });
             let thread = match thread {
                 Ok(thread) => thread,
@@ -589,6 +706,7 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
                     self.mailbox.mark_terminal();
                     self.ingress.fail_closed(TargetManagerEvent::TransportLost);
                     join.result = Some(Err(ShardRuntimeError::Unavailable));
+                    join.structurally_terminal = true;
                     failed_completion.send_replace(Some(Err(ShardRuntimeError::Unavailable)));
                     return Err(ShardRuntimeError::Unavailable);
                 }
@@ -615,6 +733,14 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
             .unwrap_or(Duration::MAX)
             .saturating_add(Duration::from_millis(100));
         self.shutdown_and_join(timeout).await
+    }
+
+    fn confirm_forced_termination(&self, proof: &SandboxTerminationProof) -> bool {
+        ChromiumConnectionOwner::confirm_forced_termination(self, proof)
+    }
+
+    fn is_terminally_joined_after(&self, proof: &SandboxTerminationProof) -> bool {
+        ChromiumConnectionOwner::is_terminally_joined_after(self, proof)
     }
 }
 
@@ -696,14 +822,37 @@ fn run_owner_thread<D: TargetManagerDrain>(
             client,
             events,
             driver,
-            ingress,
-            mailbox,
-            shard_fence,
+            OwnerActorContext {
+                ingress,
+                mailbox,
+                shard_fence,
+            },
             config.transport.default_command_timeout,
         )
         .run(receiver, shutdown)
         .await
     })
+}
+
+fn publish_owner_thread_result(
+    mailbox: &Weak<OwnerMailbox>,
+    completion: &watch::Sender<Option<Result<(), ShardRuntimeError>>>,
+    result: Result<(), ShardRuntimeError>,
+) {
+    let result = if result.is_err()
+        && catch_unwind(AssertUnwindSafe(|| {
+            if let Some(mailbox) = mailbox.upgrade() {
+                mailbox.mark_terminal();
+                mailbox.fail_closed();
+            }
+        }))
+        .is_err()
+    {
+        Err(ShardRuntimeError::OutcomeUncertain)
+    } else {
+        result
+    };
+    completion.send_replace(Some(result));
 }
 
 trait FailureSink: Send + Sync {
@@ -1050,23 +1199,27 @@ struct ChromiumOwnerActor<D> {
     next_target_incarnation: u64,
 }
 
+struct OwnerActorContext<D> {
+    ingress: Arc<TargetManagerIngress<D>>,
+    mailbox: Weak<OwnerMailbox>,
+    shard_fence: ShardFence,
+}
+
 impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     fn new(
         client: CdpClient,
         events: mpsc::Receiver<CdpIncoming>,
         driver: VerifiedChromiumDriverOwner,
-        ingress: Arc<TargetManagerIngress<D>>,
-        mailbox: Weak<OwnerMailbox>,
-        shard_fence: ShardFence,
+        context: OwnerActorContext<D>,
         command_timeout: Duration,
     ) -> Self {
         Self {
             client,
             events,
             driver,
-            ingress,
-            mailbox,
-            shard_fence,
+            ingress: context.ingress,
+            mailbox: context.mailbox,
+            shard_fence: context.shard_fence,
             command_timeout,
             routes: BTreeMap::new(),
             contexts: BTreeMap::new(),
@@ -2531,5 +2684,188 @@ fn map_connection_error(error: ChromiumConnectionError) -> ShardRuntimeError {
         | ChromiumConnectionError::RevisionMismatch { .. }
         | ChromiumConnectionError::InvalidVersionField { .. } => ShardRuntimeError::Rejected,
         _ => ShardRuntimeError::OutcomeUncertain,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use browserd_chromium::Sha256Digest;
+    use browserd_core::{
+        EgressFence, LaunchGeneration, OwnerFence, RouteGeneration, SessionIncarnation, ShardId,
+        WorkerEpoch, WorkerId,
+    };
+    use browserd_sandbox::{ChromiumBinaryDigest, DedicatedEgressSpec, EgressPolicyBinding};
+
+    struct PublicationOrderProbe {
+        completion: Mutex<watch::Receiver<Option<Result<(), ShardRuntimeError>>>>,
+        failed_before_completion: AtomicBool,
+    }
+
+    impl FailureSink for PublicationOrderProbe {
+        fn fail_closed(&self) {
+            let completion_is_pending = self
+                .completion
+                .lock()
+                .is_ok_and(|completion| completion.borrow().is_none());
+            self.failed_before_completion
+                .store(completion_is_pending, Ordering::Release);
+        }
+    }
+
+    struct NoopDrain;
+
+    impl TargetManagerDrain for NoopDrain {
+        fn begin_drain(&self) {}
+    }
+
+    fn test_identity() -> ChromiumArtifactIdentity {
+        let digest = Sha256Digest::from_hex(&"07".repeat(32)).expect("digest should be valid");
+        ChromiumArtifactIdentity {
+            binary_digest: digest,
+            product_version: "149.0.7827.55".to_owned(),
+            chromium_revision: "r1234567".to_owned(),
+            browser_protocol_schema_digest: digest,
+            js_protocol_schema_digest: digest,
+            launch_profile_digest: digest,
+            extension_bundle_digest: digest,
+            font_bundle_digest: digest,
+            certificate_runtime_bundle_digest: digest,
+        }
+    }
+
+    fn test_fence() -> ShardFence {
+        ShardFence::new(
+            OwnerFence::new(
+                WorkerId::new("owner-result-convergence").expect("worker ID should be valid"),
+                WorkerEpoch::new(9).expect("worker epoch should be valid"),
+            ),
+            ShardId::new(),
+            LaunchGeneration::new(3).expect("launch generation should be valid"),
+        )
+    }
+
+    fn test_launch_spec(fence: &ShardFence) -> LaunchSpec {
+        let egress = EgressFence::new(
+            fence.clone(),
+            RouteGeneration::new(1).expect("route generation should be valid"),
+            SessionId::new(),
+            SessionIncarnation::new(1).expect("session incarnation should be valid"),
+        );
+        let dedicated = DedicatedEgressSpec::new(
+            egress,
+            EgressPolicyBinding::new("strict", [7; 32]).expect("policy should be valid"),
+            Duration::from_secs(30),
+        )
+        .expect("dedicated egress should be valid");
+        LaunchSpec::production(
+            TenantId::new(),
+            dedicated,
+            ChromiumBinaryDigest::new([7; 32]),
+        )
+    }
+
+    #[test]
+    fn owner_error_fails_closed_before_completion_publication() {
+        let mailbox = Arc::new(OwnerMailbox::new(Duration::from_secs(1)));
+        let (completion, receiver) = watch::channel(None);
+        let probe = Arc::new(PublicationOrderProbe {
+            completion: Mutex::new(receiver.clone()),
+            failed_before_completion: AtomicBool::new(false),
+        });
+        let sink: Arc<dyn FailureSink> = probe.clone();
+        assert!(mailbox.bind_failure_sink(sink).is_ok());
+
+        publish_owner_thread_result(
+            &Arc::downgrade(&mailbox),
+            &completion,
+            Err(ShardRuntimeError::OutcomeUncertain),
+        );
+
+        assert!(probe.failed_before_completion.load(Ordering::Acquire));
+        assert_eq!(
+            *receiver.borrow(),
+            Some(Err(ShardRuntimeError::OutcomeUncertain))
+        );
+        assert!(
+            mailbox
+                .endpoint
+                .lock()
+                .is_ok_and(|endpoint| matches!(*endpoint, OwnerEndpoint::Terminal))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_join_waiters_converge_after_exact_termination_is_confirmed() {
+        let fence = test_fence();
+        let launch_spec = test_launch_spec(&fence);
+        let proof = SandboxTerminationProof::from_test_launch_spec(launch_spec.clone());
+        let owner = ChromiumConnectionOwner::new_bounded_for_launch(
+            test_identity(),
+            ChromiumConnectionConfig::default(),
+            fence,
+            8,
+            Arc::new(NoopDrain),
+            launch_spec,
+        )
+        .expect("owner should be valid")
+        .0;
+        owner.accepted.store(true, Ordering::Release);
+        assert!(owner.confirm_forced_termination(&proof));
+
+        let first = tokio::spawn({
+            let owner = Arc::clone(&owner);
+            async move { owner.shutdown_and_join(Duration::from_secs(1)).await }
+        });
+        let second = tokio::spawn({
+            let owner = Arc::clone(&owner);
+            async move { owner.shutdown_and_join(Duration::from_secs(1)).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while owner.thread.completion.receiver_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both cleanup waiters should subscribe");
+        {
+            let mut join = owner
+                .thread
+                .join
+                .lock()
+                .expect("join state should remain available");
+            join.result = Some(Err(ShardRuntimeError::OutcomeUncertain));
+            join.structurally_terminal = true;
+        }
+        owner
+            .thread
+            .completion
+            .send_replace(Some(Err(ShardRuntimeError::OutcomeUncertain)));
+
+        assert_eq!(first.await.expect("first waiter should join"), Ok(()));
+        assert_eq!(second.await.expect("second waiter should join"), Ok(()));
+    }
+
+    #[test]
+    fn exact_proof_cannot_confirm_a_different_launch_with_the_same_shard_fence() {
+        let fence = test_fence();
+        let terminated_spec = test_launch_spec(&fence);
+        let different_spec = test_launch_spec(&fence);
+        assert_ne!(terminated_spec, different_spec);
+        let proof = SandboxTerminationProof::from_test_launch_spec(terminated_spec);
+        let owner = ChromiumConnectionOwner::new_bounded_for_launch(
+            test_identity(),
+            ChromiumConnectionConfig::default(),
+            fence,
+            8,
+            Arc::new(NoopDrain),
+            different_spec,
+        )
+        .expect("owner should be valid")
+        .0;
+
+        assert!(!owner.confirm_forced_termination(&proof));
+        assert!(!owner.is_terminally_joined_after(&proof));
     }
 }

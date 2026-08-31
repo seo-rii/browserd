@@ -12,6 +12,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::SandboxTerminationProof;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShardRuntimeError {
     Unavailable,
@@ -130,6 +132,18 @@ pub trait BrowserShardRuntime: Send + Sync + 'static {
     ) -> Result<(), ShardRuntimeError>;
 
     async fn terminate(&self, fence: &ShardFence) -> Result<(), ShardRuntimeError>;
+
+    /// Releases only local runtime ownership after exact sandbox termination has been proven.
+    async fn force_terminate(
+        &self,
+        fence: &ShardFence,
+        proof: &SandboxTerminationProof,
+    ) -> Result<(), ShardRuntimeError> {
+        if !proof.matches_fence(fence) {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        self.terminate(fence).await
+    }
 }
 
 type ActorResult<T> = Result<T, ShardActorError>;

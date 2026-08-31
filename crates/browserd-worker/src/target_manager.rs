@@ -277,6 +277,19 @@ where
         let runtime_result = self.inner.terminate(fence).await;
         target_result.and(runtime_result)
     }
+
+    async fn force_terminate(
+        &self,
+        fence: &ShardFence,
+        proof: &crate::SandboxTerminationProof,
+    ) -> Result<(), ShardRuntimeError> {
+        if !proof.matches_fence(fence) {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        let target_result = self.targets.shutdown().await;
+        let runtime_result = self.inner.force_terminate(fence, proof).await;
+        target_result.and(runtime_result)
+    }
 }
 
 impl<B, D> ProductionTargetManager<B, D>

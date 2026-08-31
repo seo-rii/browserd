@@ -496,6 +496,98 @@ fn descriptor() -> (ShardLaunchDescriptor, ShardFence) {
 }
 
 #[tokio::test]
+async fn external_and_runtime_cleanup_share_one_exact_terminal_proof() {
+    let (descriptor, fence) = descriptor();
+    let terminated_spec = descriptor.launch_spec().clone();
+    let different_spec = LaunchSpec::production(
+        TenantId::new(),
+        terminated_spec.dedicated_egress().clone(),
+        terminated_spec.chromium_binary_digest(),
+    );
+    let rpc = Arc::new(FakeRpc {
+        calls: Mutex::new(Vec::new()),
+        launch_generations: Mutex::new(Vec::new()),
+        cancelled_specs: Mutex::new(Vec::new()),
+        cleanup_outcomes: Mutex::new(VecDeque::new()),
+        cleanup_finished: Notify::new(),
+        create_error: false,
+    });
+    let runtime = Arc::new(ProductionSandboxShardRuntime::new(
+        descriptor,
+        Duration::from_secs(30),
+        Arc::clone(&rpc),
+        sink(),
+        Arc::new(Inner(Mutex::new(Vec::new()))),
+    ));
+    let exact = runtime.exact_termination();
+
+    let (external, local) = tokio::join!(
+        exact.terminate(CleanupReason::WorkerLeaseExpired),
+        runtime.terminate(&fence),
+    );
+
+    let proof = external.expect("exact terminal cleanup should issue a proof");
+    assert!(proof.matches_launch_spec(&terminated_spec));
+    assert!(!proof.matches_launch_spec(&different_spec));
+    assert_eq!(local, Ok(()));
+    assert_eq!(
+        rpc.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| **call == "cancel")
+            .count(),
+        1,
+        "one exact LaunchSpec terminal proof must be shared by both cleanup owners",
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_first_exact_cleanup_caller_does_not_cancel_the_owned_flight() {
+    let (descriptor, _fence) = descriptor();
+    let rpc = blocking_rpc();
+    let runtime = ProductionSandboxShardRuntime::new(
+        descriptor,
+        Duration::from_secs(30),
+        Arc::clone(&rpc),
+        sink(),
+        Arc::new(Inner(Mutex::new(Vec::new()))),
+    );
+    let exact = runtime.exact_termination();
+    let first = tokio::spawn({
+        let exact = Arc::clone(&exact);
+        async move { exact.terminate(CleanupReason::WorkerLeaseExpired).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), rpc.cancel_started.notified())
+        .await
+        .expect("the owned exact cleanup should start");
+
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("the first caller should be cancelled")
+            .is_cancelled()
+    );
+    let second = tokio::spawn({
+        let exact = Arc::clone(&exact);
+        async move { exact.terminate(CleanupReason::WorkerLeaseExpired).await }
+    });
+    rpc.release_cancel.notify_one();
+
+    let second_result = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("the second caller should observe the owned flight")
+        .expect("the second caller task should join");
+    assert!(second_result.is_ok());
+    assert_eq!(
+        rpc.cancelled_specs.lock().unwrap().len(),
+        1,
+        "caller cancellation must not reissue the exact cleanup RPC",
+    );
+}
+
+#[tokio::test]
 async fn sandbox_runtime_claims_cdp_before_inner_readiness_and_terminates_exact_shard() {
     let (descriptor, fence) = descriptor();
     let rpc = Arc::new(FakeRpc {
@@ -710,7 +802,8 @@ async fn uncertain_local_shutdown_keeps_termination_retryable_after_exact_cleanu
     assert_eq!(inner.terminations.load(Ordering::SeqCst), 2);
     assert_eq!(
         *rpc.calls.lock().unwrap(),
-        vec!["create", "claim", "cancel", "cancel"]
+        vec!["create", "claim", "cancel"],
+        "local cleanup retries must reuse the cached exact terminal proof",
     );
 }
 

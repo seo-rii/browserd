@@ -9,7 +9,8 @@ pub use lifecycle::{
 };
 pub use production_runtime::{ProductionWorkerRuntime, ProductionWorkerRuntimeError};
 pub use production_shard_factory::{
-    ProductionSandboxControl, ProductionSessionShardConfig, ProductionSessionShardFactory,
+    ProductionQualificationBounds, ProductionSandboxControl, ProductionSessionShardConfig,
+    ProductionSessionShardFactory,
 };
 pub use session_shard_router::{
     ProvisionedSessionShard, RoutedArtifactStore, SessionShardFactory, SessionShardLifecycle,
