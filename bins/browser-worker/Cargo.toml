@@ -17,11 +17,13 @@ browserd-policy = { path = "../../crates/browserd-policy" }
 browserd-sandbox = { path = "../../crates/browserd-sandbox" }
 browserd-session = { path = "../../crates/browserd-session" }
 browserd-worker = { path = "../../crates/browserd-worker" }
+hex.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
 browserd-cdp = { path = "../../crates/browserd-cdp" }
 nix.workspace = true
-serde_json.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
