@@ -63,6 +63,10 @@ impl ProvisionedSessionShard {
             lifecycle,
         }
     }
+
+    pub(crate) fn lifecycle(&self) -> Arc<dyn SessionShardLifecycle> {
+        Arc::clone(&self.lifecycle)
+    }
 }
 
 pub struct SessionShardRouter<F, A> {
@@ -401,7 +405,7 @@ where
                             in_flight: 0,
                         } = &*state
                         {
-                            let lifecycle = Arc::clone(&shard.lifecycle);
+                            let lifecycle = shard.lifecycle();
                             *state = EntryState::Closing;
                             break lifecycle;
                         }
@@ -411,7 +415,7 @@ where
                             .map_err(|_| DependencyError::Unavailable)?;
                     }
                     EntryState::Active { shard, in_flight } => {
-                        let lifecycle = Arc::clone(&shard.lifecycle);
+                        let lifecycle = shard.lifecycle();
                         if *in_flight == 0 {
                             *state = EntryState::Closing;
                             break lifecycle;

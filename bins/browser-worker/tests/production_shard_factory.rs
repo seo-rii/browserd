@@ -1,7 +1,8 @@
 #![allow(clippy::expect_used)]
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -97,7 +98,9 @@ impl ProductionSandboxControl for FailingSandbox {
 
 struct ScriptedSandbox {
     daemon_epoch: u64,
-    peer: Mutex<Option<oneshot::Sender<(Receiver, Sender)>>>,
+    peers: Mutex<VecDeque<oneshot::Sender<(Receiver, Sender)>>>,
+    launches: AtomicUsize,
+    claims: AtomicUsize,
     renewals: AtomicUsize,
     kills: AtomicUsize,
 }
@@ -109,6 +112,7 @@ impl SandboxShardRpc for ScriptedSandbox {
         _spec: LaunchSpec,
         _lease_ttl: Duration,
     ) -> Result<CreateShardOutcome, ShardRuntimeError> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
         Ok(CreateShardOutcome::Created)
     }
 
@@ -119,6 +123,7 @@ impl SandboxShardRpc for ScriptedSandbox {
         _worker_epoch: u64,
         _launch_generation: LaunchGeneration,
     ) -> Result<ChromiumCdpPipes, ShardRuntimeError> {
+        self.claims.fetch_add(1, Ordering::SeqCst);
         let (command_reader, command_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .map_err(|_| ShardRuntimeError::Unavailable)?;
         let (event_reader, event_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
@@ -129,10 +134,10 @@ impl SandboxShardRpc for ScriptedSandbox {
             Receiver::from_owned_fd(command_reader).map_err(|_| ShardRuntimeError::Unavailable)?;
         let writer =
             Sender::from_owned_fd(event_writer).map_err(|_| ShardRuntimeError::Unavailable)?;
-        self.peer
+        self.peers
             .lock()
             .map_err(|_| ShardRuntimeError::Unavailable)?
-            .take()
+            .pop_front()
             .ok_or(ShardRuntimeError::Rejected)?
             .send((reader, writer))
             .map_err(|_| ShardRuntimeError::Cancelled)?;
@@ -337,7 +342,7 @@ fn identity() -> ChromiumArtifactIdentity {
 }
 
 #[test]
-fn failed_connection_claim_cleans_the_exact_session_shard() {
+fn failed_readiness_connection_claim_cleans_the_exact_probe_shard() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -365,15 +370,7 @@ fn failed_connection_claim_cleans_the_exact_session_shard() {
     .expect("production shard configuration should be valid");
     let factory =
         ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone());
-    assert_eq!(factory.qualify_daemon(), Ok(()));
-
-    let tenant_id = TenantId::new();
-    let session_id = SessionId::new();
-    let fence = OwnershipFence::new(worker_id.clone(), worker_epoch, 3, 5);
-    assert!(matches!(
-        factory.create(&tenant_id, &session_id, &fence),
-        Err(DependencyError::Unavailable)
-    ));
+    assert_eq!(factory.qualify_daemon(), Err(DependencyError::Unavailable));
 
     let launches = sandbox
         .launches
@@ -381,7 +378,6 @@ fn failed_connection_claim_cleans_the_exact_session_shard() {
         .expect("launch log should remain available");
     assert_eq!(launches.len(), 1);
     let launch = &launches[0];
-    assert_eq!(launch.tenant_id(), &tenant_id);
     assert_eq!(launch.worker_id(), &worker_id);
     assert_eq!(launch.worker_epoch(), worker_epoch);
     assert_eq!(
@@ -389,16 +385,12 @@ fn failed_connection_claim_cleans_the_exact_session_shard() {
         ChromiumBinaryDigest::new([0x11; 32]),
     );
     assert_eq!(
-        launch.dedicated_egress().egress_fence().session_id(),
-        &session_id
-    );
-    assert_eq!(
         launch
             .dedicated_egress()
             .egress_fence()
             .session_incarnation()
             .get(),
-        fence.session_incarnation()
+        1
     );
     drop(launches);
     assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
@@ -407,6 +399,159 @@ fn failed_connection_claim_cleans_the_exact_session_shard() {
         2,
         "failed activation cleanup and actor shutdown must both reconcile the exact shard"
     );
+}
+
+#[test]
+fn production_admission_stays_closed_until_real_readiness_qualification_succeeds() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let worker_id =
+        WorkerId::new("production-unqualified-factory").expect("worker identity should be valid");
+    let worker_epoch = 29;
+    let daemon_epoch = 13;
+    let sandbox = Arc::new(FailingSandbox {
+        daemon_epoch,
+        launches: Mutex::new(Vec::new()),
+        claims: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+    });
+    let config = ProductionSessionShardConfig::new(
+        worker_id.clone(),
+        worker_epoch,
+        daemon_epoch,
+        identity(),
+        ChromiumConnectionConfig::default(),
+        EgressPolicyBinding::new("strict", [5; 32]).expect("egress policy should be valid"),
+        Duration::from_secs(30),
+    )
+    .expect("production shard configuration should be valid");
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone());
+    let fence = OwnershipFence::new(worker_id, worker_epoch, 1, 1);
+
+    assert!(matches!(
+        factory.create(&TenantId::new(), &SessionId::new(), &fence),
+        Err(DependencyError::Rejected)
+    ));
+    assert!(
+        sandbox
+            .launches
+            .lock()
+            .expect("launch log should remain available")
+            .is_empty()
+    );
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 0);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn readiness_qualification_runs_a_real_shard_and_caches_failure() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let worker_id =
+        WorkerId::new("production-readiness-failure").expect("worker identity should be valid");
+    let worker_epoch = 31;
+    let daemon_epoch = 17;
+    let sandbox = Arc::new(FailingSandbox {
+        daemon_epoch,
+        launches: Mutex::new(Vec::new()),
+        claims: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+    });
+    let config = ProductionSessionShardConfig::new(
+        worker_id,
+        worker_epoch,
+        daemon_epoch,
+        identity(),
+        ChromiumConnectionConfig::default(),
+        EgressPolicyBinding::new("strict", [6; 32]).expect("egress policy should be valid"),
+        Duration::from_secs(30),
+    )
+    .expect("production shard configuration should be valid");
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone());
+
+    assert_eq!(factory.qualify_daemon(), Err(DependencyError::Unavailable));
+    assert_eq!(factory.qualify_daemon(), Err(DependencyError::Unavailable));
+    assert_eq!(
+        sandbox
+            .launches
+            .lock()
+            .expect("launch log should remain available")
+            .len(),
+        1,
+    );
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn concurrent_readiness_callers_share_one_probe_and_one_cleanup() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let worker_id =
+        WorkerId::new("production-concurrent-readiness").expect("worker identity should be valid");
+    let worker_epoch = 37;
+    let daemon_epoch = 19;
+    let (peer_tx, peer_rx) = oneshot::channel();
+    let sandbox = Arc::new(ScriptedSandbox {
+        daemon_epoch,
+        peers: Mutex::new(VecDeque::from([peer_tx])),
+        launches: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
+        renewals: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+    });
+    let config = ProductionSessionShardConfig::new(
+        worker_id,
+        worker_epoch,
+        daemon_epoch,
+        identity(),
+        ChromiumConnectionConfig::default(),
+        EgressPolicyBinding::new("strict", [8; 32]).expect("egress policy should be valid"),
+        Duration::from_secs(30),
+    )
+    .expect("production shard configuration should be valid");
+    let factory = Arc::new(ProductionSessionShardFactory::new(
+        config,
+        Arc::clone(&sandbox),
+        runtime.handle().clone(),
+    ));
+    let protocol = runtime.spawn(run_scripted_protocol(peer_rx));
+    let barrier = Arc::new(Barrier::new(3));
+    let callers = (0..2)
+        .map(|_| {
+            let factory = Arc::clone(&factory);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                factory.qualify_daemon()
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+
+    for caller in callers {
+        assert_eq!(
+            caller.join().expect("readiness caller should not panic"),
+            Ok(())
+        );
+    }
+    runtime
+        .block_on(protocol)
+        .expect("readiness CDP peer should not panic");
+    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -420,10 +565,13 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         WorkerId::new("production-shard-success").expect("worker identity should be valid");
     let worker_epoch = 23;
     let daemon_epoch = 11;
-    let (peer_tx, peer_rx) = oneshot::channel();
+    let (readiness_peer_tx, readiness_peer_rx) = oneshot::channel();
+    let (session_peer_tx, session_peer_rx) = oneshot::channel();
     let sandbox = Arc::new(ScriptedSandbox {
         daemon_epoch,
-        peer: Mutex::new(Some(peer_tx)),
+        peers: Mutex::new(VecDeque::from([readiness_peer_tx, session_peer_tx])),
+        launches: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
         renewals: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
     });
@@ -454,6 +602,15 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         Arc::clone(&sandbox),
         runtime.handle().clone(),
     ));
+    let readiness_protocol = runtime.spawn(run_scripted_protocol(readiness_peer_rx));
+    assert_eq!(factory.qualify_daemon(), Ok(()));
+    assert_eq!(factory.qualify_daemon(), Ok(()));
+    runtime
+        .block_on(readiness_protocol)
+        .expect("readiness CDP peer should not panic");
+    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 1);
     let router = SessionShardRouter::new(
         worker_id.clone(),
         worker_epoch,
@@ -462,7 +619,7 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         1,
     )
     .expect("session shard router should be valid");
-    let protocol = runtime.spawn(run_scripted_protocol(peer_rx));
+    let protocol = runtime.spawn(run_scripted_protocol(session_peer_rx));
 
     let tenant_id = TenantId::new();
     let session_id = SessionId::new();
@@ -478,5 +635,7 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
     runtime
         .block_on(protocol)
         .expect("scripted CDP peer should not panic");
-    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 2);
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 2);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 2);
 }

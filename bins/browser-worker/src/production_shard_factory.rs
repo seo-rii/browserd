@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -101,6 +101,7 @@ pub struct ProductionSessionShardFactory<B> {
     config: ProductionSessionShardConfig,
     sandbox: Arc<B>,
     runtime: Handle,
+    qualification: OnceLock<Result<(), DependencyError>>,
 }
 
 impl<B> ProductionSessionShardFactory<B> {
@@ -110,6 +111,7 @@ impl<B> ProductionSessionShardFactory<B> {
             config,
             sandbox,
             runtime,
+            qualification: OnceLock::new(),
         }
     }
 }
@@ -231,7 +233,19 @@ where
     B: ProductionSandboxControl,
 {
     fn qualify_daemon(&self) -> Result<(), DependencyError> {
-        self.probe_daemon()
+        *self.qualification.get_or_init(|| {
+            self.probe_daemon()?;
+            let tenant_id = TenantId::new();
+            let session_id = SessionId::new();
+            let fence = OwnershipFence::new(
+                self.config.worker_id.clone(),
+                self.config.worker_epoch,
+                1,
+                1,
+            );
+            let shard = self.create_provisioned(&tenant_id, &session_id, &fence)?;
+            shard.lifecycle().terminate(&fence)
+        })
     }
 
     fn heartbeat_daemon(
@@ -242,10 +256,33 @@ where
         if worker_id != &self.config.worker_id || worker_epoch != self.config.worker_epoch {
             return Err(DependencyError::Rejected);
         }
+        match self.qualification.get().copied() {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(error),
+            None => return Err(DependencyError::Rejected),
+        }
         self.probe_daemon()
     }
 
     fn create(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        match self.qualification.get().copied() {
+            Some(Ok(())) => self.create_provisioned(tenant_id, session_id, fence),
+            Some(Err(error)) => Err(error),
+            None => Err(DependencyError::Rejected),
+        }
+    }
+}
+
+impl<B> ProductionSessionShardFactory<B>
+where
+    B: ProductionSandboxControl,
+{
+    fn create_provisioned(
         &self,
         tenant_id: &TenantId,
         session_id: &SessionId,
@@ -385,12 +422,7 @@ where
             lifecycle,
         ))
     }
-}
 
-impl<B> ProductionSessionShardFactory<B>
-where
-    B: ProductionSandboxControl,
-{
     fn probe_daemon(&self) -> Result<(), DependencyError> {
         let observed = self.runtime.block_on(
             self.sandbox
