@@ -25,7 +25,7 @@ use crate::cdp_driver::CdpChromiumDriver;
 use crate::{
     CdpPipeAcceptor, ProductionTargetManager, SandboxTerminationProof, ShardRuntimeError,
     TargetBootstrapSnapshot, TargetManagerBackend, TargetManagerDrain, TargetManagerEvent,
-    TargetManagerIngress, target_manager::TargetReadiness,
+    TargetManagerIngress, WorkerSessionOptionsV1, target_manager::TargetReadiness,
 };
 
 const MAX_CDP_IDENTIFIER_BYTES: usize = 1_024;
@@ -115,6 +115,27 @@ impl ChromiumTargetManagerBackend {
                 tenant_id,
                 session_id,
                 fence,
+                options: None,
+                response,
+            })?;
+        self.wait_until_target_ready(&created.target_id)?;
+        Ok(created.page_id)
+    }
+
+    pub(crate) fn create_context_owned_with_options(
+        &self,
+        tenant_id: TenantId,
+        session_id: SessionId,
+        fence: OwnershipFence,
+        options: WorkerSessionOptionsV1,
+    ) -> Result<PageId, OwnerActorError> {
+        let created = self
+            .mailbox
+            .request(|response| OwnerRequest::CreateContext {
+                tenant_id,
+                session_id,
+                fence,
+                options: Some(Box::new(options)),
                 response,
             })?;
         self.wait_until_target_ready(&created.target_id)?;
@@ -1041,6 +1062,7 @@ enum OwnerRequest {
         tenant_id: TenantId,
         session_id: SessionId,
         fence: OwnershipFence,
+        options: Option<Box<WorkerSessionOptionsV1>>,
         response: std_mpsc::SyncSender<Result<CreatedPage, OwnerActorError>>,
     },
     DisposeContext {
@@ -1156,11 +1178,15 @@ struct ContextOwnership {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextLifecycle {
     Active,
+    DisposeRequested,
     Disposing,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ContextEntry {
     ownership: ContextOwnership,
+    options: Option<WorkerSessionOptionsV1>,
+    emulation_owner_target_id: Option<String>,
     lifecycle: ContextLifecycle,
     pages: BTreeMap<PageId, String>,
     closing_pages: BTreeSet<PageId>,
@@ -1172,7 +1198,7 @@ struct PendingPage {
     page_id: PageId,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TargetRouteEntry {
     route: ChromiumTargetRoute,
     kind: TargetKind,
@@ -1342,9 +1368,17 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 tenant_id,
                 session_id,
                 fence,
+                options,
                 response,
             } => {
-                let result = self.create_context(tenant_id, session_id, fence).await;
+                let result = self
+                    .create_context(
+                        tenant_id,
+                        session_id,
+                        fence,
+                        options.map(|options| *options),
+                    )
+                    .await;
                 let failed = matches!(
                     result,
                     Err(OwnerActorError::StateOverflow
@@ -1589,26 +1623,121 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .get(target.target_id())
             .cloned()
             .ok_or(OwnerActorError::UnknownOwnership)?;
-        if route.kind != *target.kind() {
-            return Err(OwnerActorError::UnknownOwnership);
-        }
-        if stage == BootstrapStage::ValidateTargetType && !allowed_target_kind(target.kind()) {
+        let validate_route = |actor: &Self| {
+            let current = actor
+                .routes
+                .get(target.target_id())
+                .ok_or(OwnerActorError::UnknownOwnership)?;
+            if current.route != route.route
+                || current.kind != route.kind
+                || current.page_id != route.page_id
+                || current.kind != *target.kind()
+            {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            let context = actor
+                .contexts
+                .get(current.route.browser_context_id())
+                .ok_or(OwnerActorError::UnknownOwnership)?;
+            if context.lifecycle != ContextLifecycle::Active
+                || &context.ownership.tenant_id != current.route.tenant_id()
+                || &context.ownership.session_id != current.route.owner_session_id()
+                || &context.ownership.fence != current.route.ownership_fence()
+            {
+                return Err(OwnerActorError::UnknownOwnership);
+            }
+            Ok((
+                context.options.clone(),
+                context.emulation_owner_target_id.clone(),
+            ))
+        };
+        let (options, emulation_owner_target_id) = validate_route(self)?;
+        if stage == BootstrapStage::ValidateTargetType
+            && (!allowed_target_kind(target.kind())
+                || (options.is_some()
+                    && match emulation_owner_target_id.as_deref() {
+                        Some(owner_target_id) => owner_target_id != target.target_id(),
+                        None => !matches!(target.kind(), TargetKind::Page),
+                    }))
+        {
             return Err(OwnerActorError::Rejected);
+        }
+        if stage == BootstrapStage::ApplyEmulation {
+            let Some(options) = options else {
+                return Ok(());
+            };
+            let mut commands = vec![
+                (
+                    "Emulation.setDeviceMetricsOverride",
+                    json!({
+                        "width": options.viewport.width,
+                        "height": options.viewport.height,
+                        "deviceScaleFactor": options.viewport.device_scale_factor,
+                        "mobile": false,
+                    }),
+                ),
+                (
+                    "Emulation.setLocaleOverride",
+                    json!({"locale": options.locale}),
+                ),
+                (
+                    "Emulation.setTimezoneOverride",
+                    json!({"timezoneId": options.timezone}),
+                ),
+            ];
+            if let Some(user_agent) = options.user_agent {
+                commands.push((
+                    "Network.setUserAgentOverride",
+                    json!({"userAgent": user_agent}),
+                ));
+            }
+            for (method, params) in commands {
+                validate_route(self)?;
+                self.command_event_first(
+                    method,
+                    params,
+                    Some(route.route.session_id.clone()),
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            validate_route(self)?;
+            let context = self
+                .contexts
+                .get_mut(route.route.browser_context_id())
+                .ok_or(OwnerActorError::UnknownOwnership)?;
+            match context.emulation_owner_target_id.as_deref() {
+                Some(owner_target_id) if owner_target_id != target.target_id() => {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+                Some(_) => {}
+                None => {
+                    context.emulation_owner_target_id = Some(target.target_id().to_owned());
+                }
+            }
+            return Ok(());
         }
         let command = stage_command(stage, target.kind());
         let Some((method, params)) = command else {
             return Ok(());
         };
-        self.command_event_first(
-            method,
-            params,
-            Some(route.route.session_id),
-            None,
-            None,
-            None,
-        )
-        .await
-        .map(|_| ())
+        let result = self
+            .command_event_first(
+                method,
+                params,
+                Some(route.route.session_id.clone()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ());
+        if result.is_ok() {
+            validate_route(self)?;
+        }
+        result
     }
 
     async fn close_target(&mut self, target_id: &str) -> Result<(), OwnerActorError> {
@@ -1636,13 +1765,23 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         tenant_id: TenantId,
         session_id: SessionId,
         fence: OwnershipFence,
+        options: Option<WorkerSessionOptionsV1>,
     ) -> Result<CreatedPage, OwnerActorError> {
+        let options_context_conflict = if options.is_some() {
+            !self.contexts.is_empty()
+        } else {
+            self.contexts
+                .values()
+                .any(|context| context.options.is_some())
+        };
         if self.contexts.len() >= MAX_CONTEXTS_PER_SHARD
             || self.context_by_session.contains_key(&session_id)
             || fence.worker_id() != self.shard_fence.owner().worker_id()
             || fence.worker_epoch() != self.shard_fence.owner().worker_epoch().get()
             || fence.placement_version() == 0
             || fence.session_incarnation() == 0
+            || options.as_ref().is_some_and(|options| !options.is_valid())
+            || options_context_conflict
         {
             return Err(OwnerActorError::Rejected);
         }
@@ -1673,6 +1812,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         session_id: session_id.clone(),
                         fence,
                     },
+                    options,
+                    emulation_owner_target_id: None,
                     lifecycle: ContextLifecycle::Active,
                     pages: BTreeMap::new(),
                     closing_pages: BTreeSet::new(),
@@ -1709,23 +1850,60 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         if &context.ownership.fence != fence {
             return Err(OwnerActorError::UnknownOwnership);
         }
-        if context.lifecycle == ContextLifecycle::Disposing {
-            return Ok(());
+        match context.lifecycle {
+            ContextLifecycle::Disposing => return Ok(()),
+            ContextLifecycle::DisposeRequested => {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            ContextLifecycle::Active => {}
         }
-        self.command_event_first(
-            "Target.disposeBrowserContext",
-            json!({"browserContextId": context_id}),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
+        let original_context = context.clone();
+        let context_routes = |routes: &BTreeMap<String, TargetRouteEntry>| {
+            routes
+                .iter()
+                .filter(|(_, route)| route.route.browser_context_id() == context_id)
+                .map(|(target_id, route)| (target_id.clone(), route.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let original_routes = context_routes(&self.routes);
         self.contexts
             .get_mut(&context_id)
             .ok_or(OwnerActorError::OutcomeUncertain)?
-            .lifecycle = ContextLifecycle::Disposing;
-        Ok(())
+            .lifecycle = ContextLifecycle::DisposeRequested;
+        let result = self
+            .command_event_first(
+                "Target.disposeBrowserContext",
+                json!({"browserContextId": context_id.clone()}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        match result {
+            Ok(_) => {
+                self.contexts
+                    .get_mut(&context_id)
+                    .ok_or(OwnerActorError::OutcomeUncertain)?
+                    .lifecycle = ContextLifecycle::Disposing;
+                Ok(())
+            }
+            Err(OwnerActorError::Rejected) => {
+                let mut requested_context = original_context;
+                requested_context.lifecycle = ContextLifecycle::DisposeRequested;
+                if self.contexts.get(&context_id) != Some(&requested_context)
+                    || context_routes(&self.routes) != original_routes
+                {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+                self.contexts
+                    .get_mut(&context_id)
+                    .ok_or(OwnerActorError::OutcomeUncertain)?
+                    .lifecycle = ContextLifecycle::Active;
+                Err(OwnerActorError::Rejected)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn verify_context_disposed(
@@ -1804,10 +1982,17 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         &mut self,
         session_id: &SessionId,
     ) -> Result<CreatedPage, OwnerActorError> {
-        let (context_id, page_count) = {
+        let (context_id, page_count, has_options) = {
             let (context_id, context) = self.active_context_for_session(session_id)?;
-            (context_id.to_owned(), context.pages.len())
+            (
+                context_id.to_owned(),
+                context.pages.len(),
+                context.options.is_some(),
+            )
         };
+        if has_options && page_count != 0 {
+            return Err(OwnerActorError::Rejected);
+        }
         if page_count >= MAX_PAGES_PER_CONTEXT {
             return Err(OwnerActorError::StateOverflow);
         }
@@ -1875,6 +2060,20 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         if &context.ownership.tenant_id != tenant_id || &context.ownership.fence != fence {
             return Err(OwnerActorError::UnknownOwnership);
         }
+        if context.options.is_some() {
+            let owner_target_id = context
+                .emulation_owner_target_id
+                .as_deref()
+                .ok_or(OwnerActorError::Rejected)?;
+            let page_id = context
+                .pages
+                .iter()
+                .find_map(|(page_id, target_id)| {
+                    (target_id == owner_target_id).then(|| page_id.clone())
+                })
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            return Ok(vec![page_id]);
+        }
         Ok(context.pages.keys().cloned().collect())
     }
 
@@ -1903,7 +2102,9 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .contexts
             .get(&context_id)
             .ok_or(OwnerActorError::OutcomeUncertain)?;
-        if context.lifecycle != ContextLifecycle::Active {
+        if context.lifecycle != ContextLifecycle::Active
+            || context.emulation_owner_target_id.as_deref() == Some(target_id.as_str())
+        {
             return Err(OwnerActorError::Rejected);
         }
         let response = self
@@ -2132,6 +2333,11 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .pages
             .get(page_id)
             .ok_or(OwnerActorError::UnknownOwnership)?;
+        if context.options.is_some()
+            && context.emulation_owner_target_id.as_deref() != Some(target_id.as_str())
+        {
+            return Err(OwnerActorError::Rejected);
+        }
         if context.closing_pages.contains(page_id) {
             return Err(OwnerActorError::Rejected);
         }
@@ -2268,8 +2474,11 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .contexts
                     .get(&browser_context_id)
                     .ok_or(OwnerActorError::UnknownOwnership)?;
-                if context.lifecycle != ContextLifecycle::Active {
-                    return Err(OwnerActorError::UnknownOwnership);
+                match context.lifecycle {
+                    ContextLifecycle::Active => {}
+                    ContextLifecycle::DisposeRequested | ContextLifecycle::Disposing => {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
                 }
                 let ownership = context.ownership.clone();
                 let page_id = if matches!(target.kind(), TargetKind::Page) {
@@ -2368,6 +2577,15 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     if route.route.session_id != session_id {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
+                    let context = self
+                        .contexts
+                        .get(route.route.browser_context_id())
+                        .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    if context.lifecycle == ContextLifecycle::Active
+                        && context.emulation_owner_target_id.as_deref() == Some(target_id.as_str())
+                    {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
                     let route = self
                         .routes
                         .remove(&target_id)
@@ -2417,6 +2635,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     };
                     let route = self
                         .routes
+                        .get(&target_id)
+                        .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    let context = self
+                        .contexts
+                        .get(route.route.browser_context_id())
+                        .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    if context.lifecycle == ContextLifecycle::Active
+                        && context.emulation_owner_target_id.as_deref() == Some(target_id.as_str())
+                    {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
+                    let route = self
+                        .routes
                         .remove(&target_id)
                         .ok_or(OwnerActorError::OutcomeUncertain)?;
                     if self.retired_targets.len() >= MAX_RETIRED_TARGETS
@@ -2457,6 +2688,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 let target_id = required_string(params, "targetId")?;
                 if self.retired_targets.contains_key(&target_id) {
                     return Ok(());
+                }
+                let route = self
+                    .routes
+                    .get(&target_id)
+                    .ok_or(OwnerActorError::OutcomeUncertain)?;
+                let context = self
+                    .contexts
+                    .get(route.route.browser_context_id())
+                    .ok_or(OwnerActorError::OutcomeUncertain)?;
+                if context.lifecycle == ContextLifecycle::Active
+                    && context.emulation_owner_target_id.as_deref() == Some(target_id.as_str())
+                {
+                    return Err(OwnerActorError::OutcomeUncertain);
                 }
                 let route = self
                     .routes

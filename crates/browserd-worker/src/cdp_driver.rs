@@ -11,7 +11,7 @@ use crate::chromium_owner::{
 };
 use crate::{
     ActionExecutionResult, ApprovedActionError, ChromiumDriver, DependencyError,
-    LiveApprovalContext, WorkerActionCommand,
+    LiveApprovalContext, WorkerActionCommand, WorkerSessionOptionsV1,
 };
 
 const MAX_ACTION_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -292,6 +292,36 @@ impl ChromiumDriver for CdpChromiumDriver {
             .map_err(|_| DependencyError::Unavailable)?;
         self.backend
             .create_context_owned(tenant_id.clone(), session_id.clone(), fence.clone())
+            .map_err(map_owner_error)
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        if !options.is_valid()
+            || self.isolation != IsolationProfile::DedicatedProcess
+            || options.network_class != "public"
+            || options.checkpoint_ref.is_some()
+            || options.dialog_policy != "auto_dismiss"
+            || options.feature_profile != "standard"
+        {
+            return Err(DependencyError::Rejected);
+        }
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.backend
+            .create_context_owned_with_options(
+                tenant_id.clone(),
+                session_id.clone(),
+                fence.clone(),
+                options.clone(),
+            )
             .map_err(map_owner_error)
     }
 
