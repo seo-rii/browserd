@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use browserd_sandbox::ChromiumBinaryDigest;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -32,6 +33,12 @@ impl Sha256Digest {
 
     pub fn to_hex(self) -> String {
         hex::encode(self.0)
+    }
+}
+
+impl From<Sha256Digest> for ChromiumBinaryDigest {
+    fn from(value: Sha256Digest) -> Self {
+        Self::new(value.0)
     }
 }
 

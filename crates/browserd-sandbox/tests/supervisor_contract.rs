@@ -11,10 +11,10 @@ use browserd_core::{
     ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome, DedicatedEgressSpec,
-    EgressPolicyBinding, InspectResources, KillShardOutcome, LaunchSpec, RenewLeaseError,
-    SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle, SandboxSupervisor,
-    SupervisorConfig, WorkerOwnership,
+    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome,
+    DedicatedEgressSpec, EgressPolicyBinding, InspectResources, KillShardOutcome, LaunchSpec,
+    RenewLeaseError, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
+    SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -146,7 +146,11 @@ fn launch_spec(shard_id: ShardId) -> LaunchSpec {
     let dedicated_egress =
         DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_secs(5))
             .expect("dedicated egress spec is valid");
-    LaunchSpec::production(TenantId::new(), dedicated_egress)
+    LaunchSpec::production(
+        TenantId::new(),
+        dedicated_egress,
+        ChromiumBinaryDigest::new([0x3c; 32]),
+    )
 }
 
 #[derive(Clone)]

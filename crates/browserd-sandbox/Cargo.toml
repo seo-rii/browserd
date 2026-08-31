@@ -12,6 +12,7 @@ browserd-core = { path = "../browserd-core" }
 browserd-launch-gate = { path = "../browserd-launch-gate" }
 bytes.workspace = true
 futures.workspace = true
+hex.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

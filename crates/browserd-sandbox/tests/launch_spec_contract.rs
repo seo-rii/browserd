@@ -10,10 +10,10 @@ use browserd_core::{
     ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    CleanupReason, CreateShardOutcome, DedicatedEgressSpec, EgressPolicyBinding, InspectResources,
-    LaunchSpec, RpcFailureCode, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
-    SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcServer, SandboxSupervisor,
-    SupervisorConfig, WorkerOwnership,
+    ChromiumBinaryDigest, CleanupReason, CreateShardOutcome, DedicatedEgressSpec,
+    EgressPolicyBinding, InspectResources, LaunchSpec, RpcFailureCode, SandboxBackend,
+    SandboxCapabilities, SandboxError, SandboxHandle, SandboxRpcClient, SandboxRpcConfig,
+    SandboxRpcError, SandboxRpcServer, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use serde_json::json;
 use tempfile::tempdir;
@@ -23,6 +23,10 @@ use tokio_util::sync::CancellationToken;
 
 fn worker() -> WorkerId {
     WorkerId::new("worker-launch-contract").expect("worker ID is valid")
+}
+
+fn chromium_digest(byte: u8) -> ChromiumBinaryDigest {
+    ChromiumBinaryDigest::new([byte; 32])
 }
 
 fn launch_spec(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> LaunchSpec {
@@ -42,7 +46,7 @@ fn launch_spec(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> Lau
     let dedicated_egress =
         DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_millis(50))
             .expect("dedicated egress spec is valid");
-    LaunchSpec::production(TenantId::new(), dedicated_egress)
+    LaunchSpec::production(TenantId::new(), dedicated_egress, chromium_digest(0x3c))
 }
 
 #[test]
@@ -54,6 +58,7 @@ fn production_launch_spec_derives_every_duplicate_identity_from_the_full_fence()
     assert_eq!(spec.shard_id(), &shard_id);
     assert_eq!(spec.worker_id(), &worker_id);
     assert_eq!(spec.worker_epoch(), 7);
+    assert_eq!(spec.chromium_binary_digest(), chromium_digest(0x3c));
     assert_eq!(
         spec.dedicated_egress().egress_fence().shard().shard_id(),
         spec.shard_id()
@@ -83,6 +88,24 @@ fn production_launch_spec_derives_every_duplicate_identity_from_the_full_fence()
         spec.dedicated_egress().initial_lease_ttl(),
         Duration::from_millis(50)
     );
+}
+
+#[test]
+fn launch_spec_requires_a_canonical_chromium_binary_digest() {
+    let spec = launch_spec(ShardId::new(), worker(), 7);
+    let mut wire = serde_json::to_value(&spec).expect("launch spec should serialize");
+    assert_eq!(wire["chromium_binary_digest"], json!("3c".repeat(32)),);
+
+    wire.as_object_mut()
+        .expect("launch spec wire value should be an object")
+        .remove("chromium_binary_digest");
+    assert!(serde_json::from_value::<LaunchSpec>(wire.clone()).is_err());
+
+    wire["chromium_binary_digest"] = json!("3c".repeat(31));
+    assert!(serde_json::from_value::<LaunchSpec>(wire.clone()).is_err());
+
+    wire["chromium_binary_digest"] = json!("zz".repeat(32));
+    assert!(serde_json::from_value::<LaunchSpec>(wire).is_err());
 }
 
 #[test]
@@ -216,7 +239,27 @@ async fn rpc_round_trip_preserves_the_complete_dedicated_egress_launch_contract(
     assert!(matches!(
         client
             .create_shard(
-                LaunchSpec::production(spec.tenant_id().clone(), conflicting_egress),
+                LaunchSpec::production(
+                    spec.tenant_id().clone(),
+                    conflicting_egress,
+                    spec.chromium_binary_digest(),
+                ),
+                Duration::from_millis(80),
+            )
+            .await,
+        Err(SandboxRpcError::Remote {
+            code: RpcFailureCode::LaunchBindingMismatch,
+            ..
+        })
+    ));
+    assert!(matches!(
+        client
+            .create_shard(
+                LaunchSpec::production(
+                    spec.tenant_id().clone(),
+                    spec.dedicated_egress().clone(),
+                    chromium_digest(0x7d),
+                ),
                 Duration::from_millis(80),
             )
             .await,
@@ -259,14 +302,22 @@ async fn an_existing_shard_distinguishes_fence_and_immutable_binding_conflicts()
         first.dedicated_egress().initial_lease_ttl(),
     )
     .expect("conflicting egress spec remains structurally valid");
-    let conflicting_binding = LaunchSpec::production(first.tenant_id().clone(), conflicting_egress);
+    let conflicting_binding = LaunchSpec::production(
+        first.tenant_id().clone(),
+        conflicting_egress,
+        first.chromium_binary_digest(),
+    );
     let conflicting_ttl_egress = DedicatedEgressSpec::new(
         first.dedicated_egress().egress_fence().clone(),
         first.dedicated_egress().policy_binding().clone(),
         first.dedicated_egress().initial_lease_ttl() + Duration::from_millis(1),
     )
     .expect("conflicting TTL remains structurally valid");
-    let conflicting_ttl = LaunchSpec::production(first.tenant_id().clone(), conflicting_ttl_egress);
+    let conflicting_ttl = LaunchSpec::production(
+        first.tenant_id().clone(),
+        conflicting_ttl_egress,
+        first.chromium_binary_digest(),
+    );
 
     assert_eq!(
         supervisor
@@ -368,6 +419,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "worker_epoch": spec.worker_epoch(),
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": spec.dedicated_egress(),
+                "chromium_binary_digest": spec.chromium_binary_digest(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::LaunchFenceMismatch,
@@ -381,6 +433,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "worker_epoch": spec.worker_epoch(),
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": spec.dedicated_egress(),
+                "chromium_binary_digest": spec.chromium_binary_digest(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::LaunchFenceMismatch,
@@ -394,6 +447,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "worker_epoch": spec.worker_epoch() + 1,
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": spec.dedicated_egress(),
+                "chromium_binary_digest": spec.chromium_binary_digest(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::LaunchFenceMismatch,
@@ -407,6 +461,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "worker_epoch": spec.worker_epoch(),
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": excessive_ttl,
+                "chromium_binary_digest": spec.chromium_binary_digest(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::InvalidLease,
@@ -420,6 +475,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "worker_epoch": spec.worker_epoch(),
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": uninitialized_digest,
+                "chromium_binary_digest": spec.chromium_binary_digest(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::InvalidEgressPolicyBinding,

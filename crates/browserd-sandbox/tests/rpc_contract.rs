@@ -11,11 +11,11 @@ use browserd_core::{
     SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec, EgressPolicyBinding,
-    InspectResources, KillShardOutcome, LaunchSpec, RpcFailureCode, SandboxBackend,
-    SandboxCapabilities, SandboxError, SandboxHandle, SandboxRpcClient, SandboxRpcConfig,
-    SandboxRpcError, SandboxRpcPeerBinding, SandboxRpcServer, SandboxSupervisor, SupervisorConfig,
-    WorkerOwnership,
+    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec,
+    EgressPolicyBinding, InspectResources, KillShardOutcome, LaunchSpec, RpcFailureCode,
+    SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle, SandboxRpcClient,
+    SandboxRpcConfig, SandboxRpcError, SandboxRpcPeerBinding, SandboxRpcServer, SandboxSupervisor,
+    SupervisorConfig, WorkerOwnership,
 };
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use serde_json::json;
@@ -247,7 +247,11 @@ fn launch_spec(shard_id: ShardId, worker_id: WorkerId, worker_epoch: u64) -> Lau
     let dedicated_egress =
         DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_millis(50))
             .expect("dedicated egress spec is valid");
-    LaunchSpec::production(TenantId::new(), dedicated_egress)
+    LaunchSpec::production(
+        TenantId::new(),
+        dedicated_egress,
+        ChromiumBinaryDigest::new([0x3c; 32]),
+    )
 }
 
 fn supervisor(backend: RecordingBackend) -> Arc<SandboxSupervisor<RecordingBackend>> {

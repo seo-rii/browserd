@@ -588,6 +588,7 @@ dependencies = [
  "browserd-launch-gate",
  "bytes",
  "futures",
+ "hex",
  "nix",
  "serde",
  "serde_json",

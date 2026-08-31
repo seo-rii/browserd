@@ -10,8 +10,8 @@ use browserd_core::{
     ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome, DedicatedEgressSpec,
-    EgressPolicyBinding, KillShardOutcome, LaunchSpec,
+    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome,
+    DedicatedEgressSpec, EgressPolicyBinding, KillShardOutcome, LaunchSpec,
 };
 use browserd_session::OwnershipFence;
 use browserd_worker::{
@@ -168,7 +168,11 @@ fn descriptor() -> (ShardLaunchDescriptor, ShardFence) {
     );
     let policy = EgressPolicyBinding::new("strict", [9; 32]).unwrap();
     let dedicated = DedicatedEgressSpec::new(egress, policy, Duration::from_secs(30)).unwrap();
-    let launch = LaunchSpec::production(TenantId::new(), dedicated);
+    let launch = LaunchSpec::production(
+        TenantId::new(),
+        dedicated,
+        ChromiumBinaryDigest::new([0x3c; 32]),
+    );
     (
         ShardLaunchDescriptor::new(launch, shard.clone(), "dedicated", "strict").unwrap(),
         shard,

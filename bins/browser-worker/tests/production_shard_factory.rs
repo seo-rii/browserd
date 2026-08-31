@@ -13,8 +13,8 @@ use browserd_cdp::CdpTransportConfig;
 use browserd_chromium::{ChromiumArtifactIdentity, ChromiumConnectionConfig, Sha256Digest};
 use browserd_core::{LaunchGeneration, SessionId, ShardId, TenantId, WorkerId};
 use browserd_sandbox::{
-    ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome, EgressPolicyBinding,
-    KillShardOutcome, LaunchSpec,
+    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome,
+    EgressPolicyBinding, KillShardOutcome, LaunchSpec,
 };
 use browserd_session::OwnershipFence;
 use browserd_worker::{
@@ -384,6 +384,10 @@ fn failed_connection_claim_cleans_the_exact_session_shard() {
     assert_eq!(launch.tenant_id(), &tenant_id);
     assert_eq!(launch.worker_id(), &worker_id);
     assert_eq!(launch.worker_epoch(), worker_epoch);
+    assert_eq!(
+        launch.chromium_binary_digest(),
+        ChromiumBinaryDigest::new([0x11; 32]),
+    );
     assert_eq!(
         launch.dedicated_egress().egress_fence().session_id(),
         &session_id

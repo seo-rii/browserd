@@ -35,6 +35,7 @@ pub use rpc::{
 };
 
 use std::collections::HashMap;
+use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +43,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use browserd_core::{EgressFence, LaunchGeneration, LeaseId, ShardId, TenantId, WorkerId};
 use futures::{FutureExt, future::join_all};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::sync::{Mutex, oneshot, watch};
 use tokio::time::{Instant, timeout};
@@ -162,6 +163,61 @@ impl SupervisorConfig {
 
 pub const MAX_DEDICATED_EGRESS_LEASE_TTL: Duration = Duration::from_secs(5 * 60);
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ChromiumBinaryDigest([u8; 32]);
+
+impl ChromiumBinaryDigest {
+    #[must_use]
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn from_hex(value: &str) -> Result<Self, ChromiumBinaryDigestError> {
+        let bytes = hex::decode(value).map_err(|_| ChromiumBinaryDigestError)?;
+        let bytes = <[u8; 32]>::try_from(bytes).map_err(|_| ChromiumBinaryDigestError)?;
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl fmt::Display for ChromiumBinaryDigest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&hex::encode(self.0))
+    }
+}
+
+impl Serialize for ChromiumBinaryDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_hex())
+    }
+}
+
+impl<'de> Deserialize<'de> for ChromiumBinaryDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_hex(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("Chromium binary digest must be exactly 64 hexadecimal characters")]
+pub struct ChromiumBinaryDigestError;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressPolicyBinding {
@@ -263,17 +319,23 @@ pub struct LaunchSpec {
     shard_id: ShardId,
     worker_id: WorkerId,
     worker_epoch: u64,
+    chromium_binary_digest: ChromiumBinaryDigest,
     dedicated_egress: DedicatedEgressSpec,
 }
 
 impl LaunchSpec {
-    pub fn production(tenant_id: TenantId, dedicated_egress: DedicatedEgressSpec) -> Self {
+    pub fn production(
+        tenant_id: TenantId,
+        dedicated_egress: DedicatedEgressSpec,
+        chromium_binary_digest: ChromiumBinaryDigest,
+    ) -> Self {
         let shard_fence = dedicated_egress.egress_fence().shard();
         Self {
             tenant_id,
             shard_id: shard_fence.shard_id().clone(),
             worker_id: shard_fence.owner().worker_id().clone(),
             worker_epoch: shard_fence.owner().worker_epoch().get(),
+            chromium_binary_digest,
             dedicated_egress,
         }
     }
@@ -283,6 +345,7 @@ impl LaunchSpec {
         shard_id: ShardId,
         worker_id: WorkerId,
         worker_epoch: u64,
+        chromium_binary_digest: ChromiumBinaryDigest,
         dedicated_egress: DedicatedEgressSpec,
     ) -> Result<Self, SandboxError> {
         let spec = Self {
@@ -290,6 +353,7 @@ impl LaunchSpec {
             shard_id,
             worker_id,
             worker_epoch,
+            chromium_binary_digest,
             dedicated_egress,
         };
         spec.validate()?;
@@ -329,6 +393,10 @@ impl LaunchSpec {
             .egress_fence()
             .shard()
             .launch_generation()
+    }
+
+    pub const fn chromium_binary_digest(&self) -> ChromiumBinaryDigest {
+        self.chromium_binary_digest
     }
 
     pub const fn dedicated_egress(&self) -> &DedicatedEgressSpec {
@@ -2171,7 +2239,11 @@ mod tests {
                 .expect("test egress spec is valid");
         supervisor
             .create_shard(
-                LaunchSpec::production(TenantId::new(), dedicated_egress),
+                LaunchSpec::production(
+                    TenantId::new(),
+                    dedicated_egress,
+                    ChromiumBinaryDigest::new([0x3c; 32]),
+                ),
                 WorkerOwnership::new(
                     worker_id.clone(),
                     1,

@@ -18,8 +18,8 @@ use browserd_core::{
     SessionId, SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumRuntime,
-    CleanupReason, DedicatedEgressSpec, EgressPolicyBinding, EgressRouteBackend,
+    CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumBinaryDigest,
+    ChromiumRuntime, CleanupReason, DedicatedEgressSpec, EgressPolicyBinding, EgressRouteBackend,
     FilePreparedShardJournal, LaunchGateRuntime, LaunchSpec, LinuxProcessBackend,
     LinuxSandboxBackend, LinuxSandboxConfig, NetworkNamespaceIdentity, PinnedNetworkNamespace,
     PreparedLinuxChild, PreparedShardCleanupStage, PreparedShardCleanupStageStatus,
@@ -1604,7 +1604,11 @@ fn launch_spec_for_generation_and_tenant(
     let dedicated_egress =
         DedicatedEgressSpec::new(egress_fence, policy_binding, Duration::from_secs(5))
             .expect("dedicated egress spec is valid");
-    LaunchSpec::production(tenant_id, dedicated_egress)
+    LaunchSpec::production(
+        tenant_id,
+        dedicated_egress,
+        ChromiumBinaryDigest::new([0x3c; 32]),
+    )
 }
 
 #[test]
@@ -2455,6 +2459,7 @@ async fn released_shard_generation_never_aliases_new_linux_recovery_locators() {
             Duration::from_secs(5),
         )
         .expect("dedicated egress should be valid"),
+        ChromiumBinaryDigest::new([0x3c; 32]),
     );
     backend
         .provision_gated(&second_spec)

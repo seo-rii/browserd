@@ -279,7 +279,11 @@ where
             self.config.owner_lease_ttl,
         )
         .map_err(|_| DependencyError::Rejected)?;
-        let launch_spec = LaunchSpec::production(tenant_id.clone(), dedicated_egress);
+        let launch_spec = LaunchSpec::production(
+            tenant_id.clone(),
+            dedicated_egress,
+            self.config.chromium_identity.binary_digest.into(),
+        );
         let descriptor = ShardLaunchDescriptor::new(
             launch_spec,
             shard_fence.clone(),

@@ -19,9 +19,9 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec, InspectResources,
-    KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxError, SandboxSupervisor,
-    WorkerOwnership,
+    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec,
+    InspectResources, KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxError,
+    SandboxSupervisor, WorkerOwnership,
 };
 
 const CLIENT_DESCRIPTOR_READY: u8 = 0x51;
@@ -250,6 +250,7 @@ enum RpcRequest {
         worker_id: WorkerId,
         worker_epoch: u64,
         tenant_id: TenantId,
+        chromium_binary_digest: ChromiumBinaryDigest,
         dedicated_egress: DedicatedEgressSpec,
         lease_ttl_ms: u64,
     },
@@ -436,6 +437,7 @@ impl SandboxRpcClient {
                 worker_id: spec.worker_id().clone(),
                 worker_epoch: spec.worker_epoch(),
                 tenant_id: spec.tenant_id().clone(),
+                chromium_binary_digest: spec.chromium_binary_digest(),
                 dedicated_egress: spec.dedicated_egress().clone(),
                 lease_ttl_ms,
             })
@@ -1135,6 +1137,7 @@ where
                                     worker_id,
                                     worker_epoch,
                                     tenant_id,
+                                    chromium_binary_digest,
                                     dedicated_egress,
                                     lease_ttl_ms,
                                 } => {
@@ -1153,6 +1156,7 @@ where
                                             shard_id,
                                             worker_id.clone(),
                                             worker_epoch,
+                                            chromium_binary_digest,
                                             dedicated_egress,
                                         ) {
                                             Ok(spec) => match supervisor

@@ -11,9 +11,9 @@ use browserd_core::{
     ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    CleanupReason, CreateShardOutcome, DedicatedEgressSpec, EgressPolicyBinding, InspectResources,
-    LaunchSpec, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
-    SandboxSupervisor, SupervisorConfig, WorkerOwnership,
+    ChromiumBinaryDigest, CleanupReason, CreateShardOutcome, DedicatedEgressSpec,
+    EgressPolicyBinding, InspectResources, LaunchSpec, SandboxBackend, SandboxCapabilities,
+    SandboxError, SandboxHandle, SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
@@ -136,7 +136,7 @@ fn launch_spec(
     let binding = EgressPolicyBinding::new(profile, digest).expect("binding should be valid");
     let egress = DedicatedEgressSpec::new(fence, binding, lease_ttl)
         .expect("dedicated egress spec should be valid");
-    LaunchSpec::production(tenant_id, egress)
+    LaunchSpec::production(tenant_id, egress, ChromiumBinaryDigest::new([0x3c; 32]))
 }
 
 fn ownership() -> WorkerOwnership {
@@ -315,7 +315,11 @@ async fn in_flight_binding_conflicts_are_typed_without_a_second_backend_effect()
     assert_eq!(
         supervisor
             .create_shard(
-                LaunchSpec::production(tenant_id.clone(), different_binding),
+                LaunchSpec::production(
+                    tenant_id.clone(),
+                    different_binding,
+                    ChromiumBinaryDigest::new([0x3c; 32]),
+                ),
                 ownership(),
             )
             .await,
@@ -324,7 +328,11 @@ async fn in_flight_binding_conflicts_are_typed_without_a_second_backend_effect()
     assert_eq!(
         supervisor
             .create_shard(
-                LaunchSpec::production(tenant_id, different_ttl),
+                LaunchSpec::production(
+                    tenant_id,
+                    different_ttl,
+                    ChromiumBinaryDigest::new([0x3c; 32]),
+                ),
                 ownership()
             )
             .await,
@@ -420,7 +428,11 @@ async fn only_a_newer_launch_generation_supersedes_a_failed_tombstone() {
     assert_eq!(
         supervisor
             .create_shard(
-                LaunchSpec::production(tenant_id.clone(), changed_binding),
+                LaunchSpec::production(
+                    tenant_id.clone(),
+                    changed_binding,
+                    ChromiumBinaryDigest::new([0x3c; 32]),
+                ),
                 ownership(),
             )
             .await,

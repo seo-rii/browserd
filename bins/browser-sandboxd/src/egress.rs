@@ -1436,8 +1436,8 @@ mod tests {
         ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
     };
     use browserd_sandbox::{
-        DedicatedEgressSpec, EgressPolicyBinding, LaunchSpec, PinnedNetworkNamespace,
-        ShardEgressReservation, ShardIngressLease,
+        ChromiumBinaryDigest, DedicatedEgressSpec, EgressPolicyBinding, LaunchSpec,
+        PinnedNetworkNamespace, ShardEgressReservation, ShardIngressLease,
     };
     use tokio::sync::Notify;
 
@@ -1470,6 +1470,7 @@ mod tests {
             TenantId::new(),
             DedicatedEgressSpec::new(fence, binding, Duration::from_secs(30))
                 .expect("egress spec should be valid"),
+            ChromiumBinaryDigest::new([0x3c; 32]),
         )
     }
 
