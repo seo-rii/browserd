@@ -72,6 +72,19 @@ impl SessionShardFactory for ShardFactory {
             }),
         ))
     }
+
+    fn create_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        if !options.is_valid() {
+            return Err(DependencyError::Rejected);
+        }
+        self.create(tenant_id, session_id, fence)
+    }
 }
 
 struct RejectArtifacts;

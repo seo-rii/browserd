@@ -72,6 +72,19 @@ impl ChromiumDriver for ExecutorDriver {
         Ok(PageId::new())
     }
 
+    fn create_context_owned_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        session_id: &SessionId,
+        _fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        if !options.is_valid() {
+            return Err(DependencyError::Rejected);
+        }
+        self.create_context(session_id)
+    }
+
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
         Ok(())
     }

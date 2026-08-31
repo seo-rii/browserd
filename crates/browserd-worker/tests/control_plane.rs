@@ -16,7 +16,9 @@ use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalDecision, CanonicalActionProposal, CredentialRefsHash,
     Origin,
 };
-use browserd_session::{LeasePolicy, SessionLifecycle, SessionTime, SessionTimeoutPolicy};
+use browserd_session::{
+    LeasePolicy, OwnershipFence, SessionLifecycle, SessionTime, SessionTimeoutPolicy,
+};
 use browserd_viewer::ViewerScopes;
 use browserd_worker::{
     ActionApprovalRequirement, ActionExecutionResult, ActionJournalConfig, ActionStatus,
@@ -69,6 +71,19 @@ impl ChromiumDriver for FakeDriver {
         _session_id: &browserd_core::SessionId,
     ) -> Result<PageId, DependencyError> {
         Ok(PageId::new())
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        session_id: &browserd_core::SessionId,
+        _fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        if !options.is_valid() {
+            return Err(DependencyError::Rejected);
+        }
+        self.create_context(session_id)
     }
 
     fn close_context(&self, _session_id: &browserd_core::SessionId) -> Result<(), DependencyError> {

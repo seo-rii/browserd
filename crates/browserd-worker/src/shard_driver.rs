@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ActionExecutionResult, ApprovedActionError, BrowserShardActor, BrowserShardRuntime,
     ChromiumDriver, DependencyError, LiveApprovalContext, ShardActorError, ShardRuntimeError,
+    WorkerSessionOptionsV1,
 };
 
 /// Adapts the synchronous Chromium control-plane contract to a shard runtime while retaining the
@@ -25,6 +26,7 @@ pub struct ChromiumDriverShardRuntime<D> {
 struct OwnedContext {
     tenant_id: Option<TenantId>,
     fence: OwnershipFence,
+    options: Option<WorkerSessionOptionsV1>,
     primary_page: PageId,
 }
 
@@ -68,6 +70,7 @@ impl<D> ChromiumDriverShardRuntime<D> {
         tenant_id: Option<&TenantId>,
         session_id: &SessionId,
         fence: &OwnershipFence,
+        options: Option<&WorkerSessionOptionsV1>,
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError>
     where
@@ -82,17 +85,24 @@ impl<D> ChromiumDriverShardRuntime<D> {
             .lock()
             .map_err(|_| ShardRuntimeError::Unavailable)?;
         if let Some(context) = contexts.get(session_id) {
-            return if context.tenant_id == tenant_id && &context.fence == fence {
+            return if context.tenant_id == tenant_id
+                && &context.fence == fence
+                && context.options.as_ref() == options
+            {
                 Ok(())
             } else {
                 Err(ShardRuntimeError::Rejected)
             };
         }
-        let page = if let Some(tenant_id) = tenant_id.as_ref() {
-            self.driver
-                .create_context_owned(tenant_id, session_id, fence)
-        } else {
-            self.driver.create_context(session_id)
+        let page = match (tenant_id.as_ref(), options) {
+            (Some(tenant_id), Some(options)) => self
+                .driver
+                .create_context_owned_with_options(tenant_id, session_id, fence, options),
+            (Some(tenant_id), None) => self
+                .driver
+                .create_context_owned(tenant_id, session_id, fence),
+            (None, None) => self.driver.create_context(session_id),
+            (None, Some(_)) => return Err(ShardRuntimeError::Rejected),
         }
         .map_err(map_dependency_error)?;
         if cancellation.is_cancelled() {
@@ -104,6 +114,7 @@ impl<D> ChromiumDriverShardRuntime<D> {
             OwnedContext {
                 tenant_id,
                 fence: fence.clone(),
+                options: options.cloned(),
                 primary_page: page,
             },
         );
@@ -130,7 +141,7 @@ impl<D: ChromiumDriver> BrowserShardRuntime for ChromiumDriverShardRuntime<D> {
         fence: &OwnershipFence,
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError> {
-        self.create_context_for(None, session_id, fence, cancellation)
+        self.create_context_for(None, session_id, fence, None, cancellation)
     }
 
     async fn create_context_owned(
@@ -140,7 +151,24 @@ impl<D: ChromiumDriver> BrowserShardRuntime for ChromiumDriverShardRuntime<D> {
         fence: &OwnershipFence,
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError> {
-        self.create_context_for(Some(tenant_id), session_id, fence, cancellation)
+        self.create_context_for(Some(tenant_id), session_id, fence, None, cancellation)
+    }
+
+    async fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+        cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        self.create_context_for(
+            Some(tenant_id),
+            session_id,
+            fence,
+            Some(options),
+            cancellation,
+        )
     }
 
     async fn dispose_context(
@@ -249,6 +277,26 @@ impl<D: ChromiumDriver> ActorChromiumDriver<D> {
         self.runtime.primary_page(session_id, fence)
     }
 
+    pub async fn create_context_owned_with_options_async(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        self.actor
+            .attach_session_owned_with_options(
+                &self.shard_fence,
+                tenant_id.clone(),
+                session_id.clone(),
+                fence.clone(),
+                options.clone(),
+            )
+            .await
+            .map_err(map_actor_error)?;
+        self.runtime.primary_page(session_id, fence)
+    }
+
     pub async fn close_context_fenced_async(
         &self,
         session_id: &SessionId,
@@ -296,6 +344,18 @@ impl<D: ChromiumDriver> ChromiumDriver for ActorChromiumDriver<D> {
         fence: &OwnershipFence,
     ) -> Result<PageId, DependencyError> {
         futures::executor::block_on(self.create_context_owned_async(tenant_id, session_id, fence))
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        futures::executor::block_on(
+            self.create_context_owned_with_options_async(tenant_id, session_id, fence, options),
+        )
     }
 
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError> {

@@ -238,12 +238,12 @@ pub trait ChromiumDriver: Send + Sync + 'static {
     }
     fn create_context_owned_with_options(
         &self,
-        tenant_id: &TenantId,
-        session_id: &SessionId,
-        fence: &OwnershipFence,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
         _options: &WorkerSessionOptionsV1,
     ) -> Result<PageId, DependencyError> {
-        self.create_context_owned(tenant_id, session_id, fence)
+        Err(DependencyError::Rejected)
     }
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError>;
     fn close_context_fenced(

@@ -261,6 +261,22 @@ where
             .await
     }
 
+    async fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &crate::WorkerSessionOptionsV1,
+        cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        if !self.targets.is_ready() {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        self.inner
+            .create_context_owned_with_options(tenant_id, session_id, fence, options, cancellation)
+            .await
+    }
+
     async fn dispose_context(
         &self,
         session_id: &SessionId,

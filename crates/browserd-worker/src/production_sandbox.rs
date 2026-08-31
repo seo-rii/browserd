@@ -13,7 +13,7 @@ use futures::FutureExt;
 use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::{BrowserShardRuntime, ShardRuntimeError};
+use crate::{BrowserShardRuntime, ShardRuntimeError, WorkerSessionOptionsV1};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxTerminationProof {
@@ -682,6 +682,32 @@ where
                 tenant_id,
                 session_id,
                 fence,
+                operation_cancel,
+            ) => result,
+        }
+    }
+
+    async fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+        cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        let _operation = self.admit_operation().await?;
+        let lifecycle = self.operation_cancellation.child_token();
+        let _cancel_on_drop = CancelOnDrop(lifecycle.clone());
+        let operation_cancel = lifecycle.clone();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ShardRuntimeError::Cancelled),
+            () = lifecycle.cancelled() => Err(ShardRuntimeError::Cancelled),
+            result = self.inner.create_context_owned_with_options(
+                tenant_id,
+                session_id,
+                fence,
+                options,
                 operation_cancel,
             ) => result,
         }

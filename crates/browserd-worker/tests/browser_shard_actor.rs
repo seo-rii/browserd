@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -6,12 +6,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use browserd_core::{
     LaunchGeneration, OwnerFence, SessionId, ShardAdmission, ShardFence, ShardHealth, ShardId,
-    ShardLifecycle, WorkerEpoch, WorkerId,
+    ShardLifecycle, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_session::OwnershipFence;
 use browserd_worker::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
-    DetachSessionOutcome, ShardActorError, ShardRuntimeError,
+    DetachSessionOutcome, ShardActorError, ShardRuntimeError, WorkerSessionOptionsV1,
+    WorkerViewport,
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,7 @@ struct FakeRuntime {
     create_started: Semaphore,
     create_release: Semaphore,
     created: Mutex<Vec<SessionId>>,
+    owned_options: Mutex<Vec<(TenantId, SessionId, OwnershipFence, WorkerSessionOptionsV1)>>,
     disposed: Mutex<Vec<SessionId>>,
     create_results: Mutex<VecDeque<Result<(), ShardRuntimeError>>>,
     dispose_results: Mutex<VecDeque<Result<(), ShardRuntimeError>>>,
@@ -59,6 +61,7 @@ impl Default for FakeRuntime {
             create_started: Semaphore::new(0),
             create_release: Semaphore::new(0),
             created: Mutex::new(Vec::new()),
+            owned_options: Mutex::new(Vec::new()),
             disposed: Mutex::new(Vec::new()),
             create_results: Mutex::new(VecDeque::new()),
             dispose_results: Mutex::new(VecDeque::new()),
@@ -124,6 +127,30 @@ impl BrowserShardRuntime for FakeRuntime {
         };
         created.push(session_id.clone());
         Ok(())
+    }
+
+    async fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+        cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        let result = self.create_context(session_id, fence, cancellation).await;
+        if result.is_ok() {
+            let mut observed = self
+                .owned_options
+                .lock()
+                .map_err(|_| ShardRuntimeError::Unavailable)?;
+            observed.push((
+                tenant_id.clone(),
+                session_id.clone(),
+                fence.clone(),
+                options.clone(),
+            ));
+        }
+        result
     }
 
     async fn dispose_context(
@@ -192,6 +219,103 @@ fn session_fence(shard: &ShardFence, placement_version: u64) -> OwnershipFence {
 
 fn config(fence: ShardFence, mailbox_capacity: usize) -> Option<BrowserShardActorConfig> {
     BrowserShardActorConfig::new(fence, mailbox_capacity, 16, 64).ok()
+}
+
+fn session_options(locale: &str) -> WorkerSessionOptionsV1 {
+    WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: locale.to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: Some("browserd-actor-options-test".to_owned()),
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: BTreeMap::from([("suite".to_owned(), "browser-shard-actor".to_owned())]),
+    }
+}
+
+#[tokio::test]
+async fn owned_session_options_are_forwarded_and_bound_to_the_attach_flight() {
+    let Some(fence) = shard_fence(5, 1) else {
+        return;
+    };
+    let Some(config) = config(fence.clone(), 8) else {
+        return;
+    };
+    let runtime = Arc::new(FakeRuntime::default());
+    let (actor, task) = BrowserShardActor::spawn(config, Arc::clone(&runtime));
+    assert_eq!(actor.activate(&fence).await, Ok(()));
+
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let ownership = session_fence(&fence, 1);
+    let options = session_options("ko-KR");
+    assert_eq!(
+        actor
+            .attach_session_owned_with_options(
+                &fence,
+                tenant_id.clone(),
+                session_id.clone(),
+                ownership.clone(),
+                options.clone(),
+            )
+            .await,
+        Ok(AttachSessionOutcome::Attached),
+    );
+
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runtime
+            .owned_options
+            .lock()
+            .ok()
+            .and_then(|calls| calls.first().cloned()),
+        Some((
+            tenant_id.clone(),
+            session_id.clone(),
+            ownership.clone(),
+            options.clone(),
+        )),
+    );
+    assert_eq!(
+        actor
+            .attach_session_owned_with_options(
+                &fence,
+                tenant_id.clone(),
+                session_id.clone(),
+                ownership.clone(),
+                options,
+            )
+            .await,
+        Ok(AttachSessionOutcome::AlreadyAttached),
+    );
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        actor
+            .attach_session_owned_with_options(
+                &fence,
+                tenant_id,
+                session_id,
+                ownership,
+                session_options("en-US"),
+            )
+            .await,
+        Err(ShardActorError::StaleSessionFence)
+    );
+    assert_eq!(runtime.create_calls.load(Ordering::SeqCst), 1);
+
+    drop(actor);
+    assert!(task.await.is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

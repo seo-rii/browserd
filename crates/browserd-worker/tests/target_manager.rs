@@ -14,7 +14,7 @@ use browserd_targets::{
 use browserd_worker::{
     BrowserShardRuntime, ProductionTargetManager, ShardRuntimeError, TargetBootstrapSnapshot,
     TargetManagedShardRuntime, TargetManagerBackend, TargetManagerDrain, TargetManagerEvent,
-    TargetManagerIngressError,
+    TargetManagerIngressError, WorkerSessionOptionsV1, WorkerViewport,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -96,6 +96,7 @@ impl TargetManagerDrain for Drain {
 #[derive(Default)]
 struct OwnershipForwardingRuntime {
     owned_creates: Mutex<Vec<(TenantId, SessionId, OwnershipFence)>>,
+    owned_options: Mutex<Vec<(TenantId, SessionId, OwnershipFence, WorkerSessionOptionsV1)>>,
     unfenced_creates: AtomicUsize,
 }
 
@@ -133,6 +134,26 @@ impl BrowserShardRuntime for OwnershipForwardingRuntime {
         Ok(())
     }
 
+    async fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        self.owned_options
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .push((
+                tenant_id.clone(),
+                session_id.clone(),
+                fence.clone(),
+                options.clone(),
+            ));
+        Ok(())
+    }
+
     async fn dispose_context(
         &self,
         _session_id: &SessionId,
@@ -159,7 +180,7 @@ fn fence() -> ShardFence {
 }
 
 #[tokio::test]
-async fn target_managed_runtime_preserves_owned_context_tenant_and_full_fence() {
+async fn target_managed_runtime_preserves_owned_context_options_and_full_identity() {
     let snapshot = TargetBootstrapSnapshot::new(vec![], vec![]).unwrap();
     let backend = Backend {
         snapshot: Mutex::new(Some(snapshot)),
@@ -175,21 +196,42 @@ async fn target_managed_runtime_preserves_owned_context_tenant_and_full_fence() 
     let tenant_id = TenantId::new();
     let session_id = SessionId::new();
     let ownership = OwnershipFence::new(WorkerId::new("target-worker").unwrap(), 9, 41, 7);
+    let options = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: Some("browserd-target-manager-test".to_owned()),
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: Default::default(),
+    };
 
     let result = runtime
-        .create_context_owned(
+        .create_context_owned_with_options(
             &tenant_id,
             &session_id,
             &ownership,
+            &options,
             CancellationToken::new(),
         )
         .await;
 
     assert_eq!(result, Ok(()));
     assert_eq!(inner.unfenced_creates.load(Ordering::SeqCst), 0);
+    assert!(inner.owned_creates.lock().unwrap().is_empty());
     assert_eq!(
-        inner.owned_creates.lock().ok().map(|calls| calls.clone()),
-        Some(vec![(tenant_id, session_id, ownership)])
+        inner.owned_options.lock().ok().map(|calls| calls.clone()),
+        Some(vec![(tenant_id, session_id, ownership, options)])
     );
 }
 

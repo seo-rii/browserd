@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +17,7 @@ use browserd_sandbox::{
 use browserd_session::OwnershipFence;
 use browserd_worker::{
     BrowserShardRuntime, CdpPipeAcceptor, ProductionSandboxShardRuntime, SandboxShardRpc,
-    ShardLaunchDescriptor, ShardRuntimeError,
+    ShardLaunchDescriptor, ShardRuntimeError, WorkerSessionOptionsV1, WorkerViewport,
 };
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -248,6 +248,10 @@ fn sink() -> Arc<Sink> {
 
 struct Inner(Mutex<Vec<&'static str>>);
 
+struct OptionsInner {
+    calls: Mutex<Vec<(TenantId, SessionId, OwnershipFence, WorkerSessionOptionsV1)>>,
+}
+
 #[async_trait]
 impl BrowserShardRuntime for Inner {
     async fn readiness_check(
@@ -279,6 +283,56 @@ impl BrowserShardRuntime for Inner {
 
     async fn terminate(&self, _fence: &ShardFence) -> Result<(), ShardRuntimeError> {
         self.0.lock().unwrap().push("terminate");
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BrowserShardRuntime for OptionsInner {
+    async fn readiness_check(
+        &self,
+        _fence: &ShardFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        Ok(())
+    }
+
+    async fn create_context(
+        &self,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        Err(ShardRuntimeError::Rejected)
+    }
+
+    async fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        self.calls.lock().unwrap().push((
+            tenant_id.clone(),
+            session_id.clone(),
+            fence.clone(),
+            options.clone(),
+        ));
+        Ok(())
+    }
+
+    async fn dispose_context(
+        &self,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        Ok(())
+    }
+
+    async fn terminate(&self, _fence: &ShardFence) -> Result<(), ShardRuntimeError> {
         Ok(())
     }
 }
@@ -679,6 +733,109 @@ async fn ready_sandbox_runtime_renews_the_exact_launch_lease() {
     assert_eq!(
         *rpc.calls.lock().unwrap(),
         vec!["create", "claim", "renew", "cancel"]
+    );
+}
+
+#[tokio::test]
+async fn owned_context_options_are_forwarded_once_inside_existing_admission_boundaries() {
+    let (descriptor, fence) = descriptor();
+    let rpc = Arc::new(FakeRpc {
+        calls: Mutex::new(Vec::new()),
+        launch_generations: Mutex::new(Vec::new()),
+        cancelled_specs: Mutex::new(Vec::new()),
+        cleanup_outcomes: Mutex::new(VecDeque::new()),
+        cleanup_finished: Notify::new(),
+        create_error: false,
+    });
+    let inner = Arc::new(OptionsInner {
+        calls: Mutex::new(Vec::new()),
+    });
+    let runtime = ProductionSandboxShardRuntime::new(
+        descriptor,
+        Duration::from_secs(20),
+        rpc,
+        sink(),
+        Arc::clone(&inner),
+    );
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let ownership = OwnershipFence::new(
+        fence.owner().worker_id().clone(),
+        fence.owner().worker_epoch().get(),
+        7,
+        3,
+    );
+    let options = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: Some("browserd-sandbox-options-test".to_owned()),
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 1_800,
+        idle_timeout_seconds: 600,
+        metadata: BTreeMap::from([("agent_run_id".to_owned(), "sandbox-options".to_owned())]),
+    };
+
+    assert_eq!(
+        runtime
+            .create_context_owned_with_options(
+                &tenant_id,
+                &session_id,
+                &ownership,
+                &options,
+                CancellationToken::new(),
+            )
+            .await,
+        Err(ShardRuntimeError::Rejected)
+    );
+    assert!(inner.calls.lock().unwrap().is_empty());
+
+    assert_eq!(
+        runtime
+            .readiness_check(&fence, CancellationToken::new())
+            .await,
+        Ok(())
+    );
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    assert_eq!(
+        runtime
+            .create_context_owned_with_options(
+                &tenant_id,
+                &session_id,
+                &ownership,
+                &options,
+                cancelled,
+            )
+            .await,
+        Err(ShardRuntimeError::Cancelled)
+    );
+    assert!(inner.calls.lock().unwrap().is_empty());
+
+    assert_eq!(
+        runtime
+            .create_context_owned_with_options(
+                &tenant_id,
+                &session_id,
+                &ownership,
+                &options,
+                CancellationToken::new(),
+            )
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        *inner.calls.lock().unwrap(),
+        vec![(tenant_id, session_id, ownership, options)]
     );
 }
 

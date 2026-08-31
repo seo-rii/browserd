@@ -12,8 +12,10 @@ use browserd_core::{
 use browserd_policy::CanonicalActionProposal;
 use browserd_session::OwnershipFence;
 use browserd_worker::{
-    ActionExecutionResult, ApprovedActionError, BrowserShardRuntime, ChromiumDriver,
-    ChromiumDriverShardRuntime, DependencyError, LiveApprovalContext, ShardRuntimeError,
+    ActionExecutionResult, ActorChromiumDriver, ApprovedActionError, BrowserShardActor,
+    BrowserShardActorConfig, BrowserShardRuntime, ChromiumDriver, ChromiumDriverShardRuntime,
+    DependencyError, LiveApprovalContext, ShardRuntimeError, WorkerSessionOptionsV1,
+    WorkerViewport,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +29,7 @@ struct OwnedCreate {
     tenant_id: TenantId,
     session_id: SessionId,
     fence: OwnershipFence,
+    options: Option<WorkerSessionOptionsV1>,
 }
 
 #[derive(Default)]
@@ -73,6 +76,7 @@ impl ChromiumDriver for RecordingDriver {
                 tenant_id: tenant_id.clone(),
                 session_id: session_id.clone(),
                 fence: fence.clone(),
+                options: None,
             });
         if let Some(gate) = &self.gate {
             gate.started
@@ -84,6 +88,25 @@ impl ChromiumDriver for RecordingDriver {
                 .recv_timeout(Duration::from_secs(1))
                 .map_err(|_| DependencyError::Unavailable)?;
         }
+        Ok(PageId::new())
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        self.owned_creates
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?
+            .push(OwnedCreate {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                fence: fence.clone(),
+                options: Some(options.clone()),
+            });
         Ok(PageId::new())
     }
 
@@ -184,6 +207,112 @@ fn shard_fence() -> ShardFence {
     )
 }
 
+fn session_options(locale: &str) -> WorkerSessionOptionsV1 {
+    WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: locale.to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: Some("browserd-shard-driver-test/1".to_owned()),
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 1_800,
+        idle_timeout_seconds: 600,
+        metadata: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn runtime_forwards_exact_options_and_rejects_an_options_only_retry() {
+    let driver = Arc::new(RecordingDriver::default());
+    let runtime = ChromiumDriverShardRuntime::new(Arc::clone(&driver));
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let exact = ownership(9);
+    let first = session_options("ko-KR");
+    let changed = session_options("en-US");
+
+    assert_eq!(
+        runtime
+            .create_context_owned_with_options(
+                &tenant_id,
+                &session_id,
+                &exact,
+                &first,
+                CancellationToken::new(),
+            )
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        runtime
+            .create_context_owned_with_options(
+                &tenant_id,
+                &session_id,
+                &exact,
+                &changed,
+                CancellationToken::new(),
+            )
+            .await,
+        Err(ShardRuntimeError::Rejected)
+    );
+    assert_eq!(
+        driver.owned_creates.lock().ok().map(|calls| calls.clone()),
+        Some(vec![OwnedCreate {
+            tenant_id,
+            session_id,
+            fence: exact,
+            options: Some(first),
+        }])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actor_driver_forwards_exact_options_and_rejects_an_options_only_retry() {
+    let driver = Arc::new(RecordingDriver::default());
+    let runtime = Arc::new(ChromiumDriverShardRuntime::new(Arc::clone(&driver)));
+    let shard_fence = shard_fence();
+    let config = BrowserShardActorConfig::new(shard_fence.clone(), 16, 4, 16)
+        .expect("actor config should be valid");
+    let (actor, task) = BrowserShardActor::spawn(config, Arc::clone(&runtime));
+    assert_eq!(actor.activate(&shard_fence).await, Ok(()));
+    let actor_driver = ActorChromiumDriver::new(runtime, actor.clone(), shard_fence.clone());
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let exact = ownership(10);
+    let first = session_options("ko-KR");
+    let changed = session_options("en-US");
+
+    assert!(
+        actor_driver
+            .create_context_owned_with_options(&tenant_id, &session_id, &exact, &first)
+            .is_ok()
+    );
+    assert_eq!(
+        actor_driver.create_context_owned_with_options(&tenant_id, &session_id, &exact, &changed,),
+        Err(DependencyError::Rejected)
+    );
+    assert_eq!(
+        driver.owned_creates.lock().ok().map(|calls| calls.clone()),
+        Some(vec![OwnedCreate {
+            tenant_id,
+            session_id: session_id.clone(),
+            fence: exact.clone(),
+            options: Some(first),
+        }])
+    );
+
+    assert_eq!(actor.shutdown(&shard_fence).await, Ok(()));
+    assert!(task.await.is_ok_and(|result| result.is_ok()));
+}
+
 #[tokio::test]
 async fn dispose_preserves_exact_owned_context_fence_and_rejects_stale_fence_before_effect() {
     let driver = Arc::new(RecordingDriver::default());
@@ -226,6 +355,7 @@ async fn dispose_preserves_exact_owned_context_fence_and_rejects_stale_fence_bef
             tenant_id,
             session_id: session_id.clone(),
             fence: exact.clone(),
+            options: None,
         }])
     );
     assert_eq!(
@@ -325,6 +455,7 @@ async fn concurrent_create_and_terminate_linearize_to_one_exact_fenced_close() {
             tenant_id,
             session_id: session_id.clone(),
             fence: exact.clone(),
+            options: None,
         }])
     );
     assert_eq!(

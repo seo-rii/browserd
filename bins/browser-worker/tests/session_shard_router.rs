@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use browserd_session::OwnershipFence;
 use browserd_worker::{
     ActionExecutionResult, ApprovedActionError, ArtifactStoreReceipt, ArtifactStoreRequest,
     ChromiumDriver, DependencyError, LiveApprovalContext, SandboxClient, UnavailableChromiumDriver,
+    WorkerSessionOptionsV1, WorkerViewport,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -174,6 +176,69 @@ impl SessionShardFactory for BlockingFactory {
             PageId::new(),
             Arc::new(UnavailableChromiumDriver),
             self.lifecycle.clone(),
+        ))
+    }
+}
+
+struct OptionsFactory {
+    creations: AtomicUsize,
+    gate: Option<Arc<CallGate>>,
+    observed: Mutex<Vec<WorkerSessionOptionsV1>>,
+    page_id: PageId,
+}
+
+impl OptionsFactory {
+    fn new(gate: Option<Arc<CallGate>>) -> Self {
+        Self {
+            creations: AtomicUsize::new(0),
+            gate,
+            observed: Mutex::new(Vec::new()),
+            page_id: PageId::new(),
+        }
+    }
+}
+
+impl SessionShardFactory for OptionsFactory {
+    fn qualify_daemon(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn heartbeat_daemon(
+        &self,
+        _worker_id: &WorkerId,
+        _worker_epoch: u64,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn create_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        self.creations.fetch_add(1, Ordering::SeqCst);
+        self.observed
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?
+            .push(options.clone());
+        if let Some(gate) = self.gate.as_ref() {
+            gate.block()?;
+        }
+        Ok(ProvisionedSessionShard::new(
+            self.page_id.clone(),
+            Arc::new(UnavailableChromiumDriver),
+            Arc::new(Lifecycle::default()),
         ))
     }
 }
@@ -479,6 +544,28 @@ fn fence(worker: &WorkerId, placement_version: u64) -> OwnershipFence {
     OwnershipFence::new(worker.clone(), 7, placement_version, 1)
 }
 
+fn session_options(profile: &str) -> WorkerSessionOptionsV1 {
+    WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: Some("browserd-test-agent".to_owned()),
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: profile.to_owned(),
+        ttl_seconds: 1_800,
+        idle_timeout_seconds: 600,
+        metadata: BTreeMap::from([("agent_run_id".to_owned(), "router-options".to_owned())]),
+    }
+}
+
 fn router<F, A>(
     factory: Arc<F>,
     artifacts: Arc<A>,
@@ -532,6 +619,132 @@ fn exact_create_retry_publishes_one_session_shard() {
     assert_eq!(second, first);
     assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
     assert!(router.shard_managed_contexts());
+}
+
+#[test]
+fn create_with_options_forwards_the_exact_v1_options_to_the_factory() {
+    let factory = Arc::new(OptionsFactory::new(None));
+    let Some(router) = router(Arc::clone(&factory), Arc::new(RejectArtifacts), 8) else {
+        return;
+    };
+    let Some(worker) = worker() else {
+        return;
+    };
+    let options = session_options("standard");
+    let result = router.create_context_owned_with_options(
+        &TenantId::new(),
+        &SessionId::new(),
+        &fence(&worker, 41),
+        &options,
+    );
+
+    assert!(result.is_ok());
+    assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
+    assert!(
+        factory
+            .observed
+            .lock()
+            .ok()
+            .is_some_and(|observed| observed.as_slice() == [options])
+    );
+}
+
+#[test]
+fn concurrent_exact_options_retry_shares_one_factory_flight_and_page() {
+    let (gate, entered) = CallGate::new();
+    let factory = Arc::new(OptionsFactory::new(Some(Arc::clone(&gate))));
+    let Some(router) = router(Arc::clone(&factory), Arc::new(RejectArtifacts), 8).map(Arc::new)
+    else {
+        return;
+    };
+    let Some(worker) = worker() else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let ownership = fence(&worker, 42);
+    let options = session_options("standard");
+    let first_router = Arc::clone(&router);
+    let first_tenant = tenant.clone();
+    let first_session = session.clone();
+    let first_ownership = ownership.clone();
+    let first_options = options.clone();
+    let first = std::thread::spawn(move || {
+        first_router.create_context_owned_with_options(
+            &first_tenant,
+            &first_session,
+            &first_ownership,
+            &first_options,
+        )
+    });
+    assert!(entered.recv_timeout(TEST_TIMEOUT).is_ok());
+
+    let second_router = Arc::clone(&router);
+    let (second_sender, second_receiver) = mpsc::channel();
+    let second = std::thread::spawn(move || {
+        let result = second_router
+            .create_context_owned_with_options(&tenant, &session, &ownership, &options);
+        let _ = second_sender.send(result.clone());
+        result
+    });
+    assert!(
+        second_receiver
+            .recv_timeout(Duration::from_millis(100))
+            .is_err()
+    );
+    assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
+
+    gate.release();
+    let first = first.join();
+    let second = second.join();
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    assert_eq!(second.ok(), first.ok());
+    assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn concurrent_retry_with_different_options_is_rejected_without_a_second_factory_effect() {
+    let (gate, entered) = CallGate::new();
+    let factory = Arc::new(OptionsFactory::new(Some(Arc::clone(&gate))));
+    let Some(router) = router(Arc::clone(&factory), Arc::new(RejectArtifacts), 8).map(Arc::new)
+    else {
+        return;
+    };
+    let Some(worker) = worker() else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let ownership = fence(&worker, 43);
+    let first_router = Arc::clone(&router);
+    let first_tenant = tenant.clone();
+    let first_session = session.clone();
+    let first_ownership = ownership.clone();
+    let first = std::thread::spawn(move || {
+        first_router.create_context_owned_with_options(
+            &first_tenant,
+            &first_session,
+            &first_ownership,
+            &session_options("standard"),
+        )
+    });
+    assert!(entered.recv_timeout(TEST_TIMEOUT).is_ok());
+
+    assert_eq!(
+        router.create_context_owned_with_options(
+            &tenant,
+            &session,
+            &ownership,
+            &session_options("privileged"),
+        ),
+        Err(DependencyError::Rejected)
+    );
+    assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
+
+    gate.release();
+    assert!(first.join().is_ok_and(|result| result.is_ok()));
+    assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
 }
 
 #[test]

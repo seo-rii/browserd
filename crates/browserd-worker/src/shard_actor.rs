@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::SandboxTerminationProof;
+use crate::{SandboxTerminationProof, WorkerSessionOptionsV1};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShardRuntimeError {
@@ -124,6 +124,17 @@ pub trait BrowserShardRuntime: Send + Sync + 'static {
         self.create_context(session_id, fence, cancellation).await
     }
 
+    async fn create_context_owned_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _options: &WorkerSessionOptionsV1,
+        _cancellation: CancellationToken,
+    ) -> Result<(), ShardRuntimeError> {
+        Err(ShardRuntimeError::Rejected)
+    }
+
     async fn dispose_context(
         &self,
         session_id: &SessionId,
@@ -158,6 +169,7 @@ enum Command {
         tenant_id: Option<TenantId>,
         session_id: SessionId,
         session_fence: OwnershipFence,
+        options: Option<Box<WorkerSessionOptionsV1>>,
         reply: oneshot::Sender<ActorResult<AttachSessionOutcome>>,
     },
     DetachSession {
@@ -284,6 +296,7 @@ impl BrowserShardActor {
             tenant_id: None,
             session_id,
             session_fence,
+            options: None,
             reply,
         })
         .await?;
@@ -303,6 +316,28 @@ impl BrowserShardActor {
             tenant_id: Some(tenant_id),
             session_id,
             session_fence,
+            options: None,
+            reply,
+        })
+        .await?;
+        self.receive(response).await
+    }
+
+    pub async fn attach_session_owned_with_options(
+        &self,
+        shard_fence: &ShardFence,
+        tenant_id: TenantId,
+        session_id: SessionId,
+        session_fence: OwnershipFence,
+        options: WorkerSessionOptionsV1,
+    ) -> ActorResult<AttachSessionOutcome> {
+        let (reply, response) = oneshot::channel();
+        self.send(Command::AttachSession {
+            shard_fence: shard_fence.clone(),
+            tenant_id: Some(tenant_id),
+            session_id,
+            session_fence,
+            options: Some(Box::new(options)),
             reply,
         })
         .await?;
@@ -465,7 +500,14 @@ struct ShardActorTask<R> {
     shutdown_cancel: CancellationToken,
     termination_sender: watch::Sender<Option<Result<(), ShardRuntimeError>>>,
     state: ShardState,
-    live_sessions: HashMap<SessionId, (Option<TenantId>, OwnershipFence)>,
+    live_sessions: HashMap<
+        SessionId,
+        (
+            Option<TenantId>,
+            OwnershipFence,
+            Option<WorkerSessionOptionsV1>,
+        ),
+    >,
     detached_sessions: HashMap<SessionId, OwnershipFence>,
     total_contexts_created: u64,
     ownership_lost: bool,
@@ -541,10 +583,17 @@ impl<R: BrowserShardRuntime> ShardActorTask<R> {
                 tenant_id,
                 session_id,
                 session_fence,
+                options,
                 reply,
             } => {
                 let result = self
-                    .attach_session(&shard_fence, tenant_id, session_id, session_fence)
+                    .attach_session(
+                        &shard_fence,
+                        tenant_id,
+                        session_id,
+                        session_fence,
+                        options.map(|options| *options),
+                    )
                     .await;
                 let _ = reply.send(result);
             }
@@ -595,11 +644,17 @@ impl<R: BrowserShardRuntime> ShardActorTask<R> {
         tenant_id: Option<TenantId>,
         session_id: SessionId,
         session_fence: OwnershipFence,
+        options: Option<WorkerSessionOptionsV1>,
     ) -> ActorResult<AttachSessionOutcome> {
         self.validate_shard_fence(shard_fence)?;
         self.validate_session_fence(&session_fence)?;
-        if let Some((existing_tenant, existing_fence)) = self.live_sessions.get(&session_id) {
-            return if existing_tenant == &tenant_id && existing_fence == &session_fence {
+        if let Some((existing_tenant, existing_fence, existing_options)) =
+            self.live_sessions.get(&session_id)
+        {
+            return if existing_tenant == &tenant_id
+                && existing_fence == &session_fence
+                && existing_options == &options
+            {
                 Ok(AttachSessionOutcome::AlreadyAttached)
             } else {
                 Err(ShardActorError::StaleSessionFence)
@@ -621,21 +676,35 @@ impl<R: BrowserShardRuntime> ShardActorTask<R> {
 
         let runtime = self.runtime.clone();
         let operation_cancel = self.ownership_cancel.child_token();
-        let result = if let Some(tenant_id) = tenant_id.as_ref() {
-            self.await_runtime(runtime.create_context_owned(
-                tenant_id,
-                &session_id,
-                &session_fence,
-                operation_cancel,
-            ))
-            .await
-        } else {
-            self.await_runtime(runtime.create_context(
-                &session_id,
-                &session_fence,
-                operation_cancel,
-            ))
-            .await
+        let result = match (tenant_id.as_ref(), options.as_ref()) {
+            (Some(tenant_id), Some(options)) => {
+                self.await_runtime(runtime.create_context_owned_with_options(
+                    tenant_id,
+                    &session_id,
+                    &session_fence,
+                    options,
+                    operation_cancel,
+                ))
+                .await
+            }
+            (Some(tenant_id), None) => {
+                self.await_runtime(runtime.create_context_owned(
+                    tenant_id,
+                    &session_id,
+                    &session_fence,
+                    operation_cancel,
+                ))
+                .await
+            }
+            (None, None) => {
+                self.await_runtime(runtime.create_context(
+                    &session_id,
+                    &session_fence,
+                    operation_cancel,
+                ))
+                .await
+            }
+            (None, Some(_)) => Err(ShardActorError::StaleSessionFence),
         };
         if let Err(error) = result {
             if error == ShardActorError::Runtime(ShardRuntimeError::OutcomeUncertain) {
@@ -646,7 +715,7 @@ impl<R: BrowserShardRuntime> ShardActorTask<R> {
         self.commit_if_owned(move |actor| {
             actor
                 .live_sessions
-                .insert(session_id, (tenant_id, session_fence));
+                .insert(session_id, (tenant_id, session_fence, options));
             actor.total_contexts_created += 1;
             if actor.total_contexts_created == actor.config.max_contexts_created_lifetime {
                 actor.transition(ShardEvent::BeginDraining)?;
@@ -671,7 +740,7 @@ impl<R: BrowserShardRuntime> ShardActorTask<R> {
                 Err(ShardActorError::StaleSessionFence)
             };
         }
-        let Some((_, current)) = self.live_sessions.get(&session_id) else {
+        let Some((_, current, _)) = self.live_sessions.get(&session_id) else {
             return Err(ShardActorError::SessionNotFound);
         };
         if current != &session_fence {

@@ -8,7 +8,7 @@ use browserd_sandbox::CleanupReason;
 use browserd_session::OwnershipFence;
 use browserd_worker::{
     ActionExecutionResult, ApprovedActionError, ArtifactStoreReceipt, ArtifactStoreRequest,
-    ChromiumDriver, DependencyError, LiveApprovalContext, SandboxClient,
+    ChromiumDriver, DependencyError, LiveApprovalContext, SandboxClient, WorkerSessionOptionsV1,
 };
 
 pub trait SessionShardLifecycle: Send + Sync + 'static {
@@ -34,6 +34,16 @@ pub trait SessionShardFactory: Send + Sync + 'static {
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<ProvisionedSessionShard, DependencyError>;
+
+    fn create_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _options: &WorkerSessionOptionsV1,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
 }
 
 pub trait RoutedArtifactStore: Send + Sync + 'static {
@@ -86,6 +96,7 @@ struct RouterState {
 struct SessionEntry {
     tenant_id: TenantId,
     fence: OwnershipFence,
+    options: Option<WorkerSessionOptionsV1>,
     state: Mutex<EntryState>,
     changed: Condvar,
 }
@@ -338,6 +349,7 @@ where
         tenant_id: &TenantId,
         session_id: &SessionId,
         fence: &OwnershipFence,
+        options: Option<&WorkerSessionOptionsV1>,
     ) -> Result<PageId, DependencyError> {
         self.validate_fence(fence)?;
         let (entry, creator) = {
@@ -354,6 +366,7 @@ where
                 let entry = Arc::new(SessionEntry {
                     tenant_id: tenant_id.clone(),
                     fence: fence.clone(),
+                    options: options.cloned(),
                     state: Mutex::new(EntryState::Provisioning),
                     changed: Condvar::new(),
                 });
@@ -363,14 +376,23 @@ where
             }
         };
 
-        if entry.tenant_id != *tenant_id || entry.fence != *fence {
+        if entry.tenant_id != *tenant_id
+            || entry.fence != *fence
+            || entry.options.as_ref() != options
+        {
             return Err(DependencyError::Rejected);
         }
         if !creator {
             return Self::await_create(&entry);
         }
 
-        match self.factory.create(tenant_id, session_id, fence) {
+        let created = match options {
+            Some(options) => self
+                .factory
+                .create_with_options(tenant_id, session_id, fence, options),
+            None => self.factory.create(tenant_id, session_id, fence),
+        };
+        match created {
             Ok(shard) => Self::publish_create(&entry, shard),
             Err(error) => {
                 self.publish_create_failure(session_id, &entry, error);
@@ -508,7 +530,17 @@ where
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<PageId, DependencyError> {
-        self.create_owned(tenant_id, session_id, fence)
+        self.create_owned(tenant_id, session_id, fence, None)
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        self.create_owned(tenant_id, session_id, fence, Some(options))
     }
 
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {

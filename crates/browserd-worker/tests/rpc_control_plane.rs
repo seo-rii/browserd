@@ -45,6 +45,31 @@ fn session_options() -> WorkerSessionOptionsV1 {
     }
 }
 
+#[test]
+fn options_aware_create_does_not_fall_back_to_the_legacy_driver_method() {
+    let Some(worker_id) = WorkerId::new("worker-options-fail-closed").ok() else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let fence = OwnershipFence::new(worker_id, 1, 1, 1);
+    let driver = UnavailableChromiumDriver;
+
+    assert_eq!(
+        driver.create_context_owned(&tenant_id, &session_id, &fence),
+        Err(DependencyError::Unavailable)
+    );
+    assert_eq!(
+        driver.create_context_owned_with_options(
+            &tenant_id,
+            &session_id,
+            &fence,
+            &session_options(),
+        ),
+        Err(DependencyError::Rejected)
+    );
+}
+
 struct FrozenClock;
 
 impl WorkerClock for FrozenClock {
@@ -62,6 +87,19 @@ impl ChromiumDriver for ReadyDriver {
 
     fn create_context(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
         Ok(PageId::new())
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        session_id: &SessionId,
+        _fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        if !options.is_valid() {
+            return Err(DependencyError::Rejected);
+        }
+        self.create_context(session_id)
     }
 
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
@@ -278,6 +316,16 @@ impl ChromiumDriver for BlockingActionDriver {
 
     fn create_context(&self, session_id: &SessionId) -> Result<PageId, DependencyError> {
         ReadyDriver.create_context(session_id)
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        ReadyDriver.create_context_owned_with_options(tenant_id, session_id, fence, options)
     }
 
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError> {

@@ -19,7 +19,7 @@ use browserd_worker::{
     ChromiumConnectionOwner, ChromiumDriver, ChromiumDriverShardRuntime,
     ChromiumTargetManagerBackend, DependencyError, ExactSandboxTermination,
     ProductionSandboxShardRuntime, SandboxShardRpc, ShardActorError, ShardLaunchDescriptor,
-    ShardRuntimeError, TargetManagedShardRuntime, TargetManagerDrain,
+    ShardRuntimeError, TargetManagedShardRuntime, TargetManagerDrain, WorkerSessionOptionsV1,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
@@ -564,7 +564,40 @@ where
         match *qualification {
             QualificationPhase::Terminal(Ok(())) => {
                 drop(qualification);
-                self.create_provisioned(tenant_id, session_id, fence)
+                self.create_provisioned(tenant_id, session_id, fence, None)
+            }
+            QualificationPhase::Terminal(Err(error)) => Err(error),
+            QualificationPhase::Unstarted | QualificationPhase::Running => {
+                Err(DependencyError::Rejected)
+            }
+        }
+    }
+
+    fn create_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        if !options.is_valid()
+            || options.network_policy_id.as_str() != self.config.egress_policy.profile()
+            || options.network_class != "public"
+            || options.checkpoint_ref.is_some()
+            || options.dialog_policy != "auto_dismiss"
+            || options.feature_profile != "standard"
+        {
+            return Err(DependencyError::Rejected);
+        }
+        let qualification = self
+            .qualification
+            .phase
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        match *qualification {
+            QualificationPhase::Terminal(Ok(())) => {
+                drop(qualification);
+                self.create_provisioned(tenant_id, session_id, fence, Some(options))
             }
             QualificationPhase::Terminal(Err(error)) => Err(error),
             QualificationPhase::Unstarted | QualificationPhase::Running => {
@@ -623,9 +656,19 @@ where
         tenant_id: &TenantId,
         session_id: &SessionId,
         fence: &OwnershipFence,
+        options: Option<&WorkerSessionOptionsV1>,
     ) -> Result<ProvisionedSessionShard, DependencyError> {
-        self.start_session_shard(tenant_id, session_id, fence)
-            .map(|shard| shard.provisioned)
+        match options {
+            Some(options) => self.start_session_shard_with_deadline(
+                tenant_id,
+                session_id,
+                fence,
+                Some(options),
+                None,
+            ),
+            None => self.start_session_shard(tenant_id, session_id, fence),
+        }
+        .map(|shard| shard.provisioned)
     }
 
     fn start_session_shard(
@@ -634,7 +677,7 @@ where
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<StartedSessionShard, DependencyError> {
-        self.start_session_shard_with_deadline(tenant_id, session_id, fence, None)
+        self.start_session_shard_with_deadline(tenant_id, session_id, fence, None, None)
     }
 
     fn start_session_shard_until(
@@ -644,7 +687,7 @@ where
         fence: &OwnershipFence,
         deadline: Instant,
     ) -> Result<StartedSessionShard, DependencyError> {
-        self.start_session_shard_with_deadline(tenant_id, session_id, fence, Some(deadline))
+        self.start_session_shard_with_deadline(tenant_id, session_id, fence, None, Some(deadline))
     }
 
     fn start_session_shard_with_deadline(
@@ -652,6 +695,7 @@ where
         tenant_id: &TenantId,
         session_id: &SessionId,
         fence: &OwnershipFence,
+        options: Option<&WorkerSessionOptionsV1>,
         deadline: Option<Instant>,
     ) -> Result<StartedSessionShard, DependencyError> {
         if fence.worker_id() != &self.config.worker_id
@@ -759,8 +803,18 @@ where
             actor.clone(),
             shard_fence.clone(),
         ));
-        let context = match deadline {
-            Some(deadline) => self.runtime.block_on(async {
+        let context = match (deadline, options) {
+            (Some(deadline), Some(options)) => self.runtime.block_on(async {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    actor_driver.create_context_owned_with_options_async(
+                        tenant_id, session_id, fence, options,
+                    ),
+                )
+                .await
+                .unwrap_or(Err(DependencyError::Unavailable))
+            }),
+            (Some(deadline), None) => self.runtime.block_on(async {
                 tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
                     actor_driver.create_context_owned_async(tenant_id, session_id, fence),
@@ -768,7 +822,9 @@ where
                 .await
                 .unwrap_or(Err(DependencyError::Unavailable))
             }),
-            None => actor_driver.create_context_owned(tenant_id, session_id, fence),
+            (None, Some(options)) => actor_driver
+                .create_context_owned_with_options(tenant_id, session_id, fence, options),
+            (None, None) => actor_driver.create_context_owned(tenant_id, session_id, fence),
         };
         let primary_page_id = match context {
             Ok(page_id) => page_id,

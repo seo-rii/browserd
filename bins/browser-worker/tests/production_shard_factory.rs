@@ -23,7 +23,7 @@ use browserd_sandbox::{
 use browserd_session::OwnershipFence;
 use browserd_worker::{
     ArtifactStoreReceipt, ArtifactStoreRequest, ChromiumDriver, DependencyError, SandboxClient,
-    SandboxShardRpc, ShardRuntimeError,
+    SandboxShardRpc, ShardRuntimeError, WorkerSessionOptionsV1, WorkerViewport,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1067,6 +1067,114 @@ fn production_admission_stays_closed_until_real_readiness_qualification_succeeds
     );
     assert_eq!(sandbox.claims.load(Ordering::SeqCst), 0);
     assert_eq!(sandbox.kills.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn unsupported_session_options_are_rejected_before_sandbox_effect() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let worker_id = WorkerId::new("production-network-policy-binding")
+        .expect("worker identity should be valid");
+    let worker_epoch = 31;
+    let daemon_epoch = 17;
+    let (readiness_peer_tx, readiness_peer_rx) = oneshot::channel();
+    let sandbox = Arc::new(ScriptedSandbox {
+        daemon_epoch,
+        cancel_delay: Mutex::new(Duration::ZERO),
+        peer_termination: None,
+        panic_next_cancel: AtomicBool::new(false),
+        peers: Mutex::new(VecDeque::from([readiness_peer_tx])),
+        launches: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
+        renewals: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+        cancelled_specs: Mutex::new(Vec::new()),
+    });
+    let config = ProductionSessionShardConfig::new(
+        worker_id.clone(),
+        worker_epoch,
+        daemon_epoch,
+        identity(),
+        ChromiumConnectionConfig::default(),
+        EgressPolicyBinding::new("strict", [25; 32]).expect("egress policy should be valid"),
+        Duration::from_secs(30),
+    )
+    .expect("production shard configuration should be valid");
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone())
+            .expect("multi-thread runtime should be supported");
+    let readiness_protocol = runtime.spawn(run_scripted_protocol(
+        readiness_peer_rx,
+        CleanupProbe::Clean,
+    ));
+    assert_eq!(factory.qualify_daemon(), Ok(()));
+    wait_protocol(&runtime, readiness_protocol).expect("readiness peer should not panic");
+    let effects_before = (
+        sandbox.launches.load(Ordering::SeqCst),
+        sandbox.claims.load(Ordering::SeqCst),
+        sandbox.kills.load(Ordering::SeqCst),
+    );
+    let options = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: None,
+        network_policy_id: "strict".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 1_800,
+        idle_timeout_seconds: 600,
+        metadata: Default::default(),
+    };
+    let mut policy_mismatch = options.clone();
+    policy_mismatch.network_policy_id = "different-policy".to_owned();
+    let mut unsupported_network_class = options.clone();
+    unsupported_network_class.network_class = "private".to_owned();
+    let mut unsupported_checkpoint = options.clone();
+    unsupported_checkpoint.checkpoint_ref = Some("checkpoint-1".to_owned());
+    let mut unsupported_dialog = options.clone();
+    unsupported_dialog.dialog_policy = "hold".to_owned();
+    let mut unsupported_feature = options.clone();
+    unsupported_feature.feature_profile = "privileged".to_owned();
+    let mut invalid = options;
+    invalid.locale.clear();
+    let fence = OwnershipFence::new(worker_id, worker_epoch, 3, 1);
+
+    for (case, options) in [
+        ("network policy mismatch", policy_mismatch),
+        ("unsupported network class", unsupported_network_class),
+        ("unsupported checkpoint", unsupported_checkpoint),
+        ("unsupported dialog policy", unsupported_dialog),
+        ("unsupported feature profile", unsupported_feature),
+        ("invalid options", invalid),
+    ] {
+        assert!(
+            matches!(
+                factory.create_with_options(&TenantId::new(), &SessionId::new(), &fence, &options,),
+                Err(DependencyError::Rejected)
+            ),
+            "{case} must be rejected"
+        );
+        assert_eq!(
+            (
+                sandbox.launches.load(Ordering::SeqCst),
+                sandbox.claims.load(Ordering::SeqCst),
+                sandbox.kills.load(Ordering::SeqCst),
+            ),
+            effects_before,
+            "{case} must not launch, claim, or clean a sandbox"
+        );
+    }
 }
 
 #[test]
