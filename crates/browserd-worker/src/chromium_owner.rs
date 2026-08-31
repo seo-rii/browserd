@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc as std_mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use browserd_cdp::{CdpClient, CdpCommandError, CdpIncoming};
@@ -188,14 +188,46 @@ impl ChromiumTargetManagerBackend {
         command: PageCommand,
         execution_fence: Option<PageExecutionFence>,
     ) -> Result<Value, OwnerActorError> {
-        self.mailbox
-            .request(|response| OwnerRequest::ExecutePageCommand {
-                session_id,
-                page_id,
-                command,
-                execution_fence,
-                response,
-            })
+        self.execute_page_command_with_deadline(session_id, page_id, command, execution_fence, None)
+    }
+
+    pub(crate) fn execute_page_command_until(
+        &self,
+        session_id: SessionId,
+        page_id: PageId,
+        command: PageCommand,
+        execution_fence: Option<PageExecutionFence>,
+        deadline: Instant,
+    ) -> Result<Value, OwnerActorError> {
+        self.execute_page_command_with_deadline(
+            session_id,
+            page_id,
+            command,
+            execution_fence,
+            Some(deadline),
+        )
+    }
+
+    fn execute_page_command_with_deadline(
+        &self,
+        session_id: SessionId,
+        page_id: PageId,
+        command: PageCommand,
+        execution_fence: Option<PageExecutionFence>,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let build = |response| OwnerRequest::ExecutePageCommand {
+            session_id,
+            page_id,
+            command,
+            execution_fence,
+            deadline,
+            response,
+        };
+        match deadline {
+            Some(deadline) => self.mailbox.request_until(build, deadline),
+            None => self.mailbox.request(build),
+        }
     }
 
     pub(crate) fn observe_page(
@@ -205,13 +237,46 @@ impl ChromiumTargetManagerBackend {
         session_incarnation: u64,
         page_id: PageId,
     ) -> Result<ObservedPage, OwnerActorError> {
-        self.mailbox.request(|response| OwnerRequest::ObservePage {
+        self.observe_page_with_deadline(tenant_id, session_id, session_incarnation, page_id, None)
+    }
+
+    pub(crate) fn observe_page_until(
+        &self,
+        tenant_id: TenantId,
+        session_id: SessionId,
+        session_incarnation: u64,
+        page_id: PageId,
+        deadline: Instant,
+    ) -> Result<ObservedPage, OwnerActorError> {
+        self.observe_page_with_deadline(
             tenant_id,
             session_id,
             session_incarnation,
             page_id,
+            Some(deadline),
+        )
+    }
+
+    fn observe_page_with_deadline(
+        &self,
+        tenant_id: TenantId,
+        session_id: SessionId,
+        session_incarnation: u64,
+        page_id: PageId,
+        deadline: Option<Instant>,
+    ) -> Result<ObservedPage, OwnerActorError> {
+        let build = |response| OwnerRequest::ObservePage {
+            tenant_id,
+            session_id,
+            session_incarnation,
+            page_id,
+            deadline,
             response,
-        })
+        };
+        match deadline {
+            Some(deadline) => self.mailbox.request_until(build, deadline),
+            None => self.mailbox.request(build),
+        }
     }
 
     pub(crate) fn validate_session(&self, session_id: SessionId) -> Result<(), OwnerActorError> {
@@ -722,6 +787,22 @@ impl OwnerMailbox {
         &self,
         build: impl FnOnce(std_mpsc::SyncSender<Result<T, OwnerActorError>>) -> OwnerRequest,
     ) -> Result<T, OwnerActorError> {
+        self.request_with_deadline(build, None)
+    }
+
+    fn request_until<T>(
+        &self,
+        build: impl FnOnce(std_mpsc::SyncSender<Result<T, OwnerActorError>>) -> OwnerRequest,
+        deadline: Instant,
+    ) -> Result<T, OwnerActorError> {
+        self.request_with_deadline(build, Some(deadline))
+    }
+
+    fn request_with_deadline<T>(
+        &self,
+        build: impl FnOnce(std_mpsc::SyncSender<Result<T, OwnerActorError>>) -> OwnerRequest,
+        deadline: Option<Instant>,
+    ) -> Result<T, OwnerActorError> {
         let sender = {
             let endpoint = self
                 .endpoint
@@ -733,8 +814,15 @@ impl OwnerMailbox {
                 OwnerEndpoint::Terminal => return Err(OwnerActorError::OutcomeUncertain),
             }
         };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(OwnerActorError::DeadlineBeforeDispatch);
+        }
         let (response, receiver) = std_mpsc::sync_channel(1);
-        match sender.try_send(build(response)) {
+        let request = build(response);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(OwnerActorError::DeadlineBeforeDispatch);
+        }
+        match sender.try_send(request) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.mark_terminal();
@@ -747,7 +835,11 @@ impl OwnerMailbox {
                 return Err(OwnerActorError::OutcomeUncertain);
             }
         }
-        receiver.recv_timeout(self.request_timeout).map_err(|_| {
+        let response_timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(self.request_timeout)
+            .min(self.request_timeout);
+        receiver.recv_timeout(response_timeout).map_err(|_| {
             self.mark_terminal();
             self.fail_closed();
             OwnerActorError::OutcomeUncertain
@@ -812,6 +904,7 @@ enum OwnerRequest {
         page_id: PageId,
         command: PageCommand,
         execution_fence: Option<PageExecutionFence>,
+        deadline: Option<Instant>,
         response: std_mpsc::SyncSender<Result<Value, OwnerActorError>>,
     },
     ObservePage {
@@ -819,6 +912,7 @@ enum OwnerRequest {
         session_id: SessionId,
         session_incarnation: u64,
         page_id: PageId,
+        deadline: Option<Instant>,
         response: std_mpsc::SyncSender<Result<ObservedPage, OwnerActorError>>,
     },
     ValidateSession {
@@ -831,6 +925,7 @@ enum OwnerRequest {
 pub(crate) enum OwnerActorError {
     Rejected,
     UnknownOwnership,
+    DeadlineBeforeDispatch,
     StateOverflow,
     Unavailable,
     OutcomeUncertain,
@@ -1160,10 +1255,11 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 page_id,
                 command,
                 execution_fence,
+                deadline,
                 response,
             } => {
                 let result = self
-                    .execute_page_command(&session_id, &page_id, command, execution_fence)
+                    .execute_page_command(&session_id, &page_id, command, execution_fence, deadline)
                     .await;
                 let failed = matches!(
                     result,
@@ -1180,10 +1276,17 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 session_id,
                 session_incarnation,
                 page_id,
+                deadline,
                 response,
             } => {
                 let result = self
-                    .observe_page(&tenant_id, &session_id, session_incarnation, &page_id)
+                    .observe_page(
+                        &tenant_id,
+                        &session_id,
+                        session_incarnation,
+                        &page_id,
+                        deadline,
+                    )
                     .await;
                 let failed = matches!(
                     result,
@@ -1222,6 +1325,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             None,
             Some(&mut catch_up),
             None,
+            None,
         )
         .await?;
         self.command_event_first(
@@ -1229,6 +1333,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             json!({"discover": true}),
             None,
             Some(&mut catch_up),
+            None,
             None,
         )
         .await?;
@@ -1238,6 +1343,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 json!({}),
                 None,
                 Some(&mut catch_up),
+                None,
                 None,
             )
             .await?;
@@ -1300,9 +1406,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         let Some((method, params)) = command else {
             return Ok(());
         };
-        self.command_event_first(method, params, Some(route.route.session_id), None, None)
-            .await
-            .map(|_| ())
+        self.command_event_first(
+            method,
+            params,
+            Some(route.route.session_id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn close_target(&mut self, target_id: &str) -> Result<(), OwnerActorError> {
@@ -1313,6 +1426,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .command_event_first(
                 "Target.closeTarget",
                 json!({"targetId": target_id}),
+                None,
                 None,
                 None,
                 None,
@@ -1343,6 +1457,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .command_event_first(
                 "Target.createBrowserContext",
                 json!({"disposeOnDetach": true}),
+                None,
                 None,
                 None,
                 None,
@@ -1410,6 +1525,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             None,
             None,
             None,
+            None,
         )
         .await?;
         self.contexts
@@ -1438,6 +1554,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     "browserContextId": context_id,
                     "background": false,
                 }),
+                None,
                 None,
                 None,
                 None,
@@ -1531,6 +1648,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 None,
                 None,
                 None,
+                None,
             )
             .await?;
         if response.get("success").and_then(Value::as_bool) != Some(true) {
@@ -1560,6 +1678,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             None,
             None,
             None,
+            None,
         )
         .await
         .map(|_| ())
@@ -1571,6 +1690,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         page_id: &PageId,
         command: PageCommand,
         execution_fence: Option<PageExecutionFence>,
+        deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
         let (_, target_id, route) = self.owned_page_route(session_id, page_id)?;
         let cdp_session_id = route.session_id().to_owned();
@@ -1584,6 +1704,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         Some(cdp_session_id),
                         None,
                         guarded,
+                        deadline,
                     )
                     .await?;
                 if result
@@ -1602,6 +1723,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id),
                     None,
                     guarded,
+                    deadline,
                 )
                 .await
             }
@@ -1612,6 +1734,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id.clone()),
                     None,
                     guarded.clone(),
+                    deadline,
                 )
                 .await?;
                 self.command_event_first(
@@ -1620,6 +1743,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id),
                     None,
                     guarded,
+                    deadline,
                 )
                 .await
                 .map_err(|_| OwnerActorError::OutcomeUncertain)
@@ -1631,6 +1755,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id),
                     None,
                     guarded,
+                    deadline,
                 )
                 .await
             }
@@ -1641,6 +1766,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id),
                     None,
                     guarded,
+                    deadline,
                 )
                 .await
             }
@@ -1651,6 +1777,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id),
                     None,
                     guarded,
+                    deadline,
                 )
                 .await
             }
@@ -1663,6 +1790,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         session_id: &SessionId,
         session_incarnation: u64,
         page_id: &PageId,
+        deadline: Option<Instant>,
     ) -> Result<ObservedPage, OwnerActorError> {
         let (_, target_id, route) = self.owned_page_route(session_id, page_id)?;
         if route.tenant_id() != tenant_id
@@ -1681,6 +1809,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 Some(route.session_id().to_owned()),
                 None,
                 None,
+                deadline,
             )
             .await?;
         let origin = response
@@ -1765,16 +1894,46 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         session_id: Option<String>,
         mut catch_up: Option<&mut Vec<PausedTarget>>,
         guarded: Option<GuardedPageExecution>,
+        deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
         let client = self.client.clone();
-        let command_timeout = self.command_timeout;
+        let command_timeout_cap = self.command_timeout;
+        let command_deadline = deadline;
+        let submitted = Arc::new(AtomicBool::new(false));
+        let submitted_by_command = Arc::clone(&submitted);
         let command = async move {
+            let command_timeout = match command_deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(OwnerActorError::DeadlineBeforeDispatch);
+                    }
+                    deadline.duration_since(now).min(command_timeout_cap)
+                }
+                None => command_timeout_cap,
+            };
+            submitted_by_command.store(true, Ordering::Release);
             client
                 .command(method, params, session_id, Some(command_timeout))
                 .await
+                .map_err(map_command_error)
+        };
+        let expires = async move {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending::<()>().await,
+            }
         };
         tokio::pin!(command);
+        tokio::pin!(expires);
         loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(if submitted.load(Ordering::Acquire) {
+                    OwnerActorError::OutcomeUncertain
+                } else {
+                    OwnerActorError::DeadlineBeforeDispatch
+                });
+            }
             if let Some(guarded) = guarded.as_ref() {
                 let route = self
                     .routes
@@ -1789,12 +1948,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
             tokio::select! {
                 biased;
+                () = &mut expires => {
+                    return Err(if submitted.load(Ordering::Acquire) {
+                        OwnerActorError::OutcomeUncertain
+                    } else {
+                        OwnerActorError::DeadlineBeforeDispatch
+                    });
+                }
                 incoming = self.events.recv() => {
                     let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
                     self.handle_incoming(incoming, catch_up.as_deref_mut())?;
                 }
                 response = &mut command => {
-                    let response = response.map_err(map_command_error)?;
+                    let response = response?;
                     if !response.is_object() {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
@@ -2199,7 +2365,8 @@ fn map_actor_stage_error(error: OwnerActorError) -> BootstrapStageFailure {
     match error {
         OwnerActorError::UnknownOwnership => BootstrapStageFailure::UnknownOwnership,
         OwnerActorError::Rejected => BootstrapStageFailure::Rejected,
-        OwnerActorError::StateOverflow
+        OwnerActorError::DeadlineBeforeDispatch
+        | OwnerActorError::StateOverflow
         | OwnerActorError::Unavailable
         | OwnerActorError::OutcomeUncertain => BootstrapStageFailure::StateOverflow,
     }
@@ -2213,7 +2380,9 @@ fn map_actor_runtime_error(error: OwnerActorError) -> ShardRuntimeError {
         OwnerActorError::StateOverflow | OwnerActorError::Unavailable => {
             ShardRuntimeError::Unavailable
         }
-        OwnerActorError::OutcomeUncertain => ShardRuntimeError::OutcomeUncertain,
+        OwnerActorError::DeadlineBeforeDispatch | OwnerActorError::OutcomeUncertain => {
+            ShardRuntimeError::OutcomeUncertain
+        }
     }
 }
 

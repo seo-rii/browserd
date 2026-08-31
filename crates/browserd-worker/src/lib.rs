@@ -20,15 +20,15 @@ pub use production_sandbox::{
 };
 pub use rpc::{
     PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement,
-    WorkerActionCommand, WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType,
-    WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt,
-    WorkerArtifactSource, WorkerArtifactState, WorkerCanonicalActionProposal,
-    WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
-    WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient,
-    WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError,
-    WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle,
-    WorkerSessionReceipt,
+    WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerActionStatus,
+    WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
+    WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
+    WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt,
+    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt,
+    WorkerRpcBlockingClient, WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig,
+    WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode,
+    WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
+    WorkerSessionLifecycle, WorkerSessionReceipt,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
@@ -200,6 +200,7 @@ impl LiveApprovalContext {
 pub enum ApprovedActionError {
     ApprovalStale(StaleApprovalReason),
     DispatchRevoked,
+    DeadlineBeforeDispatch,
     Unavailable,
     OutcomeUncertain,
 }
@@ -254,6 +255,19 @@ pub trait ChromiumDriver: Send + Sync + 'static {
         page_id: Option<&PageId>,
         payload: &[u8],
     ) -> ActionExecutionResult;
+    fn execute_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        if Instant::now() >= deadline {
+            ActionExecutionResult::FailedKnown("action_timeout".to_owned())
+        } else {
+            self.execute_action(session_id, page_id, payload)
+        }
+    }
     fn inspect_approval_context(
         &self,
         session_id: &SessionId,
@@ -280,6 +294,32 @@ pub trait ChromiumDriver: Send + Sync + 'static {
             &LiveApprovalContext,
         ) -> Result<(), ApprovedActionError>,
     ) -> Result<ActionExecutionResult, ApprovedActionError>;
+    #[allow(clippy::too_many_arguments)]
+    fn execute_approved_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        if Instant::now() >= deadline {
+            Err(ApprovedActionError::DeadlineBeforeDispatch)
+        } else {
+            self.execute_approved_action(
+                session_id,
+                page_id,
+                payload,
+                proposal,
+                inspected,
+                authorize_and_commit,
+            )
+        }
+    }
     fn cancel_action(
         &self,
         session_id: &SessionId,
@@ -774,6 +814,7 @@ struct ActionRecord {
     requester_principal_id: PrincipalId,
     page_id: Option<PageId>,
     payload: Vec<u8>,
+    execution_timeout: Duration,
     approval_id: Option<ApprovalId>,
     dispatch_permit: Option<DispatchPermit>,
 }
@@ -1745,6 +1786,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             page_id,
             payload,
             approval,
+            Duration::from_secs(30),
             now,
         )
     }
@@ -1780,6 +1822,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             page_id,
             payload,
             approval,
+            Duration::from_secs(30),
             now,
         )
     }
@@ -1800,6 +1843,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         page_id: Option<PageId>,
         payload: Vec<u8>,
         approval: Option<ActionApprovalRequirement>,
+        execution_timeout: Duration,
         now: SessionTime,
     ) -> Result<ActionId, WorkerError> {
         self.authorize(peer)?;
@@ -1818,6 +1862,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             page_id,
             payload,
             approval,
+            execution_timeout,
             now,
         )?;
         while self
@@ -1842,6 +1887,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         page_id: Option<PageId>,
         payload: Vec<u8>,
         approval: Option<ActionApprovalRequirement>,
+        execution_timeout: Duration,
         now: SessionTime,
     ) -> Result<ActionId, WorkerError> {
         self.authorize(peer)?;
@@ -1851,6 +1897,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
+        if execution_timeout.is_zero() || execution_timeout > Duration::from_secs(300) {
+            return Err(WorkerError::InvalidConfiguration);
+        }
         let approval_binding = approval.as_ref().map(|requirement| {
             (
                 requirement.proposal.hash(),
@@ -2028,6 +2077,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         requester_principal_id,
                         page_id,
                         payload,
+                        execution_timeout,
                         approval_id: None,
                         dispatch_permit: None,
                     },
@@ -2078,6 +2128,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 requester_principal_id,
                 page_id,
                 payload,
+                execution_timeout,
                 approval_id: approval_id.clone(),
                 dispatch_permit: None,
             },
@@ -2189,7 +2240,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
         executor: &Arc<SessionExecutor>,
     ) -> Result<Option<WorkerActionSnapshot>, WorkerError> {
-        let (action_id, page_id, payload, permit, approval_request) = {
+        let (action_id, page_id, payload, execution_timeout, permit, approval_request) = {
             let mut session = executor
                 .state
                 .lock()
@@ -2205,19 +2256,21 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             {
                 return Ok(None);
             }
-            let (page_id, payload, approval_id, requester_principal_id) = session
-                .actions
-                .get(&action_id)
-                .filter(|action| action.snapshot.status == ActionStatus::Queued)
-                .map(|action| {
-                    (
-                        action.page_id.clone(),
-                        action.payload.clone(),
-                        action.approval_id.clone(),
-                        action.requester_principal_id.clone(),
-                    )
-                })
-                .ok_or(WorkerError::InvalidActionTransition)?;
+            let (page_id, payload, execution_timeout, approval_id, requester_principal_id) =
+                session
+                    .actions
+                    .get(&action_id)
+                    .filter(|action| action.snapshot.status == ActionStatus::Queued)
+                    .map(|action| {
+                        (
+                            action.page_id.clone(),
+                            action.payload.clone(),
+                            action.execution_timeout,
+                            action.approval_id.clone(),
+                            action.requester_principal_id.clone(),
+                        )
+                    })
+                    .ok_or(WorkerError::InvalidActionTransition)?;
             let approval_request = approval_id
                 .as_ref()
                 .map(|approval_id| {
@@ -2281,8 +2334,18 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 },
                 Ordering::Release,
             );
-            (action_id, page_id, payload, permit, approval_request)
+            (
+                action_id,
+                page_id,
+                payload,
+                execution_timeout,
+                permit,
+                approval_request,
+            )
         };
+        let execution_deadline = Instant::now()
+            .checked_add(execution_timeout)
+            .ok_or(WorkerError::InvalidConfiguration)?;
         let (outcome, response_error, known_failure_reason) =
             if let Some((request, feature, requester_principal_id)) = approval_request {
                 let proposal = request.proposal().clone();
@@ -2308,12 +2371,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                             )
                             .is_ok();
                         let execution = if driver_entered {
-                            self.driver.execute_approved_action(
+                            self.driver.execute_approved_action_until(
                                 session_id,
                                 page_id,
                                 &payload,
                                 &proposal,
                                 &live,
+                                execution_deadline,
                                 &mut |observed| {
                                     if executor
                                         .approved_dispatch_phase
@@ -2528,6 +2592,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                                     Some(KnownFailureReason::NotDispatched),
                                 ),
                             },
+                            Err(ApprovedActionError::DeadlineBeforeDispatch) => (
+                                ActionExecutionResult::FailedKnown("action_timeout".to_owned()),
+                                None,
+                                Some(KnownFailureReason::ExecutionTimedOut),
+                            ),
                             Err(
                                 ApprovedActionError::Unavailable
                                 | ApprovedActionError::OutcomeUncertain,
@@ -2543,12 +2612,18 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     ),
                 }
             } else {
-                (
-                    self.driver
-                        .execute_action(session_id, page_id.as_ref(), &payload),
-                    None,
-                    None,
+                let outcome = self.driver.execute_action_until(
+                    session_id,
+                    page_id.as_ref(),
+                    &payload,
+                    execution_deadline,
+                );
+                let known_failure_reason = matches!(
+                    &outcome,
+                    ActionExecutionResult::FailedKnown(reason) if reason == "action_timeout"
                 )
+                .then_some(KnownFailureReason::ExecutionTimedOut);
+                (outcome, None, known_failure_reason)
             };
         let mut session = executor
             .state

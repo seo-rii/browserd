@@ -44,12 +44,12 @@ use browserd_http::{
 };
 use browserd_viewer::{TicketError, TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use browserd_worker::{
-    PendingWorkerRpc, WorkerActionCommand, WorkerActionReceipt, WorkerApprovalDecision,
-    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
-    WorkerArtifactState, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
-    WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcBlockingClient, WorkerRpcCompletionError,
-    WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
+    PendingWorkerRpc, WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionReceipt,
+    WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt,
+    WorkerArtifactSource, WorkerArtifactState, WorkerCreateSessionReceipt,
+    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcBlockingClient,
+    WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode,
+    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
 };
 use chrono::Utc;
 use jsonwebtoken::Algorithm;
@@ -1279,6 +1279,9 @@ where
                 "action exceeds the production worker bounds",
             ));
         }
+        let execution_timeout_ms =
+            WorkerActionExecutionTimeout::new(command.body.execution_timeout_ms)
+                .ok_or_else(|| ApiError::invalid_request("action execution timeout is invalid"))?;
         let canonical = serde_json::to_value(&command.body)
             .map_err(|_| ApiError::new(ErrorCode::Internal, "action canonicalization failed"))?;
         let canonical_request_hash =
@@ -1371,6 +1374,7 @@ where
             kind,
             page_id: Some(command.body.page_id),
             action,
+            execution_timeout_ms,
             approval: None,
             now_unix_millis,
         };

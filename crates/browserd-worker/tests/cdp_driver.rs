@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use browserd_cdp::CdpTransportConfig;
 use browserd_chromium::{ChromiumArtifactIdentity, ChromiumConnectionConfig, Sha256Digest};
@@ -484,6 +484,24 @@ async fn page_lifecycle_and_bounded_actions_use_the_owned_flattened_route() {
     respond(&mut writer, &command, json!({})).await;
     assert_eq!(activate.await.unwrap(), Ok(()));
 
+    assert!(matches!(
+        driver.execute_action_until(
+            &session_id,
+            Some(&page_id),
+            br#"{"type":"reload"}"#,
+            Instant::now(),
+        ),
+        ActionExecutionResult::FailedKnown(reason) if reason == "action_timeout"
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), read_command(&mut reader))
+            .await
+            .is_err(),
+        "an expired action budget must be rejected before CDP dispatch"
+    );
+    assert!(!drain.0.load(Ordering::SeqCst));
+    assert!(!manager.is_tainted());
+
     let navigate = tokio::task::spawn_blocking({
         let driver = driver.clone();
         let session_id = session_id.clone();
@@ -544,4 +562,66 @@ async fn page_lifecycle_and_bounded_actions_use_the_owned_flattened_route() {
     .await
     .expect("uncertain close must drain the shard");
     assert!(drain.0.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn action_deadline_after_cdp_submission_is_unknown_and_fail_closed() {
+    let drain = Arc::new(Drain(AtomicBool::new(false)));
+    let (owner, manager) = ChromiumConnectionOwner::new_bounded(
+        identity(),
+        connection_config(),
+        shard_fence(),
+        16,
+        drain.clone(),
+    )
+    .unwrap();
+    let driver = owner.chromium_driver(IsolationProfile::SharedContext);
+    let (pipes, mut reader, mut writer) = pipe_pair();
+    let accept = tokio::spawn({
+        let owner = owner.clone();
+        async move { owner.accept_cdp_pipes(pipes).await }
+    });
+    qualify(&mut reader, &mut writer).await;
+    assert_eq!(accept.await.unwrap(), Ok(()));
+    bootstrap_empty(manager.clone(), &mut reader, &mut writer).await;
+
+    let session_id = SessionId::new();
+    let page_id = create_owned_context(
+        driver.clone(),
+        TenantId::new(),
+        session_id.clone(),
+        ownership_fence(),
+        &mut reader,
+        &mut writer,
+    )
+    .await;
+    let action = tokio::task::spawn_blocking(move || {
+        driver.execute_action_until(
+            &session_id,
+            Some(&page_id),
+            br#"{"type":"reload"}"#,
+            Instant::now() + Duration::from_millis(100),
+        )
+    });
+    let command = tokio::time::timeout(Duration::from_millis(500), read_command(&mut reader))
+        .await
+        .expect("the action must reach the CDP submission boundary");
+    assert_eq!(command["method"], "Page.reload");
+    assert_eq!(command["sessionId"], "flat-primary");
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), action)
+            .await
+            .expect("the absolute action deadline must end the call")
+            .unwrap(),
+        ActionExecutionResult::OutcomeUnknown
+    );
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while !drain.0.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a deadline after CDP submission must drain the shard");
+    assert!(manager.is_tainted());
 }

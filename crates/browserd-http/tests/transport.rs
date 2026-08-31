@@ -460,6 +460,32 @@ async fn failed_known_exposes_not_dispatched_reason() -> Result<(), Box<dyn Erro
 }
 
 #[tokio::test]
+async fn failed_known_exposes_execution_timeout_reason() -> Result<(), Box<dyn Error>> {
+    let session_id = SessionId::new();
+    let action_id = ActionId::new();
+    let response = app(
+        Arc::new(ActionSnapshotService(terminal_action_snapshot(
+            action_id.clone(),
+            TerminalDetail::FailedKnown(KnownFailureReason::ExecutionTimedOut),
+        )?)),
+        principal(&["session:read"])?,
+    )
+    .oneshot(
+        Request::builder()
+            .uri(format!("/v1/sessions/{session_id}/actions/{action_id}"))
+            .header("authorization", "Bearer valid")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["data"]["action_id"], action_id.to_string());
+    assert_eq!(json["data"]["status"], "failed_known");
+    assert_eq!(json["data"]["reason"], "execution_timed_out");
+    Ok(())
+}
+
+#[tokio::test]
 async fn viewer_websocket_rejects_origin_protocol_and_ticket_before_upgrade()
 -> Result<(), Box<dyn Error>> {
     let session_id = SessionId::new();

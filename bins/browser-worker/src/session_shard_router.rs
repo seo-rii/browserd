@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 use browserd_core::{ActionId, PageId, SessionId, TenantId, WorkerId};
 use browserd_policy::CanonicalActionProposal;
@@ -549,6 +550,19 @@ where
         driver.execute_action(session_id, page_id, payload)
     }
 
+    fn execute_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        let Ok((driver, _active)) = self.routed_driver(session_id) else {
+            return ActionExecutionResult::OutcomeUnknown;
+        };
+        driver.execute_action_until(session_id, page_id, payload, deadline)
+    }
+
     fn inspect_approval_context(
         &self,
         session_id: &SessionId,
@@ -579,6 +593,33 @@ where
             payload,
             proposal,
             inspected,
+            authorize_and_commit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_approved_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        let (driver, _active) = self
+            .routed_driver(session_id)
+            .map_err(Self::map_approved_route_error)?;
+        driver.execute_approved_action_until(
+            session_id,
+            page_id,
+            payload,
+            proposal,
+            inspected,
+            deadline,
             authorize_and_commit,
         )
     }

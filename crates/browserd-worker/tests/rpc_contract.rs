@@ -7,10 +7,11 @@ use browserd_core::{
 };
 use browserd_worker::{
     WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionCommand,
-    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
-    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
-    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt,
-    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
+    WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerActionStatus,
+    WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
+    WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
+    WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence,
 };
 
 fn fence() -> WorkerSessionFence {
@@ -36,12 +37,17 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 5);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 6);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
     let approval_id = ApprovalId::new();
     let principal_id = PrincipalId::new();
+    let execution_timeout = WorkerActionExecutionTimeout::new(2_500);
+    assert!(execution_timeout.is_some());
+    let Some(execution_timeout) = execution_timeout else {
+        return;
+    };
 
     let requests = vec![
         WorkerRpcRequest::Probe {
@@ -65,6 +71,7 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
             kind: ActionKind::Mutating,
             page_id: Some(page_id.clone()),
             action: WorkerActionCommand::Click { x: 20, y: 30 },
+            execution_timeout_ms: execution_timeout,
             approval: Some(Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 4,
                 frame_document_epoch: 9,

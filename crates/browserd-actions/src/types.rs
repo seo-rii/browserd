@@ -188,6 +188,7 @@ pub enum KnownFailureReason {
     PolicyDenied,
     ApprovalDenied,
     ApprovalTimedOut,
+    ExecutionTimedOut,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

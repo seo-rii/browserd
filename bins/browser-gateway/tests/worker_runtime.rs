@@ -1174,6 +1174,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
             kind,
             page_id,
             action,
+            execution_timeout_ms,
             ..
         } => Some((
             fence,
@@ -1185,6 +1186,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
             kind,
             page_id,
             action,
+            execution_timeout_ms,
         )),
         _ => None,
     });
@@ -1198,6 +1200,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
         kind,
         page_id,
         action,
+        execution_timeout_ms,
     )) = submit
     else {
         return Err("submit RPC not recorded".into());
@@ -1212,6 +1215,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
     assert_eq!(*kind, ActionKind::ReadOnly);
     assert_eq!(page_id.as_ref(), Some(&worker.page_id));
     assert_eq!(action, &WorkerActionCommand::GetTitle);
+    assert_eq!(execution_timeout_ms.get(), 1_000);
     drop(requests);
 
     let fetched = router.execute(

@@ -15,10 +15,11 @@ use browserd_worker::{
     ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
     ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
     LiveApprovalContext, SandboxClient, WorkerActionApprovalRequirement, WorkerActionCommand,
-    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerClock,
-    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
-    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence,
+    WorkerActionExecutionTimeout, WorkerActionStatus, WorkerApprovalActionType,
+    WorkerApprovalDecision, WorkerClock, WorkerConfig, WorkerControlPlane,
+    WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError, WorkerIsolationProfile,
+    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerSessionFence,
 };
 
 struct FrozenClock;
@@ -293,6 +294,7 @@ fn submit_action_request(
         action: WorkerActionCommand::TypeText {
             text: key.to_owned(),
         },
+        execution_timeout_ms: WorkerActionExecutionTimeout::DEFAULT,
         approval: approval_required.then(|| {
             Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 1,

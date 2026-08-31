@@ -42,11 +42,50 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 5;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 6;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
 const MAX_WORKER_ACTION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_WORKER_POINTER_COORDINATE: u64 = 1_000_000;
+const MAX_WORKER_ACTION_EXECUTION_TIMEOUT_MS: u64 = 300_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct WorkerActionExecutionTimeout(u64);
+
+impl WorkerActionExecutionTimeout {
+    pub const DEFAULT: Self = Self(30_000);
+
+    #[must_use]
+    pub const fn new(milliseconds: u64) -> Option<Self> {
+        if milliseconds == 0 || milliseconds > MAX_WORKER_ACTION_EXECUTION_TIMEOUT_MS {
+            None
+        } else {
+            Some(Self(milliseconds))
+        }
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        Duration::from_millis(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WorkerActionExecutionTimeout {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let milliseconds = u64::deserialize(deserializer)?;
+        Self::new(milliseconds)
+            .ok_or_else(|| serde::de::Error::custom("invalid action execution timeout"))
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -650,6 +689,7 @@ pub enum WorkerRpcRequest {
         kind: ActionKind,
         page_id: Option<PageId>,
         action: WorkerActionCommand,
+        execution_timeout_ms: WorkerActionExecutionTimeout,
         approval: Option<Box<WorkerActionApprovalRequirement>>,
         now_unix_millis: u64,
     },
@@ -1263,6 +1303,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 kind,
                 page_id,
                 action,
+                execution_timeout_ms,
                 approval,
                 now_unix_millis,
             } => {
@@ -1324,6 +1365,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         page_id,
                         payload,
                         approval,
+                        execution_timeout_ms.duration(),
                         now,
                     )
                     .map_err(worker_failure)?;

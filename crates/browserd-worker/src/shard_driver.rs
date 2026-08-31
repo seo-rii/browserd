@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use browserd_core::{ActionId, PageId, SessionId, ShardFence, TenantId};
@@ -298,6 +299,18 @@ impl<D: ChromiumDriver> ChromiumDriver for ActorChromiumDriver<D> {
             .execute_action(session_id, page_id, payload)
     }
 
+    fn execute_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        self.runtime
+            .driver
+            .execute_action_until(session_id, page_id, payload, deadline)
+    }
+
     fn inspect_approval_context(
         &self,
         session_id: &SessionId,
@@ -326,6 +339,30 @@ impl<D: ChromiumDriver> ChromiumDriver for ActorChromiumDriver<D> {
             payload,
             proposal,
             inspected,
+            authorize_and_commit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_approved_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        self.runtime.driver.execute_approved_action_until(
+            session_id,
+            page_id,
+            payload,
+            proposal,
+            inspected,
+            deadline,
             authorize_and_commit,
         )
     }

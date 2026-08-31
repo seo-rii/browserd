@@ -1,16 +1,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use browser_worker::{
     ProvisionedSessionShard, RoutedArtifactStore, SessionShardFactory, SessionShardLifecycle,
     SessionShardRouter,
 };
-use browserd_core::{ArtifactId, PageId, SessionId, TenantId, WorkerId};
+use browserd_core::{ActionId, ArtifactId, PageId, SessionId, TenantId, WorkerId};
+use browserd_policy::CanonicalActionProposal;
 use browserd_session::OwnershipFence;
 use browserd_worker::{
-    ArtifactStoreReceipt, ArtifactStoreRequest, ChromiumDriver, DependencyError, SandboxClient,
-    UnavailableChromiumDriver,
+    ActionExecutionResult, ApprovedActionError, ArtifactStoreReceipt, ArtifactStoreRequest,
+    ChromiumDriver, DependencyError, LiveApprovalContext, SandboxClient, UnavailableChromiumDriver,
 };
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -238,6 +239,130 @@ impl SessionShardFactory for LockProbeFactory {
 
 struct RejectArtifacts;
 
+#[derive(Default)]
+struct DeadlineDriver {
+    observed_deadline: Mutex<Option<Instant>>,
+}
+
+impl ChromiumDriver for DeadlineDriver {
+    fn qualify(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn create_context(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn create_page(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn close_page(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn activate_page(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn execute_action(
+        &self,
+        _session_id: &SessionId,
+        _page_id: Option<&PageId>,
+        _payload: &[u8],
+    ) -> ActionExecutionResult {
+        ActionExecutionResult::FailedKnown("legacy_execution".to_owned())
+    }
+
+    fn execute_action_until(
+        &self,
+        _session_id: &SessionId,
+        _page_id: Option<&PageId>,
+        _payload: &[u8],
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        if let Ok(mut observed) = self.observed_deadline.lock() {
+            *observed = Some(deadline);
+        }
+        ActionExecutionResult::Succeeded(vec![9])
+    }
+
+    fn inspect_approval_context(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn execute_approved_action(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _payload: &[u8],
+        _proposal: &CanonicalActionProposal,
+        _inspected: &LiveApprovalContext,
+        _authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        Err(ApprovedActionError::Unavailable)
+    }
+
+    fn cancel_action(
+        &self,
+        _session_id: &SessionId,
+        _action_id: &ActionId,
+    ) -> Result<bool, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+}
+
+struct DeadlineFactory {
+    driver: Arc<DeadlineDriver>,
+    lifecycle: Arc<Lifecycle>,
+}
+
+impl SessionShardFactory for DeadlineFactory {
+    fn qualify_daemon(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn heartbeat_daemon(
+        &self,
+        _worker_id: &WorkerId,
+        _worker_epoch: u64,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn create(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+    ) -> Result<ProvisionedSessionShard, DependencyError> {
+        Ok(ProvisionedSessionShard::new(
+            PageId::new(),
+            self.driver.clone(),
+            self.lifecycle.clone(),
+        ))
+    }
+}
+
 impl RoutedArtifactStore for RejectArtifacts {
     fn store(
         &self,
@@ -349,6 +474,42 @@ fn exact_create_retry_publishes_one_session_shard() {
     assert_eq!(second, first);
     assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
     assert!(router.shard_managed_contexts());
+}
+
+#[test]
+fn action_deadline_is_delegated_to_the_routed_driver() {
+    let driver = Arc::new(DeadlineDriver::default());
+    let factory = Arc::new(DeadlineFactory {
+        driver: Arc::clone(&driver),
+        lifecycle: Arc::new(Lifecycle::default()),
+    });
+    let Some(router) = router(factory, Arc::new(RejectArtifacts), 8) else {
+        return;
+    };
+    let Some(worker) = worker() else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let ownership = fence(&worker, 11);
+    assert!(
+        router
+            .create_context_owned(&tenant_id, &session_id, &ownership)
+            .is_ok()
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        router.execute_action_until(&session_id, None, b"deadline", deadline),
+        ActionExecutionResult::Succeeded(vec![9])
+    );
+    assert_eq!(
+        driver
+            .observed_deadline
+            .lock()
+            .ok()
+            .and_then(|observed| *observed),
+        Some(deadline)
+    );
 }
 
 #[test]

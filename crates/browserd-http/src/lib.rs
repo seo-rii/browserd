@@ -1530,6 +1530,9 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                         browserd_actions::KnownFailureReason::ApprovalTimedOut => {
                             "approval_timed_out"
                         }
+                        browserd_actions::KnownFailureReason::ExecutionTimedOut => {
+                            "execution_timed_out"
+                        }
                     };
                     data.insert("reason".to_owned(), json!(reason));
                 }

@@ -579,6 +579,7 @@ fn terminal_reserve_frame_bytes(
         TerminalDetail::FailedKnown(KnownFailureReason::PolicyDenied),
         TerminalDetail::FailedKnown(KnownFailureReason::ApprovalDenied),
         TerminalDetail::FailedKnown(KnownFailureReason::ApprovalTimedOut),
+        TerminalDetail::FailedKnown(KnownFailureReason::ExecutionTimedOut),
         TerminalDetail::CancelledBeforeDispatch,
         TerminalDetail::CancelledConfirmed,
         TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::AmbiguousTransportLoss),

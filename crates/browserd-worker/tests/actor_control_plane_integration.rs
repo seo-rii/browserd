@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use browserd_actions::ActionJournalLimits;
 use browserd_core::{
@@ -23,6 +23,7 @@ use browserd_worker::{
 struct ContextDriver {
     pages: Mutex<HashMap<SessionId, PageId>>,
     owners: Mutex<HashMap<SessionId, (TenantId, OwnershipFence)>>,
+    action_deadline: Mutex<Option<Instant>>,
 }
 
 impl ChromiumDriver for ContextDriver {
@@ -91,6 +92,19 @@ impl ChromiumDriver for ContextDriver {
         _payload: &[u8],
     ) -> ActionExecutionResult {
         ActionExecutionResult::Succeeded(Vec::new())
+    }
+
+    fn execute_action_until(
+        &self,
+        _session_id: &SessionId,
+        _page_id: Option<&PageId>,
+        _payload: &[u8],
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        if let Ok(mut observed) = self.action_deadline.lock() {
+            *observed = Some(deadline);
+        }
+        ActionExecutionResult::Succeeded(vec![7])
     }
 
     fn inspect_approval_context(
@@ -206,6 +220,19 @@ async fn worker_session_create_and_close_are_owned_by_the_shard_actor() {
         actor.clone(),
         shard_fence.clone(),
     ));
+    let delegated_deadline = Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        driver.execute_action_until(&SessionId::new(), None, b"deadline", delegated_deadline),
+        ActionExecutionResult::Succeeded(vec![7])
+    );
+    assert_eq!(
+        context_driver
+            .action_deadline
+            .lock()
+            .ok()
+            .and_then(|deadline| *deadline),
+        Some(delegated_deadline)
+    );
 
     let directory = tempfile::tempdir();
     assert!(directory.is_ok());

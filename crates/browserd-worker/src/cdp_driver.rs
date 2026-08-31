@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use browserd_core::{ActionId, IsolationProfile, PageId, SessionId, TenantId};
 use browserd_policy::{CanonicalActionProposal, Origin};
@@ -61,13 +62,24 @@ impl CdpChromiumDriver {
         command: PageCommand,
         result_shape: ActionResultShape,
         execution_fence: Option<PageExecutionFence>,
+        deadline: Option<Instant>,
     ) -> ActionExecutionResult {
-        match self.backend.execute_page_command(
-            session_id.clone(),
-            page_id.clone(),
-            command,
-            execution_fence,
-        ) {
+        let execution = match deadline {
+            Some(deadline) => self.backend.execute_page_command_until(
+                session_id.clone(),
+                page_id.clone(),
+                command,
+                execution_fence,
+                deadline,
+            ),
+            None => self.backend.execute_page_command(
+                session_id.clone(),
+                page_id.clone(),
+                command,
+                execution_fence,
+            ),
+        };
+        match execution {
             Ok(result) => {
                 let safe_result = match result_shape {
                     ActionResultShape::Unit => json!({"ok": true}),
@@ -100,6 +112,9 @@ impl CdpChromiumDriver {
             Err(OwnerActorError::Rejected | OwnerActorError::UnknownOwnership) => {
                 ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
             }
+            Err(OwnerActorError::DeadlineBeforeDispatch) => {
+                ActionExecutionResult::FailedKnown("action_timeout".to_owned())
+            }
             Err(
                 OwnerActorError::StateOverflow
                 | OwnerActorError::Unavailable
@@ -113,24 +128,36 @@ impl CdpChromiumDriver {
         session_id: &SessionId,
         page_id: &PageId,
         proposal: &CanonicalActionProposal,
-    ) -> Result<LiveApprovalContext, DependencyError> {
-        let observed = self
-            .backend
-            .observe_page(
+        deadline: Option<Instant>,
+    ) -> Result<LiveApprovalContext, ObservationError> {
+        let observed = match deadline {
+            Some(deadline) => self.backend.observe_page_until(
                 proposal.tenant_id().clone(),
                 session_id.clone(),
                 proposal.session_incarnation(),
                 page_id.clone(),
-            )
-            .map_err(map_owner_error)?;
+                deadline,
+            ),
+            None => self.backend.observe_page(
+                proposal.tenant_id().clone(),
+                session_id.clone(),
+                proposal.session_incarnation(),
+                page_id.clone(),
+            ),
+        }
+        .map_err(|error| match error {
+            OwnerActorError::DeadlineBeforeDispatch => ObservationError::DeadlineBeforeDispatch,
+            error => ObservationError::Dependency(map_owner_error(error)),
+        })?;
         if observed.tenant_id != *proposal.tenant_id()
             || observed.session_id != *proposal.session_id()
             || observed.session_incarnation != proposal.session_incarnation()
             || page_id != proposal.page_id()
         {
-            return Err(DependencyError::Rejected);
+            return Err(ObservationError::Dependency(DependencyError::Rejected));
         }
-        let origin = Origin::parse(&observed.origin).map_err(|_| DependencyError::Rejected)?;
+        let origin = Origin::parse(&observed.origin)
+            .map_err(|_| ObservationError::Dependency(DependencyError::Rejected))?;
         Ok(LiveApprovalContext {
             target_incarnation: observed.target_incarnation,
             frame_document_epoch: observed.frame_document_epoch,
@@ -143,6 +170,100 @@ impl CdpChromiumDriver {
             chromium_build: self.chromium_build.to_string(),
             effective_isolation: self.isolation,
         })
+    }
+
+    fn execute_action_with_deadline(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+        deadline: Option<Instant>,
+    ) -> ActionExecutionResult {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return ActionExecutionResult::FailedKnown("action_timeout".to_owned());
+        }
+        let Ok(_effect) = self.effect_gate.lock() else {
+            return ActionExecutionResult::OutcomeUnknown;
+        };
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return ActionExecutionResult::FailedKnown("action_timeout".to_owned());
+        }
+        let Some(page_id) = page_id else {
+            return ActionExecutionResult::FailedKnown("page_required".to_owned());
+        };
+        let (command, result_shape) = match parse_action_payload(payload) {
+            Ok(parsed) => parsed,
+            Err(reason) => return ActionExecutionResult::FailedKnown(reason.to_owned()),
+        };
+        self.dispatch_action(session_id, page_id, command, result_shape, None, deadline)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_approved_action_with_deadline(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        deadline: Option<Instant>,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ApprovedActionError::DeadlineBeforeDispatch);
+        }
+        let _effect = self
+            .effect_gate
+            .lock()
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ApprovedActionError::DeadlineBeforeDispatch);
+        }
+        let (command, result_shape) =
+            parse_action_payload(payload).map_err(|_| ApprovedActionError::DispatchRevoked)?;
+        let observed = self
+            .observe(session_id, page_id, proposal, deadline)
+            .map_err(|error| match error {
+                ObservationError::DeadlineBeforeDispatch => {
+                    ApprovedActionError::DeadlineBeforeDispatch
+                }
+                ObservationError::Dependency(DependencyError::Rejected) => {
+                    ApprovedActionError::DispatchRevoked
+                }
+                ObservationError::Dependency(DependencyError::Unavailable) => {
+                    ApprovedActionError::Unavailable
+                }
+                ObservationError::Dependency(DependencyError::OutcomeUncertain) => {
+                    ApprovedActionError::OutcomeUncertain
+                }
+            })?;
+        if let Some(reason) = inspected.stale_reason(&observed) {
+            return Err(ApprovedActionError::ApprovalStale(reason));
+        }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ApprovedActionError::DeadlineBeforeDispatch);
+        }
+        let execution_fence = PageExecutionFence {
+            target_incarnation: observed.target_incarnation,
+            frame_document_epoch: observed.frame_document_epoch,
+            url_revision: observed.url_revision,
+        };
+        authorize_and_commit(&observed)?;
+        Ok(
+            match self.dispatch_action(
+                session_id,
+                page_id,
+                command,
+                result_shape,
+                Some(execution_fence),
+                deadline,
+            ) {
+                ActionExecutionResult::FailedKnown(_) => ActionExecutionResult::OutcomeUnknown,
+                result => result,
+            },
+        )
     }
 }
 
@@ -232,17 +353,17 @@ impl ChromiumDriver for CdpChromiumDriver {
         page_id: Option<&PageId>,
         payload: &[u8],
     ) -> ActionExecutionResult {
-        let Ok(_effect) = self.effect_gate.lock() else {
-            return ActionExecutionResult::OutcomeUnknown;
-        };
-        let Some(page_id) = page_id else {
-            return ActionExecutionResult::FailedKnown("page_required".to_owned());
-        };
-        let (command, result_shape) = match parse_action_payload(payload) {
-            Ok(parsed) => parsed,
-            Err(reason) => return ActionExecutionResult::FailedKnown(reason.to_owned()),
-        };
-        self.dispatch_action(session_id, page_id, command, result_shape, None)
+        self.execute_action_with_deadline(session_id, page_id, payload, None)
+    }
+
+    fn execute_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        self.execute_action_with_deadline(session_id, page_id, payload, Some(deadline))
     }
 
     fn inspect_approval_context(
@@ -255,7 +376,11 @@ impl ChromiumDriver for CdpChromiumDriver {
             .effect_gate
             .lock()
             .map_err(|_| DependencyError::Unavailable)?;
-        self.observe(session_id, page_id, proposal)
+        self.observe(session_id, page_id, proposal, None)
+            .map_err(|error| match error {
+                ObservationError::DeadlineBeforeDispatch => DependencyError::OutcomeUncertain,
+                ObservationError::Dependency(error) => error,
+            })
     }
 
     fn execute_approved_action(
@@ -269,39 +394,38 @@ impl ChromiumDriver for CdpChromiumDriver {
             &LiveApprovalContext,
         ) -> Result<(), ApprovedActionError>,
     ) -> Result<ActionExecutionResult, ApprovedActionError> {
-        let _effect = self
-            .effect_gate
-            .lock()
-            .map_err(|_| ApprovedActionError::Unavailable)?;
-        let (command, result_shape) =
-            parse_action_payload(payload).map_err(|_| ApprovedActionError::DispatchRevoked)?;
-        let observed =
-            self.observe(session_id, page_id, proposal)
-                .map_err(|error| match error {
-                    DependencyError::Rejected => ApprovedActionError::DispatchRevoked,
-                    DependencyError::Unavailable => ApprovedActionError::Unavailable,
-                    DependencyError::OutcomeUncertain => ApprovedActionError::OutcomeUncertain,
-                })?;
-        if let Some(reason) = inspected.stale_reason(&observed) {
-            return Err(ApprovedActionError::ApprovalStale(reason));
-        }
-        let execution_fence = PageExecutionFence {
-            target_incarnation: observed.target_incarnation,
-            frame_document_epoch: observed.frame_document_epoch,
-            url_revision: observed.url_revision,
-        };
-        authorize_and_commit(&observed)?;
-        Ok(
-            match self.dispatch_action(
-                session_id,
-                page_id,
-                command,
-                result_shape,
-                Some(execution_fence),
-            ) {
-                ActionExecutionResult::FailedKnown(_) => ActionExecutionResult::OutcomeUnknown,
-                result => result,
-            },
+        self.execute_approved_action_with_deadline(
+            session_id,
+            page_id,
+            payload,
+            proposal,
+            inspected,
+            None,
+            authorize_and_commit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_approved_action_until(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        self.execute_approved_action_with_deadline(
+            session_id,
+            page_id,
+            payload,
+            proposal,
+            inspected,
+            Some(deadline),
+            authorize_and_commit,
         )
     }
 
@@ -326,6 +450,11 @@ enum ActionResultShape {
     Unit,
     Url,
     Title,
+}
+
+enum ObservationError {
+    DeadlineBeforeDispatch,
+    Dependency(DependencyError),
 }
 
 fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShape), &'static str> {
@@ -363,6 +492,8 @@ fn map_owner_error(error: OwnerActorError) -> DependencyError {
         OwnerActorError::StateOverflow | OwnerActorError::Unavailable => {
             DependencyError::Unavailable
         }
-        OwnerActorError::OutcomeUncertain => DependencyError::OutcomeUncertain,
+        OwnerActorError::DeadlineBeforeDispatch | OwnerActorError::OutcomeUncertain => {
+            DependencyError::OutcomeUncertain
+        }
     }
 }
