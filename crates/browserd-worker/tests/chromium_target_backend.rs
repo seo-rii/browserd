@@ -325,7 +325,136 @@ async fn owned_target_routes_preserve_full_identity_and_forward_exact_detaches()
 }
 
 #[tokio::test]
-async fn unknown_or_duplicate_target_lifecycle_event_drains_the_shard() {
+async fn cleanup_accepts_terminal_event_order_but_rejects_a_mismatched_retired_session() {
+    for (order, first_method, second_method) in [
+        (
+            "detach then destroy",
+            "Target.detachedFromTarget",
+            "Target.targetDestroyed",
+        ),
+        (
+            "destroy then detach",
+            "Target.targetDestroyed",
+            "Target.detachedFromTarget",
+        ),
+    ] {
+        let drain = Arc::new(Drain(AtomicBool::new(false)));
+        let (owner, manager) = ChromiumConnectionOwner::new_bounded(
+            identity(),
+            connection_config(),
+            fence(),
+            8,
+            drain.clone(),
+        )
+        .unwrap();
+        let backend = owner.target_manager_backend();
+        let (pipes, mut command_reader, mut event_writer) = pipe_pair();
+        let accept = tokio::spawn({
+            let owner = owner.clone();
+            async move { owner.accept_cdp_pipes(pipes).await }
+        });
+        qualify(&mut command_reader, &mut event_writer).await;
+        assert_eq!(accept.await.unwrap(), Ok(()));
+        bootstrap_empty(manager.clone(), &mut command_reader, &mut event_writer).await;
+
+        let tenant_id = TenantId::new();
+        let session_id = SessionId::new();
+        let ownership = ownership_fence();
+        let target_id = if first_method == "Target.detachedFromTarget" {
+            "detach-first-target"
+        } else {
+            "destroy-first-target"
+        };
+        let flat_session_id = if first_method == "Target.detachedFromTarget" {
+            "flat-detach-first"
+        } else {
+            "flat-destroy-first"
+        };
+        create_owned_primary(
+            owner.chromium_driver(IsolationProfile::SharedContext),
+            tenant_id,
+            session_id.clone(),
+            ownership.clone(),
+            "cleanup-context",
+            target_id,
+            flat_session_id,
+            &mut command_reader,
+            &mut event_writer,
+        )
+        .await;
+
+        let cleanup = tokio::task::spawn_blocking({
+            let driver = owner.chromium_driver(IsolationProfile::SharedContext);
+            let session_id = session_id.clone();
+            let ownership = ownership.clone();
+            move || driver.close_context_fenced(&session_id, &ownership)
+        });
+        let dispose = read_command(&mut command_reader).await;
+        assert_eq!(dispose["method"], "Target.disposeBrowserContext");
+
+        for method in [first_method, second_method] {
+            let params = if method == "Target.detachedFromTarget" {
+                json!({"sessionId": flat_session_id, "targetId": target_id})
+            } else {
+                json!({"targetId": target_id})
+            };
+            write_message(
+                &mut event_writer,
+                json!({
+                    "method": method,
+                    "params": params,
+                }),
+            )
+            .await;
+        }
+        respond(&mut event_writer, &dispose, json!({})).await;
+
+        assert_eq!(cleanup.await.unwrap(), Ok(()), "{order}");
+        let route_removed = tokio::time::timeout(Duration::from_millis(200), async {
+            while manager.ready_target_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            route_removed.is_ok(),
+            "{order} must remove the final target route"
+        );
+        assert!(
+            matches!(backend.target_route(target_id), Ok(None)),
+            "{order} must leave the owner actor live with no stale route"
+        );
+        assert!(!drain.0.load(Ordering::SeqCst), "{order} must not drain");
+        assert!(!manager.is_tainted(), "{order} must not taint the manager");
+        assert!(manager.is_ready(), "{order} must remain ready");
+
+        write_message(
+            &mut event_writer,
+            json!({
+                "method": "Target.detachedFromTarget",
+                "params": {
+                    "sessionId": "wrong-retired-session",
+                    "targetId": target_id,
+                },
+            }),
+        )
+        .await;
+        let mismatch_rejected = tokio::time::timeout(Duration::from_millis(200), async {
+            while !drain.0.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            mismatch_rejected.is_ok(),
+            "{order} must reject a mismatched retired session"
+        );
+        assert!(manager.is_tainted());
+    }
+}
+
+#[tokio::test]
+async fn unknown_target_lifecycle_event_drains_the_shard() {
     let drain = Arc::new(Drain(AtomicBool::new(false)));
     let (owner, manager) = ChromiumConnectionOwner::new_bounded(
         identity(),

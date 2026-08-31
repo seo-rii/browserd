@@ -15,9 +15,9 @@ use browserd_sandbox::{
 use browserd_session::OwnershipFence;
 use browserd_worker::{
     ActorChromiumDriver, BrowserShardActor, BrowserShardActorConfig, ChromiumConnectionOwner,
-    ChromiumDriver, ChromiumDriverShardRuntime, DependencyError, ProductionSandboxShardRuntime,
-    SandboxShardRpc, ShardActorError, ShardLaunchDescriptor, ShardRuntimeError,
-    TargetManagedShardRuntime, TargetManagerDrain,
+    ChromiumDriver, ChromiumDriverShardRuntime, ChromiumTargetManagerBackend, DependencyError,
+    ProductionSandboxShardRuntime, SandboxShardRpc, ShardActorError, ShardLaunchDescriptor,
+    ShardRuntimeError, TargetManagedShardRuntime, TargetManagerDrain,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -114,6 +114,12 @@ impl<B> ProductionSessionShardFactory<B> {
             qualification: OnceLock::new(),
         }
     }
+}
+
+struct StartedSessionShard {
+    provisioned: ProvisionedSessionShard,
+    driver: Arc<dyn ChromiumDriver>,
+    readiness: ChromiumTargetManagerBackend,
 }
 
 struct ShardDrainState(AtomicBool);
@@ -243,8 +249,22 @@ where
                 1,
                 1,
             );
-            let shard = self.create_provisioned(&tenant_id, &session_id, &fence)?;
-            shard.lifecycle().terminate(&fence)
+            let shard = self.start_session_shard(&tenant_id, &session_id, &fence)?;
+            let probe = shard
+                .driver
+                .close_context_fenced(&session_id, &fence)
+                .and_then(|()| {
+                    shard
+                        .readiness
+                        .verify_context_disposed(&tenant_id, &session_id, &fence)
+                        .map_err(map_runtime_error)
+                });
+            let cleanup = shard.provisioned.lifecycle().terminate(&fence);
+            if cleanup.is_err() {
+                Err(DependencyError::OutcomeUncertain)
+            } else {
+                probe
+            }
         })
     }
 
@@ -288,6 +308,16 @@ where
         session_id: &SessionId,
         fence: &OwnershipFence,
     ) -> Result<ProvisionedSessionShard, DependencyError> {
+        self.start_session_shard(tenant_id, session_id, fence)
+            .map(|shard| shard.provisioned)
+    }
+
+    fn start_session_shard(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<StartedSessionShard, DependencyError> {
         if fence.worker_id() != &self.config.worker_id
             || fence.worker_epoch() != self.config.worker_epoch
             || fence.placement_version() == 0
@@ -337,6 +367,7 @@ where
             Arc::clone(&drain),
         )
         .map_err(map_runtime_error)?;
+        let readiness = owner.target_manager_backend();
         let cdp_driver = Arc::new(owner.chromium_driver(IsolationProfile::DedicatedProcess));
         let driver_runtime = Arc::new(ChromiumDriverShardRuntime::new(Arc::clone(&cdp_driver)));
         let target_runtime = Arc::new(TargetManagedShardRuntime::new(
@@ -416,11 +447,15 @@ where
             }),
             changed: Condvar::new(),
         });
-        Ok(ProvisionedSessionShard::new(
-            primary_page_id,
+        Ok(StartedSessionShard {
+            provisioned: ProvisionedSessionShard::new(
+                primary_page_id,
+                Arc::clone(&driver),
+                lifecycle,
+            ),
             driver,
-            lifecycle,
-        ))
+            readiness,
+        })
     }
 
     fn probe_daemon(&self) -> Result<(), DependencyError> {

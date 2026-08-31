@@ -245,7 +245,17 @@ async fn qualify_protocol(reader: &mut Receiver, writer: &mut Sender) {
     .await;
 }
 
-async fn run_scripted_protocol(peer_rx: oneshot::Receiver<(Receiver, Sender)>) {
+#[derive(Clone, Copy)]
+enum CleanupProbe {
+    Skip,
+    Clean,
+    OrphanTarget,
+}
+
+async fn run_scripted_protocol(
+    peer_rx: oneshot::Receiver<(Receiver, Sender)>,
+    cleanup_probe: CleanupProbe,
+) {
     let (mut reader, mut writer) = peer_rx.await.expect("CDP peer should be transferred");
     qualify_protocol(&mut reader, &mut writer).await;
 
@@ -316,7 +326,40 @@ async fn run_scripted_protocol(peer_rx: oneshot::Receiver<(Receiver, Sender)>) {
 
     let dispose = read_command(&mut reader).await;
     assert_eq!(dispose["method"], "Target.disposeBrowserContext");
+    if matches!(cleanup_probe, CleanupProbe::Clean) {
+        let destroyed = serde_json::to_vec(&json!({
+            "method": "Target.targetDestroyed",
+            "params": {"targetId": "target-production"}
+        }))
+        .expect("CDP target-destroyed event should encode");
+        writer
+            .write_all(&destroyed)
+            .await
+            .expect("CDP target-destroyed event should be writable");
+        writer
+            .write_all(&[0])
+            .await
+            .expect("CDP target-destroyed terminator should be writable");
+    }
     respond(&mut writer, &dispose, json!({})).await;
+    if !matches!(cleanup_probe, CleanupProbe::Skip) {
+        let targets = read_command(&mut reader).await;
+        assert_eq!(targets["method"], "Target.getTargets");
+        let target_infos = match cleanup_probe {
+            CleanupProbe::OrphanTarget => json!([{
+                "targetId": "target-production",
+                "browserContextId": "context-production",
+                "type": "page",
+            }]),
+            CleanupProbe::Clean | CleanupProbe::Skip => json!([]),
+        };
+        respond(&mut writer, &targets, json!({"targetInfos": target_infos})).await;
+        if matches!(cleanup_probe, CleanupProbe::Clean) {
+            let contexts = read_command(&mut reader).await;
+            assert_eq!(contexts["method"], "Target.getBrowserContexts");
+            respond(&mut writer, &contexts, json!({"browserContextIds": []})).await;
+        }
+    }
     let mut byte = [0_u8; 1];
     let closed = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut byte))
         .await
@@ -526,7 +569,7 @@ fn concurrent_readiness_callers_share_one_probe_and_one_cleanup() {
         Arc::clone(&sandbox),
         runtime.handle().clone(),
     ));
-    let protocol = runtime.spawn(run_scripted_protocol(peer_rx));
+    let protocol = runtime.spawn(run_scripted_protocol(peer_rx, CleanupProbe::Clean));
     let barrier = Arc::new(Barrier::new(3));
     let callers = (0..2)
         .map(|_| {
@@ -549,6 +592,56 @@ fn concurrent_readiness_callers_share_one_probe_and_one_cleanup() {
     runtime
         .block_on(protocol)
         .expect("readiness CDP peer should not panic");
+    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn readiness_rejects_and_caches_an_orphaned_context_target() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let worker_id =
+        WorkerId::new("production-orphan-readiness").expect("worker identity should be valid");
+    let worker_epoch = 41;
+    let daemon_epoch = 23;
+    let (peer_tx, peer_rx) = oneshot::channel();
+    let sandbox = Arc::new(ScriptedSandbox {
+        daemon_epoch,
+        peers: Mutex::new(VecDeque::from([peer_tx])),
+        launches: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
+        renewals: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+    });
+    let config = ProductionSessionShardConfig::new(
+        worker_id,
+        worker_epoch,
+        daemon_epoch,
+        identity(),
+        ChromiumConnectionConfig::default(),
+        EgressPolicyBinding::new("strict", [10; 32]).expect("egress policy should be valid"),
+        Duration::from_secs(30),
+    )
+    .expect("production shard configuration should be valid");
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone());
+    let protocol = runtime.spawn(run_scripted_protocol(peer_rx, CleanupProbe::OrphanTarget));
+
+    assert_eq!(
+        factory.qualify_daemon(),
+        Err(DependencyError::OutcomeUncertain)
+    );
+    assert_eq!(
+        factory.qualify_daemon(),
+        Err(DependencyError::OutcomeUncertain)
+    );
+    runtime
+        .block_on(protocol)
+        .expect("orphaned cleanup CDP peer should not panic");
     assert_eq!(sandbox.launches.load(Ordering::SeqCst), 1);
     assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
     assert_eq!(sandbox.kills.load(Ordering::SeqCst), 1);
@@ -602,7 +695,10 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         Arc::clone(&sandbox),
         runtime.handle().clone(),
     ));
-    let readiness_protocol = runtime.spawn(run_scripted_protocol(readiness_peer_rx));
+    let readiness_protocol = runtime.spawn(run_scripted_protocol(
+        readiness_peer_rx,
+        CleanupProbe::Clean,
+    ));
     assert_eq!(factory.qualify_daemon(), Ok(()));
     assert_eq!(factory.qualify_daemon(), Ok(()));
     runtime
@@ -619,7 +715,7 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         1,
     )
     .expect("session shard router should be valid");
-    let protocol = runtime.spawn(run_scripted_protocol(session_peer_rx));
+    let protocol = runtime.spawn(run_scripted_protocol(session_peer_rx, CleanupProbe::Skip));
 
     let tenant_id = TenantId::new();
     let session_id = SessionId::new();

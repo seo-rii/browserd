@@ -151,6 +151,37 @@ impl TargetReadiness {
             }
         }
     }
+
+    pub(crate) fn wait_until_empty(&self, timeout: Duration) -> Result<(), ShardRuntimeError> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(ShardRuntimeError::Rejected)?;
+        let mut ready_targets = self
+            .state
+            .ready_targets
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        loop {
+            if self.state.tainted.load(Ordering::Acquire) {
+                return Err(ShardRuntimeError::OutcomeUncertain);
+            }
+            if ready_targets.is_empty() {
+                return Ok(());
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(ShardRuntimeError::OutcomeUncertain)?;
+            let (guard, result) = self
+                .state
+                .target_changed
+                .wait_timeout(ready_targets, remaining)
+                .map_err(|_| ShardRuntimeError::Unavailable)?;
+            ready_targets = guard;
+            if result.timed_out() && !ready_targets.is_empty() {
+                return Err(ShardRuntimeError::OutcomeUncertain);
+            }
+        }
+    }
 }
 
 pub struct ProductionTargetManager<B, D> {

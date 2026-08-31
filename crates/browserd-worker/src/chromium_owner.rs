@@ -134,6 +134,26 @@ impl ChromiumTargetManagerBackend {
             })
     }
 
+    pub fn verify_context_disposed(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<(), ShardRuntimeError> {
+        self.mailbox
+            .request(|response| OwnerRequest::VerifyContextDisposed {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                fence: fence.clone(),
+                response,
+            })
+            .map_err(map_actor_runtime_error)?;
+        self.readiness
+            .get()
+            .ok_or(ShardRuntimeError::Unavailable)?
+            .wait_until_empty(self.target_ready_timeout)
+    }
+
     pub(crate) fn create_page(&self, session_id: SessionId) -> Result<PageId, OwnerActorError> {
         let created = self.mailbox.request(|response| OwnerRequest::CreatePage {
             session_id,
@@ -879,6 +899,12 @@ enum OwnerRequest {
         fence: OwnershipFence,
         response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
     },
+    VerifyContextDisposed {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        fence: OwnershipFence,
+        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+    },
     CreatePage {
         session_id: SessionId,
         response: std_mpsc::SyncSender<Result<CreatedPage, OwnerActorError>>,
@@ -1020,7 +1046,7 @@ struct ChromiumOwnerActor<D> {
     context_by_session: BTreeMap<SessionId, String>,
     pending_pages: BTreeMap<String, PendingPage>,
     closed_page_tombstones: BTreeMap<PageId, SessionId>,
-    retired_targets: BTreeSet<String>,
+    retired_targets: BTreeMap<String, String>,
     next_target_incarnation: u64,
 }
 
@@ -1047,7 +1073,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             context_by_session: BTreeMap::new(),
             pending_pages: BTreeMap::new(),
             closed_page_tombstones: BTreeMap::new(),
-            retired_targets: BTreeSet::new(),
+            retired_targets: BTreeMap::new(),
             next_target_incarnation: 1,
         }
     }
@@ -1188,6 +1214,20 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         | OwnerActorError::Unavailable
                         | OwnerActorError::OutcomeUncertain)
                 );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::VerifyContextDisposed {
+                tenant_id,
+                session_id,
+                fence,
+                response,
+            } => {
+                let result = self
+                    .verify_context_disposed(&tenant_id, &session_id, &fence)
+                    .await;
+                let failed = result.is_err();
                 if response.send(result).is_err() || failed {
                     return Err(());
                 }
@@ -1535,6 +1575,78 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         Ok(())
     }
 
+    async fn verify_context_disposed(
+        &mut self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<(), OwnerActorError> {
+        let context_id = self
+            .context_by_session
+            .get(session_id)
+            .cloned()
+            .ok_or(OwnerActorError::UnknownOwnership)?;
+        let context = self
+            .contexts
+            .get(&context_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if &context.ownership.tenant_id != tenant_id
+            || &context.ownership.session_id != session_id
+            || &context.ownership.fence != fence
+            || context.lifecycle != ContextLifecycle::Disposing
+        {
+            return Err(OwnerActorError::UnknownOwnership);
+        }
+        let targets = self
+            .command_event_first("Target.getTargets", json!({}), None, None, None, None)
+            .await?;
+        let target_infos = targets
+            .as_object()
+            .and_then(|targets| targets.get("targetInfos"))
+            .and_then(Value::as_array)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if !target_infos.is_empty() {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
+        let contexts = self
+            .command_event_first(
+                "Target.getBrowserContexts",
+                json!({}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let context_ids = contexts
+            .as_object()
+            .and_then(|contexts| contexts.get("browserContextIds"))
+            .and_then(Value::as_array)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let context = self
+            .contexts
+            .get(&context_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if &context.ownership.tenant_id != tenant_id
+            || &context.ownership.session_id != session_id
+            || &context.ownership.fence != fence
+            || context.lifecycle != ContextLifecycle::Disposing
+            || !context_ids.is_empty()
+            || !self.routes.is_empty()
+            || !self.pending_pages.is_empty()
+            || !context.pages.is_empty()
+            || !context.closing_pages.is_empty()
+        {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
+        if self.context_by_session.get(session_id) != Some(&context_id) {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
+        self.contexts.remove(&context_id);
+        self.context_by_session.remove(session_id);
+        Ok(())
+    }
+
     async fn create_page(
         &mut self,
         session_id: &SessionId,
@@ -1564,7 +1676,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .as_object()
             .ok_or(OwnerActorError::OutcomeUncertain)
             .and_then(|response| required_string(response, "targetId"))?;
-        if self.retired_targets.contains(&target_id) {
+        if self.retired_targets.contains_key(&target_id) {
             return Err(OwnerActorError::OutcomeUncertain);
         }
         if let Some(route) = self.routes.get(&target_id) {
@@ -1996,7 +2108,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .get("targetInfo")
                     .ok_or(OwnerActorError::OutcomeUncertain)?;
                 let (target, browser_context_id) = parse_target_info(target_info)?;
-                if self.retired_targets.contains(target.target_id()) {
+                if self.retired_targets.contains_key(target.target_id()) {
                     return Err(OwnerActorError::OutcomeUncertain);
                 }
                 let context = self
@@ -2089,6 +2201,13 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 let session_id = required_string(params, "sessionId")?;
                 let target_id = optional_string(params, "targetId")?;
                 if let Some(target_id) = target_id {
+                    if let Some(retired_session_id) = self.retired_targets.get(&target_id) {
+                        return if retired_session_id == &session_id {
+                            Ok(())
+                        } else {
+                            Err(OwnerActorError::OutcomeUncertain)
+                        };
+                    }
                     let route = self
                         .routes
                         .get(&target_id)
@@ -2101,7 +2220,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         .remove(&target_id)
                         .ok_or(OwnerActorError::OutcomeUncertain)?;
                     if self.retired_targets.len() >= MAX_RETIRED_TARGETS
-                        || !self.retired_targets.insert(target_id.clone())
+                        || self
+                            .retired_targets
+                            .insert(target_id.clone(), route.route.session_id.clone())
+                            .is_some()
                     {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
@@ -2127,19 +2249,28 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         .try_send(TargetManagerEvent::Detached { target_id })
                         .map_err(|_| OwnerActorError::StateOverflow)?;
                 } else {
-                    let target_id = self
-                        .routes
-                        .iter()
-                        .find_map(|(target_id, entry)| {
-                            (entry.route.session_id == session_id).then(|| target_id.clone())
-                        })
-                        .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    let target_id = match self.routes.iter().find_map(|(target_id, entry)| {
+                        (entry.route.session_id == session_id).then(|| target_id.clone())
+                    }) {
+                        Some(target_id) => target_id,
+                        None if self
+                            .retired_targets
+                            .values()
+                            .any(|retired_session_id| retired_session_id == &session_id) =>
+                        {
+                            return Ok(());
+                        }
+                        None => return Err(OwnerActorError::OutcomeUncertain),
+                    };
                     let route = self
                         .routes
                         .remove(&target_id)
                         .ok_or(OwnerActorError::OutcomeUncertain)?;
                     if self.retired_targets.len() >= MAX_RETIRED_TARGETS
-                        || !self.retired_targets.insert(target_id.clone())
+                        || self
+                            .retired_targets
+                            .insert(target_id.clone(), route.route.session_id.clone())
+                            .is_some()
                     {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
@@ -2171,12 +2302,18 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .as_object()
                     .ok_or(OwnerActorError::OutcomeUncertain)?;
                 let target_id = required_string(params, "targetId")?;
+                if self.retired_targets.contains_key(&target_id) {
+                    return Ok(());
+                }
                 let route = self
                     .routes
                     .remove(&target_id)
                     .ok_or(OwnerActorError::OutcomeUncertain)?;
                 if self.retired_targets.len() >= MAX_RETIRED_TARGETS
-                    || !self.retired_targets.insert(target_id.clone())
+                    || self
+                        .retired_targets
+                        .insert(target_id.clone(), route.route.session_id.clone())
+                        .is_some()
                 {
                     return Err(OwnerActorError::OutcomeUncertain);
                 }
