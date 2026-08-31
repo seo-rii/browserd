@@ -15,10 +15,11 @@ use browserd_worker::{
     ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
     ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
     LiveApprovalContext, SandboxClient, UnavailableChromiumDriver, UnavailableSandboxClient,
-    WorkerActionApprovalRequirement, WorkerActionStatus, WorkerApprovalActionType, WorkerClock,
-    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
-    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence,
+    WorkerActionApprovalRequirement, WorkerActionCommand, WorkerActionStatus,
+    WorkerApprovalActionType, WorkerClock, WorkerConfig, WorkerControlPlane,
+    WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError, WorkerIsolationProfile,
+    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerSessionFence,
 };
 
 struct FrozenClock;
@@ -361,7 +362,9 @@ fn submit_action_request(
         canonical_request_hash: [request_hash_byte; 32],
         kind: ActionKind::Mutating,
         page_id: Some(page_id.clone()),
-        payload: idempotency_key.as_bytes().to_vec(),
+        action: WorkerActionCommand::TypeText {
+            text: idempotency_key.to_owned(),
+        },
         approval: None,
         now_unix_millis: action_sequence.saturating_add(1),
     }
@@ -744,7 +747,7 @@ async fn accepted_pending_approval_action_is_returned_without_dispatching_it() {
             canonical_request_hash: [6; 32],
             kind: ActionKind::Mutating,
             page_id: Some(created.primary_page_id),
-            payload: b"click".to_vec(),
+            action: WorkerActionCommand::Click { x: 20, y: 30 },
             approval: Some(Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 1,
                 frame_document_epoch: 1,

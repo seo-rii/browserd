@@ -44,12 +44,12 @@ use browserd_http::{
 };
 use browserd_viewer::{TicketError, TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use browserd_worker::{
-    PendingWorkerRpc, WorkerActionReceipt, WorkerApprovalDecision, WorkerApprovalReceipt,
-    WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
-    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
-    WorkerPageReceipt, WorkerRpcBlockingClient, WorkerRpcCompletionError, WorkerRpcEnqueueError,
-    WorkerRpcError, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
-    WorkerSessionLifecycle,
+    PendingWorkerRpc, WorkerActionCommand, WorkerActionReceipt, WorkerApprovalDecision,
+    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
+    WorkerArtifactState, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
+    WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcBlockingClient, WorkerRpcCompletionError,
+    WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
 };
 use chrono::Utc;
 use jsonwebtoken::Algorithm;
@@ -1228,33 +1228,62 @@ where
                 "session incarnation precondition failed",
             ));
         }
+        let action = match &command.body.action {
+            ActionPayload::Reload => WorkerActionCommand::Reload,
+            ActionPayload::TypeText { text } => {
+                WorkerActionCommand::TypeText { text: text.clone() }
+            }
+            ActionPayload::GetUrl => WorkerActionCommand::GetUrl,
+            ActionPayload::GetTitle => WorkerActionCommand::GetTitle,
+            ActionPayload::Navigate { .. }
+            | ActionPayload::GoBack
+            | ActionPayload::GoForward
+            | ActionPayload::Click { .. }
+            | ActionPayload::DoubleClick { .. }
+            | ActionPayload::Hover { .. }
+            | ActionPayload::Fill { .. }
+            | ActionPayload::FillSecret { .. }
+            | ActionPayload::PressKey { .. }
+            | ActionPayload::Scroll { .. }
+            | ActionPayload::SelectOption { .. }
+            | ActionPayload::SetFiles { .. }
+            | ActionPayload::Focus { .. }
+            | ActionPayload::Blur { .. }
+            | ActionPayload::Check { .. }
+            | ActionPayload::Uncheck { .. }
+            | ActionPayload::HandleDialog { .. }
+            | ActionPayload::Snapshot
+            | ActionPayload::GetText { .. }
+            | ActionPayload::GetHtml { .. }
+            | ActionPayload::GetAttribute { .. }
+            | ActionPayload::GetProperties { .. }
+            | ActionPayload::GetComputedStyle { .. }
+            | ActionPayload::QueryAll { .. }
+            | ActionPayload::ExtractTable { .. }
+            | ActionPayload::NewPage { .. }
+            | ActionPayload::ClosePage
+            | ActionPayload::ActivatePage
+            | ActionPayload::WaitFor { .. }
+            | ActionPayload::Evaluate { .. }
+            | ActionPayload::Screenshot
+            | ActionPayload::Pdf
+            | ActionPayload::Scrape
+            | ActionPayload::Checkpoint => {
+                return Err(ApiError::invalid_request(
+                    "action is not supported by the production worker",
+                ));
+            }
+        };
+        if !action.is_valid() {
+            return Err(ApiError::invalid_request(
+                "action exceeds the production worker bounds",
+            ));
+        }
         let canonical = serde_json::to_value(&command.body)
             .map_err(|_| ApiError::new(ErrorCode::Internal, "action canonicalization failed"))?;
         let canonical_request_hash =
             *browserd_operations::CanonicalRequestHash::from_json(&canonical).as_bytes();
-        let payload = serde_json::to_vec(&command.body.action)
-            .map_err(|_| ApiError::new(ErrorCode::Internal, "action serialization failed"))?;
-        let kind = if matches!(
-            &command.body.action,
-            ActionPayload::Snapshot
-                | ActionPayload::GetText { .. }
-                | ActionPayload::GetHtml { .. }
-                | ActionPayload::GetUrl
-                | ActionPayload::GetTitle
-                | ActionPayload::GetAttribute { .. }
-                | ActionPayload::GetProperties { .. }
-                | ActionPayload::GetComputedStyle { .. }
-                | ActionPayload::QueryAll { .. }
-                | ActionPayload::ExtractTable { .. }
-                | ActionPayload::Screenshot
-                | ActionPayload::Pdf
-                | ActionPayload::Scrape
-                | ActionPayload::Checkpoint
-        ) {
-            ActionKind::ReadOnly
-        } else {
-            ActionKind::Mutating
-        };
+        let kind = action.kind();
         let idempotency_key = command.idempotency_key.to_string();
         let claim = ClaimGatewayAction::new(
             principal.tenant_id().clone(),
@@ -1304,8 +1333,7 @@ where
                                 if matches!(
                                     current.terminal().map(|terminal| terminal.detail()),
                                     Some(TerminalDetail::CancelledBeforeDispatch)
-                                ) =>
-                            {}
+                                ) => {}
                             Err(cancel_error) => {
                                 return Err(action_coordination_api_error(cancel_error));
                             }
@@ -1342,7 +1370,7 @@ where
             canonical_request_hash,
             kind,
             page_id: Some(command.body.page_id),
-            payload,
+            action,
             approval: None,
             now_unix_millis,
         };

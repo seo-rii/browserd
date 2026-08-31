@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex};
 use browserd_core::{ActionId, IsolationProfile, PageId, SessionId, TenantId};
 use browserd_policy::{CanonicalActionProposal, Origin};
 use browserd_session::OwnershipFence;
-use serde::Deserialize;
 use serde_json::json;
 
 use crate::chromium_owner::{
@@ -11,14 +10,11 @@ use crate::chromium_owner::{
 };
 use crate::{
     ActionExecutionResult, ApprovedActionError, ChromiumDriver, DependencyError,
-    LiveApprovalContext,
+    LiveApprovalContext, WorkerActionCommand,
 };
 
 const MAX_ACTION_PAYLOAD_BYTES: usize = 64 * 1024;
 const MAX_ACTION_RESULT_BYTES: usize = 64 * 1024;
-const MAX_NAVIGATION_URL_BYTES: usize = 8 * 1024;
-const MAX_INSERT_TEXT_BYTES: usize = 16 * 1024;
-const MAX_POINTER_COORDINATE: f64 = 1_000_000.0;
 
 #[derive(Clone)]
 pub struct CdpChromiumDriver {
@@ -325,17 +321,6 @@ impl ChromiumDriver for CdpChromiumDriver {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum CdpAction {
-    Navigate { url: String },
-    Reload,
-    Click { x: f64, y: f64 },
-    TypeText { text: String },
-    GetUrl,
-    GetTitle,
-}
-
 #[derive(Clone, Copy)]
 enum ActionResultShape {
     Unit,
@@ -347,30 +332,28 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
     if payload.is_empty() || payload.len() > MAX_ACTION_PAYLOAD_BYTES {
         return Err("invalid_action_payload");
     }
-    let action = serde_json::from_slice::<CdpAction>(payload).map_err(|_| "unsupported_action")?;
+    let action =
+        serde_json::from_slice::<WorkerActionCommand>(payload).map_err(|_| "unsupported_action")?;
+    if !action.is_valid() {
+        return Err("invalid_action_arguments");
+    }
     match action {
-        CdpAction::Navigate { url }
-            if url.len() <= MAX_NAVIGATION_URL_BYTES
-                && !url.chars().any(char::is_control)
-                && (url.starts_with("https://") || url.starts_with("http://")) =>
-        {
+        WorkerActionCommand::Navigate { url } => {
             Ok((PageCommand::Navigate { url }, ActionResultShape::Unit))
         }
-        CdpAction::Reload => Ok((PageCommand::Reload, ActionResultShape::Unit)),
-        CdpAction::Click { x, y }
-            if x.is_finite()
-                && y.is_finite()
-                && x.abs() <= MAX_POINTER_COORDINATE
-                && y.abs() <= MAX_POINTER_COORDINATE =>
-        {
-            Ok((PageCommand::Click { x, y }, ActionResultShape::Unit))
-        }
-        CdpAction::TypeText { text } if text.len() <= MAX_INSERT_TEXT_BYTES => {
+        WorkerActionCommand::Reload => Ok((PageCommand::Reload, ActionResultShape::Unit)),
+        WorkerActionCommand::Click { x, y } => Ok((
+            PageCommand::Click {
+                x: x as f64,
+                y: y as f64,
+            },
+            ActionResultShape::Unit,
+        )),
+        WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }
-        CdpAction::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
-        CdpAction::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
-        _ => Err("invalid_action_arguments"),
+        WorkerActionCommand::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
+        WorkerActionCommand::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
     }
 }
 

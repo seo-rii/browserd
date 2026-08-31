@@ -42,7 +42,54 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 4;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 5;
+
+const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
+const MAX_WORKER_ACTION_TEXT_BYTES: usize = 16 * 1024;
+const MAX_WORKER_POINTER_COORDINATE: u64 = 1_000_000;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerActionCommand {
+    Navigate { url: String },
+    Reload,
+    Click { x: i64, y: i64 },
+    TypeText { text: String },
+    GetUrl,
+    GetTitle,
+}
+
+impl WorkerActionCommand {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Navigate { url } => {
+                !url.is_empty()
+                    && url.len() <= MAX_WORKER_ACTION_URL_BYTES
+                    && !url.chars().any(char::is_control)
+                    && (url.starts_with("https://") || url.starts_with("http://"))
+            }
+            Self::Click { x, y } => {
+                x.unsigned_abs() <= MAX_WORKER_POINTER_COORDINATE
+                    && y.unsigned_abs() <= MAX_WORKER_POINTER_COORDINATE
+            }
+            Self::TypeText { text } => {
+                !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
+            }
+            Self::Reload | Self::GetUrl | Self::GetTitle => true,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> ActionKind {
+        match self {
+            Self::GetUrl | Self::GetTitle => ActionKind::ReadOnly,
+            Self::Navigate { .. } | Self::Reload | Self::Click { .. } | Self::TypeText { .. } => {
+                ActionKind::Mutating
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -602,7 +649,7 @@ pub enum WorkerRpcRequest {
         canonical_request_hash: [u8; 32],
         kind: ActionKind,
         page_id: Option<PageId>,
-        payload: Vec<u8>,
+        action: WorkerActionCommand,
         approval: Option<Box<WorkerActionApprovalRequirement>>,
         now_unix_millis: u64,
     },
@@ -1215,12 +1262,24 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 canonical_request_hash,
                 kind,
                 page_id,
-                payload,
+                action,
                 approval,
                 now_unix_millis,
             } => {
                 let ownership = self.ownership_fence(&fence)?;
                 let now = SessionTime::new(now_unix_millis);
+                if !action.is_valid() || kind != action.kind() {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        "action command is invalid or its kind does not match",
+                    ));
+                }
+                let payload = serde_json::to_vec(&action).map_err(|_| {
+                    WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        "action command cannot be encoded",
+                    )
+                })?;
                 let approval = match approval {
                     Some(approval) => {
                         let page_id = page_id.clone().ok_or_else(|| {

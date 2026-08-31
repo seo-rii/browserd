@@ -6,11 +6,11 @@ use browserd_core::{
     ActionId, ApprovalId, ArtifactId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
-    WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionReceipt,
-    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt,
-    WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
-    WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence,
+    WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionCommand,
+    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
+    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
+    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt,
+    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
 };
 
 fn fence() -> WorkerSessionFence {
@@ -36,7 +36,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 4);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 5);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -64,7 +64,7 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
             canonical_request_hash: [4; 32],
             kind: ActionKind::Mutating,
             page_id: Some(page_id.clone()),
-            payload: br#"{"type":"click"}"#.to_vec(),
+            action: WorkerActionCommand::Click { x: 20, y: 30 },
             approval: Some(Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 4,
                 frame_document_epoch: 9,

@@ -20,14 +20,15 @@ pub use production_sandbox::{
 };
 pub use rpc::{
     PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement,
-    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
-    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
-    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler,
-    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
-    WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient, WorkerRpcClient,
-    WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError, WorkerRpcError,
-    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerActionCommand, WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType,
+    WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt,
+    WorkerArtifactSource, WorkerArtifactState, WorkerCanonicalActionProposal,
+    WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
+    WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient,
+    WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError,
+    WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle,
+    WorkerSessionReceipt,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,

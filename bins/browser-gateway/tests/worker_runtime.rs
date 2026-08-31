@@ -20,7 +20,7 @@ use browserd_api::{
     ActionSubmitRequest, ApiRequest, ApiResponse, ApiRouter, ApiService, ApprovalDecisionBody,
     ApprovalDecisionRequest, ApprovalListQuery, ArtifactRequest, PageActivateRequest,
     PageCreateBody, PageCreateRequest, PageDeleteRequest, PageListRequest, ResolutionRequestKind,
-    decode_session_create,
+    WaitUntil, decode_session_create,
 };
 use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
@@ -31,13 +31,13 @@ use browserd_core::{
     SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
-    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
-    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
-    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerCreateSessionReceipt,
-    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt,
-    WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailure,
-    WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
-    WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerActionCommand, WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType,
+    WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt,
+    WorkerArtifactSource, WorkerArtifactState, WorkerCanonicalActionProposal,
+    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
+    WorkerPageReceipt, WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError,
+    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
 };
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
@@ -1173,7 +1173,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
             canonical_request_hash,
             kind,
             page_id,
-            payload,
+            action,
             ..
         } => Some((
             fence,
@@ -1184,7 +1184,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
             canonical_request_hash,
             kind,
             page_id,
-            payload,
+            action,
         )),
         _ => None,
     });
@@ -1197,7 +1197,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
         hash,
         kind,
         page_id,
-        payload,
+        action,
     )) = submit
     else {
         return Err("submit RPC not recorded".into());
@@ -1211,8 +1211,7 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
     assert_ne!(hash, &[0; 32]);
     assert_eq!(*kind, ActionKind::ReadOnly);
     assert_eq!(page_id.as_ref(), Some(&worker.page_id));
-    let wire_payload = serde_json::from_slice::<serde_json::Value>(payload)?;
-    assert_eq!(wire_payload, serde_json::json!({"type": "get_title"}));
+    assert_eq!(action, &WorkerActionCommand::GetTitle);
     drop(requests);
 
     let fetched = router.execute(
@@ -1269,6 +1268,62 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
                     && annotation.resolved_by() == principal.principal_id()
             })
     ));
+    Ok(())
+}
+
+#[test]
+fn unsupported_public_actions_are_rejected_before_durable_claim_or_worker_enqueue()
+-> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let idempotency_key = Uuid::new_v4();
+    let requests_before = worker
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?
+        .len();
+    let unsupported = router.execute(
+        &principal,
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key,
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 1_000,
+                action: ActionPayload::Navigate {
+                    url: "https://example.test/path".to_owned(),
+                    wait_until: WaitUntil::Load,
+                },
+            },
+        }),
+    );
+    let error = unsupported
+        .err()
+        .ok_or("unsupported action unexpectedly reached the worker")?;
+    assert_eq!(error.code(), browserd_core::ErrorCode::InvalidRequest);
+    assert_eq!(
+        worker
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .len(),
+        requests_before
+    );
+
+    let supported = router.execute(
+        &principal,
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id,
+            idempotency_key,
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 1_000,
+                action: ActionPayload::GetTitle,
+            },
+        }),
+    )?;
+    assert!(matches!(supported, ApiResponse::Action(_)));
     Ok(())
 }
 

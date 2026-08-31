@@ -362,9 +362,7 @@ impl Fixture {
 
     fn mutating_command(&self, idempotency_key: Uuid) -> ActionSubmitCommand {
         let mut command = self.command(idempotency_key);
-        command.body.action = ActionPayload::PressKey {
-            key: "Enter".to_owned(),
-        };
+        command.body.action = ActionPayload::Reload;
         command
     }
 

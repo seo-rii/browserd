@@ -12,7 +12,7 @@ use browserd_core::{
     ActionId, LeaseId, OperationId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
-    WORKER_RPC_PROTOCOL_VERSION, WorkerActionReceipt, WorkerActionStatus,
+    WORKER_RPC_PROTOCOL_VERSION, WorkerActionCommand, WorkerActionReceipt, WorkerActionStatus,
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
     WorkerProbeReceipt, WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcError,
     WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
@@ -817,7 +817,7 @@ async fn action_client_rejects_a_receipt_with_a_different_identity() {
         canonical_request_hash: [7; 32],
         kind: ActionKind::Mutating,
         page_id: Some(PageId::new()),
-        payload: Vec::new(),
+        action: WorkerActionCommand::Reload,
         approval: None,
         now_unix_millis: 1,
     };

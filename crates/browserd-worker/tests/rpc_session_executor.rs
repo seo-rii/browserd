@@ -14,10 +14,10 @@ use browserd_session::{LeasePolicy, OwnershipFence, SessionTime, SessionTimeoutP
 use browserd_worker::{
     ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
     ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
-    LiveApprovalContext, SandboxClient, WorkerActionApprovalRequirement, WorkerActionStatus,
-    WorkerApprovalActionType, WorkerApprovalDecision, WorkerClock, WorkerConfig,
-    WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError,
-    WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
+    LiveApprovalContext, SandboxClient, WorkerActionApprovalRequirement, WorkerActionCommand,
+    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerClock,
+    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
+    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
     WorkerRpcResponse, WorkerSessionFence,
 };
 
@@ -290,7 +290,9 @@ fn submit_action_request(
         canonical_request_hash: [request_hash_byte; 32],
         kind: ActionKind::Mutating,
         page_id: Some(page_id.clone()),
-        payload: key.as_bytes().to_vec(),
+        action: WorkerActionCommand::TypeText {
+            text: key.to_owned(),
+        },
         approval: approval_required.then(|| {
             Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 1,
