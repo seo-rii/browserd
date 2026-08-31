@@ -105,10 +105,7 @@ fn rejects_invalid_identity_metadata_before_verifying_files() {
     invalid_identity.product_version.clear();
     let artifact = CompatibilityArtifact {
         identity: invalid_identity,
-        files: vec![ArtifactFile::new(
-            "chrome",
-            digest(b"pinned chromium"),
-        )],
+        files: vec![ArtifactFile::new("chrome", digest(b"pinned chromium"))],
     };
 
     assert_eq!(
