@@ -98,6 +98,28 @@ fn requires_the_chromium_binary_digest_to_be_covered_by_the_manifest() {
 }
 
 #[test]
+fn rejects_invalid_identity_metadata_before_verifying_files() {
+    let root = tempdir().expect("temporary directory must be created");
+    write(root.path(), "chrome", b"pinned chromium");
+    let mut invalid_identity = identity(digest(b"pinned chromium"));
+    invalid_identity.product_version.clear();
+    let artifact = CompatibilityArtifact {
+        identity: invalid_identity,
+        files: vec![ArtifactFile::new(
+            "chrome",
+            digest(b"pinned chromium"),
+        )],
+    };
+
+    assert_eq!(
+        artifact.verify(root.path()),
+        Err(CompatibilityError::InvalidArtifactIdentity {
+            field: "product_version"
+        })
+    );
+}
+
+#[test]
 fn rejects_manifest_paths_that_escape_or_follow_symlinks() {
     let root = tempdir().expect("temporary directory must be created");
     let outside = tempdir().expect("outside directory must be created");

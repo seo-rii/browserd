@@ -18,6 +18,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+const MAX_ARTIFACT_IDENTITY_FIELD_BYTES: usize = 1_024;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Sha256Digest([u8; 32]);
 
@@ -71,6 +73,23 @@ pub struct ChromiumArtifactIdentity {
     pub certificate_runtime_bundle_digest: Sha256Digest,
 }
 
+impl ChromiumArtifactIdentity {
+    pub fn validate(&self) -> Result<(), CompatibilityError> {
+        for (field, value) in [
+            ("product_version", self.product_version.as_str()),
+            ("chromium_revision", self.chromium_revision.as_str()),
+        ] {
+            if value.is_empty()
+                || value.len() > MAX_ARTIFACT_IDENTITY_FIELD_BYTES
+                || value.chars().any(char::is_control)
+            {
+                return Err(CompatibilityError::InvalidArtifactIdentity { field });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactFile {
     pub relative_path: PathBuf,
@@ -94,6 +113,7 @@ pub struct CompatibilityArtifact {
 
 impl CompatibilityArtifact {
     pub fn verify(&self, root: &Path) -> Result<(), CompatibilityError> {
+        self.identity.validate()?;
         if self.files.is_empty() {
             return Err(CompatibilityError::EmptyArtifactManifest);
         }
@@ -341,6 +361,8 @@ pub enum CompatibilityError {
     EmptyArtifactManifest,
     #[error("the Chromium binary digest is not covered by the artifact manifest")]
     ChromiumBinaryNotInManifest,
+    #[error("the Chromium artifact identity field is invalid: {field}")]
+    InvalidArtifactIdentity { field: &'static str },
     #[error("artifact path is not a safe relative path: {relative_path}")]
     UnsafeRelativePath { relative_path: String },
     #[error("artifact path contains a symbolic link: {relative_path}")]

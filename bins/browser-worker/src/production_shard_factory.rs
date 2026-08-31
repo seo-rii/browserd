@@ -81,8 +81,7 @@ impl ProductionSessionShardConfig {
             || owner_lease_ttl.is_zero()
             || owner_lease_ttl > MAX_DEDICATED_EGRESS_LEASE_TTL
             || !chromium_connection.is_valid()
-            || chromium_identity.product_version.is_empty()
-            || chromium_identity.chromium_revision.is_empty()
+            || chromium_identity.validate().is_err()
         {
             return Err(DependencyError::Rejected);
         }
