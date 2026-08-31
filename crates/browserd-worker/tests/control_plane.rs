@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -23,7 +23,8 @@ use browserd_worker::{
     ApprovedActionError, ArtifactScanVerdict, ArtifactStoreReceipt, ArtifactStoreRequest,
     ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand, CreateSessionOutcome,
     DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient, WorkerArtifactLimits,
-    WorkerClock, WorkerConfig, WorkerControlPlane, WorkerError,
+    WorkerClock, WorkerConfig, WorkerControlPlane, WorkerError, WorkerSessionOptionsV1,
+    WorkerViewport,
 };
 use sha2::{Digest, Sha256};
 
@@ -313,15 +314,24 @@ fn config(queue_capacity: usize) -> Option<WorkerConfig> {
 }
 
 fn config_with_max_sessions(queue_capacity: usize, max_sessions: usize) -> Option<WorkerConfig> {
+    let lease = LeasePolicy::new(Duration::from_millis(100), Duration::from_millis(20)).ok()?;
+    let timeout =
+        SessionTimeoutPolicy::new(Duration::from_millis(1_000), Duration::from_millis(500)).ok()?;
+    config_with_policies(queue_capacity, max_sessions, lease, timeout)
+}
+
+fn config_with_policies(
+    queue_capacity: usize,
+    max_sessions: usize,
+    lease: LeasePolicy,
+    timeout: SessionTimeoutPolicy,
+) -> Option<WorkerConfig> {
     static JOURNAL_ROOT: OnceLock<Option<tempfile::TempDir>> = OnceLock::new();
 
     let worker_id = WorkerId::new("worker-test").ok()?;
     let endpoint =
         InternalEndpoint::loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9010)).ok()?;
     let peer = AuthenticatedPeer::new("gateway-internal").ok()?;
-    let lease = LeasePolicy::new(Duration::from_millis(100), Duration::from_millis(20)).ok()?;
-    let timeout =
-        SessionTimeoutPolicy::new(Duration::from_millis(1_000), Duration::from_millis(500)).ok()?;
     let root = JOURNAL_ROOT
         .get_or_init(|| tempfile::tempdir().ok())
         .as_ref()?;
@@ -1546,6 +1556,77 @@ fn heartbeat_renews_ownership_and_expiry_cleans_worker_loss() {
         ),
         Err(WorkerError::Stopped)
     );
+}
+
+#[test]
+fn request_timeouts_override_worker_defaults_at_the_exact_idle_boundary() {
+    let Some(lease) = LeasePolicy::new(Duration::from_secs(20), Duration::from_secs(5)).ok() else {
+        return;
+    };
+    let Some(timeout) =
+        SessionTimeoutPolicy::new(Duration::from_secs(60), Duration::from_secs(30)).ok()
+    else {
+        return;
+    };
+    let Some(config) = config_with_policies(1, 16, lease, timeout) else {
+        return;
+    };
+    let driver = Arc::new(FakeDriver {
+        qualified: true,
+        ..FakeDriver::default()
+    });
+    let sandbox = Arc::new(FakeSandbox {
+        qualified: true,
+        ..FakeSandbox::default()
+    });
+    let Some(peer) = AuthenticatedPeer::new("gateway-internal").ok() else {
+        return;
+    };
+    let worker = WorkerControlPlane::new_with_clock(
+        config,
+        Arc::clone(&driver),
+        Arc::clone(&sandbox),
+        Arc::new(TestClock),
+    );
+    let options = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: None,
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 10,
+        idle_timeout_seconds: 4,
+        metadata: BTreeMap::from([("agent_run_id".to_owned(), "timeout-boundary".to_owned())]),
+    };
+
+    let created = worker.create_session_with_options(
+        &peer,
+        create_command(TenantId::new(), "request-timeout-boundary", 61),
+        &options,
+        SessionTime::new(0),
+    );
+    assert!(created.is_ok());
+    let Some(created) = created.ok() else {
+        return;
+    };
+    let snapshot = worker.get_session(&peer, &created.session_id, &created.fence);
+    assert!(snapshot.is_ok());
+    let Some(snapshot) = snapshot.ok() else {
+        return;
+    };
+    assert_eq!(snapshot.session_expires_at, Some(SessionTime::new(10_000)));
+    assert_eq!(snapshot.idle_expires_at, Some(SessionTime::new(4_000)));
+    assert_eq!(worker.expire_due(&peer, SessionTime::new(3_999)), Ok(0));
+    assert_eq!(worker.expire_due(&peer, SessionTime::new(4_000)), Ok(1));
 }
 
 #[test]

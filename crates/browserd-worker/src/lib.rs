@@ -1098,6 +1098,15 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
     ) -> Result<CreateSessionOutcome, WorkerError> {
         self.authorize(peer)?;
+        let timeout_policy = match options {
+            Some(options) if options.is_valid() => SessionTimeoutPolicy::new(
+                Duration::from_secs(options.ttl_seconds),
+                Duration::from_secs(options.idle_timeout_seconds),
+            )
+            .map_err(|_| WorkerError::InvalidConfiguration)?,
+            Some(_) => return Err(WorkerError::InvalidConfiguration),
+            None => self.config.timeout_policy,
+        };
         if self.driver.qualify().is_err() || self.sandbox.qualify().is_err() {
             return Err(WorkerError::NotReady);
         }
@@ -1226,7 +1235,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 session_id.clone(),
                 fence.clone(),
                 self.config.lease_policy,
-                self.config.timeout_policy,
+                timeout_policy,
                 now,
             );
             machine
