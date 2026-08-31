@@ -1211,7 +1211,8 @@ fn action_endpoints_preserve_request_identity_and_complete_worker_status()
     assert_ne!(hash, &[0; 32]);
     assert_eq!(*kind, ActionKind::ReadOnly);
     assert_eq!(page_id.as_ref(), Some(&worker.page_id));
-    assert!(serde_json::from_slice::<serde_json::Value>(payload).is_ok());
+    let wire_payload = serde_json::from_slice::<serde_json::Value>(payload)?;
+    assert_eq!(wire_payload, serde_json::json!({"type": "get_title"}));
     drop(requests);
 
     let fetched = router.execute(

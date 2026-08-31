@@ -1232,7 +1232,7 @@ where
             .map_err(|_| ApiError::new(ErrorCode::Internal, "action canonicalization failed"))?;
         let canonical_request_hash =
             *browserd_operations::CanonicalRequestHash::from_json(&canonical).as_bytes();
-        let payload = serde_json::to_vec(&command.body)
+        let payload = serde_json::to_vec(&command.body.action)
             .map_err(|_| ApiError::new(ErrorCode::Internal, "action serialization failed"))?;
         let kind = if matches!(
             &command.body.action,
