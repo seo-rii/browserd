@@ -625,6 +625,7 @@ struct CleaningShard {
     in_progress: bool,
     notification_version: u64,
     notifications: watch::Sender<u64>,
+    create_outcome: CreateShardOutcome,
 }
 
 #[derive(Debug)]
@@ -632,6 +633,7 @@ struct TerminatedShard {
     launch_spec: LaunchSpec,
     worker_id: WorkerId,
     worker_epoch: u64,
+    create_outcome: CreateShardOutcome,
 }
 
 #[derive(Debug, Default)]
@@ -926,6 +928,7 @@ where
                             active.ownership.worker_id.clone(),
                             active.ownership.worker_epoch,
                             active.launch_spec.clone(),
+                            CreateShardOutcome::AlreadyExists,
                         )
                     })
                     .or_else(|| {
@@ -934,11 +937,16 @@ where
                                 cleaning.worker_id.clone(),
                                 cleaning.worker_epoch,
                                 cleaning.launch_spec.clone(),
+                                cleaning.create_outcome,
                             )
                         })
                     });
-                if let Some((existing_worker_id, existing_worker_epoch, existing_spec)) =
-                    existing_owner
+                if let Some((
+                    existing_worker_id,
+                    existing_worker_epoch,
+                    existing_spec,
+                    create_outcome,
+                )) = existing_owner
                 {
                     if existing_worker_id != spec.worker_id {
                         return Err(SandboxError::OwnershipMismatch);
@@ -957,7 +965,7 @@ where
                     if existing_spec != spec {
                         return Err(SandboxError::LaunchBindingMismatch);
                     }
-                    return Ok(CreateShardOutcome::AlreadyExists);
+                    return Ok(create_outcome);
                 }
                 if let Some(terminated) = state.terminated.get(&spec.shard_id) {
                     if terminated.worker_id != spec.worker_id {
@@ -977,7 +985,7 @@ where
                     if terminated.launch_spec != spec {
                         return Err(SandboxError::LaunchBindingMismatch);
                     }
-                    return Ok(CreateShardOutcome::AlreadyExists);
+                    return Ok(terminated.create_outcome);
                 }
                 if let Some(failed) = state.failed.get(&spec.shard_id) {
                     if failed.worker_id != spec.worker_id {
@@ -1092,6 +1100,7 @@ where
                             in_progress: false,
                             notification_version: 0,
                             notifications,
+                            create_outcome: CreateShardOutcome::Cancelled,
                         },
                     );
                     drop(state);
@@ -1411,6 +1420,213 @@ where
         }
     }
 
+    pub async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        reason: CleanupReason,
+    ) -> Result<KillShardOutcome, SandboxError> {
+        spec.validate()?;
+        enum CancelStep {
+            Return(KillShardOutcome),
+            Wait(watch::Receiver<Option<Result<CreateShardOutcome, SandboxError>>>),
+            Kill,
+        }
+
+        loop {
+            let step = {
+                let mut state = self.state.lock().await;
+                if let Some(terminated) = state.terminated.get_mut(&spec.shard_id) {
+                    if terminated.worker_id != spec.worker_id {
+                        return Err(SandboxError::OwnershipMismatch);
+                    }
+                    if terminated.worker_epoch != spec.worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: terminated.worker_epoch,
+                            actual: spec.worker_epoch,
+                        });
+                    }
+                    if terminated.launch_spec.dedicated_egress.egress_fence
+                        != spec.dedicated_egress.egress_fence
+                    {
+                        return Err(SandboxError::LaunchFenceMismatch);
+                    }
+                    if terminated.launch_spec != *spec {
+                        return Err(SandboxError::LaunchBindingMismatch);
+                    }
+                    terminated.create_outcome = CreateShardOutcome::Cancelled;
+                    CancelStep::Return(KillShardOutcome::AlreadyTerminated)
+                } else if let Some(provisioning) = state.provisioning.get_mut(&spec.shard_id) {
+                    if provisioning.ownership.worker_id != spec.worker_id {
+                        return Err(SandboxError::OwnershipMismatch);
+                    }
+                    if provisioning.ownership.worker_epoch != spec.worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: provisioning.ownership.worker_epoch,
+                            actual: spec.worker_epoch,
+                        });
+                    }
+                    if provisioning.launch_spec.dedicated_egress.egress_fence
+                        != spec.dedicated_egress.egress_fence
+                    {
+                        return Err(SandboxError::LaunchFenceMismatch);
+                    }
+                    if provisioning.launch_spec != *spec {
+                        return Err(SandboxError::LaunchBindingMismatch);
+                    }
+                    provisioning.cancellation.get_or_insert(reason);
+                    CancelStep::Wait(provisioning.completion.subscribe())
+                } else if let Some(failed) = state.failed.get(&spec.shard_id) {
+                    if failed.worker_id != spec.worker_id {
+                        return Err(SandboxError::OwnershipMismatch);
+                    }
+                    if failed.worker_epoch != spec.worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: failed.worker_epoch,
+                            actual: spec.worker_epoch,
+                        });
+                    }
+                    if spec.launch_generation() > failed.launch_spec.launch_generation() {
+                        if failed.launch_spec.tenant_id != spec.tenant_id {
+                            return Err(SandboxError::LaunchBindingMismatch);
+                        }
+                        state.failed.remove(&spec.shard_id);
+                        state.terminated.insert(
+                            spec.shard_id.clone(),
+                            TerminatedShard {
+                                launch_spec: spec.clone(),
+                                worker_id: spec.worker_id.clone(),
+                                worker_epoch: spec.worker_epoch,
+                                create_outcome: CreateShardOutcome::Cancelled,
+                            },
+                        );
+                        CancelStep::Return(KillShardOutcome::AlreadyTerminated)
+                    } else {
+                        if failed.launch_spec.dedicated_egress.egress_fence
+                            != spec.dedicated_egress.egress_fence
+                        {
+                            return Err(SandboxError::LaunchFenceMismatch);
+                        }
+                        if failed.launch_spec != *spec {
+                            return Err(SandboxError::LaunchBindingMismatch);
+                        }
+                        return Err(failed.error.clone());
+                    }
+                } else if let Some(active) = state.active.get(&spec.shard_id) {
+                    if active.ownership.worker_id != spec.worker_id {
+                        return Err(SandboxError::OwnershipMismatch);
+                    }
+                    if active.ownership.worker_epoch != spec.worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: active.ownership.worker_epoch,
+                            actual: spec.worker_epoch,
+                        });
+                    }
+                    if active.launch_spec.dedicated_egress.egress_fence
+                        != spec.dedicated_egress.egress_fence
+                    {
+                        return Err(SandboxError::LaunchFenceMismatch);
+                    }
+                    if active.launch_spec != *spec {
+                        return Err(SandboxError::LaunchBindingMismatch);
+                    }
+                    let active = state
+                        .active
+                        .remove(&spec.shard_id)
+                        .ok_or(SandboxError::ShardNotFound)?;
+                    let (notifications, _) = watch::channel(0);
+                    state.cleaning.insert(
+                        spec.shard_id.clone(),
+                        CleaningShard {
+                            launch_spec: active.launch_spec,
+                            worker_id: active.ownership.worker_id,
+                            worker_epoch: active.ownership.worker_epoch,
+                            handle: active.handle,
+                            reason,
+                            progress: CleanupResult {
+                                route_revoked: false,
+                                cgroup_killed: false,
+                                namespaces_cleaned: false,
+                            },
+                            in_progress: false,
+                            notification_version: 0,
+                            notifications,
+                            create_outcome: CreateShardOutcome::Cancelled,
+                        },
+                    );
+                    CancelStep::Kill
+                } else if let Some(cleaning) = state.cleaning.get_mut(&spec.shard_id) {
+                    if cleaning.worker_id != spec.worker_id {
+                        return Err(SandboxError::OwnershipMismatch);
+                    }
+                    if cleaning.worker_epoch != spec.worker_epoch {
+                        return Err(SandboxError::WorkerEpochMismatch {
+                            expected: cleaning.worker_epoch,
+                            actual: spec.worker_epoch,
+                        });
+                    }
+                    if cleaning.launch_spec.dedicated_egress.egress_fence
+                        != spec.dedicated_egress.egress_fence
+                    {
+                        return Err(SandboxError::LaunchFenceMismatch);
+                    }
+                    if cleaning.launch_spec != *spec {
+                        return Err(SandboxError::LaunchBindingMismatch);
+                    }
+                    cleaning.create_outcome = CreateShardOutcome::Cancelled;
+                    CancelStep::Kill
+                } else {
+                    state.terminated.insert(
+                        spec.shard_id.clone(),
+                        TerminatedShard {
+                            launch_spec: spec.clone(),
+                            worker_id: spec.worker_id.clone(),
+                            worker_epoch: spec.worker_epoch,
+                            create_outcome: CreateShardOutcome::Cancelled,
+                        },
+                    );
+                    CancelStep::Return(KillShardOutcome::AlreadyTerminated)
+                }
+            };
+
+            match step {
+                CancelStep::Return(outcome) => return Ok(outcome),
+                CancelStep::Wait(mut completion) => loop {
+                    let result = completion.borrow().clone();
+                    match result {
+                        Some(Ok(CreateShardOutcome::Cancelled)) => break,
+                        Some(Err(SandboxError::IncompleteCleanup { result })) => {
+                            return Ok(KillShardOutcome::CleanupIncomplete(result));
+                        }
+                        Some(Err(error)) => return Err(error),
+                        Some(Ok(
+                            CreateShardOutcome::Created | CreateShardOutcome::AlreadyExists,
+                        )) => {
+                            return Err(SandboxError::Backend(
+                                "cancelled provisioning published an active shard".to_owned(),
+                            ));
+                        }
+                        None => {}
+                    }
+                    completion.changed().await.map_err(|_| {
+                        SandboxError::Backend(
+                            "provisioning completion disappeared during cancellation".to_owned(),
+                        )
+                    })?;
+                },
+                CancelStep::Kill => {
+                    return self
+                        .kill_shard(
+                            &spec.shard_id,
+                            spec.worker_epoch,
+                            spec.launch_generation(),
+                            reason,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
     pub async fn kill_shard(
         &self,
         shard_id: &ShardId,
@@ -1480,6 +1696,7 @@ where
                         in_progress: false,
                         notification_version: 0,
                         notifications,
+                        create_outcome: CreateShardOutcome::AlreadyExists,
                     },
                 );
             }
@@ -1634,6 +1851,7 @@ where
                                     launch_spec: cleaning.launch_spec,
                                     worker_id: cleaning.worker_id,
                                     worker_epoch: cleaning.worker_epoch,
+                                    create_outcome: cleaning.create_outcome,
                                 },
                             );
                             Ok(KillShardOutcome::Terminated(result))

@@ -258,6 +258,11 @@ enum RpcRequest {
         dedicated_egress: DedicatedEgressSpec,
         lease_ttl_ms: u64,
     },
+    CancelOrKillShard {
+        sandboxd_epoch: u64,
+        spec: LaunchSpec,
+        reason: CleanupReason,
+    },
     RenewOwnerLease {
         sandboxd_epoch: u64,
         shard_id: ShardId,
@@ -292,6 +297,7 @@ impl RpcRequest {
         match self {
             Self::ProbeDaemonEpoch { sandboxd_epoch, .. }
             | Self::CreateShard { sandboxd_epoch, .. }
+            | Self::CancelOrKillShard { sandboxd_epoch, .. }
             | Self::RenewOwnerLease { sandboxd_epoch, .. }
             | Self::KillShard { sandboxd_epoch, .. }
             | Self::InspectResources { sandboxd_epoch, .. }
@@ -316,6 +322,10 @@ impl RpcRequest {
                 worker_epoch,
                 ..
             } => worker_id == &binding.worker_id && *worker_epoch == binding.worker_epoch,
+            Self::CancelOrKillShard { spec, .. } => {
+                spec.worker_id() == &binding.worker_id
+                    && spec.worker_epoch() == binding.worker_epoch
+            }
             Self::RenewOwnerLease { worker_epoch, .. }
             | Self::KillShard { worker_epoch, .. }
             | Self::InspectResources { worker_epoch, .. } => *worker_epoch == binding.worker_epoch,
@@ -331,6 +341,7 @@ enum RpcSuccess {
         request_nonce: LeaseId,
     },
     CreateShard(CreateShardOutcome),
+    CancelOrKillShard(KillShardOutcome),
     Renewed,
     KillShard(KillShardOutcome),
     InspectResources(InspectResources),
@@ -497,6 +508,24 @@ impl SandboxRpcClient {
             .await?;
         match response {
             RpcSuccess::KillShard(outcome) => Ok(outcome),
+            _ => Err(SandboxRpcError::Protocol),
+        }
+    }
+
+    pub async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        reason: CleanupReason,
+    ) -> Result<KillShardOutcome, SandboxRpcError> {
+        let response = self
+            .exchange(RpcRequest::CancelOrKillShard {
+                sandboxd_epoch: self.expected_daemon_epoch,
+                spec: spec.clone(),
+                reason,
+            })
+            .await?;
+        match response {
+            RpcSuccess::CancelOrKillShard(outcome) => Ok(outcome),
             _ => Err(SandboxRpcError::Protocol),
         }
     }
@@ -1207,6 +1236,16 @@ where
                                         Err(error) => RpcResponse::Failure(error.into()),
                                     }
                                 }
+                                RpcRequest::CancelOrKillShard {
+                                    sandboxd_epoch: _,
+                                    spec,
+                                    reason,
+                                } => match supervisor.cancel_or_kill_shard(&spec, reason).await {
+                                    Ok(outcome) => RpcResponse::Success(
+                                        RpcSuccess::CancelOrKillShard(outcome),
+                                    ),
+                                    Err(error) => RpcResponse::Failure(error.into()),
+                                },
                                 RpcRequest::KillShard {
                                     sandboxd_epoch: _,
                                     shard_id,

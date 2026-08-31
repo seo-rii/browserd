@@ -472,7 +472,7 @@ async fn authenticated_epoch_probe_succeeds_without_creating_a_shard() {
     let server_shutdown = shutdown.clone();
     let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
     let client = SandboxRpcClient::new(
-        socket,
+        socket.clone(),
         4 * 1024,
         Duration::from_millis(200),
         nix::unistd::Uid::effective().as_raw(),
@@ -726,13 +726,14 @@ async fn stale_sandboxd_incarnation_is_rejected_before_any_backend_effect() {
     let server_shutdown = shutdown.clone();
     let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
     let client = SandboxRpcClient::new(
-        socket,
+        socket.clone(),
         4 * 1024,
         Duration::from_millis(200),
         nix::unistd::Uid::effective().as_raw(),
         SANDBOXD_EPOCH + 1,
     )
     .expect("client config is valid");
+    let spec = launch_spec(ShardId::new(), worker(), 9);
 
     assert!(matches!(
         client
@@ -740,7 +741,28 @@ async fn stale_sandboxd_incarnation_is_rejected_before_any_backend_effect() {
             .await,
         Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
     ));
+    assert!(matches!(
+        client
+            .cancel_or_kill_shard(&spec, CleanupReason::Administrative)
+            .await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
     assert!(observed_backend.events().is_empty());
+    let current_client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("current client config is valid");
+    assert_eq!(
+        current_client
+            .create_shard(spec, Duration::from_millis(80))
+            .await,
+        Ok(CreateShardOutcome::Created),
+        "a stale-incarnation cancel must not install a tombstone"
+    );
 
     shutdown.cancel();
     assert!(matches!(task.await, Ok(Ok(()))));
@@ -773,12 +795,32 @@ async fn exact_peer_binding_rejects_a_same_uid_request_for_another_worker() {
     .expect("client config is valid");
     let wrong_worker =
         WorkerId::new("worker-rpc-same-uid-impostor").expect("impostor worker ID should be valid");
+    let wrong_worker_shard = ShardId::new();
+    let wrong_epoch_shard = ShardId::new();
 
     assert!(matches!(
         client
             .create_shard(
-                launch_spec(ShardId::new(), wrong_worker, 9),
+                launch_spec(ShardId::new(), wrong_worker.clone(), 9),
                 Duration::from_millis(80),
+            )
+            .await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(matches!(
+        client
+            .cancel_or_kill_shard(
+                &launch_spec(wrong_worker_shard.clone(), wrong_worker, 9),
+                CleanupReason::Administrative,
+            )
+            .await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(matches!(
+        client
+            .cancel_or_kill_shard(
+                &launch_spec(wrong_epoch_shard.clone(), worker(), 8),
+                CleanupReason::Administrative,
             )
             .await,
         Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
@@ -786,6 +828,26 @@ async fn exact_peer_binding_rejects_a_same_uid_request_for_another_worker() {
     assert!(
         observed_backend.events().is_empty(),
         "an unauthorized same-UID request must be rejected before any backend effect"
+    );
+    assert_eq!(
+        client
+            .create_shard(
+                launch_spec(wrong_worker_shard, worker(), 9),
+                Duration::from_millis(80),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created),
+        "a rejected worker-bound cancel must not install a tombstone"
+    );
+    assert_eq!(
+        client
+            .create_shard(
+                launch_spec(wrong_epoch_shard, worker(), 9),
+                Duration::from_millis(80),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created),
+        "a rejected epoch-bound cancel must not install a tombstone"
     );
 
     shutdown.cancel();
@@ -865,6 +927,159 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
             .await,
         Ok(KillShardOutcome::Terminated(_))
     ));
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn rpc_cancel_before_create_installs_an_exact_tombstone_without_backend_effects() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let observed_backend = backend.clone();
+    let server = SandboxRpcServer::new(supervisor(backend), rpc_config());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        rpc_config().max_frame_bytes(),
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    let spec = launch_spec(ShardId::new(), worker(), 9);
+
+    assert_eq!(
+        client
+            .cancel_or_kill_shard(&spec, CleanupReason::Administrative)
+            .await,
+        Ok(KillShardOutcome::AlreadyTerminated)
+    );
+    assert_eq!(
+        client.create_shard(spec, Duration::from_millis(80)).await,
+        Ok(CreateShardOutcome::Cancelled)
+    );
+    assert!(
+        observed_backend.events().is_empty(),
+        "the exact pre-cancel tombstone must suppress provisioning across RPC"
+    );
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn rpc_cancel_during_provision_reconciles_to_a_terminal_cleanup_outcome() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let inner = RecordingBackend::default();
+    let observed_backend = inner.clone();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let backend = DelayedBackend {
+        inner,
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    };
+    let supervisor_config = SupervisorConfig::new(Duration::from_secs(3), Duration::from_secs(4))
+        .expect("lease ordering is valid");
+    let supervisor = Arc::new(SandboxSupervisor::new(supervisor_config, backend));
+    let server_config = SandboxRpcConfig::new(
+        4 * 1024,
+        4,
+        Duration::from_secs(3),
+        Duration::from_millis(5),
+        Some(nix::unistd::Uid::effective().as_raw()),
+    )
+    .expect("base RPC config is valid")
+    .with_daemon_epoch(SANDBOXD_EPOCH)
+    .expect("RPC config is valid");
+    let server = SandboxRpcServer::new(supervisor, server_config);
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_secs(3),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    let spec = launch_spec(ShardId::new(), worker(), 9);
+    let create = tokio::spawn({
+        let client = client.clone();
+        let spec = spec.clone();
+        async move {
+            client
+                .create_shard(spec, Duration::from_millis(2_500))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("provisioning must reach the backend within the test deadline");
+    let mut cancel = tokio::spawn({
+        let client = client.clone();
+        let spec = spec.clone();
+        async move {
+            client
+                .cancel_or_kill_shard(&spec, CleanupReason::Administrative)
+                .await
+        }
+    });
+
+    let unexpected = tokio::time::timeout(Duration::from_millis(1_500), async {
+        loop {
+            match client
+                .renew_owner_lease(
+                    spec.shard_id(),
+                    spec.worker_epoch(),
+                    spec.launch_generation(),
+                    Duration::from_millis(2_500),
+                )
+                .await
+            {
+                Err(SandboxRpcError::Remote {
+                    code: RpcFailureCode::ShardNotFound,
+                    ..
+                }) => break None,
+                Ok(()) => tokio::task::yield_now().await,
+                outcome => break Some(outcome),
+            }
+        }
+    })
+    .await
+    .expect("the RPC cancellation marker must become visible before provisioning completes");
+    assert!(
+        unexpected.is_none(),
+        "cancellation marker probe failed unexpectedly: {unexpected:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut cancel)
+            .await
+            .is_err(),
+        "the RPC cancel must remain pending before provisioning cleanup"
+    );
+    release.notify_one();
+
+    assert_eq!(
+        create.await.expect("create task should not panic"),
+        Ok(CreateShardOutcome::Cancelled)
+    );
+    assert!(matches!(
+        cancel.await.expect("cancel task should not panic"),
+        Ok(KillShardOutcome::Terminated(_)) | Ok(KillShardOutcome::AlreadyTerminated)
+    ));
+    assert_eq!(
+        observed_backend.events(),
+        ["provision", "revoke", "kill", "cleanup"]
+    );
 
     shutdown.cancel();
     assert!(matches!(task.await, Ok(Ok(()))));
