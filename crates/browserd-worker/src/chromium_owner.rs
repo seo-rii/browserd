@@ -392,13 +392,28 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
         if timeout.is_zero() {
             return Err(ShardRuntimeError::Rejected);
         }
-        self.thread.shutdown.cancel();
-        if self
-            .shutdown_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
         {
-            let _ = self.mailbox.begin_shutdown();
+            let mut join = self
+                .thread
+                .join
+                .lock()
+                .map_err(|_| ShardRuntimeError::Unavailable)?;
+            if let Some(result) = join.result {
+                return result;
+            }
+            self.thread.shutdown.cancel();
+            if self
+                .shutdown_started
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = self.mailbox.begin_shutdown();
+            }
+            if !self.accepted.load(Ordering::Acquire) && join.handle.is_none() {
+                join.result = Some(Ok(()));
+                self.thread.completion.send_replace(Some(Ok(())));
+                return Ok(());
+            }
         }
         let mut completion = self.thread.completion.subscribe();
         let thread_result = tokio::time::timeout(timeout, async {
@@ -438,54 +453,64 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
 #[async_trait]
 impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
     async fn accept_cdp_pipes(&self, pipes: ChromiumCdpPipes) -> Result<(), ShardRuntimeError> {
-        if self
-            .accepted
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(ShardRuntimeError::Rejected);
-        }
-
-        let expected = self.expected.clone();
-        let config = self.config.clone();
-        let command_capacity = config.transport.command_queue_capacity;
-        let ingress = self.ingress.clone();
-        let mailbox = Arc::downgrade(&self.mailbox);
-        let shard_fence = self.shard_fence.clone();
-        let shutdown = self.thread.shutdown.clone();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let completion = self.thread.completion.clone();
-        let thread = std::thread::Builder::new()
-            .name("browserd-chromium-owner".to_owned())
-            .spawn(move || {
-                let input = OwnerThreadInput {
-                    pipes,
-                    expected,
-                    config,
-                    command_capacity,
-                    ingress,
-                    mailbox,
-                    shard_fence,
-                    ready: ready_tx,
-                    shutdown,
-                };
-                let result = catch_unwind(AssertUnwindSafe(|| run_owner_thread(input)))
-                    .unwrap_or(Err(ShardRuntimeError::OutcomeUncertain));
-                completion.send_replace(Some(result));
-            });
-        let thread = match thread {
-            Ok(thread) => thread,
-            Err(_) => {
-                self.mailbox.mark_terminal();
-                self.ingress.fail_closed(TargetManagerEvent::TransportLost);
-                return Err(ShardRuntimeError::Unavailable);
+        let ready_rx = {
+            let mut join = self
+                .thread
+                .join
+                .lock()
+                .map_err(|_| ShardRuntimeError::Unavailable)?;
+            if self.shutdown_started.load(Ordering::Acquire) {
+                return Err(ShardRuntimeError::Rejected);
             }
+            if self
+                .accepted
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(ShardRuntimeError::Rejected);
+            }
+
+            let expected = self.expected.clone();
+            let config = self.config.clone();
+            let command_capacity = config.transport.command_queue_capacity;
+            let ingress = self.ingress.clone();
+            let mailbox = Arc::downgrade(&self.mailbox);
+            let shard_fence = self.shard_fence.clone();
+            let shutdown = self.thread.shutdown.clone();
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let completion = self.thread.completion.clone();
+            let failed_completion = completion.clone();
+            let thread = std::thread::Builder::new()
+                .name("browserd-chromium-owner".to_owned())
+                .spawn(move || {
+                    let input = OwnerThreadInput {
+                        pipes,
+                        expected,
+                        config,
+                        command_capacity,
+                        ingress,
+                        mailbox,
+                        shard_fence,
+                        ready: ready_tx,
+                        shutdown,
+                    };
+                    let result = catch_unwind(AssertUnwindSafe(|| run_owner_thread(input)))
+                        .unwrap_or(Err(ShardRuntimeError::OutcomeUncertain));
+                    completion.send_replace(Some(result));
+                });
+            let thread = match thread {
+                Ok(thread) => thread,
+                Err(_) => {
+                    self.mailbox.mark_terminal();
+                    self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                    join.result = Some(Err(ShardRuntimeError::Unavailable));
+                    failed_completion.send_replace(Some(Err(ShardRuntimeError::Unavailable)));
+                    return Err(ShardRuntimeError::Unavailable);
+                }
+            };
+            join.handle = Some(thread);
+            ready_rx
         };
-        self.thread
-            .join
-            .lock()
-            .map_err(|_| ShardRuntimeError::Unavailable)?
-            .handle = Some(thread);
         match ready_rx.await {
             Ok(result) => result,
             Err(_) => {
@@ -494,6 +519,17 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
                 Err(ShardRuntimeError::OutcomeUncertain)
             }
         }
+    }
+
+    async fn shutdown_cdp(&self) -> Result<(), ShardRuntimeError> {
+        let timeout = self
+            .config
+            .transport
+            .default_command_timeout
+            .checked_mul(4)
+            .unwrap_or(Duration::MAX)
+            .saturating_add(Duration::from_millis(100));
+        self.shutdown_and_join(timeout).await
     }
 }
 

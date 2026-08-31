@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -90,14 +91,29 @@ impl SandboxShardRpc for FakeRpc {
     }
 }
 
-struct Sink(Mutex<usize>);
+struct Sink {
+    accepts: Mutex<usize>,
+    shutdowns: AtomicUsize,
+}
 
 #[async_trait]
 impl CdpPipeAcceptor for Sink {
     async fn accept_cdp_pipes(&self, _pipes: ChromiumCdpPipes) -> Result<(), ShardRuntimeError> {
-        *self.0.lock().unwrap() += 1;
+        *self.accepts.lock().unwrap() += 1;
         Ok(())
     }
+
+    async fn shutdown_cdp(&self) -> Result<(), ShardRuntimeError> {
+        self.shutdowns.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+fn sink() -> Arc<Sink> {
+    Arc::new(Sink {
+        accepts: Mutex::new(0),
+        shutdowns: AtomicUsize::new(0),
+    })
 }
 
 struct Inner(Mutex<Vec<&'static str>>);
@@ -166,7 +182,7 @@ async fn sandbox_runtime_claims_cdp_before_inner_readiness_and_terminates_exact_
         calls: Mutex::new(Vec::new()),
         launch_generations: Mutex::new(Vec::new()),
     });
-    let sink = Arc::new(Sink(Mutex::new(0)));
+    let sink = sink();
     let inner = Arc::new(Inner(Mutex::new(Vec::new())));
     let runtime = ProductionSandboxShardRuntime::new(
         descriptor,
@@ -187,9 +203,10 @@ async fn sandbox_runtime_claims_cdp_before_inner_readiness_and_terminates_exact_
         *rpc.launch_generations.lock().unwrap(),
         vec![LaunchGeneration::new(3).unwrap()]
     );
-    assert_eq!(*sink.0.lock().unwrap(), 1);
+    assert_eq!(*sink.accepts.lock().unwrap(), 1);
     assert_eq!(*inner.0.lock().unwrap(), vec!["ready"]);
     assert_eq!(runtime.terminate(&fence).await, Ok(()));
+    assert_eq!(sink.shutdowns.load(Ordering::SeqCst), 1);
     assert_eq!(*rpc.calls.lock().unwrap(), vec!["create", "claim", "kill"]);
     assert_eq!(
         *rpc.launch_generations.lock().unwrap(),
@@ -211,7 +228,7 @@ async fn ready_sandbox_runtime_renews_the_exact_launch_lease() {
         descriptor,
         Duration::from_secs(20),
         Arc::clone(&rpc),
-        Arc::new(Sink(Mutex::new(0))),
+        sink(),
         Arc::new(Inner(Mutex::new(Vec::new()))),
     );
 
@@ -253,7 +270,7 @@ async fn stale_shard_fence_is_rejected_before_any_sandbox_rpc_effect() {
         descriptor,
         Duration::from_secs(20),
         rpc.clone(),
-        Arc::new(Sink(Mutex::new(0))),
+        sink(),
         Arc::new(Inner(Mutex::new(Vec::new()))),
     );
     let stale = ShardFence::new(

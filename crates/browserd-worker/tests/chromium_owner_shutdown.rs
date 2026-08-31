@@ -28,6 +28,72 @@ impl TargetManagerDrain for Drain {
     }
 }
 
+fn identity() -> ChromiumArtifactIdentity {
+    let digest = Sha256Digest::from_hex(&"00".repeat(32)).expect("test digest should be valid");
+    ChromiumArtifactIdentity {
+        binary_digest: digest,
+        product_version: "149.0.7827.55".to_owned(),
+        chromium_revision: "r1234567".to_owned(),
+        browser_protocol_schema_digest: digest,
+        js_protocol_schema_digest: digest,
+        launch_profile_digest: digest,
+        extension_bundle_digest: digest,
+        font_bundle_digest: digest,
+        certificate_runtime_bundle_digest: digest,
+    }
+}
+
+fn connection_config() -> ChromiumConnectionConfig {
+    ChromiumConnectionConfig {
+        transport: CdpTransportConfig {
+            max_frame_bytes: 64 * 1024,
+            max_pending_commands: 16,
+            command_queue_capacity: 16,
+            event_queue_capacity: 16,
+            write_timeout: Duration::from_millis(500),
+            default_command_timeout: Duration::from_millis(500),
+        },
+        version_probe_timeout: Duration::from_millis(500),
+        max_version_field_bytes: 1_024,
+    }
+}
+
+fn shard_fence() -> ShardFence {
+    ShardFence::new(
+        OwnerFence::new(
+            WorkerId::new("chromium-owner-shutdown-worker")
+                .expect("worker identity should be valid"),
+            WorkerEpoch::new(17).expect("worker epoch should be valid"),
+        ),
+        ShardId::new(),
+        LaunchGeneration::new(3).expect("launch generation should be valid"),
+    )
+}
+
+#[tokio::test]
+async fn shutdown_before_pipe_acceptance_is_immediate_and_idempotent() {
+    let drain = Arc::new(Drain(AtomicBool::new(false)));
+    let (owner, _manager) = ChromiumConnectionOwner::new_bounded(
+        identity(),
+        connection_config(),
+        shard_fence(),
+        16,
+        drain,
+    )
+    .expect("Chromium owner should be constructed");
+
+    let first = tokio::time::timeout(
+        Duration::from_millis(50),
+        owner.shutdown_and_join(Duration::from_millis(25)),
+    )
+    .await;
+    assert_eq!(first, Ok(Ok(())));
+    assert_eq!(
+        owner.shutdown_and_join(Duration::from_millis(25)).await,
+        Ok(())
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_shutdown_joins_the_owner_thread_once_for_concurrent_callers() {
     let baseline_owner_threads = std::fs::read_dir("/proc/self/task")
@@ -39,39 +105,9 @@ async fn explicit_shutdown_joins_the_owner_thread_once_for_concurrent_callers() 
         })
         .count();
 
-    let digest = Sha256Digest::from_hex(&"00".repeat(32)).expect("test digest should be valid");
-    let identity = ChromiumArtifactIdentity {
-        binary_digest: digest,
-        product_version: "149.0.7827.55".to_owned(),
-        chromium_revision: "r1234567".to_owned(),
-        browser_protocol_schema_digest: digest,
-        js_protocol_schema_digest: digest,
-        launch_profile_digest: digest,
-        extension_bundle_digest: digest,
-        font_bundle_digest: digest,
-        certificate_runtime_bundle_digest: digest,
-    };
-    let connection_config = ChromiumConnectionConfig {
-        transport: CdpTransportConfig {
-            max_frame_bytes: 64 * 1024,
-            max_pending_commands: 16,
-            command_queue_capacity: 16,
-            event_queue_capacity: 16,
-            write_timeout: Duration::from_millis(500),
-            default_command_timeout: Duration::from_millis(500),
-        },
-        version_probe_timeout: Duration::from_millis(500),
-        max_version_field_bytes: 1_024,
-    };
-    let shard_fence = ShardFence::new(
-        OwnerFence::new(
-            WorkerId::new("chromium-owner-shutdown-worker")
-                .expect("worker identity should be valid"),
-            WorkerEpoch::new(17).expect("worker epoch should be valid"),
-        ),
-        ShardId::new(),
-        LaunchGeneration::new(3).expect("launch generation should be valid"),
-    );
+    let identity = identity();
+    let connection_config = connection_config();
+    let shard_fence = shard_fence();
     let drain = Arc::new(Drain(AtomicBool::new(false)));
     let (owner, _manager) =
         ChromiumConnectionOwner::new_bounded(identity, connection_config, shard_fence, 16, drain)

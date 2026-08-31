@@ -176,6 +176,9 @@ pub trait CdpPipeAcceptor: Send + Sync + 'static {
     /// Takes exclusive ownership of both capability FDs. Returning success means the exact
     /// Chromium transport has accepted them; they must never be reused.
     async fn accept_cdp_pipes(&self, pipes: ChromiumCdpPipes) -> Result<(), ShardRuntimeError>;
+
+    /// Cancels and joins every execution owner created after accepting the CDP capabilities.
+    async fn shutdown_cdp(&self) -> Result<(), ShardRuntimeError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -373,14 +376,15 @@ where
             return Ok(());
         }
         let inner = self.inner.terminate(fence).await;
+        let cdp = self.cdp.shutdown_cdp().await;
         let cleanup = self.cleanup_shard(CleanupReason::WorkerLeaseExpired).await;
         *state = ProvisionState::Terminated;
-        match (inner, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(ShardRuntimeError::OutcomeUncertain), _) | (_, Err(_)) => {
-                Err(ShardRuntimeError::OutcomeUncertain)
-            }
-            (Err(error), Ok(())) => Err(error),
+        match (inner, cdp, cleanup) {
+            (Ok(()), Ok(()), Ok(())) => Ok(()),
+            (Err(ShardRuntimeError::OutcomeUncertain), _, _)
+            | (_, Err(ShardRuntimeError::OutcomeUncertain), _)
+            | (_, _, Err(_)) => Err(ShardRuntimeError::OutcomeUncertain),
+            (Err(error), _, Ok(())) | (_, Err(error), Ok(())) => Err(error),
         }
     }
 }
