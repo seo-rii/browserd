@@ -829,6 +829,7 @@ struct SessionState {
     action_queue: VecDeque<ActionId>,
     artifacts: HashMap<ArtifactId, ArtifactRecord>,
     artifact_committed_bytes: u64,
+    artifact_reserved_bytes: u64,
     approvals: HashMap<ApprovalId, ApprovalRecord>,
     action_ledger: ActionLedger<FileActionJournal>,
     durability_degraded: bool,
@@ -1224,6 +1225,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     action_queue: VecDeque::new(),
                     artifacts: HashMap::new(),
                     artifact_committed_bytes: 0,
+                    artifact_reserved_bytes: 0,
                     approvals: HashMap::new(),
                     action_ledger,
                     durability_degraded: false,
@@ -2903,10 +2905,6 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     ) -> Result<ArtifactId, WorkerError> {
         self.authorize(peer)?;
         let executor = self.session(session_id)?;
-        let _cleanup_owner = executor
-            .cleanup_owner
-            .lock()
-            .map_err(|_| WorkerError::StateUnavailable)?;
         let size_bytes =
             u64::try_from(upload.bytes.len()).map_err(|_| WorkerError::CapacityExceeded)?;
         if size_bytes > self.config.artifact_limits.max_file_bytes
@@ -2929,81 +2927,116 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .lock()
                 .map_err(|_| WorkerError::StateUnavailable)?;
             validate_fence(&session, fence)?;
-            let projected_committed = session
-                .artifact_committed_bytes
+            let projected_reserved = session
+                .artifact_reserved_bytes
                 .checked_add(size_bytes)
                 .ok_or(WorkerError::CapacityExceeded)?;
-            if projected_committed > self.config.artifact_limits.max_committed_bytes {
+            let projected_total = session
+                .artifact_committed_bytes
+                .checked_add(projected_reserved)
+                .ok_or(WorkerError::CapacityExceeded)?;
+            if projected_reserved > self.config.artifact_limits.max_in_flight_bytes
+                || projected_total > self.config.artifact_limits.max_committed_bytes
+            {
                 return Err(WorkerError::CapacityExceeded);
             }
             session
                 .machine
                 .record_activity(fence, now)
                 .map_err(map_session_error)?;
+            session.artifact_reserved_bytes = projected_reserved;
             session.tenant_id.clone()
         };
-        let artifact_id = ArtifactId::new();
-        let request = ArtifactStoreRequest::new(
-            tenant_id,
-            session_id.clone(),
-            artifact_id.clone(),
-            fence.clone(),
-            upload.bytes,
-            upload.content_type,
-            self.config.artifact_limits.max_file_bytes,
-        )?;
-        let key = request.key().clone();
-        let receipt = self
-            .sandbox
-            .store_artifact(&request)
+        let result = (|| {
+            let _cleanup_owner = executor
+                .cleanup_owner
+                .lock()
+                .map_err(|_| WorkerError::StateUnavailable)?;
+            {
+                let mut session = executor
+                    .state
+                    .lock()
+                    .map_err(|_| WorkerError::StateUnavailable)?;
+                validate_fence(&session, fence)?;
+                session
+                    .machine
+                    .record_activity(fence, now)
+                    .map_err(map_session_error)?;
+            }
+            let artifact_id = ArtifactId::new();
+            let request = ArtifactStoreRequest::new(
+                tenant_id,
+                session_id.clone(),
+                artifact_id.clone(),
+                fence.clone(),
+                upload.bytes,
+                upload.content_type,
+                self.config.artifact_limits.max_file_bytes,
+            )?;
+            let key = request.key().clone();
+            let receipt = self
+                .sandbox
+                .store_artifact(&request)
+                .map_err(|_| WorkerError::DependencyUnavailable)?;
+            if receipt.key() != &key
+                || receipt.size_bytes() != size_bytes
+                || receipt.checksum() != &checksum
+            {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            let metadata = ArtifactContentMetadata::new(
+                receipt.size_bytes(),
+                *receipt.checksum(),
+                receipt.detected_content_type(),
+                ArtifactContentSource::ClientUpload,
+                "browserd-worker-upload",
+            )
             .map_err(|_| WorkerError::DependencyUnavailable)?;
-        if receipt.key() != &key
-            || receipt.size_bytes() != size_bytes
-            || receipt.checksum() != &checksum
-        {
-            return Err(WorkerError::DependencyUnavailable);
-        }
-        let metadata = ArtifactContentMetadata::new(
-            receipt.size_bytes(),
-            *receipt.checksum(),
-            receipt.detected_content_type(),
-            ArtifactContentSource::ClientUpload,
-            "browserd-worker-upload",
-        )
-        .map_err(|_| WorkerError::DependencyUnavailable)?;
-        let mut artifact = Artifact::new_upload(key);
-        artifact
-            .apply_materialized(ArtifactEvent::UploadStored, metadata)
-            .and_then(|_| artifact.apply(ArtifactEvent::ScanStarted))
-            .and_then(|_| {
-                artifact.apply(match receipt.scan_verdict() {
-                    ArtifactScanVerdict::Clean => ArtifactEvent::ScanPassed,
-                    ArtifactScanVerdict::Quarantined => ArtifactEvent::ScanQuarantined,
-                    ArtifactScanVerdict::Rejected => ArtifactEvent::ScanRejected,
+            let mut artifact = Artifact::new_upload(key);
+            artifact
+                .apply_materialized(ArtifactEvent::UploadStored, metadata)
+                .and_then(|_| artifact.apply(ArtifactEvent::ScanStarted))
+                .and_then(|_| {
+                    artifact.apply(match receipt.scan_verdict() {
+                        ArtifactScanVerdict::Clean => ArtifactEvent::ScanPassed,
+                        ArtifactScanVerdict::Quarantined => ArtifactEvent::ScanQuarantined,
+                        ArtifactScanVerdict::Rejected => ArtifactEvent::ScanRejected,
+                    })
                 })
-            })
-            .map_err(|_| WorkerError::DependencyUnavailable)?;
-        let mut session = executor
-            .state
-            .lock()
-            .map_err(|_| WorkerError::StateUnavailable)?;
-        validate_fence(&session, fence)?;
-        let projected_committed = session
-            .artifact_committed_bytes
-            .checked_add(size_bytes)
-            .ok_or(WorkerError::CapacityExceeded)?;
-        if projected_committed > self.config.artifact_limits.max_committed_bytes {
-            return Err(WorkerError::CapacityExceeded);
+                .map_err(|_| WorkerError::DependencyUnavailable)?;
+            let mut session = executor
+                .state
+                .lock()
+                .map_err(|_| WorkerError::StateUnavailable)?;
+            validate_fence(&session, fence)?;
+            let projected_committed = session
+                .artifact_committed_bytes
+                .checked_add(size_bytes)
+                .ok_or(WorkerError::StateUnavailable)?;
+            let remaining_reserved = session
+                .artifact_reserved_bytes
+                .checked_sub(size_bytes)
+                .ok_or(WorkerError::StateUnavailable)?;
+            session.artifact_reserved_bytes = remaining_reserved;
+            session.artifact_committed_bytes = projected_committed;
+            session.artifacts.insert(
+                artifact_id.clone(),
+                ArtifactRecord {
+                    artifact,
+                    object_generation: receipt.object_generation(),
+                },
+            );
+            Ok(artifact_id)
+        })();
+        if result.is_err() {
+            let mut session = match executor.state.lock() {
+                Ok(session) => session,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            session.artifact_reserved_bytes =
+                session.artifact_reserved_bytes.saturating_sub(size_bytes);
         }
-        session.artifact_committed_bytes = projected_committed;
-        session.artifacts.insert(
-            artifact_id.clone(),
-            ArtifactRecord {
-                artifact,
-                object_generation: receipt.object_generation(),
-            },
-        );
-        Ok(artifact_id)
+        result
     }
 
     pub fn get_artifact(

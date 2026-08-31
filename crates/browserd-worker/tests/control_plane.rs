@@ -1328,6 +1328,77 @@ fn artifact_without_clean_scan_receipt_is_never_available() {
 }
 
 #[test]
+fn concurrent_artifact_quota_is_reserved_before_storage_completes() {
+    let Some(limits) = WorkerArtifactLimits::new(4, 5, 4).ok() else {
+        return;
+    };
+    let Some((worker, peer, _driver, sandbox)) = ready_worker_with_artifact_limits(limits) else {
+        return;
+    };
+    let worker = Arc::new(worker);
+    let Some(created) = create_ready_session(&worker, &peer, "artifact-concurrent-quota") else {
+        return;
+    };
+    let storage_started = Arc::new(Barrier::new(2));
+    let release_storage = Arc::new(Barrier::new(2));
+    let Ok(mut artifact_barriers) = sandbox.artifact_barriers.lock() else {
+        return;
+    };
+    *artifact_barriers = Some((Arc::clone(&storage_started), Arc::clone(&release_storage)));
+    drop(artifact_barriers);
+
+    let first_worker = Arc::clone(&worker);
+    let first_peer = peer.clone();
+    let first_session_id = created.session_id.clone();
+    let first_fence = created.fence.clone();
+    let first_handle = thread::spawn(move || {
+        first_worker.upload_artifact(
+            &first_peer,
+            &first_session_id,
+            &first_fence,
+            ArtifactUpload {
+                bytes: vec![1, 2, 3],
+                content_type: "application/octet-stream".to_owned(),
+            },
+            SessionTime::new(1),
+        )
+    });
+    storage_started.wait();
+
+    let second_worker = Arc::clone(&worker);
+    let second_peer = peer.clone();
+    let second_session_id = created.session_id.clone();
+    let second_fence = created.fence.clone();
+    let (second_tx, second_rx) = std::sync::mpsc::channel();
+    let second_handle = thread::spawn(move || {
+        let result = second_worker.upload_artifact(
+            &second_peer,
+            &second_session_id,
+            &second_fence,
+            ArtifactUpload {
+                bytes: vec![4, 5, 6],
+                content_type: "application/octet-stream".to_owned(),
+            },
+            SessionTime::new(2),
+        );
+        let _ = second_tx.send(result);
+    });
+    let second_before_release = second_rx.recv_timeout(Duration::from_millis(100)).ok();
+    let stores_before_release = sandbox.artifact_store_count.load(Ordering::SeqCst);
+
+    release_storage.wait();
+    assert!(first_handle.join().is_ok_and(|result| result.is_ok()));
+    assert!(second_handle.join().is_ok());
+    assert_eq!(
+        second_before_release,
+        Some(Err(WorkerError::CapacityExceeded)),
+        "concurrent quota loser must be rejected while the reserved upload is still in storage"
+    );
+    assert_eq!(stores_before_release, 1);
+    assert_eq!(sandbox.artifact_store_count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn artifact_file_and_committed_quotas_reject_before_storage() {
     let Some(file_limits) = WorkerArtifactLimits::new(2, 8, 4).ok() else {
         return;
