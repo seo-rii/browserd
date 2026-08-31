@@ -171,6 +171,7 @@ pub enum RpcFailureCode {
     InvalidEgressPolicyBinding,
     LaunchFenceMismatch,
     LaunchBindingMismatch,
+    ChromiumBinaryDigestMismatch,
     MissingCapability,
     AdmissionClosed,
     OwnershipMismatch,
@@ -201,6 +202,9 @@ impl From<SandboxError> for RpcFailure {
             SandboxError::LaunchFenceMismatch => RpcFailureCode::LaunchFenceMismatch,
             SandboxError::LaunchGenerationMismatch => RpcFailureCode::LaunchFenceMismatch,
             SandboxError::LaunchBindingMismatch => RpcFailureCode::LaunchBindingMismatch,
+            SandboxError::ChromiumBinaryDigestMismatch => {
+                RpcFailureCode::ChromiumBinaryDigestMismatch
+            }
             SandboxError::MissingCapability { .. } => RpcFailureCode::MissingCapability,
             SandboxError::AdmissionClosed => RpcFailureCode::AdmissionClosed,
             SandboxError::OwnershipMismatch => RpcFailureCode::OwnershipMismatch,

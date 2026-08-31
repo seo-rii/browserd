@@ -2100,6 +2100,8 @@ pub enum SandboxError {
     LaunchFenceMismatch,
     #[error("launch immutable binding conflicts with the existing shard")]
     LaunchBindingMismatch,
+    #[error("launch spec Chromium binary digest does not match the pinned executable")]
+    ChromiumBinaryDigestMismatch,
     #[error("production sandbox capability is missing: {name}")]
     MissingCapability { name: &'static str },
     #[error("launch spec and owner lease do not identify the same worker epoch")]

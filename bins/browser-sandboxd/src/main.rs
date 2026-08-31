@@ -15,8 +15,8 @@ use browser_sandboxd::{
 };
 use browserd_core::WorkerId;
 use browserd_sandbox::{
-    CgroupLimits, ChromiumRuntime, FilePreparedShardJournal, LaunchGateRuntime,
-    LinuxSandboxBackend, LinuxSandboxConfig, PreparedShardJournalLimits,
+    CgroupLimits, ChromiumBinaryDigest, ChromiumRuntime, FilePreparedShardJournal,
+    LaunchGateRuntime, LinuxSandboxBackend, LinuxSandboxConfig, PreparedShardJournalLimits,
     PreparedShardRecoveryRoots, ReadOnlyMount, SandboxRpcConfig, SandboxRpcPeerBinding,
     SandboxRpcServer, SandboxSupervisor, StartupPreparedShardReconciler, StdLinuxProcessBackend,
     StdSandboxFilesystem, SupervisorConfig,
@@ -96,10 +96,15 @@ impl Config {
         let mounts: Vec<MountWire> =
             serde_json::from_str(&required("BROWSERD_SANDBOX_READ_ONLY_MOUNTS_JSON")?)
                 .context("BROWSERD_SANDBOX_READ_ONLY_MOUNTS_JSON is invalid")?;
-        let chromium = ChromiumRuntime::new(
+        let chromium_digest =
+            ChromiumBinaryDigest::from_hex(&required("BROWSERD_CHROMIUM_BINARY_SHA256")?)
+                .context("BROWSERD_CHROMIUM_BINARY_SHA256 is invalid")?;
+        let chromium = ChromiumRuntime::from_path(
             required_path("BROWSERD_CHROMIUM_HOST_EXECUTABLE")?,
             required_path("BROWSERD_CHROMIUM_SANDBOX_EXECUTABLE")?,
-        );
+            chromium_digest,
+        )
+        .context("BROWSERD_CHROMIUM_HOST_EXECUTABLE could not be pinned")?;
         let launch_gate = LaunchGateRuntime::new(
             required_path("BROWSERD_LAUNCH_GATE_HOST_EXECUTABLE")?,
             required_path("BROWSERD_LAUNCH_GATE_SANDBOX_EXECUTABLE")?,

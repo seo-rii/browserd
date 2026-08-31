@@ -11,12 +11,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use browserd_core::{EgressFence, LeaseId, ShardFence, ShardId, TenantId};
 use browserd_launch_gate::APPROVAL_FRAME;
-use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl, open, openat};
+use nix::errno::Errno;
+use nix::fcntl::{
+    FcntlArg, FdFlag, OFlag, OpenHow, ResolveFlag, SealFlag, fcntl, open, openat, openat2,
+};
+use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::sys::signal::Signal;
-use nix::sys::stat::{Mode, fstat};
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
 use nix::sys::statfs::fstatfs;
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 use nix::unistd::{pipe2, write as write_fd};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
@@ -43,6 +48,11 @@ const PREPARED_CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PREPARED_CHILD_EXIT_POLL: Duration = Duration::from_millis(5);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const NSFS_MAGIC: u64 = 0x6e73_6673;
+const MAX_CHROMIUM_EXECUTABLE_BYTES: usize = 1024 * 1024 * 1024;
+const CHROMIUM_EXECUTABLE_SEALS: SealFlag = SealFlag::F_SEAL_WRITE
+    .union(SealFlag::F_SEAL_GROW)
+    .union(SealFlag::F_SEAL_SHRINK)
+    .union(SealFlag::F_SEAL_SEAL);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CgroupLimits {
@@ -80,22 +90,198 @@ impl CgroupLimits {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
+struct SealedChromiumExecutable {
+    file: fs::File,
+    digest: crate::ChromiumBinaryDigest,
+}
+
+#[derive(Clone, Debug)]
 pub struct ChromiumRuntime {
-    host_executable: PathBuf,
+    executable: Arc<SealedChromiumExecutable>,
+    source_path: Option<PathBuf>,
     sandbox_executable: PathBuf,
 }
 
 impl ChromiumRuntime {
-    #[must_use]
-    pub fn new(
+    pub fn from_path(
         host_executable: impl Into<PathBuf>,
         sandbox_executable: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            host_executable: host_executable.into(),
-            sandbox_executable: sandbox_executable.into(),
+        expected_digest: crate::ChromiumBinaryDigest,
+    ) -> Result<Self, SandboxError> {
+        let host_executable = host_executable.into();
+        validate_absolute_path(&host_executable)?;
+        let relative_executable = host_executable
+            .strip_prefix(Path::new("/"))
+            .map_err(|_| SandboxError::Backend("unsafe Chromium executable path".into()))?;
+        let filesystem_root = open(
+            Path::new("/"),
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Backend(format!("open filesystem root: {error}")))?;
+        let source = openat2(
+            &filesystem_root,
+            relative_executable,
+            OpenHow::new()
+                .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
+                .resolve(
+                    ResolveFlag::RESOLVE_BENEATH
+                        | ResolveFlag::RESOLVE_NO_MAGICLINKS
+                        | ResolveFlag::RESOLVE_NO_SYMLINKS,
+                ),
+        )
+        .map_err(|error| {
+            SandboxError::Backend(format!("securely open Chromium executable: {error}"))
+        })?;
+        let metadata = fstat(&source).map_err(|error| {
+            SandboxError::Backend(format!("inspect Chromium executable: {error}"))
+        })?;
+        if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFREG)
+            || metadata.st_mode & 0o111 == 0
+            || metadata.st_size <= 0
+            || usize::try_from(metadata.st_size)
+                .ok()
+                .is_none_or(|size| size > MAX_CHROMIUM_EXECUTABLE_BYTES)
+        {
+            return Err(SandboxError::Backend(
+                "Chromium executable must be a nonempty bounded regular executable".into(),
+            ));
         }
+        Self::pin(
+            fs::File::from(source),
+            Some(host_executable),
+            sandbox_executable,
+            expected_digest,
+        )
+    }
+
+    pub fn from_bytes(
+        bytes: &[u8],
+        sandbox_executable: impl Into<PathBuf>,
+        expected_digest: crate::ChromiumBinaryDigest,
+    ) -> Result<Self, SandboxError> {
+        Self::pin(bytes, None, sandbox_executable, expected_digest)
+    }
+
+    fn pin(
+        mut source: impl Read,
+        source_path: Option<PathBuf>,
+        sandbox_executable: impl Into<PathBuf>,
+        expected_digest: crate::ChromiumBinaryDigest,
+    ) -> Result<Self, SandboxError> {
+        let base_flags = MFdFlags::MFD_CLOEXEC | MFdFlags::MFD_ALLOW_SEALING;
+        let executable_flags = base_flags | MFdFlags::from_bits_retain(nix::libc::MFD_EXEC);
+        let descriptor = match memfd_create("browserd-chromium", executable_flags) {
+            Ok(descriptor) => descriptor,
+            Err(Errno::EINVAL) => {
+                memfd_create("browserd-chromium", base_flags).map_err(|error| {
+                    SandboxError::Backend(format!("create Chromium memfd: {error}"))
+                })?
+            }
+            Err(error) => {
+                return Err(SandboxError::Backend(format!(
+                    "create executable Chromium memfd: {error}"
+                )));
+            }
+        };
+        let mut executable = fs::File::from(descriptor);
+        let mut hasher = Sha256::new();
+        let mut total = 0_usize;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source.read(&mut buffer).map_err(|error| {
+                SandboxError::Backend(format!("read Chromium executable: {error}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read)
+                .ok_or_else(|| SandboxError::Backend("Chromium executable size overflow".into()))?;
+            if total > MAX_CHROMIUM_EXECUTABLE_BYTES {
+                return Err(SandboxError::Backend(
+                    "Chromium executable exceeds its size bound".into(),
+                ));
+            }
+            executable.write_all(&buffer[..read]).map_err(|error| {
+                SandboxError::Backend(format!("copy Chromium executable: {error}"))
+            })?;
+            hasher.update(&buffer[..read]);
+        }
+        if total == 0 {
+            return Err(SandboxError::Backend(
+                "Chromium executable must not be empty".into(),
+            ));
+        }
+        let actual_digest = crate::ChromiumBinaryDigest::new(hasher.finalize().into());
+        if actual_digest != expected_digest {
+            return Err(SandboxError::ChromiumBinaryDigestMismatch);
+        }
+        fchmod(&executable, Mode::from_bits_truncate(0o555)).map_err(|error| {
+            SandboxError::Backend(format!("make pinned Chromium executable: {error}"))
+        })?;
+        fcntl(
+            &executable,
+            FcntlArg::F_ADD_SEALS(CHROMIUM_EXECUTABLE_SEALS),
+        )
+        .map_err(|error| SandboxError::Backend(format!("seal Chromium executable: {error}")))?;
+        let seals = fcntl(&executable, FcntlArg::F_GET_SEALS)
+            .map(SealFlag::from_bits_truncate)
+            .map_err(|error| {
+                SandboxError::Backend(format!("verify Chromium executable seals: {error}"))
+            })?;
+        if !seals.contains(CHROMIUM_EXECUTABLE_SEALS) {
+            return Err(SandboxError::Backend(
+                "Chromium executable seals are incomplete".into(),
+            ));
+        }
+        Ok(Self {
+            executable: Arc::new(SealedChromiumExecutable {
+                file: executable,
+                digest: expected_digest,
+            }),
+            source_path,
+            sandbox_executable: sandbox_executable.into(),
+        })
+    }
+
+    fn launch_executable(&self, forbidden_fd: i32) -> Result<fs::File, SandboxError> {
+        let descriptor_path = PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            self.executable.file.as_raw_fd()
+        ));
+        let mut descriptor = fs::File::from(
+            open(
+                &descriptor_path,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| {
+                SandboxError::Backend(format!("duplicate pinned Chromium executable: {error}"))
+            })?,
+        );
+        let mut held_descriptors = Vec::new();
+        while [CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, forbidden_fd]
+            .contains(&descriptor.as_raw_fd())
+        {
+            let duplicate = fcntl(&descriptor, FcntlArg::F_DUPFD_CLOEXEC(5)).map_err(|error| {
+                SandboxError::Backend(format!("relocate Chromium executable descriptor: {error}"))
+            })?;
+            // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor on success.
+            let replacement = unsafe { fs::File::from_raw_fd(duplicate) };
+            held_descriptors.push(descriptor);
+            descriptor = replacement;
+        }
+        descriptor.seek(SeekFrom::Start(0)).map_err(|error| {
+            SandboxError::Backend(format!("rewind Chromium executable descriptor: {error}"))
+        })?;
+        Ok(descriptor)
+    }
+
+    #[must_use]
+    pub fn binary_digest(&self) -> crate::ChromiumBinaryDigest {
+        self.executable.digest
     }
 }
 
@@ -171,7 +357,6 @@ impl LinuxSandboxConfig {
         validate_absolute_path(&cgroup_root)?;
         validate_absolute_path(&sandbox_root)?;
         validate_absolute_path(&bwrap_executable)?;
-        validate_absolute_path(&chromium.host_executable)?;
         validate_absolute_path(&chromium.sandbox_executable)?;
         validate_absolute_path(&launch_gate.host_executable)?;
         validate_absolute_path(&launch_gate.sandbox_executable)?;
@@ -200,7 +385,10 @@ impl LinuxSandboxConfig {
             || launch_gate.host_executable.starts_with(&cgroup_root)
             || launch_gate.host_executable.starts_with(&sandbox_root)
             || launch_gate.host_executable == bwrap_executable
-            || launch_gate.host_executable == chromium.host_executable
+            || chromium
+                .source_path
+                .as_ref()
+                .is_some_and(|source_path| launch_gate.host_executable == *source_path)
             || ["/proc", "/dev", "/sys", "/tmp", "/profile"]
                 .into_iter()
                 .any(|protected| launch_gate.sandbox_executable.starts_with(protected))
@@ -239,6 +427,13 @@ impl LinuxSandboxConfig {
             {
                 return Err(SandboxError::Backend(
                     "runtime mount overlaps launch gate".into(),
+                ));
+            }
+            if mount.destination.starts_with(&chromium.sandbox_executable)
+                || chromium.sandbox_executable.starts_with(&mount.destination)
+            {
+                return Err(SandboxError::Backend(
+                    "runtime mount overlaps Chromium executable".into(),
                 ));
             }
         }
@@ -707,11 +902,13 @@ impl ChromiumCdpPipes {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct SpawnRequest {
     program: PathBuf,
     arguments: Vec<OsString>,
     inherited_fds: Vec<i32>,
+    child_only_inherited_fds: Vec<i32>,
+    chromium_executable: fs::File,
     cgroup_procs_path: PathBuf,
 }
 
@@ -729,8 +926,13 @@ impl SpawnRequest {
     #[must_use]
     pub fn inherited_fds(&self) -> &[i32] {
         // The process backend creates and maps per-launch CDP pipe ends to child FDs 3/4.
-        // Only caller-supplied descriptors, such as the seccomp program, are listed here.
+        // Caller-supplied descriptors and the per-launch sealed Chromium capability are listed.
         &self.inherited_fds
+    }
+
+    #[must_use]
+    pub fn chromium_executable_fd(&self) -> BorrowedFd<'_> {
+        self.chromium_executable.as_fd()
     }
 
     #[must_use]
@@ -1117,17 +1319,19 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         backend_token: &str,
         request: &SpawnRequest,
     ) -> Result<PreparedLinuxChild, SandboxError> {
-        for descriptor in request.inherited_fds() {
+        for raw_descriptor in request.inherited_fds() {
             // SAFETY: this only borrows the caller-owned descriptor for the duration of fcntl.
-            let descriptor = unsafe { BorrowedFd::borrow_raw(*descriptor) };
+            let descriptor = unsafe { BorrowedFd::borrow_raw(*raw_descriptor) };
             let flags = fcntl(descriptor, FcntlArg::F_GETFD).map_err(|error| {
                 SandboxError::Backend(format!(
                     "required inherited descriptor is not open: {error}"
                 ))
             })?;
-            if FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC) {
+            let close_on_exec = FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC);
+            let child_only = request.child_only_inherited_fds.contains(raw_descriptor);
+            if close_on_exec != child_only {
                 return Err(SandboxError::Backend(
-                    "required inherited descriptor is not inheritable across exec".into(),
+                    "required inherited descriptor has unsafe close-on-exec state".into(),
                 ));
             }
         }
@@ -1193,15 +1397,14 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             .map_err(|error| SandboxError::Backend(format!("execution gate: {error}")))?;
         let (info_read, info_write) = pipe2(OFlag::O_CLOEXEC)
             .map_err(|error| SandboxError::Backend(format!("sandbox PID pipe: {error}")))?;
-        fcntl(&info_write, FcntlArg::F_SETFD(FdFlag::empty())).map_err(|error| {
-            SandboxError::Backend(format!("sandbox bootstrap descriptor: {error}"))
-        })?;
         let mut command = Command::new(request.program());
         let cgroup_procs_fd = cgroup_procs.as_raw_fd();
         let cdp_command_reader_fd = cdp_command_reader.as_raw_fd();
         let cdp_event_writer_fd = cdp_event_writer.as_raw_fd();
+        let mut child_only_inherited_fds = request.child_only_inherited_fds.clone();
+        child_only_inherited_fds.push(info_write.as_raw_fd());
         // SAFETY: this callback runs after fork and before exec. It performs only one libc write
-        // through a descriptor opened by the parent, followed by async-signal-safe dup2 calls.
+        // through a descriptor opened by the parent, followed by async-signal-safe fcntl/dup2 calls.
         // Writing 0 attaches the calling bootstrap itself, so the supervisor never resolves a
         // reusable numeric PID. The CDP sources were relocated away from targets 3/4 in the parent,
         // preventing either dup2 from clobbering the other source.
@@ -1220,6 +1423,20 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                     return Err(std::io::Error::other(
                         "sandbox cgroup attachment was incomplete",
                     ));
+                }
+                for descriptor in &child_only_inherited_fds {
+                    let flags = nix::libc::fcntl(*descriptor, nix::libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if nix::libc::fcntl(
+                        *descriptor,
+                        nix::libc::F_SETFD,
+                        flags & !nix::libc::FD_CLOEXEC,
+                    ) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 if nix::libc::dup2(cdp_command_reader_fd, CHROMIUM_CDP_READ_FD)
                     != CHROMIUM_CDP_READ_FD
@@ -2391,7 +2608,6 @@ where
         }
         for executable in [
             &self.config.bwrap_executable,
-            &self.config.chromium.host_executable,
             &self.config.launch_gate.host_executable,
         ] {
             if !self.filesystem.is_file(executable)?
@@ -2840,11 +3056,24 @@ where
         )
     }
 
-    #[must_use]
-    pub fn planned_spawn_request(&self, spec: &LaunchSpec) -> SpawnRequest {
+    fn validate_chromium_binding(&self, spec: &LaunchSpec) -> Result<(), SandboxError> {
+        if spec.chromium_binary_digest() == self.config.chromium.binary_digest() {
+            Ok(())
+        } else {
+            Err(SandboxError::ChromiumBinaryDigestMismatch)
+        }
+    }
+
+    pub fn planned_spawn_request(&self, spec: &LaunchSpec) -> Result<SpawnRequest, SandboxError> {
+        self.validate_chromium_binding(spec)?;
         let instance_directory = Self::instance_directory_name(spec);
         let runtime_path = self.config.sandbox_root.join(&instance_directory);
         let profile_path = runtime_path.join("profile");
+        let chromium_executable = self
+            .config
+            .chromium
+            .launch_executable(self.config.seccomp_fd)?;
+        let chromium_executable_fd = chromium_executable.as_raw_fd();
         let mut arguments = [
             "--die-with-parent",
             "--new-session",
@@ -2878,12 +3107,10 @@ where
         arguments.push(profile_path.into_os_string());
         arguments.push(OsString::from("/profile"));
         arguments.extend([
-            OsString::from("--ro-bind"),
-            self.config
-                .chromium
-                .host_executable
-                .clone()
-                .into_os_string(),
+            OsString::from("--perms"),
+            OsString::from("0555"),
+            OsString::from("--ro-bind-data"),
+            OsString::from(chromium_executable_fd.to_string()),
             self.config
                 .chromium
                 .sandbox_executable
@@ -2931,16 +3158,18 @@ where
             OsString::from("--user-data-dir=/profile"),
             OsString::from("--disable-features=BackForwardCache"),
         ]);
-        SpawnRequest {
+        Ok(SpawnRequest {
             program: self.config.bwrap_executable.clone(),
             arguments,
-            inherited_fds: vec![self.config.seccomp_fd],
+            inherited_fds: vec![self.config.seccomp_fd, chromium_executable_fd],
+            child_only_inherited_fds: vec![chromium_executable_fd],
+            chromium_executable,
             cgroup_procs_path: self
                 .config
                 .cgroup_root
                 .join(instance_directory)
                 .join("cgroup.procs"),
-        }
+        })
     }
 }
 
@@ -3065,6 +3294,7 @@ where
     }
 
     async fn provision_gated(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
+        self.validate_chromium_binding(spec)?;
         let instance_directory = Self::instance_directory_name(spec);
         let cgroup_path = self.config.cgroup_root.join(&instance_directory);
         let runtime_path = self.config.sandbox_root.join(instance_directory);
@@ -3248,9 +3478,10 @@ where
             self.update_provision(spec.shard_id(), &backend_token, |provision| {
                 provision.child_may_exist = true;
             })?;
+            let spawn_request = self.planned_spawn_request(spec)?;
             let prepared_child = self
                 .process
-                .spawn_prepared(&backend_token, &self.planned_spawn_request(spec))
+                .spawn_prepared(&backend_token, &spawn_request)
                 .await?;
             let (identity, network_namespace) = prepared_child.into_parts();
             self.complete_prepared_effect(spawn_effect).await?;

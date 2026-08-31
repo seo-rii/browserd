@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -28,6 +28,22 @@ use browserd_sandbox::{
     ShardEgressFence, ShardEgressReservation, ShardIngressLease, ShardIngressReceipt, SpawnRequest,
     StdLinuxProcessBackend, StdSandboxFilesystem,
 };
+use sha2::{Digest, Sha256};
+
+const TEST_CHROMIUM_BYTES: &[u8] = b"browserd test Chromium";
+
+fn chromium_digest(bytes: &[u8]) -> ChromiumBinaryDigest {
+    ChromiumBinaryDigest::new(Sha256::digest(bytes).into())
+}
+
+fn chromium_runtime(sandbox_executable: impl Into<PathBuf>) -> ChromiumRuntime {
+    ChromiumRuntime::from_bytes(
+        TEST_CHROMIUM_BYTES,
+        sandbox_executable,
+        chromium_digest(TEST_CHROMIUM_BYTES),
+    )
+    .expect("test Chromium bytes should be pinned")
+}
 
 fn current_network_namespace() -> Result<PinnedNetworkNamespace, SandboxError> {
     let descriptor: OwnedFd = File::open("/proc/self/ns/net")
@@ -1472,7 +1488,7 @@ fn config() -> LinuxSandboxConfig {
         "/sys/fs/cgroup/browserd",
         "/var/lib/browserd/shards",
         "/usr/bin/bwrap",
-        ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+        chromium_runtime("/opt/browser/chrome"),
         LaunchGateRuntime::new(
             "/usr/libexec/browserd-launch-gate",
             "/opt/browser/browserd-launch-gate",
@@ -1501,7 +1517,9 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
         },
         FakeEgress::default(),
     );
-    let request = backend.planned_spawn_request(&launch_spec(ShardId::new()));
+    let request = backend
+        .planned_spawn_request(&launch_spec(ShardId::new()))
+        .expect("sealed Chromium launch capability should be available");
     let arguments = request.arguments();
 
     assert_eq!(
@@ -1516,6 +1534,25 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
                 "/opt/browser/browserd-launch-gate",
             ]
     }));
+    let executable_fd = request.chromium_executable_fd().as_raw_fd();
+    assert!(arguments.windows(5).any(|window| {
+        window[0] == "--perms"
+            && window[1] == "0555"
+            && window[2] == "--ro-bind-data"
+            && window[3]
+                .to_str()
+                .and_then(|descriptor| descriptor.parse::<i32>().ok())
+                == Some(executable_fd)
+            && window[4] == "/opt/browser/chrome"
+    }));
+    assert!(request.inherited_fds().contains(&executable_fd));
+    assert!(![CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD].contains(&executable_fd));
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument == "/opt/chromium/chrome"),
+        "the mutable host path must not be re-resolved during launch",
+    );
     assert_eq!(
         arguments
             .iter()
@@ -1552,6 +1589,214 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
         "tenant policy profile data must not become a Chromium argument"
     );
     assert!(!arguments.iter().any(|argument| argument == "--block-fd"));
+}
+
+#[test]
+fn chromium_runtime_pins_the_verified_bytes_in_a_sealed_executable() {
+    let temporary = tempfile::tempdir().expect("temporary directory should be created");
+    let source = temporary.path().join("chrome");
+    let approved_bytes = b"approved Chromium bytes";
+    std::fs::write(&source, approved_bytes).expect("Chromium source should be written");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+        .expect("Chromium source should be executable");
+    let runtime = ChromiumRuntime::from_path(
+        &source,
+        "/opt/browser/chrome",
+        chromium_digest(approved_bytes),
+    )
+    .expect("verified Chromium source should be pinned");
+
+    std::fs::write(&source, b"mutated Chromium bytes")
+        .expect("the original source path should remain independently mutable");
+    let base_spec = launch_spec(ShardId::new());
+    let approved_spec = LaunchSpec::production(
+        base_spec.tenant_id().clone(),
+        base_spec.dedicated_egress().clone(),
+        chromium_digest(approved_bytes),
+    );
+    let request = LinuxSandboxBackend::new(
+        LinuxSandboxConfig::new(
+            "/sys/fs/cgroup/browserd",
+            "/var/lib/browserd/shards",
+            "/usr/bin/bwrap",
+            runtime,
+            LaunchGateRuntime::new(
+                "/usr/libexec/browserd-launch-gate",
+                "/opt/browser/browserd-launch-gate",
+            ),
+            [],
+            CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
+            9,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .expect("configuration should be valid"),
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    )
+    .planned_spawn_request(&approved_spec)
+    .expect("sealed Chromium launch capability should be available");
+    let executable = request.chromium_executable_fd();
+    let descriptor_flags = nix::fcntl::fcntl(executable, nix::fcntl::FcntlArg::F_GETFD)
+        .expect("Chromium executable descriptor flags should be readable");
+    assert!(
+        nix::fcntl::FdFlag::from_bits_truncate(descriptor_flags)
+            .contains(nix::fcntl::FdFlag::FD_CLOEXEC),
+        "the parent capability must not leak through a concurrent unrelated spawn",
+    );
+    let metadata =
+        nix::sys::stat::fstat(executable).expect("Chromium executable metadata should be readable");
+    assert_eq!(metadata.st_mode & 0o555, 0o555);
+    let seals = nix::fcntl::fcntl(executable, nix::fcntl::FcntlArg::F_GET_SEALS)
+        .expect("Chromium executable seals should be readable");
+    let seals = nix::fcntl::SealFlag::from_bits_truncate(seals);
+    assert!(seals.contains(
+        nix::fcntl::SealFlag::F_SEAL_WRITE
+            | nix::fcntl::SealFlag::F_SEAL_GROW
+            | nix::fcntl::SealFlag::F_SEAL_SHRINK
+            | nix::fcntl::SealFlag::F_SEAL_SEAL
+    ));
+
+    let duplicate = nix::fcntl::fcntl(executable, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(128))
+        .expect("sealed executable should be duplicable");
+    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this test.
+    let mut pinned = unsafe { File::from_raw_fd(duplicate) };
+    pinned
+        .seek(SeekFrom::Start(0))
+        .expect("pinned executable should seek");
+    let mut bytes = Vec::new();
+    pinned
+        .read_to_end(&mut bytes)
+        .expect("pinned executable should remain readable");
+    assert_eq!(bytes, approved_bytes);
+}
+
+#[test]
+fn chromium_runtime_rejects_a_mismatched_or_symlinked_source() {
+    let temporary = tempfile::tempdir().expect("temporary directory should be created");
+    let source = temporary.path().join("chrome");
+    std::fs::write(&source, b"approved Chromium bytes").expect("Chromium source should be written");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+        .expect("Chromium source should be executable");
+    assert!(
+        ChromiumRuntime::from_path(
+            &source,
+            "/opt/browser/chrome",
+            ChromiumBinaryDigest::new([0x7d; 32]),
+        )
+        .is_err()
+    );
+
+    let symlink = temporary.path().join("chrome-link");
+    std::os::unix::fs::symlink(&source, &symlink).expect("test symlink should be created");
+    assert!(
+        ChromiumRuntime::from_path(
+            symlink,
+            "/opt/browser/chrome",
+            chromium_digest(b"approved Chromium bytes"),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn concurrent_launch_requests_own_independent_chromium_readers() {
+    let backend = backend(
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            backend
+                .planned_spawn_request(&launch_spec(ShardId::new()))
+                .expect("first launch capability should be available")
+        });
+        let second = scope.spawn(|| {
+            backend
+                .planned_spawn_request(&launch_spec(ShardId::new()))
+                .expect("second launch capability should be available")
+        });
+        (
+            first.join().expect("first planner should not panic"),
+            second.join().expect("second planner should not panic"),
+        )
+    });
+    assert_ne!(
+        first.chromium_executable_fd().as_raw_fd(),
+        second.chromium_executable_fd().as_raw_fd(),
+    );
+    nix::unistd::lseek(
+        first.chromium_executable_fd(),
+        7,
+        nix::unistd::Whence::SeekSet,
+    )
+    .expect("first launch reader should seek independently");
+
+    let duplicate = nix::fcntl::fcntl(
+        second.chromium_executable_fd(),
+        nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(128),
+    )
+    .expect("second launch reader should duplicate");
+    // SAFETY: F_DUPFD_CLOEXEC returned a new descriptor owned by this test.
+    let mut second_reader = unsafe { File::from_raw_fd(duplicate) };
+    let mut bytes = Vec::new();
+    second_reader
+        .read_to_end(&mut bytes)
+        .expect("second reader should remain at its independent initial offset");
+    assert_eq!(bytes, TEST_CHROMIUM_BYTES);
+}
+
+#[tokio::test]
+async fn chromium_digest_mismatch_fails_before_any_sandbox_effect() {
+    let filesystem = FakeFilesystem::production_tree();
+    let process_events = Arc::new(Mutex::new(Vec::new()));
+    let egress = FakeEgress::default();
+    let valid = launch_spec(ShardId::new());
+    let mismatched = LaunchSpec::production(
+        valid.tenant_id().clone(),
+        valid.dedicated_egress().clone(),
+        ChromiumBinaryDigest::new([0x7d; 32]),
+    );
+    let backend = backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::clone(&process_events),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        egress.clone(),
+    );
+    assert!(matches!(
+        backend.planned_spawn_request(&mismatched),
+        Err(SandboxError::ChromiumBinaryDigestMismatch)
+    ));
+    let result = backend.provision(&mismatched).await;
+
+    assert_eq!(result, Err(SandboxError::ChromiumBinaryDigestMismatch));
+    assert!(filesystem.events().is_empty());
+    assert!(
+        process_events
+            .lock()
+            .expect("process lock should work")
+            .is_empty()
+    );
+    assert!(
+        egress
+            .events
+            .lock()
+            .expect("egress lock should work")
+            .is_empty()
+    );
 }
 
 fn launch_spec(shard_id: ShardId) -> LaunchSpec {
@@ -1607,7 +1852,7 @@ fn launch_spec_for_generation_and_tenant(
     LaunchSpec::production(
         tenant_id,
         dedicated_egress,
-        ChromiumBinaryDigest::new([0x3c; 32]),
+        chromium_digest(TEST_CHROMIUM_BYTES),
     )
 }
 
@@ -1847,7 +2092,7 @@ fn process_request_for(bwrap: &Path) -> (tempfile::TempDir, SpawnRequest) {
             &cgroup_root,
             "/var/lib/browserd/shards",
             bwrap,
-            ChromiumRuntime::new("/opt/chromium/chrome", "/opt/chromium/chrome"),
+            chromium_runtime("/opt/chromium/chrome"),
             LaunchGateRuntime::new(
                 "/usr/libexec/browserd-launch-gate",
                 "/opt/browser/browserd-launch-gate",
@@ -1867,7 +2112,8 @@ fn process_request_for(bwrap: &Path) -> (tempfile::TempDir, SpawnRequest) {
         },
         FakeEgress::default(),
     )
-    .planned_spawn_request(&launch_spec(ShardId::new()));
+    .planned_spawn_request(&launch_spec(ShardId::new()))
+    .expect("sealed Chromium launch capability should be available");
     std::fs::create_dir_all(
         request
             .cgroup_procs_path()
@@ -1903,7 +2149,9 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
     let backend = backend(filesystem.clone(), process, egress.clone());
     let shard_id = ShardId::new();
     let spec = launch_spec(shard_id.clone());
-    let planned = backend.planned_spawn_request(&spec);
+    let planned = backend
+        .planned_spawn_request(&spec)
+        .expect("sealed Chromium launch capability should be available");
     assert_eq!(planned.program(), Path::new("/usr/bin/bwrap"));
     backend
         .provision(&spec)
@@ -1954,6 +2202,7 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
         "/tmp",
         "/dev/shm",
         "--ro-bind",
+        "--ro-bind-data",
         "--seccomp",
     ] {
         assert!(process_events.contains(argument), "missing {argument}");
@@ -1964,7 +2213,7 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
     );
     assert!(!process_events.contains("--no-sandbox"));
     assert!(!process_events.contains("/home"));
-    assert!(process_events.contains("fds:[9]"));
+    assert!(process_events.contains("fds:[9, "));
 }
 
 #[tokio::test]
@@ -2459,7 +2708,7 @@ async fn released_shard_generation_never_aliases_new_linux_recovery_locators() {
             Duration::from_secs(5),
         )
         .expect("dedicated egress should be valid"),
-        ChromiumBinaryDigest::new([0x3c; 32]),
+        chromium_digest(TEST_CHROMIUM_BYTES),
     );
     backend
         .provision_gated(&second_spec)
@@ -4489,7 +4738,7 @@ async fn unsafe_or_symlinked_roots_fail_closed_before_mutation() {
                 unsafe_root,
                 "/var/lib/browserd/shards",
                 "/usr/bin/bwrap",
-                ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+                chromium_runtime("/opt/browser/chrome"),
                 LaunchGateRuntime::new(
                     "/usr/libexec/browserd-launch-gate",
                     "/opt/browser/browserd-launch-gate",
@@ -4509,7 +4758,7 @@ async fn unsafe_or_symlinked_roots_fail_closed_before_mutation() {
                 "/sys/fs/cgroup/browserd",
                 "/var/lib/browserd/shards",
                 "/usr/bin/bwrap",
-                ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+                chromium_runtime("/opt/browser/chrome"),
                 LaunchGateRuntime::new(
                     "/usr/libexec/browserd-launch-gate",
                     "/opt/browser/browserd-launch-gate",
@@ -4551,7 +4800,7 @@ fn launch_gate_path_cannot_be_shadowed_by_a_later_runtime_mount() {
         "/sys/fs/cgroup/browserd",
         "/var/lib/browserd/shards",
         "/usr/bin/bwrap",
-        ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+        chromium_runtime("/opt/browser/chrome"),
         LaunchGateRuntime::new(
             "/usr/libexec/browserd-launch-gate",
             "/opt/browser/browserd-launch-gate",
@@ -4567,9 +4816,66 @@ fn launch_gate_path_cannot_be_shadowed_by_a_later_runtime_mount() {
 }
 
 #[test]
+fn chromium_executable_path_cannot_be_shadowed_by_a_runtime_mount() {
+    for destination in [
+        "/opt/chromium/chrome",
+        "/opt/chromium",
+        "/opt/chromium/chrome/resources",
+    ] {
+        let configuration = LinuxSandboxConfig::new(
+            "/sys/fs/cgroup/browserd",
+            "/var/lib/browserd/shards",
+            "/usr/bin/bwrap",
+            chromium_runtime("/opt/chromium/chrome"),
+            LaunchGateRuntime::new(
+                "/usr/libexec/browserd-launch-gate",
+                "/opt/browser/browserd-launch-gate",
+            ),
+            [ReadOnlyMount::new("/opt/runtime", destination)],
+            CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
+            9,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        );
+
+        assert!(
+            configuration.is_err(),
+            "runtime mount at {destination} could shadow Chromium",
+        );
+    }
+}
+
+#[test]
 fn launch_gate_paths_cannot_alias_a_runtime_or_virtual_filesystem() {
+    let temporary = tempfile::Builder::new()
+        .prefix("chromium-launch-gate-alias-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .expect("private test directory should be created");
+    let chromium_source = temporary.path().join("chrome");
+    std::fs::write(&chromium_source, TEST_CHROMIUM_BYTES).expect("test Chromium should be written");
+    std::fs::set_permissions(&chromium_source, std::fs::Permissions::from_mode(0o755))
+        .expect("test Chromium should be executable");
+    assert!(
+        LinuxSandboxConfig::new(
+            "/sys/fs/cgroup/browserd",
+            "/var/lib/browserd/shards",
+            "/usr/bin/bwrap",
+            ChromiumRuntime::from_path(
+                &chromium_source,
+                "/opt/browser/chrome",
+                chromium_digest(TEST_CHROMIUM_BYTES),
+            )
+            .expect("test Chromium should be pinned"),
+            LaunchGateRuntime::new(chromium_source, "/opt/browser/launch-gate"),
+            [],
+            CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
+            9,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .is_err()
+    );
     for launch_gate in [
-        LaunchGateRuntime::new("/opt/chromium/chrome", "/opt/browser/launch-gate"),
         LaunchGateRuntime::new("/usr/bin/bwrap", "/opt/browser/launch-gate"),
         LaunchGateRuntime::new("/usr/libexec/browserd-launch-gate", "/opt/browser"),
         LaunchGateRuntime::new(
@@ -4593,7 +4899,7 @@ fn launch_gate_paths_cannot_alias_a_runtime_or_virtual_filesystem() {
                 "/sys/fs/cgroup/browserd",
                 "/var/lib/browserd/shards",
                 "/usr/bin/bwrap",
-                ChromiumRuntime::new("/opt/chromium/chrome", "/opt/browser/chrome"),
+                chromium_runtime("/opt/browser/chrome"),
                 launch_gate,
                 [],
                 CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
@@ -4668,7 +4974,7 @@ async fn production_process_rejects_missing_required_launch_descriptors_before_e
             "/sys/fs/cgroup/browserd",
             "/var/lib/browserd/shards",
             "/definitely/missing/bwrap",
-            ChromiumRuntime::new("/opt/chromium/chrome", "/opt/chromium/chrome"),
+            chromium_runtime("/opt/chromium/chrome"),
             LaunchGateRuntime::new(
                 "/usr/libexec/browserd-launch-gate",
                 "/opt/browser/browserd-launch-gate",
@@ -4688,7 +4994,8 @@ async fn production_process_rejects_missing_required_launch_descriptors_before_e
         },
         FakeEgress::default(),
     )
-    .planned_spawn_request(&launch_spec(ShardId::new()));
+    .planned_spawn_request(&launch_spec(ShardId::new()))
+    .expect("sealed Chromium launch capability should be available");
 
     let error = StdLinuxProcessBackend::default()
         .spawn_prepared(&LeaseId::new().to_string(), &request)
@@ -5756,6 +6063,82 @@ fn production_cdp_pipes_are_mapped_claimed_and_released_exactly_once() {
 #[test]
 fn pinned_bubblewrap_preserves_inheritable_chromium_descriptors() {
     run_process_helper("real_bwrap_cdp_inheritance_helper");
+}
+
+#[test]
+fn pinned_bubblewrap_materializes_the_sealed_chromium_executable() {
+    let script = br##"#!/bin/sh
+for descriptor in /proc/self/fd/*; do
+  case "$(readlink "$descriptor")" in
+    *memfd:browserd-chromium*) exit 17 ;;
+  esac
+done
+exit 0
+"##;
+    let base_spec = launch_spec(ShardId::new());
+    let script_spec = LaunchSpec::production(
+        base_spec.tenant_id().clone(),
+        base_spec.dedicated_egress().clone(),
+        chromium_digest(script),
+    );
+    let request = LinuxSandboxBackend::new(
+        LinuxSandboxConfig::new(
+            "/sys/fs/cgroup/browserd",
+            "/var/lib/browserd/shards",
+            "/usr/bin/bwrap",
+            ChromiumRuntime::from_bytes(script, "/opt/browser/chrome", chromium_digest(script))
+                .expect("test Chromium script should be pinned"),
+            LaunchGateRuntime::new(
+                "/usr/libexec/browserd-launch-gate",
+                "/opt/browser/browserd-launch-gate",
+            ),
+            [],
+            CgroupLimits::new(512, 256, 4, 10, 100).expect("limits should be valid"),
+            9,
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .expect("config should be valid"),
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    )
+    .planned_spawn_request(&script_spec)
+    .expect("sealed Chromium launch capability should be available");
+    let executable_fd = request.chromium_executable_fd().as_raw_fd();
+    let mut command = Command::new("/usr/bin/bwrap");
+    // SAFETY: the callback runs after fork and performs only async-signal-safe fcntl calls on the
+    // request-owned descriptor. The parent remains CLOEXEC, so concurrent unrelated spawns cannot
+    // inherit the Chromium capability.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = nix::libc::fcntl(executable_fd, nix::libc::F_GETFD);
+            if flags < 0
+                || nix::libc::fcntl(
+                    executable_fd,
+                    nix::libc::F_SETFD,
+                    flags & !nix::libc::FD_CLOEXEC,
+                ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let status = command
+        .args(["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--perms", "0555"])
+        .arg("--ro-bind-data")
+        .arg(executable_fd.to_string())
+        .args(["/tmp/browserd-chromium", "--", "/tmp/browserd-chromium"])
+        .env_clear()
+        .status()
+        .expect("bubblewrap should materialize the sealed Chromium capability");
+
+    assert!(status.success());
 }
 
 #[test]
