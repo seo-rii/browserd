@@ -1060,7 +1060,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     tenant_id,
                     session_id: outcome.session_id,
                     session_incarnation: request.session_incarnation,
-                    effective_isolation: WorkerIsolationProfile::SharedContext,
+                    effective_isolation: self.worker.driver.effective_isolation(),
                     primary_page_id: outcome.primary_page_id,
                     worker_epoch: request.expected_worker_epoch,
                     placement_version: request.placement_version,

@@ -477,6 +477,10 @@ where
         self.qualify_all()
     }
 
+    fn effective_isolation(&self) -> browserd_worker::WorkerIsolationProfile {
+        browserd_worker::WorkerIsolationProfile::DedicatedProcess
+    }
+
     fn shard_managed_contexts(&self) -> bool {
         true
     }

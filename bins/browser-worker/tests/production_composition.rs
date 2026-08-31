@@ -197,6 +197,10 @@ async fn production_runtime_serves_the_real_control_plane_and_drains_owned_shard
         .await
         .expect("the real worker control plane should create a routed session");
     assert_eq!(created.worker_epoch, worker_epoch);
+    assert_eq!(
+        created.effective_isolation,
+        WorkerIsolationProfile::DedicatedProcess
+    );
     assert_eq!(factory.creations.load(Ordering::SeqCst), 1);
 
     shutdown.cancel();

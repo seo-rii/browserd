@@ -210,6 +210,9 @@ enum ApprovalAdmissionClockError {
 
 pub trait ChromiumDriver: Send + Sync + 'static {
     fn qualify(&self) -> Result<(), DependencyError>;
+    fn effective_isolation(&self) -> WorkerIsolationProfile {
+        WorkerIsolationProfile::SharedContext
+    }
     fn shard_managed_contexts(&self) -> bool {
         false
     }
