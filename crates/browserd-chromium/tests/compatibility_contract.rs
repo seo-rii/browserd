@@ -66,6 +66,38 @@ fn verifies_every_file_against_the_immutable_manifest() {
 }
 
 #[test]
+fn rejects_a_manifest_without_any_verified_files() {
+    let root = tempdir().expect("temporary directory must be created");
+    let artifact = CompatibilityArtifact {
+        identity: identity(digest(b"pinned chromium")),
+        files: Vec::new(),
+    };
+
+    assert_eq!(
+        artifact.verify(root.path()),
+        Err(CompatibilityError::EmptyArtifactManifest)
+    );
+}
+
+#[test]
+fn requires_the_chromium_binary_digest_to_be_covered_by_the_manifest() {
+    let root = tempdir().expect("temporary directory must be created");
+    write(root.path(), "protocol/browser.json", b"browser protocol");
+    let artifact = CompatibilityArtifact {
+        identity: identity(digest(b"pinned chromium")),
+        files: vec![ArtifactFile::new(
+            "protocol/browser.json",
+            digest(b"browser protocol"),
+        )],
+    };
+
+    assert_eq!(
+        artifact.verify(root.path()),
+        Err(CompatibilityError::ChromiumBinaryNotInManifest)
+    );
+}
+
+#[test]
 fn rejects_manifest_paths_that_escape_or_follow_symlinks() {
     let root = tempdir().expect("temporary directory must be created");
     let outside = tempdir().expect("outside directory must be created");

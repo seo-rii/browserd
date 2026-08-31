@@ -94,6 +94,17 @@ pub struct CompatibilityArtifact {
 
 impl CompatibilityArtifact {
     pub fn verify(&self, root: &Path) -> Result<(), CompatibilityError> {
+        if self.files.is_empty() {
+            return Err(CompatibilityError::EmptyArtifactManifest);
+        }
+        if !self
+            .files
+            .iter()
+            .any(|artifact_file| artifact_file.digest == self.identity.binary_digest)
+        {
+            return Err(CompatibilityError::ChromiumBinaryNotInManifest);
+        }
+
         for artifact_file in &self.files {
             let relative_path = artifact_file.relative_path.as_path();
             let display_path = relative_path.to_string_lossy().into_owned();
@@ -326,6 +337,10 @@ impl ReadinessProbe {
 pub enum CompatibilityError {
     #[error("the SHA-256 digest is not exactly 32 bytes of hexadecimal data")]
     InvalidDigest,
+    #[error("the Chromium artifact manifest does not contain any files")]
+    EmptyArtifactManifest,
+    #[error("the Chromium binary digest is not covered by the artifact manifest")]
+    ChromiumBinaryNotInManifest,
     #[error("artifact path is not a safe relative path: {relative_path}")]
     UnsafeRelativePath { relative_path: String },
     #[error("artifact path contains a symbolic link: {relative_path}")]
