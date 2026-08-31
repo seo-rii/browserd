@@ -311,6 +311,7 @@ name = "browser-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "browserd-chromium",
  "browserd-core",
  "browserd-policy",
  "browserd-sandbox",
