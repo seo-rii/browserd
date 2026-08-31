@@ -8,7 +8,7 @@ use browserd_sandbox::{
     SandboxRpcClient, SandboxRpcError,
 };
 use browserd_session::OwnershipFence;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{BrowserShardRuntime, ShardRuntimeError};
@@ -85,6 +85,12 @@ pub trait SandboxShardRpc: Send + Sync + 'static {
         lease_ttl: Duration,
     ) -> Result<CreateShardOutcome, ShardRuntimeError>;
 
+    async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        reason: CleanupReason,
+    ) -> Result<KillShardOutcome, ShardRuntimeError>;
+
     async fn claim_cdp_pipes(
         &self,
         shard_id: &ShardId,
@@ -118,6 +124,16 @@ impl SandboxShardRpc for SandboxRpcClient {
         lease_ttl: Duration,
     ) -> Result<CreateShardOutcome, ShardRuntimeError> {
         SandboxRpcClient::create_shard(self, spec, lease_ttl)
+            .await
+            .map_err(map_rpc_error)
+    }
+
+    async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        reason: CleanupReason,
+    ) -> Result<KillShardOutcome, ShardRuntimeError> {
+        SandboxRpcClient::cancel_or_kill_shard(self, spec, reason)
             .await
             .map_err(map_rpc_error)
     }
@@ -181,12 +197,89 @@ pub trait CdpPipeAcceptor: Send + Sync + 'static {
     async fn shutdown_cdp(&self) -> Result<(), ShardRuntimeError>;
 }
 
+async fn cleanup_runtime<B, C, R>(
+    rpc: &B,
+    cdp: &C,
+    inner: &R,
+    spec: &LaunchSpec,
+    fence: &ShardFence,
+    reason: CleanupReason,
+) -> Result<(), ShardRuntimeError>
+where
+    B: SandboxShardRpc,
+    C: CdpPipeAcceptor,
+    R: BrowserShardRuntime,
+{
+    let (local, sandbox) = tokio::join!(
+        cleanup_local(cdp, inner, fence),
+        exact_cleanup(rpc, spec, reason),
+    );
+    sandbox?;
+    local
+}
+
+async fn cleanup_local<C, R>(
+    cdp: &C,
+    inner: &R,
+    fence: &ShardFence,
+) -> Result<(), ShardRuntimeError>
+where
+    C: CdpPipeAcceptor,
+    R: BrowserShardRuntime,
+{
+    let inner = inner.terminate(fence).await;
+    let cdp = cdp.shutdown_cdp().await;
+    match (inner, cdp) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(ShardRuntimeError::OutcomeUncertain), _)
+        | (_, Err(ShardRuntimeError::OutcomeUncertain)) => Err(ShardRuntimeError::OutcomeUncertain),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+async fn exact_cleanup<B>(
+    rpc: &B,
+    spec: &LaunchSpec,
+    reason: CleanupReason,
+) -> Result<(), ShardRuntimeError>
+where
+    B: SandboxShardRpc,
+{
+    match rpc.cancel_or_kill_shard(spec, reason).await {
+        Ok(KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated) => Ok(()),
+        Ok(KillShardOutcome::CleanupIncomplete(_) | KillShardOutcome::CancellationRequested)
+        | Err(_) => Err(ShardRuntimeError::OutcomeUncertain),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProvisionState {
     New,
+    Provisioning,
     Ready,
     Tainted,
+    Terminating,
     Terminated,
+}
+
+#[derive(Clone)]
+struct ProvisionAttempt {
+    cancellation: CancellationToken,
+    completion: CancellationToken,
+}
+
+struct RuntimeState {
+    phase: ProvisionState,
+    provision: Option<ProvisionAttempt>,
+    termination: Option<watch::Receiver<Option<Result<(), ShardRuntimeError>>>>,
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 pub struct ProductionSandboxShardRuntime<B, C, R> {
@@ -195,7 +288,9 @@ pub struct ProductionSandboxShardRuntime<B, C, R> {
     rpc: Arc<B>,
     cdp: Arc<C>,
     inner: Arc<R>,
-    state: Mutex<ProvisionState>,
+    state: Arc<Mutex<RuntimeState>>,
+    operations: Arc<RwLock<()>>,
+    operation_cancellation: CancellationToken,
 }
 
 impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
@@ -213,7 +308,13 @@ impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
             rpc,
             cdp,
             inner,
-            state: Mutex::new(ProvisionState::New),
+            state: Arc::new(Mutex::new(RuntimeState {
+                phase: ProvisionState::New,
+                provision: None,
+                termination: None,
+            })),
+            operations: Arc::new(RwLock::new(())),
+            operation_cancellation: CancellationToken::new(),
         }
     }
 
@@ -225,25 +326,14 @@ impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
         }
     }
 
-    async fn cleanup_shard(&self, reason: CleanupReason) -> Result<(), ShardRuntimeError>
-    where
-        B: SandboxShardRpc,
-    {
-        match self
-            .rpc
-            .kill_shard(
-                self.descriptor.launch_spec().shard_id(),
-                self.descriptor.launch_spec().worker_epoch(),
-                self.descriptor.launch_spec().launch_generation(),
-                reason,
-            )
-            .await?
-        {
-            KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated => Ok(()),
-            KillShardOutcome::CleanupIncomplete(_) | KillShardOutcome::CancellationRequested => {
-                Err(ShardRuntimeError::OutcomeUncertain)
-            }
+    async fn admit_operation(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>, ShardRuntimeError> {
+        let operation = self.operations.read().await;
+        if self.state.lock().await.phase != ProvisionState::Ready {
+            return Err(ShardRuntimeError::Rejected);
         }
+        Ok(operation)
     }
 
     pub async fn renew_owner_lease(&self, fence: &ShardFence) -> Result<(), ShardRuntimeError>
@@ -251,18 +341,19 @@ impl<B, C, R> ProductionSandboxShardRuntime<B, C, R> {
         B: SandboxShardRpc,
     {
         self.validate_fence(fence)?;
-        let state = self.state.lock().await;
-        if *state != ProvisionState::Ready {
-            return Err(ShardRuntimeError::Rejected);
-        }
-        self.rpc
-            .renew_owner_lease(
+        let _operation = self.admit_operation().await?;
+        let lifecycle = self.operation_cancellation.child_token();
+        let _cancel_on_drop = CancelOnDrop(lifecycle.clone());
+        tokio::select! {
+            biased;
+            () = lifecycle.cancelled() => Err(ShardRuntimeError::Cancelled),
+            result = self.rpc.renew_owner_lease(
                 self.descriptor.launch_spec().shard_id(),
                 self.descriptor.launch_spec().worker_epoch(),
                 self.descriptor.launch_spec().launch_generation(),
                 self.lease_ttl,
-            )
-            .await
+            ) => result,
+        }
     }
 }
 
@@ -279,30 +370,92 @@ where
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError> {
         self.validate_fence(fence)?;
-        let mut state = self.state.lock().await;
-        match *state {
-            ProvisionState::Ready => return Ok(()),
-            ProvisionState::New => {}
-            ProvisionState::Tainted | ProvisionState::Terminated => {
-                return Err(ShardRuntimeError::Rejected);
-            }
-        }
         if cancellation.is_cancelled() || self.lease_ttl.is_zero() {
             return Err(ShardRuntimeError::Cancelled);
         }
-        match self
-            .rpc
-            .create_shard(self.descriptor.launch_spec().clone(), self.lease_ttl)
-            .await?
+        let attempt = ProvisionAttempt {
+            cancellation: CancellationToken::new(),
+            completion: CancellationToken::new(),
+        };
         {
-            CreateShardOutcome::Created | CreateShardOutcome::AlreadyExists => {}
-            CreateShardOutcome::Cancelled => return Err(ShardRuntimeError::Cancelled),
-        }
-        let setup = async {
-            if cancellation.is_cancelled() {
-                return Err(ShardRuntimeError::Cancelled);
+            let mut state = self.state.lock().await;
+            match state.phase {
+                ProvisionState::Ready => return Ok(()),
+                ProvisionState::New => {
+                    state.phase = ProvisionState::Provisioning;
+                    state.provision = Some(attempt.clone());
+                }
+                ProvisionState::Provisioning
+                | ProvisionState::Tainted
+                | ProvisionState::Terminating
+                | ProvisionState::Terminated => {
+                    return Err(ShardRuntimeError::Rejected);
+                }
             }
-            let pipes = self
+        }
+        let (disarm_cleanup, cleanup_disarmed) = oneshot::channel::<()>();
+        let cleanup_rpc = Arc::clone(&self.rpc);
+        let cleanup_cdp = Arc::clone(&self.cdp);
+        let cleanup_inner = Arc::clone(&self.inner);
+        let cleanup_spec = self.descriptor.launch_spec().clone();
+        let cleanup_fence = fence.clone();
+        let cleanup_state = Arc::clone(&self.state);
+        let cleanup_completion = attempt.completion.clone();
+        let cleanup_task = tokio::spawn(async move {
+            let cleanup = match cleanup_disarmed.await {
+                Ok(()) => Ok(()),
+                Err(_) => {
+                    let cleanup_is_owned_by_termination = {
+                        let state = cleanup_state.lock().await;
+                        matches!(
+                            state.phase,
+                            ProvisionState::Terminating | ProvisionState::Terminated
+                        )
+                    };
+                    if cleanup_is_owned_by_termination {
+                        Ok(())
+                    } else {
+                        cleanup_runtime(
+                            cleanup_rpc.as_ref(),
+                            cleanup_cdp.as_ref(),
+                            cleanup_inner.as_ref(),
+                            &cleanup_spec,
+                            &cleanup_fence,
+                            CleanupReason::BrowserFailure,
+                        )
+                        .await
+                    }
+                }
+            };
+            let mut state = cleanup_state.lock().await;
+            if state.phase == ProvisionState::Provisioning {
+                state.phase = ProvisionState::Tainted;
+            }
+            state.provision = None;
+            drop(state);
+            cleanup_completion.cancel();
+            cleanup
+        });
+        let operation_cancel = attempt.cancellation.clone();
+        let provision = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                attempt.cancellation.cancel();
+                Err(ShardRuntimeError::Cancelled)
+            },
+            () = attempt.cancellation.cancelled() => Err(ShardRuntimeError::Cancelled),
+            result = async {
+                match self
+                    .rpc
+                    .create_shard(self.descriptor.launch_spec().clone(), self.lease_ttl)
+                    .await?
+                {
+                    CreateShardOutcome::Created | CreateShardOutcome::AlreadyExists => {}
+                    CreateShardOutcome::Cancelled => {
+                        return Err(ShardRuntimeError::Cancelled);
+                    }
+                }
+                let pipes = self
                 .rpc
                 .claim_cdp_pipes(
                     self.descriptor.launch_spec().shard_id(),
@@ -311,19 +464,59 @@ where
                     self.descriptor.launch_spec().launch_generation(),
                 )
                 .await?;
-            self.cdp.accept_cdp_pipes(pipes).await?;
-            self.inner.readiness_check(fence, cancellation).await
+                self.cdp.accept_cdp_pipes(pipes).await?;
+                self.inner.readiness_check(fence, operation_cancel).await
+            } => result,
+        };
+        match provision {
+            Ok(()) => {
+                let mut state = self.state.lock().await;
+                if state.phase != ProvisionState::Provisioning {
+                    drop(state);
+                    drop(disarm_cleanup);
+                    let result = match cleanup_task.await {
+                        Ok(Ok(())) => Err(ShardRuntimeError::Cancelled),
+                        Ok(Err(_)) | Err(_) => Err(ShardRuntimeError::OutcomeUncertain),
+                    };
+                    if !attempt.completion.is_cancelled() {
+                        let mut state = self.state.lock().await;
+                        state.provision = None;
+                        attempt.completion.cancel();
+                    }
+                    return result;
+                }
+                if disarm_cleanup.send(()).is_err() {
+                    state.phase = ProvisionState::Tainted;
+                    state.provision = None;
+                    attempt.completion.cancel();
+                    cleanup_task.abort();
+                    return Err(ShardRuntimeError::OutcomeUncertain);
+                }
+                state.phase = ProvisionState::Ready;
+                state.provision = None;
+                attempt.completion.cancel();
+                cleanup_task.abort();
+                Ok(())
+            }
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                if state.phase == ProvisionState::Provisioning {
+                    state.phase = ProvisionState::Tainted;
+                }
+                drop(state);
+                drop(disarm_cleanup);
+                let result = match cleanup_task.await {
+                    Ok(Ok(())) => Err(error),
+                    Ok(Err(_)) | Err(_) => Err(ShardRuntimeError::OutcomeUncertain),
+                };
+                if !attempt.completion.is_cancelled() {
+                    let mut state = self.state.lock().await;
+                    state.provision = None;
+                    attempt.completion.cancel();
+                }
+                result
+            }
         }
-        .await;
-        if let Err(error) = setup {
-            *state = ProvisionState::Tainted;
-            return match self.cleanup_shard(CleanupReason::BrowserFailure).await {
-                Ok(()) => Err(error),
-                Err(_) => Err(ShardRuntimeError::OutcomeUncertain),
-            };
-        }
-        *state = ProvisionState::Ready;
-        Ok(())
     }
 
     async fn create_context(
@@ -332,12 +525,20 @@ where
         fence: &OwnershipFence,
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError> {
-        if *self.state.lock().await != ProvisionState::Ready {
-            return Err(ShardRuntimeError::Rejected);
+        let _operation = self.admit_operation().await?;
+        let lifecycle = self.operation_cancellation.child_token();
+        let _cancel_on_drop = CancelOnDrop(lifecycle.clone());
+        let operation_cancel = lifecycle.clone();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ShardRuntimeError::Cancelled),
+            () = lifecycle.cancelled() => Err(ShardRuntimeError::Cancelled),
+            result = self.inner.create_context(
+                session_id,
+                fence,
+                operation_cancel,
+            ) => result,
         }
-        self.inner
-            .create_context(session_id, fence, cancellation)
-            .await
     }
 
     async fn create_context_owned(
@@ -347,12 +548,21 @@ where
         fence: &OwnershipFence,
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError> {
-        if *self.state.lock().await != ProvisionState::Ready {
-            return Err(ShardRuntimeError::Rejected);
+        let _operation = self.admit_operation().await?;
+        let lifecycle = self.operation_cancellation.child_token();
+        let _cancel_on_drop = CancelOnDrop(lifecycle.clone());
+        let operation_cancel = lifecycle.clone();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ShardRuntimeError::Cancelled),
+            () = lifecycle.cancelled() => Err(ShardRuntimeError::Cancelled),
+            result = self.inner.create_context_owned(
+                tenant_id,
+                session_id,
+                fence,
+                operation_cancel,
+            ) => result,
         }
-        self.inner
-            .create_context_owned(tenant_id, session_id, fence, cancellation)
-            .await
     }
 
     async fn dispose_context(
@@ -361,30 +571,105 @@ where
         fence: &OwnershipFence,
         cancellation: CancellationToken,
     ) -> Result<(), ShardRuntimeError> {
-        if *self.state.lock().await != ProvisionState::Ready {
-            return Err(ShardRuntimeError::Rejected);
+        let _operation = self.admit_operation().await?;
+        let lifecycle = self.operation_cancellation.child_token();
+        let _cancel_on_drop = CancelOnDrop(lifecycle.clone());
+        let operation_cancel = lifecycle.clone();
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(ShardRuntimeError::Cancelled),
+            () = lifecycle.cancelled() => Err(ShardRuntimeError::Cancelled),
+            result = self.inner.dispose_context(
+                session_id,
+                fence,
+                operation_cancel,
+            ) => result,
         }
-        self.inner
-            .dispose_context(session_id, fence, cancellation)
-            .await
     }
 
     async fn terminate(&self, fence: &ShardFence) -> Result<(), ShardRuntimeError> {
         self.validate_fence(fence)?;
-        let mut state = self.state.lock().await;
-        if *state == ProvisionState::Terminated {
-            return Ok(());
+        let (mut completion, start) = {
+            let mut state = self.state.lock().await;
+            match state.phase {
+                ProvisionState::Terminated => return Ok(()),
+                ProvisionState::Terminating => {
+                    let completion = state
+                        .termination
+                        .as_ref()
+                        .cloned()
+                        .ok_or(ShardRuntimeError::OutcomeUncertain)?;
+                    (completion, None)
+                }
+                ProvisionState::New
+                | ProvisionState::Provisioning
+                | ProvisionState::Ready
+                | ProvisionState::Tainted => {
+                    let provision = state.provision.take();
+                    let (sender, receiver) = watch::channel(None);
+                    state.phase = ProvisionState::Terminating;
+                    state.termination = Some(receiver.clone());
+                    (receiver, Some((sender, provision)))
+                }
+            }
+        };
+        if let Some((sender, provision)) = start {
+            self.operation_cancellation.cancel();
+            let rpc = Arc::clone(&self.rpc);
+            let cdp = Arc::clone(&self.cdp);
+            let inner = Arc::clone(&self.inner);
+            let operations = Arc::clone(&self.operations);
+            let state = Arc::clone(&self.state);
+            let spec = self.descriptor.launch_spec().clone();
+            let fence = fence.clone();
+            tokio::spawn(async move {
+                if let Some(provision) = provision.as_ref() {
+                    provision.cancellation.cancel();
+                }
+                let quiesce = async {
+                    if let Some(provision) = provision.as_ref() {
+                        provision.completion.cancelled().await;
+                    }
+                    operations.write_owned().await
+                };
+                let (preemptive, operation_guard) = tokio::join!(
+                    exact_cleanup(rpc.as_ref(), &spec, CleanupReason::WorkerLeaseExpired,),
+                    quiesce,
+                );
+                let local = cleanup_local(cdp.as_ref(), inner.as_ref(), &fence).await;
+                let result = match (preemptive, local) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(_), _) | (_, Err(ShardRuntimeError::OutcomeUncertain)) => {
+                        Err(ShardRuntimeError::OutcomeUncertain)
+                    }
+                    (Ok(()), Err(error)) => Err(error),
+                };
+                drop(operation_guard);
+                {
+                    let mut state = state.lock().await;
+                    state.provision = None;
+                    state.termination = None;
+                    state.phase = if result.is_ok() {
+                        ProvisionState::Terminated
+                    } else {
+                        ProvisionState::Tainted
+                    };
+                }
+                sender.send_replace(Some(result));
+            });
         }
-        let inner = self.inner.terminate(fence).await;
-        let cdp = self.cdp.shutdown_cdp().await;
-        let cleanup = self.cleanup_shard(CleanupReason::WorkerLeaseExpired).await;
-        *state = ProvisionState::Terminated;
-        match (inner, cdp, cleanup) {
-            (Ok(()), Ok(()), Ok(())) => Ok(()),
-            (Err(ShardRuntimeError::OutcomeUncertain), _, _)
-            | (_, Err(ShardRuntimeError::OutcomeUncertain), _)
-            | (_, _, Err(_)) => Err(ShardRuntimeError::OutcomeUncertain),
-            (Err(error), _, Ok(())) | (_, Err(error), Ok(())) => Err(error),
+        loop {
+            if let Some(result) = *completion.borrow() {
+                return result;
+            }
+            if completion.changed().await.is_err() {
+                let mut state = self.state.lock().await;
+                if state.phase == ProvisionState::Terminating {
+                    state.phase = ProvisionState::Tainted;
+                    state.termination = None;
+                }
+                return Err(ShardRuntimeError::OutcomeUncertain);
+            }
         }
     }
 }

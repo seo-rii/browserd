@@ -30,6 +30,7 @@ use tokio::sync::oneshot;
 struct FailingSandbox {
     daemon_epoch: u64,
     launches: Mutex<Vec<LaunchSpec>>,
+    cancelled_specs: Mutex<Vec<LaunchSpec>>,
     claims: AtomicUsize,
     kills: AtomicUsize,
 }
@@ -46,6 +47,23 @@ impl SandboxShardRpc for FailingSandbox {
             .expect("launch log should remain available")
             .push(spec);
         Ok(CreateShardOutcome::Created)
+    }
+
+    async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        _reason: CleanupReason,
+    ) -> Result<KillShardOutcome, ShardRuntimeError> {
+        self.cancelled_specs
+            .lock()
+            .expect("cancel log should remain available")
+            .push(spec.clone());
+        self.kills.fetch_add(1, Ordering::SeqCst);
+        Ok(KillShardOutcome::Terminated(CleanupResult {
+            route_revoked: true,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
     }
 
     async fn claim_cdp_pipes(
@@ -103,6 +121,7 @@ struct ScriptedSandbox {
     claims: AtomicUsize,
     renewals: AtomicUsize,
     kills: AtomicUsize,
+    cancelled_specs: Mutex<Vec<LaunchSpec>>,
 }
 
 #[async_trait]
@@ -114,6 +133,23 @@ impl SandboxShardRpc for ScriptedSandbox {
     ) -> Result<CreateShardOutcome, ShardRuntimeError> {
         self.launches.fetch_add(1, Ordering::SeqCst);
         Ok(CreateShardOutcome::Created)
+    }
+
+    async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        _reason: CleanupReason,
+    ) -> Result<KillShardOutcome, ShardRuntimeError> {
+        self.cancelled_specs
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .push(spec.clone());
+        self.kills.fetch_add(1, Ordering::SeqCst);
+        Ok(KillShardOutcome::Terminated(CleanupResult {
+            route_revoked: true,
+            cgroup_killed: true,
+            namespaces_cleaned: true,
+        }))
     }
 
     async fn claim_cdp_pipes(
@@ -398,6 +434,7 @@ fn failed_readiness_connection_claim_cleans_the_exact_probe_shard() {
     let sandbox = Arc::new(FailingSandbox {
         daemon_epoch,
         launches: Mutex::new(Vec::new()),
+        cancelled_specs: Mutex::new(Vec::new()),
         claims: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
     });
@@ -420,7 +457,7 @@ fn failed_readiness_connection_claim_cleans_the_exact_probe_shard() {
         .lock()
         .expect("launch log should remain available");
     assert_eq!(launches.len(), 1);
-    let launch = &launches[0];
+    let launch = launches[0].clone();
     assert_eq!(launch.worker_id(), &worker_id);
     assert_eq!(launch.worker_epoch(), worker_epoch);
     assert_eq!(
@@ -436,6 +473,15 @@ fn failed_readiness_connection_claim_cleans_the_exact_probe_shard() {
         1
     );
     drop(launches);
+    assert_eq!(
+        sandbox
+            .cancelled_specs
+            .lock()
+            .expect("cancel log should remain available")
+            .as_slice(),
+        [launch.clone(), launch],
+        "both cleanup owners must carry the exact qualified launch spec"
+    );
     assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
     assert_eq!(
         sandbox.kills.load(Ordering::SeqCst),
@@ -458,6 +504,7 @@ fn production_admission_stays_closed_until_real_readiness_qualification_succeeds
     let sandbox = Arc::new(FailingSandbox {
         daemon_epoch,
         launches: Mutex::new(Vec::new()),
+        cancelled_specs: Mutex::new(Vec::new()),
         claims: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
     });
@@ -504,6 +551,7 @@ fn readiness_qualification_runs_a_real_shard_and_caches_failure() {
     let sandbox = Arc::new(FailingSandbox {
         daemon_epoch,
         launches: Mutex::new(Vec::new()),
+        cancelled_specs: Mutex::new(Vec::new()),
         claims: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
     });
@@ -553,6 +601,7 @@ fn concurrent_readiness_callers_share_one_probe_and_one_cleanup() {
         claims: AtomicUsize::new(0),
         renewals: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
+        cancelled_specs: Mutex::new(Vec::new()),
     });
     let config = ProductionSessionShardConfig::new(
         worker_id,
@@ -616,6 +665,7 @@ fn readiness_rejects_and_caches_an_orphaned_context_target() {
         claims: AtomicUsize::new(0),
         renewals: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
+        cancelled_specs: Mutex::new(Vec::new()),
     });
     let config = ProductionSessionShardConfig::new(
         worker_id,
@@ -667,6 +717,7 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         claims: AtomicUsize::new(0),
         renewals: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
+        cancelled_specs: Mutex::new(Vec::new()),
     });
     let connection = ChromiumConnectionConfig {
         transport: CdpTransportConfig {
