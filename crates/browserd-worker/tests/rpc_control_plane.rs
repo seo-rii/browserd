@@ -1,7 +1,8 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use browserd_actions::{ActionJournalLimits, ActionKind, ActionSequence};
@@ -15,12 +16,34 @@ use browserd_worker::{
     ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
     ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
     LiveApprovalContext, SandboxClient, UnavailableChromiumDriver, UnavailableSandboxClient,
-    WorkerActionApprovalRequirement, WorkerActionCommand, WorkerActionExecutionTimeout,
-    WorkerActionStatus, WorkerApprovalActionType, WorkerClock, WorkerConfig, WorkerControlPlane,
-    WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError, WorkerIsolationProfile,
-    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerSessionFence,
+    WORKER_SESSION_OPTIONS_VERSION, WorkerActionApprovalRequirement, WorkerActionCommand,
+    WorkerActionExecutionTimeout, WorkerActionStatus, WorkerApprovalActionType, WorkerClock,
+    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
+    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
 };
+
+fn session_options() -> WorkerSessionOptionsV1 {
+    WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: Some("browserd-rpc-options-test".to_owned()),
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: BTreeMap::from([("suite".to_owned(), "rpc-control-plane".to_owned())]),
+    }
+}
 
 struct FrozenClock;
 
@@ -108,6 +131,119 @@ impl ChromiumDriver for ReadyDriver {
     ) -> Result<ActionExecutionResult, ApprovedActionError> {
         authorize_and_commit(inspected)?;
         Ok(ActionExecutionResult::Succeeded(Vec::new()))
+    }
+
+    fn cancel_action(
+        &self,
+        _session_id: &SessionId,
+        _action_id: &ActionId,
+    ) -> Result<bool, DependencyError> {
+        Ok(true)
+    }
+}
+
+struct OptionsRecordingDriver {
+    calls: AtomicUsize,
+    observed: Mutex<Option<WorkerSessionOptionsV1>>,
+    page_id: PageId,
+}
+
+impl OptionsRecordingDriver {
+    fn new(page_id: PageId) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            observed: Mutex::new(None),
+            page_id,
+        }
+    }
+}
+
+impl ChromiumDriver for OptionsRecordingDriver {
+    fn qualify(&self) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn create_context(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        let mut observed = self
+            .observed
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        *observed = Some(options.clone());
+        Ok(self.page_id.clone())
+    }
+
+    fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn create_page(&self, _session_id: &SessionId) -> Result<PageId, DependencyError> {
+        Ok(PageId::new())
+    }
+
+    fn close_page(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn activate_page(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+
+    fn execute_action(
+        &self,
+        _session_id: &SessionId,
+        _page_id: Option<&PageId>,
+        _payload: &[u8],
+    ) -> ActionExecutionResult {
+        ActionExecutionResult::Succeeded(Vec::new())
+    }
+
+    fn inspect_approval_context(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        ReadyDriver.inspect_approval_context(session_id, page_id, proposal)
+    }
+
+    fn execute_approved_action(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        ReadyDriver.execute_approved_action(
+            session_id,
+            page_id,
+            payload,
+            proposal,
+            inspected,
+            authorize_and_commit,
+        )
     }
 
     fn cancel_action(
@@ -303,17 +439,21 @@ async fn action_rpc_fixture<D: ChromiumDriver, S: SandboxClient>(
         Arc::clone(&worker),
         peer.clone(),
     ));
+    let options = session_options();
     let created = handler
         .handle(WorkerRpcRequest::CreateSession(
             WorkerCreateSessionRequest {
                 operation_id: OperationId::new(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: format!("create-action-{endpoint_port}"),
-                canonical_request_hash: [5; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 1,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
                 now_unix_millis: 1,
             },
         ))
@@ -343,6 +483,63 @@ async fn action_rpc_fixture<D: ChromiumDriver, S: SandboxClient>(
         fence,
         primary_page_id: created.primary_page_id,
     })
+}
+
+#[tokio::test]
+async fn create_session_rpc_forwards_valid_v1_options_to_the_owned_driver_boundary()
+-> Result<(), Box<dyn Error>> {
+    let expected_page_id = PageId::new();
+    let driver = Arc::new(OptionsRecordingDriver::new(expected_page_id.clone()));
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19031).await?;
+
+    assert_eq!(fixture.primary_page_id, expected_page_id);
+    assert_eq!(driver.calls.load(Ordering::Acquire), 1);
+    assert_eq!(
+        *driver
+            .observed
+            .lock()
+            .map_err(|_| std::io::Error::other("options observation lock poisoned"))?,
+        Some(session_options()),
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_session_rpc_rejects_options_hash_mismatch_before_browser_effect()
+-> Result<(), Box<dyn Error>> {
+    let driver = Arc::new(OptionsRecordingDriver::new(PageId::new()));
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19032).await?;
+    let options = WorkerSessionOptionsV1 {
+        locale: "en-US".to_owned(),
+        ..session_options()
+    };
+    let response = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(
+            WorkerCreateSessionRequest {
+                operation_id: OperationId::new(),
+                tenant_id: fixture.fence.tenant_id.clone(),
+                idempotency_key: "create-options-hash-mismatch".to_owned(),
+                canonical_request_hash: session_options()
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
+                expected_worker_epoch: fixture.fence.worker_epoch,
+                placement_version: 2,
+                session_incarnation: 1,
+                requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
+                now_unix_millis: 2,
+            },
+        ))
+        .await;
+
+    assert!(matches!(
+        response,
+        WorkerRpcResponse::Failure(failure)
+            if failure.code == WorkerRpcFailureCode::InvalidRequest
+    ));
+    assert_eq!(driver.calls.load(Ordering::Acquire), 1);
+    Ok(())
 }
 
 fn submit_action_request(
@@ -441,17 +638,21 @@ async fn control_plane_rpc_rejects_stale_worker_epoch_before_dependency_effects(
         WorkerRpcResponse::Failure(failure)
             if failure.code == WorkerRpcFailureCode::NotReady
     ));
+    let options = session_options();
     let response = handler
         .handle(WorkerRpcRequest::CreateSession(
             WorkerCreateSessionRequest {
                 operation_id: OperationId::new(),
                 tenant_id: TenantId::new(),
                 idempotency_key: "create-stale".to_owned(),
-                canonical_request_hash: [9; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 6,
                 placement_version: 1,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
                 now_unix_millis: 1,
             },
         ))
@@ -529,17 +730,21 @@ async fn control_plane_rpc_bounds_create_bindings_and_rejects_cross_tenant_fence
         WorkerRpcResponse::Probe(receipt)
             if receipt.worker_epoch == 7 && receipt.ready
     ));
+    let options = session_options();
     let created = handler
         .handle(WorkerRpcRequest::CreateSession(
             WorkerCreateSessionRequest {
                 operation_id: OperationId::new(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: "create-tenant-fence".to_owned(),
-                canonical_request_hash: [4; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 1,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options: options.clone(),
                 now_unix_millis: 1,
             },
         ))
@@ -560,11 +765,14 @@ async fn control_plane_rpc_bounds_create_bindings_and_rejects_cross_tenant_fence
                 operation_id: created.operation_id.clone(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: "create-tenant-fence".to_owned(),
-                canonical_request_hash: [4; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 1,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options: options.clone(),
                 now_unix_millis: 2,
             },
         ))
@@ -583,11 +791,14 @@ async fn control_plane_rpc_bounds_create_bindings_and_rejects_cross_tenant_fence
                 operation_id: created.operation_id.clone(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: "create-tenant-fence".to_owned(),
-                canonical_request_hash: [4; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 2,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options: options.clone(),
                 now_unix_millis: 2,
             },
         ))
@@ -604,11 +815,14 @@ async fn control_plane_rpc_bounds_create_bindings_and_rejects_cross_tenant_fence
                 operation_id: OperationId::new(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: "create-over-capacity".to_owned(),
-                canonical_request_hash: [7; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 2,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options: options.clone(),
                 now_unix_millis: 3,
             },
         ))
@@ -625,11 +839,14 @@ async fn control_plane_rpc_bounds_create_bindings_and_rejects_cross_tenant_fence
                 operation_id: OperationId::new(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: "create-dedicated".to_owned(),
-                canonical_request_hash: [8; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::DedicatedProcess),
                 expected_worker_epoch: 7,
                 placement_version: 2,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::DedicatedProcess,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
                 now_unix_millis: 3,
             },
         ))
@@ -710,17 +927,21 @@ async fn accepted_pending_approval_action_is_returned_without_dispatching_it() {
         Arc::new(FrozenClock),
     ));
     let handler = WorkerControlPlaneRpcHandler::new(worker, peer);
+    let options = session_options();
     let created = handler
         .handle(WorkerRpcRequest::CreateSession(
             WorkerCreateSessionRequest {
                 operation_id: OperationId::new(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: "create-approval".to_owned(),
-                canonical_request_hash: [5; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 1,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
                 now_unix_millis: 1,
             },
         ))

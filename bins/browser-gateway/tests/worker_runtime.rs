@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -37,7 +37,8 @@ use browserd_worker::{
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
     WorkerPageReceipt, WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError,
     WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1, WorkerSessionReceipt,
+    WorkerViewport,
 };
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
@@ -742,6 +743,74 @@ fn create_dispatch_preserves_idempotency_and_exact_worker_fences() -> Result<(),
     assert_eq!(recorded.expected_worker_epoch, 41);
     assert_eq!(recorded.placement_version, 7);
     assert_eq!(recorded.session_incarnation, 1);
+    Ok(())
+}
+
+#[test]
+fn create_dispatch_forwards_every_v1_session_option_to_the_worker() -> Result<(), Box<dyn Error>> {
+    let tenant_id = TenantId::new();
+    let principal = authenticated_principal(tenant_id)?;
+    let worker = Arc::new(RecordingWorker {
+        request: Mutex::new(None),
+        session_id: SessionId::new(),
+        corrupt_epoch: false,
+    });
+    let runtime = Arc::new(GatewayWorkerRuntime::new(
+        Arc::clone(&worker),
+        gateway_placement()?,
+    )?);
+    let router = ApiRouter::new(runtime);
+
+    let response = router.execute(
+        &principal,
+        ApiRequest::CreateSession {
+            body: decode_session_create(CREATE_JSON)?,
+            idempotency_key: Uuid::new_v4().to_string(),
+            received_at: Instant::now(),
+        },
+    )?;
+    assert!(matches!(response, ApiResponse::SessionCreate(_)));
+
+    let recorded = worker
+        .request
+        .lock()
+        .map_err(|_| "recorded request lock poisoned")?
+        .clone()
+        .ok_or("worker request missing")?;
+    assert_eq!(
+        recorded.requested_isolation,
+        WorkerIsolationProfile::SharedContext
+    );
+    assert_eq!(recorded.options_version, 1);
+    assert_eq!(
+        recorded.canonical_request_hash,
+        recorded
+            .options
+            .canonical_request_hash(recorded.requested_isolation),
+        "gateway canonicalization and the worker option commitment must agree",
+    );
+    assert_eq!(
+        recorded.options,
+        WorkerSessionOptionsV1 {
+            workload_class_hint: "interactive".to_owned(),
+            viewport: WorkerViewport {
+                width: 1280,
+                height: 720,
+                device_scale_factor: 1,
+            },
+            locale: "ko-KR".to_owned(),
+            timezone: "Asia/Seoul".to_owned(),
+            user_agent: None,
+            network_policy_id: "public-web-default".to_owned(),
+            network_class: "public".to_owned(),
+            checkpoint_ref: None,
+            dialog_policy: "auto_dismiss".to_owned(),
+            feature_profile: "standard".to_owned(),
+            ttl_seconds: 1_800,
+            idle_timeout_seconds: 600,
+            metadata: BTreeMap::from([("agent_run_id".to_owned(), "run_123".to_owned())]),
+        }
+    );
     Ok(())
 }
 

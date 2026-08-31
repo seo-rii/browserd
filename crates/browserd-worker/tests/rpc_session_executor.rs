@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,12 +15,12 @@ use browserd_session::{LeasePolicy, OwnershipFence, SessionTime, SessionTimeoutP
 use browserd_worker::{
     ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
     ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
-    LiveApprovalContext, SandboxClient, WorkerActionApprovalRequirement, WorkerActionCommand,
-    WorkerActionExecutionTimeout, WorkerActionStatus, WorkerApprovalActionType,
-    WorkerApprovalDecision, WorkerClock, WorkerConfig, WorkerControlPlane,
-    WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError, WorkerIsolationProfile,
-    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerSessionFence,
+    LiveApprovalContext, SandboxClient, WORKER_SESSION_OPTIONS_VERSION,
+    WorkerActionApprovalRequirement, WorkerActionCommand, WorkerActionExecutionTimeout,
+    WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision, WorkerClock,
+    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
+    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
 };
 
 struct FrozenClock;
@@ -240,17 +241,39 @@ async fn rpc_fixture(
         Arc::new(FrozenClock),
     ));
     let handler = Arc::new(WorkerControlPlaneRpcHandler::new(worker, peer));
+    let options = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "en-US".to_owned(),
+        timezone: "UTC".to_owned(),
+        user_agent: None,
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: BTreeMap::new(),
+    };
     let created = handler
         .handle(WorkerRpcRequest::CreateSession(
             WorkerCreateSessionRequest {
                 operation_id: OperationId::new(),
                 tenant_id: tenant_id.clone(),
                 idempotency_key: format!("create-session-executor-{endpoint_port}"),
-                canonical_request_hash: [5; 32],
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
                 expected_worker_epoch: 7,
                 placement_version: 1,
                 session_incarnation: 1,
                 requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
                 now_unix_millis: 1,
             },
         ))

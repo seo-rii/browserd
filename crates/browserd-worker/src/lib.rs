@@ -20,16 +20,17 @@ pub use production_sandbox::{
     SandboxTerminationProof, ShardLaunchDescriptor,
 };
 pub use rpc::{
-    PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement,
-    WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerActionStatus,
-    WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
-    WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
-    WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt,
-    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerProbeReceipt,
-    WorkerRpcBlockingClient, WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig,
-    WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode,
-    WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
-    WorkerSessionLifecycle, WorkerSessionReceipt,
+    PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WORKER_SESSION_OPTIONS_VERSION,
+    WorkerActionApprovalRequirement, WorkerActionCommand, WorkerActionExecutionTimeout,
+    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
+    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
+    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler,
+    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
+    WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient, WorkerRpcClient,
+    WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError, WorkerRpcError,
+    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1,
+    WorkerSessionReceipt, WorkerViewport,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
@@ -234,6 +235,15 @@ pub trait ChromiumDriver: Send + Sync + 'static {
         fence: &OwnershipFence,
     ) -> Result<PageId, DependencyError> {
         self.create_context_fenced(session_id, fence)
+    }
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        _options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        self.create_context_owned(tenant_id, session_id, fence)
     }
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError>;
     fn close_context_fenced(
@@ -1067,6 +1077,26 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         command: CreateSessionCommand,
         now: SessionTime,
     ) -> Result<CreateSessionOutcome, WorkerError> {
+        self.create_session_internal(peer, command, None, now)
+    }
+
+    pub fn create_session_with_options(
+        &self,
+        peer: &AuthenticatedPeer,
+        command: CreateSessionCommand,
+        options: &WorkerSessionOptionsV1,
+        now: SessionTime,
+    ) -> Result<CreateSessionOutcome, WorkerError> {
+        self.create_session_internal(peer, command, Some(options), now)
+    }
+
+    fn create_session_internal(
+        &self,
+        peer: &AuthenticatedPeer,
+        command: CreateSessionCommand,
+        options: Option<&WorkerSessionOptionsV1>,
+        now: SessionTime,
+    ) -> Result<CreateSessionOutcome, WorkerError> {
         self.authorize(peer)?;
         if self.driver.qualify().is_err() || self.sandbox.qualify().is_err() {
             return Err(WorkerError::NotReady);
@@ -1216,25 +1246,32 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     Err(WorkerError::CleanupFailed)
                 };
             }
-            let primary_page_id =
-                match self
+            let context = match options {
+                Some(options) => self.driver.create_context_owned_with_options(
+                    &command.tenant_id,
+                    &session_id,
+                    &fence,
+                    options,
+                ),
+                None => self
                     .driver
-                    .create_context_owned(&command.tenant_id, &session_id, &fence)
-                {
-                    Ok(page_id) => page_id,
-                    Err(_) => {
-                        let sandbox_clean = self.driver.shard_managed_contexts()
-                            || self
-                                .sandbox
-                                .cleanup(&session_id, CleanupReason::BrowserFailure)
-                                .is_ok();
-                        return if sandbox_clean {
-                            Err(WorkerError::DependencyUnavailable)
-                        } else {
-                            Err(WorkerError::CleanupFailed)
-                        };
-                    }
-                };
+                    .create_context_owned(&command.tenant_id, &session_id, &fence),
+            };
+            let primary_page_id = match context {
+                Ok(page_id) => page_id,
+                Err(_) => {
+                    let sandbox_clean = self.driver.shard_managed_contexts()
+                        || self
+                            .sandbox
+                            .cleanup(&session_id, CleanupReason::BrowserFailure)
+                            .is_ok();
+                    return if sandbox_clean {
+                        Err(WorkerError::DependencyUnavailable)
+                    } else {
+                        Err(WorkerError::CleanupFailed)
+                    };
+                }
+            };
             if let Err(error) = machine
                 .register_target(&fence, TargetId::new(primary_page_id.to_string()))
                 .map_err(map_session_error)

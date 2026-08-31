@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 6);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 7);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();

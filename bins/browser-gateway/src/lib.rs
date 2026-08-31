@@ -44,12 +44,14 @@ use browserd_http::{
 };
 use browserd_viewer::{TicketError, TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
 use browserd_worker::{
-    PendingWorkerRpc, WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionReceipt,
-    WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt,
-    WorkerArtifactSource, WorkerArtifactState, WorkerCreateSessionReceipt,
-    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcBlockingClient,
-    WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode,
-    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
+    PendingWorkerRpc, WORKER_SESSION_OPTIONS_VERSION, WorkerActionCommand,
+    WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerApprovalDecision,
+    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
+    WorkerArtifactState, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
+    WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcBlockingClient, WorkerRpcCompletionError,
+    WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1,
+    WorkerViewport,
 };
 use chrono::Utc;
 use jsonwebtoken::Algorithm;
@@ -2140,6 +2142,26 @@ where
                 }
                 IsolationRequest::DedicatedProcess => WorkerIsolationProfile::DedicatedProcess,
                 IsolationRequest::DedicatedWorker => WorkerIsolationProfile::DedicatedWorker,
+            },
+            options_version: WORKER_SESSION_OPTIONS_VERSION,
+            options: WorkerSessionOptionsV1 {
+                workload_class_hint: request.workload_class_hint.clone(),
+                viewport: WorkerViewport {
+                    width: request.viewport.width,
+                    height: request.viewport.height,
+                    device_scale_factor: request.viewport.device_scale_factor,
+                },
+                locale: request.locale.clone(),
+                timezone: request.timezone.clone(),
+                user_agent: request.user_agent.clone(),
+                network_policy_id: request.network_policy_id.clone(),
+                network_class: request.network_class.clone(),
+                checkpoint_ref: request.checkpoint_ref.clone(),
+                dialog_policy: request.dialog_policy.clone(),
+                feature_profile: request.feature_profile.clone(),
+                ttl_seconds: request.ttl_seconds,
+                idle_timeout_seconds: request.idle_timeout_seconds,
+                metadata: request.metadata.clone(),
             },
             now_unix_millis,
         };

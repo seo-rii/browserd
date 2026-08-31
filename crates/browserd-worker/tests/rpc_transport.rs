@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::error::Error;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
@@ -16,7 +18,7 @@ use browserd_worker::{
     WorkerActionReceipt, WorkerActionStatus, WorkerCreateSessionReceipt,
     WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerProbeReceipt, WorkerRpcClient,
     WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcError, WorkerRpcHandler, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence,
+    WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -202,8 +204,86 @@ fn create_request(operation_id: OperationId) -> WorkerCreateSessionRequest {
         placement_version: 9,
         session_incarnation: 1,
         requested_isolation: WorkerIsolationProfile::SharedContext,
+        options_version: 1,
+        options: WorkerSessionOptionsV1 {
+            workload_class_hint: "interactive".to_owned(),
+            viewport: WorkerViewport {
+                width: 1280,
+                height: 720,
+                device_scale_factor: 2,
+            },
+            locale: "ko-KR".to_owned(),
+            timezone: "Asia/Seoul".to_owned(),
+            user_agent: Some("browserd-wire-test/1".to_owned()),
+            network_policy_id: "public-web-default".to_owned(),
+            network_class: "public".to_owned(),
+            checkpoint_ref: None,
+            dialog_policy: "auto_dismiss".to_owned(),
+            feature_profile: "standard".to_owned(),
+            ttl_seconds: 1_800,
+            idle_timeout_seconds: 600,
+            metadata: BTreeMap::from([
+                ("agent_run_id".to_owned(), "run_wire_1".to_owned()),
+                ("team".to_owned(), "browserd".to_owned()),
+            ]),
+        },
         now_unix_millis: 1234,
     }
+}
+
+#[test]
+fn create_session_wire_roundtrip_preserves_every_v1_option() -> Result<(), Box<dyn Error>> {
+    let request = WorkerRpcRequest::CreateSession(create_request(OperationId::new()));
+
+    let encoded = serde_json::to_vec(&request)?;
+    let decoded: WorkerRpcRequest = serde_json::from_slice(&encoded)?;
+
+    assert_eq!(decoded, request);
+    let WorkerRpcRequest::CreateSession(decoded) = decoded else {
+        return Err(std::io::Error::other("roundtrip changed the request variant").into());
+    };
+    assert_eq!(decoded.options_version, 1);
+    assert_eq!(decoded.options.viewport.width, 1280);
+    assert_eq!(decoded.options.viewport.height, 720);
+    assert_eq!(decoded.options.viewport.device_scale_factor, 2);
+    assert_eq!(decoded.options.locale, "ko-KR");
+    assert_eq!(decoded.options.timezone, "Asia/Seoul");
+    assert_eq!(
+        decoded
+            .options
+            .metadata
+            .get("agent_run_id")
+            .map(String::as_str),
+        Some("run_wire_1")
+    );
+    Ok(())
+}
+
+#[test]
+fn create_session_wire_requires_a_known_options_version() -> Result<(), Box<dyn Error>> {
+    let request = WorkerRpcRequest::CreateSession(create_request(OperationId::new()));
+    let encoded = serde_json::to_value(request)?;
+    let mut create = encoded
+        .get("params")
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("create request payload should be present"))?;
+
+    create
+        .as_object_mut()
+        .ok_or_else(|| std::io::Error::other("create request payload should be an object"))?
+        .remove("options_version");
+    assert!(
+        serde_json::from_value::<WorkerCreateSessionRequest>(create.clone()).is_err(),
+        "missing options_version must fail closed"
+    );
+
+    create["options_version"] = serde_json::json!(2);
+    let future = serde_json::from_value::<WorkerCreateSessionRequest>(create);
+    assert!(
+        future.is_err() || future.is_ok_and(|request| !request.is_valid()),
+        "an unknown options version must fail decoding or request validation"
+    );
+    Ok(())
 }
 
 #[tokio::test]

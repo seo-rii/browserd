@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -19,6 +19,7 @@ use browserd_core::{
     ActionId, ApprovalId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId,
     TenantId, WorkerId,
 };
+use browserd_operations::CanonicalRequestHash as CreateCanonicalRequestHash;
 use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalDecision, ApprovalState, CanonicalActionProposal,
     CredentialRefsHash, NodeReference, Origin,
@@ -42,12 +43,18 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 6;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 7;
+pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
 const MAX_WORKER_ACTION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_WORKER_POINTER_COORDINATE: u64 = 1_000_000;
 const MAX_WORKER_ACTION_EXECUTION_TIMEOUT_MS: u64 = 300_000;
+const MAX_SESSION_VIEWPORT_PIXELS: u64 = 67_108_864;
+const MAX_SESSION_METADATA_ENTRIES: usize = 64;
+const MAX_SESSION_METADATA_KEY_BYTES: usize = 128;
+const MAX_SESSION_METADATA_VALUE_BYTES: usize = 4 * 1024;
+const MAX_SESSION_METADATA_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -141,6 +148,117 @@ pub enum WorkerIsolationProfile {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct WorkerViewport {
+    pub width: u32,
+    pub height: u32,
+    pub device_scale_factor: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSessionOptionsV1 {
+    pub workload_class_hint: String,
+    pub viewport: WorkerViewport,
+    pub locale: String,
+    pub timezone: String,
+    pub user_agent: Option<String>,
+    pub network_policy_id: String,
+    pub network_class: String,
+    pub checkpoint_ref: Option<String>,
+    pub dialog_policy: String,
+    pub feature_profile: String,
+    pub ttl_seconds: u64,
+    pub idle_timeout_seconds: u64,
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl WorkerSessionOptionsV1 {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let metadata_bytes = self
+            .metadata
+            .iter()
+            .try_fold(0_usize, |total, (key, value)| {
+                total.checked_add(key.len())?.checked_add(value.len())
+            });
+        let viewport_pixels =
+            u64::from(self.viewport.width).checked_mul(u64::from(self.viewport.height));
+        self.viewport.width != 0
+            && self.viewport.height != 0
+            && self.viewport.width <= 16_384
+            && self.viewport.height <= 16_384
+            && viewport_pixels.is_some_and(|pixels| pixels <= MAX_SESSION_VIEWPORT_PIXELS)
+            && (1..=8).contains(&self.viewport.device_scale_factor)
+            && self.ttl_seconds != 0
+            && self.idle_timeout_seconds != 0
+            && self.idle_timeout_seconds <= self.ttl_seconds
+            && !self.workload_class_hint.trim().is_empty()
+            && self.workload_class_hint.len() <= 128
+            && !self.workload_class_hint.chars().any(char::is_control)
+            && !self.locale.trim().is_empty()
+            && self.locale.len() <= 64
+            && !self.locale.chars().any(char::is_control)
+            && !self.timezone.trim().is_empty()
+            && self.timezone.len() <= 128
+            && !self.timezone.chars().any(char::is_control)
+            && !self.network_policy_id.trim().is_empty()
+            && self.network_policy_id.len() <= 256
+            && !self.network_policy_id.chars().any(char::is_control)
+            && !self.network_class.trim().is_empty()
+            && self.network_class.len() <= 64
+            && !self.network_class.chars().any(char::is_control)
+            && !self.feature_profile.trim().is_empty()
+            && self.feature_profile.len() <= 128
+            && !self.feature_profile.chars().any(char::is_control)
+            && self.user_agent.as_ref().is_none_or(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 4_096
+                    && !value.chars().any(char::is_control)
+            })
+            && self.checkpoint_ref.as_ref().is_none_or(|value| {
+                !value.trim().is_empty()
+                    && value.len() <= 1_024
+                    && !value.chars().any(char::is_control)
+            })
+            && matches!(self.dialog_policy.as_str(), "auto_dismiss" | "hold")
+            && self.metadata.len() <= MAX_SESSION_METADATA_ENTRIES
+            && self.metadata.keys().all(|key| {
+                !key.is_empty()
+                    && key.len() <= MAX_SESSION_METADATA_KEY_BYTES
+                    && key.trim() == key
+                    && !key.chars().any(char::is_control)
+            })
+            && self.metadata.values().all(|value| {
+                value.len() <= MAX_SESSION_METADATA_VALUE_BYTES
+                    && !value.chars().any(char::is_control)
+            })
+            && metadata_bytes.is_some_and(|bytes| bytes <= MAX_SESSION_METADATA_BYTES)
+    }
+
+    #[must_use]
+    pub fn canonical_request_hash(&self, requested_isolation: WorkerIsolationProfile) -> [u8; 32] {
+        let request = serde_json::json!({
+            "isolation": requested_isolation,
+            "workload_class_hint": self.workload_class_hint,
+            "viewport": self.viewport,
+            "locale": self.locale,
+            "timezone": self.timezone,
+            "user_agent": self.user_agent,
+            "network_policy_id": self.network_policy_id,
+            "network_class": self.network_class,
+            "checkpoint_ref": self.checkpoint_ref,
+            "dialog_policy": self.dialog_policy,
+            "feature_profile": self.feature_profile,
+            "ttl_seconds": self.ttl_seconds,
+            "idle_timeout_seconds": self.idle_timeout_seconds,
+            "metadata": self.metadata,
+        });
+        *CreateCanonicalRequestHash::from_json(&request).as_bytes()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSessionFence {
     pub tenant_id: TenantId,
     pub session_id: SessionId,
@@ -167,6 +285,8 @@ pub struct WorkerCreateSessionRequest {
     pub placement_version: u64,
     pub session_incarnation: u64,
     pub requested_isolation: WorkerIsolationProfile,
+    pub options_version: u16,
+    pub options: WorkerSessionOptionsV1,
     pub now_unix_millis: u64,
 }
 
@@ -180,6 +300,12 @@ impl WorkerCreateSessionRequest {
             && self.expected_worker_epoch != 0
             && self.placement_version != 0
             && self.session_incarnation != 0
+            && self.options_version == WORKER_SESSION_OPTIONS_VERSION
+            && self.options.is_valid()
+            && self.canonical_request_hash
+                == self
+                    .options
+                    .canonical_request_hash(self.requested_isolation)
     }
 }
 
@@ -1091,9 +1217,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 }))
             }
             WorkerRpcRequest::CreateSession(request) => {
-                if !request.is_valid()
-                    || request.expected_worker_epoch != self.worker.config.worker_epoch
-                {
+                if !request.is_valid() {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        "create request contains invalid or unbound session options",
+                    ));
+                }
+                if request.expected_worker_epoch != self.worker.config.worker_epoch {
                     return Err(WorkerRpcFailure::new(
                         WorkerRpcFailureCode::FenceMismatch,
                         "create request does not match this worker epoch",
@@ -1110,7 +1240,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 }
                 let binding_key = (request.tenant_id.clone(), request.idempotency_key.clone());
                 let tenant_id = request.tenant_id.clone();
-                let outcome = self.worker.create_session(
+                let options = request.options.clone();
+                let outcome = self.worker.create_session_with_options(
                     &self.peer,
                     CreateSessionCommand {
                         tenant_id: request.tenant_id,
@@ -1119,6 +1250,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         placement_version: request.placement_version,
                         session_incarnation: request.session_incarnation,
                     },
+                    &options,
                     SessionTime::new(request.now_unix_millis),
                 );
                 let outcome = match outcome {

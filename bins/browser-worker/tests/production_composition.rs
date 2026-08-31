@@ -1,5 +1,6 @@
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,8 +14,9 @@ use browserd_core::{OperationId, PageId, SessionId, TenantId, WorkerId};
 use browserd_session::{LeasePolicy, OwnershipFence, SessionTimeoutPolicy};
 use browserd_worker::{
     ActionJournalConfig, ArtifactStoreReceipt, ArtifactStoreRequest, AuthenticatedPeer,
-    DependencyError, InternalEndpoint, UnavailableChromiumDriver, WorkerConfig, WorkerControlPlane,
-    WorkerCreateSessionRequest, WorkerIsolationProfile, WorkerRpcClient, WorkerRpcConfig,
+    DependencyError, InternalEndpoint, UnavailableChromiumDriver, WORKER_SESSION_OPTIONS_VERSION,
+    WorkerConfig, WorkerControlPlane, WorkerCreateSessionRequest, WorkerIsolationProfile,
+    WorkerRpcClient, WorkerRpcConfig, WorkerSessionOptionsV1, WorkerViewport,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -182,16 +184,38 @@ async fn production_runtime_serves_the_real_control_plane_and_drains_owned_shard
             .as_millis(),
     )
     .expect("current Unix time should fit in u64");
+    let options = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "en-US".to_owned(),
+        timezone: "UTC".to_owned(),
+        user_agent: None,
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: BTreeMap::new(),
+    };
     let created = client
         .create_session(WorkerCreateSessionRequest {
             operation_id: OperationId::new(),
             tenant_id: TenantId::new(),
             idempotency_key: "production-composition-create".to_owned(),
-            canonical_request_hash: [7; 32],
+            canonical_request_hash: options
+                .canonical_request_hash(WorkerIsolationProfile::SharedContext),
             expected_worker_epoch: worker_epoch,
             placement_version: 1,
             session_incarnation: 1,
             requested_isolation: WorkerIsolationProfile::SharedContext,
+            options_version: WORKER_SESSION_OPTIONS_VERSION,
+            options,
             now_unix_millis,
         })
         .await
