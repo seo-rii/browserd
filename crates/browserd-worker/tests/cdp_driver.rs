@@ -1601,3 +1601,150 @@ async fn navigate_without_a_typed_wait_until_is_rejected_before_cdp() {
     );
     assert!(!page.drain.0.load(Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn reload_completes_only_after_the_reloaded_document_loads() {
+    let mut page = owned_page().await;
+    let reload = spawn_action(&page, br#"{"type":"reload"}"#, None);
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.reload");
+    assert_eq!(command["sessionId"], "flat-primary");
+    // Page.reload acknowledges the request but carries no loaderId of its own.
+    respond(&mut page.writer, &command, json!({})).await;
+
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-r1",
+            "https://example.test/a",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !reload.is_finished(),
+        "a reload must await the full load of the document it commits"
+    );
+
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    assert_eq!(reload.await.unwrap(), succeeded());
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "awaiting the reload lifecycle must not issue further CDP effects"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn reload_awaits_a_loader_distinct_from_the_prior_document() {
+    let mut page = owned_page().await;
+    // Establish a fully-loaded prior document so its terminal lifecycle state cannot be
+    // mistaken for the reload's own fresh document.
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/a","wait_until":"load"}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"frameId": "frame", "loaderId": "loader-prior"}),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-prior",
+            "https://example.test/a",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    assert_eq!(navigate.await.unwrap(), succeeded());
+
+    let reload = spawn_action(&page, br#"{"type":"reload"}"#, None);
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.reload");
+    respond(&mut page.writer, &command, json!({})).await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !reload.is_finished(),
+        "the prior document's completed load must not satisfy the reload"
+    );
+
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-reloaded",
+            "https://example.test/a",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    assert_eq!(reload.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn reload_lifecycle_deadline_is_a_known_timeout() {
+    let mut page = owned_page().await;
+    let reload = spawn_action(
+        &page,
+        br#"{"type":"reload"}"#,
+        Some(Instant::now() + Duration::from_millis(150)),
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.reload");
+    respond(&mut page.writer, &command, json!({})).await;
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-slow",
+            "https://example.test/a",
+        ),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), reload)
+            .await
+            .expect("the action deadline must end the reload lifecycle wait")
+            .unwrap(),
+        ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}

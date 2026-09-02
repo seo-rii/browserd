@@ -2224,15 +2224,30 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 Ok(result)
             }
             PageCommand::Reload => {
-                self.command_event_first(
-                    "Page.reload",
-                    json!({}),
-                    Some(cdp_session_id),
-                    None,
-                    guarded,
+                // The document live before the reload; the reload's own document arrives as
+                // a later frameNavigated bearing a distinct loader.
+                let prior_loader = self
+                    .routes
+                    .get(&target_id)
+                    .and_then(|route| route.document.loader_id.clone());
+                let result = self
+                    .command_event_first(
+                        "Page.reload",
+                        json!({}),
+                        Some(cdp_session_id),
+                        None,
+                        guarded,
+                        deadline,
+                    )
+                    .await?;
+                self.await_reload_lifecycle(
+                    &target_id,
+                    prior_loader.as_deref(),
+                    WorkerNavigateWaitUntil::Load,
                     deadline,
                 )
-                .await
+                .await?;
+                Ok(result)
             }
             PageCommand::Click { x, y } => {
                 self.command_event_first(
@@ -2399,6 +2414,21 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         ))
     }
 
+    /// Latest instant a lifecycle wait may sleep to.
+    ///
+    /// Bounded by the actor command timeout and, when the action carries a deadline, by a
+    /// margin before that deadline so the mailbox reply is delivered ahead of its own
+    /// expiry rather than racing it.
+    fn lifecycle_deadline(&self, deadline: Option<Instant>) -> Instant {
+        let capped = Instant::now() + self.command_timeout;
+        deadline.map_or(capped, |deadline| {
+            deadline
+                .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
+                .unwrap_or(deadline)
+                .min(capped)
+        })
+    }
+
     /// Waits until the main-frame document committed for `loader_id` reaches `wait_until`.
     ///
     /// Lifecycle events are recorded by `handle_incoming` regardless of whether they arrive
@@ -2414,13 +2444,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         wait_until: WorkerNavigateWaitUntil,
         deadline: Option<Instant>,
     ) -> Result<(), OwnerActorError> {
-        let capped = Instant::now() + self.command_timeout;
-        let expires_at = deadline.map_or(capped, |deadline| {
-            deadline
-                .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
-                .unwrap_or(deadline)
-                .min(capped)
-        });
+        let expires_at = self.lifecycle_deadline(deadline);
         let expires = tokio::time::sleep_until(expires_at.into());
         tokio::pin!(expires);
         let mut committed = false;
@@ -2443,6 +2467,47 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     }
                 }
                 _ if committed => return Err(OwnerActorError::NavigationInterrupted),
+                _ => {}
+            }
+            tokio::select! {
+                biased;
+                () = &mut expires => return Err(OwnerActorError::NavigationTimeout),
+                incoming = self.events.recv() => {
+                    let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_incoming(incoming, None)?;
+                }
+            }
+        }
+    }
+
+    /// Awaits the fresh main-frame document a `Page.reload` commits.
+    ///
+    /// Unlike `Page.navigate`, `Page.reload` returns no `loaderId`, so the reload cannot
+    /// name its own document up front. Instead it waits for the next `Page.frameNavigated`
+    /// to commit a loader distinct from `prior_loader` — the document that was live when the
+    /// reload was issued — then defers to the shared lifecycle wait on that fresh loader.
+    async fn await_reload_lifecycle(
+        &mut self,
+        target_id: &str,
+        prior_loader: Option<&str>,
+        wait_until: WorkerNavigateWaitUntil,
+        deadline: Option<Instant>,
+    ) -> Result<(), OwnerActorError> {
+        let expires_at = self.lifecycle_deadline(deadline);
+        let expires = tokio::time::sleep_until(expires_at.into());
+        tokio::pin!(expires);
+        loop {
+            let route = self
+                .routes
+                .get(target_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            match route.document.loader_id.as_deref() {
+                Some(fresh) if Some(fresh) != prior_loader => {
+                    let fresh = fresh.to_owned();
+                    return self
+                        .await_document_lifecycle(target_id, &fresh, wait_until, deadline)
+                        .await;
+                }
                 _ => {}
             }
             tokio::select! {
