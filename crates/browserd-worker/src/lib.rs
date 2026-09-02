@@ -26,11 +26,11 @@ pub use rpc::{
     WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
     WorkerArtifactState, WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler,
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
-    WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient, WorkerRpcClient,
-    WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError, WorkerRpcError,
-    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1,
-    WorkerSessionReceipt, WorkerViewport,
+    WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient,
+    WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError,
+    WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle,
+    WorkerSessionOptionsV1, WorkerSessionReceipt, WorkerViewport,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
@@ -2667,7 +2667,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 );
                 let known_failure_reason = matches!(
                     &outcome,
-                    ActionExecutionResult::FailedKnown(reason) if reason == "action_timeout"
+                    ActionExecutionResult::FailedKnown(reason)
+                        if reason == "action_timeout" || reason == "navigation_timeout"
                 )
                 .then_some(KnownFailureReason::ExecutionTimedOut);
                 (outcome, None, known_failure_reason)

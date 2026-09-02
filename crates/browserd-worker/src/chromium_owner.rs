@@ -25,7 +25,8 @@ use crate::cdp_driver::CdpChromiumDriver;
 use crate::{
     CdpPipeAcceptor, ProductionTargetManager, SandboxTerminationProof, ShardRuntimeError,
     TargetBootstrapSnapshot, TargetManagerBackend, TargetManagerDrain, TargetManagerEvent,
-    TargetManagerIngress, WorkerSessionOptionsV1, target_manager::TargetReadiness,
+    TargetManagerIngress, WorkerNavigateWaitUntil, WorkerSessionOptionsV1,
+    target_manager::TargetReadiness,
 };
 
 const MAX_CDP_IDENTIFIER_BYTES: usize = 1_024;
@@ -34,6 +35,9 @@ const MAX_CONTEXTS_PER_SHARD: usize = 1_024;
 const MAX_PAGES_PER_CONTEXT: usize = 256;
 const MAX_CLOSED_PAGE_TOMBSTONES: usize = 4_096;
 const MAX_RETIRED_TARGETS: usize = 4_096;
+/// Lifecycle waits answer this far ahead of the action deadline so the reply reaches the
+/// mailbox before its own deadline expires; a mailbox timeout fails the whole owner closed.
+const LIFECYCLE_DEADLINE_RESPONSE_MARGIN: Duration = Duration::from_millis(50);
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1126,6 +1130,10 @@ pub(crate) enum OwnerActorError {
     StateOverflow,
     Unavailable,
     OutcomeUncertain,
+    /// The navigated document committed and was then replaced before the requested lifecycle.
+    NavigationInterrupted,
+    /// The navigate command was acknowledged but the requested lifecycle did not arrive in time.
+    NavigationTimeout,
 }
 
 #[derive(Clone, Debug)]
@@ -1136,10 +1144,18 @@ struct CreatedPage {
 
 #[derive(Clone, Debug)]
 pub(crate) enum PageCommand {
-    Navigate { url: String },
+    Navigate {
+        url: String,
+        wait_until: WorkerNavigateWaitUntil,
+    },
     Reload,
-    Click { x: f64, y: f64 },
-    InsertText { text: String },
+    Click {
+        x: f64,
+        y: f64,
+    },
+    InsertText {
+        text: String,
+    },
     ReadUrl,
     ReadTitle,
 }
@@ -1206,6 +1222,18 @@ struct TargetRouteEntry {
     target_incarnation: u64,
     frame_document_epoch: u64,
     url_revision: u64,
+    document: DocumentLoadState,
+}
+
+/// Lifecycle of the main-frame document most recently committed on a target.
+///
+/// `loader_id` correlates `Page.frameNavigated` with the `loaderId` a `Page.navigate`
+/// response returned, so a navigate action only completes on its own document.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DocumentLoadState {
+    loader_id: Option<String>,
+    dom_content_loaded: bool,
+    loaded: bool,
 }
 
 struct ChromiumOwnerActor<D> {
@@ -2160,9 +2188,12 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     ) -> Result<Value, OwnerActorError> {
         let (_, target_id, route) = self.owned_page_route(session_id, page_id)?;
         let cdp_session_id = route.session_id().to_owned();
-        let guarded = execution_fence.map(|fence| GuardedPageExecution { target_id, fence });
+        let guarded = execution_fence.map(|fence| GuardedPageExecution {
+            target_id: target_id.clone(),
+            fence,
+        });
         match command {
-            PageCommand::Navigate { url } => {
+            PageCommand::Navigate { url, wait_until } => {
                 let result = self
                     .command_event_first(
                         "Page.navigate",
@@ -2179,6 +2210,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .is_some_and(|error| !error.is_empty())
                 {
                     return Err(OwnerActorError::Rejected);
+                }
+                match result.get("loaderId") {
+                    // Same-document navigations commit no new loader and fire no lifecycle.
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(loader_id)) if valid_identifier(loader_id) => {
+                        let loader_id = loader_id.clone();
+                        self.await_document_lifecycle(&target_id, &loader_id, wait_until, deadline)
+                            .await?;
+                    }
+                    Some(_) => return Err(OwnerActorError::OutcomeUncertain),
                 }
                 Ok(result)
             }
@@ -2358,6 +2399,63 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         ))
     }
 
+    /// Waits until the main-frame document committed for `loader_id` reaches `wait_until`.
+    ///
+    /// Lifecycle events are recorded by `handle_incoming` regardless of whether they arrive
+    /// before or after the `Page.navigate` response, so this only observes route state and
+    /// keeps draining the event stream. The wait is bounded by the action deadline (less the
+    /// mailbox response margin) and the per-command timeout cap; an expired bound is a known
+    /// timeout because the navigate itself was acknowledged and the browser state stays
+    /// observable.
+    async fn await_document_lifecycle(
+        &mut self,
+        target_id: &str,
+        loader_id: &str,
+        wait_until: WorkerNavigateWaitUntil,
+        deadline: Option<Instant>,
+    ) -> Result<(), OwnerActorError> {
+        let capped = Instant::now() + self.command_timeout;
+        let expires_at = deadline.map_or(capped, |deadline| {
+            deadline
+                .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
+                .unwrap_or(deadline)
+                .min(capped)
+        });
+        let expires = tokio::time::sleep_until(expires_at.into());
+        tokio::pin!(expires);
+        let mut committed = false;
+        loop {
+            let route = self
+                .routes
+                .get(target_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            match route.document.loader_id.as_deref() {
+                Some(current) if current == loader_id => {
+                    committed = true;
+                    let satisfied = match wait_until {
+                        WorkerNavigateWaitUntil::Domcontentloaded => {
+                            route.document.dom_content_loaded || route.document.loaded
+                        }
+                        WorkerNavigateWaitUntil::Load => route.document.loaded,
+                    };
+                    if satisfied {
+                        return Ok(());
+                    }
+                }
+                _ if committed => return Err(OwnerActorError::NavigationInterrupted),
+                _ => {}
+            }
+            tokio::select! {
+                biased;
+                () = &mut expires => return Err(OwnerActorError::NavigationTimeout),
+                incoming = self.events.recv() => {
+                    let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_incoming(incoming, None)?;
+                }
+            }
+        }
+    }
+
     async fn command_event_first(
         &mut self,
         method: &'static str,
@@ -2523,6 +2621,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     target_incarnation,
                     frame_document_epoch: 1,
                     url_revision: 1,
+                    document: DocumentLoadState::default(),
                 };
                 if let Some(existing) = self.routes.get(target.target_id()) {
                     if existing.route != entry.route
@@ -2747,6 +2846,11 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .and_then(Value::as_object)
                     .ok_or(OwnerActorError::OutcomeUncertain)?;
                 if !frame.contains_key("parentId") {
+                    let loader_id = frame
+                        .get("loaderId")
+                        .and_then(Value::as_str)
+                        .filter(|loader_id| valid_identifier(loader_id))
+                        .map(str::to_owned);
                     let route = self
                         .routes
                         .values_mut()
@@ -2760,6 +2864,32 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         .url_revision
                         .checked_add(1)
                         .ok_or(OwnerActorError::StateOverflow)?;
+                    route.document = DocumentLoadState {
+                        loader_id,
+                        dom_content_loaded: false,
+                        loaded: false,
+                    };
+                }
+            }
+            "Page.domContentEventFired" | "Page.loadEventFired" => {
+                // Both events describe the target's main frame only. Events for retired
+                // targets carry no ownership consequence, so they are ignored rather than
+                // treated as a protocol fault.
+                let Some(session_id) = event_session_id
+                    .as_deref()
+                    .filter(|session_id| valid_identifier(session_id))
+                else {
+                    return Ok(());
+                };
+                if let Some(route) = self
+                    .routes
+                    .values_mut()
+                    .find(|route| route.route.session_id == session_id)
+                {
+                    route.document.dom_content_loaded = true;
+                    if method == "Page.loadEventFired" {
+                        route.document.loaded = true;
+                    }
                 }
             }
             "Page.navigatedWithinDocument" => {
@@ -2898,7 +3028,9 @@ fn map_command_error(error: CdpCommandError) -> OwnerActorError {
 fn map_actor_stage_error(error: OwnerActorError) -> BootstrapStageFailure {
     match error {
         OwnerActorError::UnknownOwnership => BootstrapStageFailure::UnknownOwnership,
-        OwnerActorError::Rejected => BootstrapStageFailure::Rejected,
+        OwnerActorError::Rejected
+        | OwnerActorError::NavigationInterrupted
+        | OwnerActorError::NavigationTimeout => BootstrapStageFailure::Rejected,
         OwnerActorError::DeadlineBeforeDispatch
         | OwnerActorError::StateOverflow
         | OwnerActorError::Unavailable
@@ -2908,9 +3040,10 @@ fn map_actor_stage_error(error: OwnerActorError) -> BootstrapStageFailure {
 
 fn map_actor_runtime_error(error: OwnerActorError) -> ShardRuntimeError {
     match error {
-        OwnerActorError::Rejected | OwnerActorError::UnknownOwnership => {
-            ShardRuntimeError::Rejected
-        }
+        OwnerActorError::Rejected
+        | OwnerActorError::UnknownOwnership
+        | OwnerActorError::NavigationInterrupted
+        | OwnerActorError::NavigationTimeout => ShardRuntimeError::Rejected,
         OwnerActorError::StateOverflow | OwnerActorError::Unavailable => {
             ShardRuntimeError::Unavailable
         }

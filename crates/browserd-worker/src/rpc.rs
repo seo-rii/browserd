@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 7;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 8;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -94,13 +94,29 @@ impl<'de> Deserialize<'de> for WorkerActionExecutionTimeout {
     }
 }
 
+/// Main-frame document lifecycle a navigate action observes before it completes.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerNavigateWaitUntil {
+    Domcontentloaded,
+    Load,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerActionCommand {
-    Navigate { url: String },
+    Navigate {
+        url: String,
+        wait_until: WorkerNavigateWaitUntil,
+    },
     Reload,
-    Click { x: i64, y: i64 },
-    TypeText { text: String },
+    Click {
+        x: i64,
+        y: i64,
+    },
+    TypeText {
+        text: String,
+    },
     GetUrl,
     GetTitle,
 }
@@ -109,7 +125,7 @@ impl WorkerActionCommand {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         match self {
-            Self::Navigate { url } => {
+            Self::Navigate { url, .. } => {
                 !url.is_empty()
                     && url.len() <= MAX_WORKER_ACTION_URL_BYTES
                     && !url.chars().any(char::is_control)

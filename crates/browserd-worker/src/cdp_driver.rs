@@ -115,6 +115,12 @@ impl CdpChromiumDriver {
             Err(OwnerActorError::DeadlineBeforeDispatch) => {
                 ActionExecutionResult::FailedKnown("action_timeout".to_owned())
             }
+            Err(OwnerActorError::NavigationInterrupted) => {
+                ActionExecutionResult::FailedKnown("navigation_interrupted".to_owned())
+            }
+            Err(OwnerActorError::NavigationTimeout) => {
+                ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
+            }
             Err(
                 OwnerActorError::StateOverflow
                 | OwnerActorError::Unavailable
@@ -497,9 +503,10 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
         return Err("invalid_action_arguments");
     }
     match action {
-        WorkerActionCommand::Navigate { url } => {
-            Ok((PageCommand::Navigate { url }, ActionResultShape::Unit))
-        }
+        WorkerActionCommand::Navigate { url, wait_until } => Ok((
+            PageCommand::Navigate { url, wait_until },
+            ActionResultShape::Unit,
+        )),
         WorkerActionCommand::Reload => Ok((PageCommand::Reload, ActionResultShape::Unit)),
         WorkerActionCommand::Click { x, y } => Ok((
             PageCommand::Click {
@@ -518,7 +525,10 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
 
 fn map_owner_error(error: OwnerActorError) -> DependencyError {
     match error {
-        OwnerActorError::Rejected | OwnerActorError::UnknownOwnership => DependencyError::Rejected,
+        OwnerActorError::Rejected
+        | OwnerActorError::UnknownOwnership
+        | OwnerActorError::NavigationInterrupted
+        | OwnerActorError::NavigationTimeout => DependencyError::Rejected,
         OwnerActorError::StateOverflow | OwnerActorError::Unavailable => {
             DependencyError::Unavailable
         }

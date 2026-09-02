@@ -10,8 +10,8 @@ use browserd_worker::{
     WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerActionStatus,
     WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
     WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
-    WorkerCanonicalActionProposal, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence,
+    WorkerCanonicalActionProposal, WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerProbeReceipt,
+    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
 };
 
 fn fence() -> WorkerSessionFence {
@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 7);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 8);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -82,6 +82,23 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
                 credential_refs: vec!["credential-1".to_owned()],
                 require_four_eyes: true,
             })),
+            now_unix_millis: 10,
+        },
+        WorkerRpcRequest::SubmitAction {
+            fence: fence.clone(),
+            action_id: action_id.clone(),
+            action_sequence: ActionSequence::new(9),
+            requester_principal_id: principal_id.clone(),
+            idempotency_key: "action-2".to_owned(),
+            canonical_request_hash: [5; 32],
+            kind: ActionKind::Mutating,
+            page_id: Some(page_id.clone()),
+            action: WorkerActionCommand::Navigate {
+                url: "https://example.test/path".to_owned(),
+                wait_until: WorkerNavigateWaitUntil::Domcontentloaded,
+            },
+            execution_timeout_ms: execution_timeout,
+            approval: None,
             now_unix_millis: 10,
         },
         WorkerRpcRequest::ResolveAction {
@@ -331,4 +348,62 @@ fn worker_request_rejects_missing_tenant_identity_and_unknown_fields() {
         }
     });
     assert!(serde_json::from_value::<WorkerRpcRequest>(encoded).is_err());
+}
+
+#[test]
+fn navigate_command_requires_a_typed_wait_until_lifecycle() {
+    let command = WorkerActionCommand::Navigate {
+        url: "https://example.test/path".to_owned(),
+        wait_until: WorkerNavigateWaitUntil::Load,
+    };
+    let encoded = serde_json::to_value(&command);
+    assert_eq!(
+        encoded.ok(),
+        Some(serde_json::json!({
+            "type": "navigate",
+            "url": "https://example.test/path",
+            "wait_until": "load",
+        }))
+    );
+    assert!(command.is_valid());
+    assert_eq!(command.kind(), ActionKind::Mutating);
+
+    let decoded = serde_json::from_value::<WorkerActionCommand>(serde_json::json!({
+        "type": "navigate",
+        "url": "https://example.test/path",
+        "wait_until": "domcontentloaded",
+    }));
+    assert_eq!(
+        decoded.ok(),
+        Some(WorkerActionCommand::Navigate {
+            url: "https://example.test/path".to_owned(),
+            wait_until: WorkerNavigateWaitUntil::Domcontentloaded,
+        })
+    );
+
+    for untyped in [
+        serde_json::json!({"type": "navigate", "url": "https://example.test/path"}),
+        serde_json::json!({
+            "type": "navigate",
+            "url": "https://example.test/path",
+            "wait_until": "networkidle",
+        }),
+        serde_json::json!({
+            "type": "navigate",
+            "url": "https://example.test/path",
+            "wait_until": "load",
+            "referrer": "https://example.test",
+        }),
+    ] {
+        assert!(
+            serde_json::from_value::<WorkerActionCommand>(untyped).is_err(),
+            "navigate commands must carry exactly one typed lifecycle"
+        );
+    }
+
+    let unsafe_scheme = WorkerActionCommand::Navigate {
+        url: "file:///etc/passwd".to_owned(),
+        wait_until: WorkerNavigateWaitUntil::Load,
+    };
+    assert!(!unsafe_scheme.is_valid());
 }

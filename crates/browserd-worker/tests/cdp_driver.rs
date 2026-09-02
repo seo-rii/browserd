@@ -185,6 +185,35 @@ async fn respond(writer: &mut Sender, command: &Value, result: Value) {
     .await;
 }
 
+fn frame_navigated(session_id: &str, frame_id: &str, loader_id: &str, url: &str) -> Value {
+    json!({
+        "method": "Page.frameNavigated",
+        "sessionId": session_id,
+        "params": {
+            "frame": {
+                "id": frame_id,
+                "loaderId": loader_id,
+                "url": url,
+                "domainAndRegistry": "example.test",
+                "securityOrigin": "https://example.test",
+                "mimeType": "text/html",
+                "secureContextType": "Secure",
+                "crossOriginIsolatedContextType": "NotIsolated",
+                "gatedAPIFeatures": []
+            },
+            "type": "Navigation"
+        }
+    })
+}
+
+fn lifecycle_event(session_id: &str, method: &str) -> Value {
+    json!({
+        "method": method,
+        "sessionId": session_id,
+        "params": {"timestamp": 1.0}
+    })
+}
+
 async fn qualify(reader: &mut Receiver, writer: &mut Sender) {
     let command = read_command(reader).await;
     assert_eq!(command["method"], "Browser.getVersion");
@@ -1101,24 +1130,52 @@ async fn page_lifecycle_and_bounded_actions_use_the_owned_flattened_route() {
             driver.execute_action(
                 &session_id,
                 Some(&page_id),
-                br#"{"type":"navigate","url":"https://example.test/path"}"#,
+                br#"{"type":"navigate","url":"https://example.test/path","wait_until":"load"}"#,
             )
         }
     });
     let command = read_command(&mut reader).await;
     assert_eq!(command["method"], "Page.navigate");
     assert_eq!(command["sessionId"], "flat-primary");
-    assert_eq!(command["params"]["url"], "https://example.test/path");
+    assert_eq!(
+        command["params"],
+        json!({"url": "https://example.test/path"})
+    );
     respond(
         &mut writer,
         &command,
         json!({"frameId": "frame", "loaderId": "loader"}),
     )
     .await;
-    assert!(matches!(
+    write_message(
+        &mut writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader",
+            "https://example.test/path",
+        ),
+    )
+    .await;
+    write_message(
+        &mut writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !navigate.is_finished(),
+        "wait_until=load must outlast DOMContentLoaded"
+    );
+    write_message(
+        &mut writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    assert_eq!(
         navigate.await.unwrap(),
-        ActionExecutionResult::Succeeded(_)
-    ));
+        ActionExecutionResult::Succeeded(br#"{"ok":true}"#.to_vec())
+    );
 
     assert!(matches!(
         driver.execute_action(
@@ -1215,4 +1272,332 @@ async fn action_deadline_after_cdp_submission_is_unknown_and_fail_closed() {
     .await
     .expect("a deadline after CDP submission must drain the shard");
     assert!(manager.is_tainted());
+}
+
+struct OwnedPage {
+    _owner: Arc<ChromiumConnectionOwner<Drain>>,
+    manager: Arc<browserd_worker::ChromiumTargetManager<Drain>>,
+    drain: Arc<Drain>,
+    driver: browserd_worker::CdpChromiumDriver,
+    reader: Receiver,
+    writer: Sender,
+    session_id: SessionId,
+    page_id: PageId,
+}
+
+async fn owned_page() -> OwnedPage {
+    let drain = Arc::new(Drain(AtomicBool::new(false)));
+    let (owner, manager) = ChromiumConnectionOwner::new_bounded(
+        identity(),
+        connection_config(),
+        shard_fence(),
+        16,
+        drain.clone(),
+    )
+    .unwrap();
+    let driver = owner.chromium_driver(IsolationProfile::SharedContext);
+    let (pipes, mut reader, mut writer) = pipe_pair();
+    let accept = tokio::spawn({
+        let owner = owner.clone();
+        async move { owner.accept_cdp_pipes(pipes).await }
+    });
+    qualify(&mut reader, &mut writer).await;
+    assert_eq!(accept.await.unwrap(), Ok(()));
+    bootstrap_empty(manager.clone(), &mut reader, &mut writer).await;
+    let session_id = SessionId::new();
+    let page_id = create_owned_context(
+        driver.clone(),
+        TenantId::new(),
+        session_id.clone(),
+        ownership_fence(),
+        &mut reader,
+        &mut writer,
+    )
+    .await;
+    OwnedPage {
+        _owner: owner,
+        manager,
+        drain,
+        driver,
+        reader,
+        writer,
+        session_id,
+        page_id,
+    }
+}
+
+fn spawn_action(
+    page: &OwnedPage,
+    payload: &'static [u8],
+    deadline: Option<Instant>,
+) -> tokio::task::JoinHandle<ActionExecutionResult> {
+    let driver = page.driver.clone();
+    let session_id = page.session_id.clone();
+    let page_id = page.page_id.clone();
+    tokio::task::spawn_blocking(move || match deadline {
+        Some(deadline) => {
+            driver.execute_action_until(&session_id, Some(&page_id), payload, deadline)
+        }
+        None => driver.execute_action(&session_id, Some(&page_id), payload),
+    })
+}
+
+fn succeeded() -> ActionExecutionResult {
+    ActionExecutionResult::Succeeded(br#"{"ok":true}"#.to_vec())
+}
+
+#[tokio::test]
+async fn navigate_domcontentloaded_completes_on_the_committed_loader_without_load() {
+    let mut page = owned_page().await;
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/a","wait_until":"domcontentloaded"}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+    assert_eq!(command["sessionId"], "flat-primary");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"frameId": "frame", "loaderId": "loader-a"}),
+    )
+    .await;
+
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !navigate.is_finished(),
+        "lifecycle events before the loader commits belong to the previous document"
+    );
+
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-a",
+            "https://example.test/a",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !navigate.is_finished(),
+        "a committed loader has not reached DOMContentLoaded yet"
+    );
+
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    assert_eq!(navigate.await.unwrap(), succeeded());
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "awaiting a lifecycle must not issue further CDP effects"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn navigate_lifecycle_events_that_precede_the_response_are_honored() {
+    let mut page = owned_page().await;
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/b","wait_until":"load"}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-b",
+            "https://example.test/b",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !navigate.is_finished(),
+        "the navigate response still bounds completion"
+    );
+
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"frameId": "frame", "loaderId": "loader-b"}),
+    )
+    .await;
+    assert_eq!(navigate.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn navigate_superseded_by_another_loader_is_a_known_failure() {
+    let mut page = owned_page().await;
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/c","wait_until":"load"}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"frameId": "frame", "loaderId": "loader-c"}),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-c",
+            "https://example.test/c",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-redirect",
+            "https://example.test/elsewhere",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+
+    assert_eq!(
+        navigate.await.unwrap(),
+        ActionExecutionResult::FailedKnown("navigation_interrupted".to_owned())
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn navigate_lifecycle_deadline_after_the_response_is_a_known_timeout() {
+    let mut page = owned_page().await;
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/d","wait_until":"load"}"#,
+        Some(Instant::now() + Duration::from_millis(150)),
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"frameId": "frame", "loaderId": "loader-d"}),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-d",
+            "https://example.test/d",
+        ),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), navigate)
+            .await
+            .expect("the action deadline must end the lifecycle wait")
+            .unwrap(),
+        ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
+    );
+
+    let uncommitted = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/e","wait_until":"domcontentloaded"}"#,
+        Some(Instant::now() + Duration::from_millis(150)),
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"frameId": "frame", "loaderId": "loader-e"}),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), uncommitted)
+            .await
+            .expect("the action deadline must end the commit wait")
+            .unwrap(),
+        ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
+    );
+
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    assert!(has_no_command_bytes(&mut page.reader, false).await);
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn same_document_navigate_completes_without_lifecycle_events() {
+    let mut page = owned_page().await;
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/f#section","wait_until":"load"}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.navigate");
+    respond(&mut page.writer, &command, json!({"frameId": "frame"})).await;
+    assert_eq!(navigate.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn navigate_without_a_typed_wait_until_is_rejected_before_cdp() {
+    let mut page = owned_page().await;
+    let navigate = spawn_action(
+        &page,
+        br#"{"type":"navigate","url":"https://example.test/g"}"#,
+        None,
+    );
+    assert_eq!(
+        navigate.await.unwrap(),
+        ActionExecutionResult::FailedKnown("unsupported_action".to_owned())
+    );
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "an untyped navigate must fail before any CDP dispatch"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
 }
