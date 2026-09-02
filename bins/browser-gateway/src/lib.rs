@@ -23,7 +23,7 @@ use browserd_api::{
     ArtifactRequest, CreateAuthority, IsolationRequest, PageActivateRequest, PageCreateRequest,
     PageDeleteRequest, PageListRequest, PageResource, RuntimeApiBackend, RuntimeCreateResult,
     SessionCatalog, SessionCreateDispatch, SessionCreateRequest, SessionResource,
-    public_approval_id,
+    WaitUntil as ApiWaitUntil, public_approval_id,
 };
 use browserd_artifacts::{
     ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactKey, ArtifactState,
@@ -48,10 +48,10 @@ use browserd_worker::{
     WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerApprovalDecision,
     WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
     WorkerArtifactState, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
-    WorkerIsolationProfile, WorkerPageReceipt, WorkerRpcBlockingClient, WorkerRpcCompletionError,
-    WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1,
-    WorkerViewport,
+    WorkerIsolationProfile, WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerRpcBlockingClient,
+    WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode,
+    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
+    WorkerSessionOptionsV1, WorkerViewport,
 };
 use chrono::Utc;
 use jsonwebtoken::Algorithm;
@@ -1231,14 +1231,20 @@ where
             ));
         }
         let action = match &command.body.action {
+            ActionPayload::Navigate { url, wait_until } => WorkerActionCommand::Navigate {
+                url: url.clone(),
+                wait_until: match wait_until {
+                    ApiWaitUntil::Domcontentloaded => WorkerNavigateWaitUntil::Domcontentloaded,
+                    ApiWaitUntil::Load => WorkerNavigateWaitUntil::Load,
+                },
+            },
             ActionPayload::Reload => WorkerActionCommand::Reload,
             ActionPayload::TypeText { text } => {
                 WorkerActionCommand::TypeText { text: text.clone() }
             }
             ActionPayload::GetUrl => WorkerActionCommand::GetUrl,
             ActionPayload::GetTitle => WorkerActionCommand::GetTitle,
-            ActionPayload::Navigate { .. }
-            | ActionPayload::GoBack
+            ActionPayload::GoBack
             | ActionPayload::GoForward
             | ActionPayload::Click { .. }
             | ActionPayload::DoubleClick { .. }

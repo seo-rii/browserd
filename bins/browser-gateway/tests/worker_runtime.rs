@@ -35,8 +35,8 @@ use browserd_worker::{
     WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt,
     WorkerArtifactSource, WorkerArtifactState, WorkerCanonicalActionProposal,
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
-    WorkerPageReceipt, WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError,
-    WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerRpcCompletionError, WorkerRpcEnqueueError,
+    WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
     WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1, WorkerSessionReceipt,
     WorkerViewport,
 };
@@ -1363,10 +1363,7 @@ fn unsupported_public_actions_are_rejected_before_durable_claim_or_worker_enqueu
                 page_id: worker.page_id.clone(),
                 if_session_incarnation: 1,
                 execution_timeout_ms: 1_000,
-                action: ActionPayload::Navigate {
-                    url: "https://example.test/path".to_owned(),
-                    wait_until: WaitUntil::Load,
-                },
+                action: ActionPayload::GoBack,
             },
         }),
     );
@@ -1397,6 +1394,53 @@ fn unsupported_public_actions_are_rejected_before_durable_claim_or_worker_enqueu
         }),
     )?;
     assert!(matches!(supported, ApiResponse::Action(_)));
+    Ok(())
+}
+
+#[test]
+fn navigate_actions_reach_the_worker_with_a_typed_wait_until_lifecycle()
+-> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let submitted = router.execute(
+        &principal,
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key: Uuid::new_v4(),
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 30_000,
+                action: ActionPayload::Navigate {
+                    url: "https://example.test/path".to_owned(),
+                    wait_until: WaitUntil::Domcontentloaded,
+                },
+            },
+        }),
+    )?;
+    let ApiResponse::Action(submitted) = submitted else {
+        return Err("unexpected navigate submit response".into());
+    };
+    assert_eq!(submitted.data().request().kind(), ActionKind::Mutating);
+
+    let requests = worker
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?;
+    let action = requests
+        .iter()
+        .find_map(|request| match request {
+            WorkerRpcRequest::SubmitAction { action, kind, .. } => Some((action, kind)),
+            _ => None,
+        })
+        .ok_or("navigate submit RPC not recorded")?;
+    assert_eq!(*action.1, ActionKind::Mutating);
+    assert_eq!(
+        action.0,
+        &WorkerActionCommand::Navigate {
+            url: "https://example.test/path".to_owned(),
+            wait_until: WorkerNavigateWaitUntil::Domcontentloaded,
+        }
+    );
     Ok(())
 }
 
