@@ -2172,6 +2172,40 @@ async fn get_html_without_a_node_reads_the_whole_document() {
 }
 
 #[tokio::test]
+async fn extract_table_returns_rows_of_cell_text() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 500).await;
+
+    let extract = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"extract_table","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-t"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "object", "value": [["a", "b"], ["c", "d"]]}}),
+    )
+    .await;
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(extract.await.unwrap())).unwrap();
+    assert_eq!(parsed["rows"], json!([["a", "b"], ["c", "d"]]));
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn get_text_with_an_unknown_ref_is_rejected_before_cdp() {
     let mut page = owned_page().await;
     let get_text = spawn_action(

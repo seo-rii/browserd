@@ -1646,6 +1646,30 @@ fn node_read_actions_reach_the_worker_as_read_only() -> Result<(), Box<dyn Error
                 name: "href".to_owned(),
             },
         ),
+        (
+            ActionPayload::GetProperties {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            WorkerActionCommand::GetProperties {
+                node_ref: "0000000000000001".to_owned(),
+            },
+        ),
+        (
+            ActionPayload::GetComputedStyle {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            WorkerActionCommand::GetComputedStyle {
+                node_ref: "0000000000000001".to_owned(),
+            },
+        ),
+        (
+            ActionPayload::ExtractTable {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            WorkerActionCommand::ExtractTable {
+                node_ref: "0000000000000001".to_owned(),
+            },
+        ),
     ] {
         let (principal, worker, router, session_id) = resource_fixture()?;
         let submitted = router.execute(

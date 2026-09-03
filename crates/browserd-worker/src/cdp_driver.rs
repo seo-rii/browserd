@@ -545,6 +545,18 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             PageCommand::GetAttribute { node_ref, name },
             ActionResultShape::Json,
         )),
+        WorkerActionCommand::GetProperties { node_ref } => Ok((
+            PageCommand::GetProperties { node_ref },
+            ActionResultShape::Json,
+        )),
+        WorkerActionCommand::GetComputedStyle { node_ref } => Ok((
+            PageCommand::GetComputedStyle { node_ref },
+            ActionResultShape::Json,
+        )),
+        WorkerActionCommand::ExtractTable { node_ref } => Ok((
+            PageCommand::ExtractTable { node_ref },
+            ActionResultShape::Json,
+        )),
         WorkerActionCommand::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
         WorkerActionCommand::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
     }

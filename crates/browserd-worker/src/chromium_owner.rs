@@ -47,6 +47,12 @@ const NODE_STORE_TTL: Duration = Duration::from_secs(300);
 const MAX_QUERY_ALL_MATCHES: usize = 256;
 /// Extracts a bounded, rendered-text view of a resolved node for `get_text`.
 const NODE_TEXT_FUNCTION: &str = "function () { const value = this.innerText != null ? this.innerText : (this.textContent || ''); return String(value).slice(0, 60000); }";
+/// Collects a curated set of scalar element properties for `get_properties`.
+const NODE_PROPERTIES_FUNCTION: &str = "function () { const el = this; const out = {}; for (const key of ['tagName','id','className','name','type','value','checked','disabled','selected','readOnly','multiple','href','src','alt','title','placeholder','ariaLabel','role']) { const v = el[key]; if (v !== undefined && v !== null && typeof v !== 'object' && typeof v !== 'function') out[key] = v; } return out; }";
+/// Serializes the full computed style of a resolved node for `get_computed_style`.
+const NODE_COMPUTED_STYLE_FUNCTION: &str = "function () { const s = getComputedStyle(this); const out = {}; for (let i = 0; i < s.length; i++) { const p = s[i]; out[p] = s.getPropertyValue(p); } return out; }";
+/// Extracts a table's cells into rows of trimmed text for `extract_table`.
+const NODE_TABLE_FUNCTION: &str = "function () { const rows = this.rows ? Array.from(this.rows) : Array.from(this.querySelectorAll('tr')); return rows.map(r => Array.from(r.cells && r.cells.length ? r.cells : r.querySelectorAll('td,th')).map(c => (c.innerText != null ? c.innerText : (c.textContent || '')).trim())); }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1187,6 +1193,15 @@ pub(crate) enum PageCommand {
         node_ref: String,
         name: String,
     },
+    GetProperties {
+        node_ref: String,
+    },
+    GetComputedStyle {
+        node_ref: String,
+    },
+    ExtractTable {
+        node_ref: String,
+    },
     ReadUrl,
     ReadTitle,
 }
@@ -2310,6 +2325,54 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     deadline,
                 )
                 .await
+            }
+            PageCommand::GetProperties { node_ref } => {
+                let value = self
+                    .call_function_on_node(
+                        &target_id,
+                        cdp_session_id,
+                        guarded,
+                        &node_ref,
+                        NodeFunctionCall {
+                            declaration: NODE_PROPERTIES_FUNCTION,
+                            arguments: json!([]),
+                        },
+                        deadline,
+                    )
+                    .await?;
+                Ok(json!({ "properties": value }))
+            }
+            PageCommand::GetComputedStyle { node_ref } => {
+                let value = self
+                    .call_function_on_node(
+                        &target_id,
+                        cdp_session_id,
+                        guarded,
+                        &node_ref,
+                        NodeFunctionCall {
+                            declaration: NODE_COMPUTED_STYLE_FUNCTION,
+                            arguments: json!([]),
+                        },
+                        deadline,
+                    )
+                    .await?;
+                Ok(json!({ "styles": value }))
+            }
+            PageCommand::ExtractTable { node_ref } => {
+                let value = self
+                    .call_function_on_node(
+                        &target_id,
+                        cdp_session_id,
+                        guarded,
+                        &node_ref,
+                        NodeFunctionCall {
+                            declaration: NODE_TABLE_FUNCTION,
+                            arguments: json!([]),
+                        },
+                        deadline,
+                    )
+                    .await?;
+                Ok(json!({ "rows": value }))
             }
             PageCommand::GoBack => {
                 self.navigate_history(&target_id, cdp_session_id, guarded, -1, deadline)
