@@ -1169,6 +1169,12 @@ pub(crate) enum PageCommand {
     Click {
         node_ref: String,
     },
+    DoubleClick {
+        node_ref: String,
+    },
+    Hover {
+        node_ref: String,
+    },
     InsertText {
         text: String,
     },
@@ -2382,6 +2388,36 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .await
             }
             PageCommand::Click { node_ref } => {
+                let point = self
+                    .node_pointer_target(
+                        &target_id,
+                        &cdp_session_id,
+                        guarded.clone(),
+                        &node_ref,
+                        deadline,
+                    )
+                    .await?;
+                self.dispatch_mouse_click(&cdp_session_id, guarded, point, 1, deadline)
+                    .await
+                    .map_err(|_| OwnerActorError::OutcomeUncertain)
+            }
+            PageCommand::DoubleClick { node_ref } => {
+                let point = self
+                    .node_pointer_target(
+                        &target_id,
+                        &cdp_session_id,
+                        guarded.clone(),
+                        &node_ref,
+                        deadline,
+                    )
+                    .await?;
+                self.dispatch_mouse_click(&cdp_session_id, guarded.clone(), point, 1, deadline)
+                    .await?;
+                self.dispatch_mouse_click(&cdp_session_id, guarded, point, 2, deadline)
+                    .await
+                    .map_err(|_| OwnerActorError::OutcomeUncertain)
+            }
+            PageCommand::Hover { node_ref } => {
                 let (x, y) = self
                     .node_pointer_target(
                         &target_id,
@@ -2393,23 +2429,13 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .await?;
                 self.command_event_first(
                     "Input.dispatchMouseEvent",
-                    json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
-                    Some(cdp_session_id.clone()),
-                    None,
-                    guarded.clone(),
-                    deadline,
-                )
-                .await?;
-                self.command_event_first(
-                    "Input.dispatchMouseEvent",
-                    json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1}),
+                    json!({"type": "mouseMoved", "x": x, "y": y}),
                     Some(cdp_session_id),
                     None,
                     guarded,
                     deadline,
                 )
                 .await
-                .map_err(|_| OwnerActorError::OutcomeUncertain)
             }
             PageCommand::InsertText { text } => {
                 self.command_event_first(
@@ -2948,6 +2974,36 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
         }
         Ok((sum_x / 4.0, sum_y / 4.0))
+    }
+
+    /// Dispatches a left mouse press/release pair at a point with the given click count.
+    async fn dispatch_mouse_click(
+        &mut self,
+        cdp_session_id: &str,
+        guarded: Option<GuardedPageExecution>,
+        point: (f64, f64),
+        click_count: i64,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let (x, y) = point;
+        self.command_event_first(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": click_count}),
+            Some(cdp_session_id.to_owned()),
+            None,
+            guarded.clone(),
+            deadline,
+        )
+        .await?;
+        self.command_event_first(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": click_count}),
+            Some(cdp_session_id.to_owned()),
+            None,
+            guarded,
+            deadline,
+        )
+        .await
     }
 
     /// Reads the rendered text of a resolved node handle.

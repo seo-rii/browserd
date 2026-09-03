@@ -1278,9 +1278,13 @@ where
             ActionPayload::Click { node_ref } => WorkerActionCommand::Click {
                 node_ref: node_ref.clone(),
             },
-            ActionPayload::DoubleClick { .. }
-            | ActionPayload::Hover { .. }
-            | ActionPayload::Fill { .. }
+            ActionPayload::DoubleClick { node_ref } => WorkerActionCommand::DoubleClick {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::Hover { node_ref } => WorkerActionCommand::Hover {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::Fill { .. }
             | ActionPayload::FillSecret { .. }
             | ActionPayload::SelectOption { .. }
             | ActionPayload::SetFiles { .. }

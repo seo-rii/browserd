@@ -1754,6 +1754,57 @@ fn click_reaches_the_worker_as_a_mutating_node_reference() -> Result<(), Box<dyn
 }
 
 #[test]
+fn pointer_mutations_reach_the_worker_as_typed_node_references() -> Result<(), Box<dyn Error>> {
+    let node = || "0000000000000001".to_owned();
+    for (payload, expected) in [
+        (
+            ActionPayload::DoubleClick { node_ref: node() },
+            WorkerActionCommand::DoubleClick { node_ref: node() },
+        ),
+        (
+            ActionPayload::Hover { node_ref: node() },
+            WorkerActionCommand::Hover { node_ref: node() },
+        ),
+    ] {
+        let (principal, worker, router, session_id) = resource_fixture()?;
+        let submitted = router.execute(
+            &principal,
+            ApiRequest::SubmitAction(ActionSubmitCommand {
+                session_id: session_id.clone(),
+                idempotency_key: Uuid::new_v4(),
+                body: ActionSubmitRequest {
+                    page_id: worker.page_id.clone(),
+                    if_session_incarnation: 1,
+                    execution_timeout_ms: 30_000,
+                    action: payload,
+                },
+            }),
+        )?;
+        let ApiResponse::Action(submitted) = submitted else {
+            return Err("unexpected pointer-mutation submit response".into());
+        };
+        assert_eq!(submitted.data().request().kind(), ActionKind::Mutating);
+
+        let requests = worker
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?;
+        let found = requests.iter().any(|request| {
+            matches!(
+                request,
+                WorkerRpcRequest::SubmitAction { action, kind, .. }
+                    if *kind == ActionKind::Mutating && action == &expected
+            )
+        });
+        assert!(
+            found,
+            "pointer mutation {expected:?} did not reach the worker"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn action_lookup_treats_worker_identity_drift_as_ambiguous_after_dispatch()
 -> Result<(), Box<dyn Error>> {
     let (principal, worker, router, session_id) = resource_fixture()?;

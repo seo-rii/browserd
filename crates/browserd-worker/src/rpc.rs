@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 15;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 16;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -125,6 +125,12 @@ pub enum WorkerActionCommand {
     Click {
         node_ref: String,
     },
+    DoubleClick {
+        node_ref: String,
+    },
+    Hover {
+        node_ref: String,
+    },
     TypeText {
         text: String,
     },
@@ -171,7 +177,9 @@ impl WorkerActionCommand {
                     && !url.chars().any(char::is_control)
                     && (url.starts_with("https://") || url.starts_with("http://"))
             }
-            Self::Click { node_ref } => valid_worker_node_ref(node_ref),
+            Self::Click { node_ref }
+            | Self::DoubleClick { node_ref }
+            | Self::Hover { node_ref } => valid_worker_node_ref(node_ref),
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
@@ -221,6 +229,8 @@ impl WorkerActionCommand {
             | Self::GoBack
             | Self::GoForward
             | Self::Click { .. }
+            | Self::DoubleClick { .. }
+            | Self::Hover { .. }
             | Self::TypeText { .. }
             | Self::PressKey { .. }
             | Self::Scroll { .. } => ActionKind::Mutating,

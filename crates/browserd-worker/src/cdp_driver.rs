@@ -518,6 +518,13 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
         WorkerActionCommand::Click { node_ref } => {
             Ok((PageCommand::Click { node_ref }, ActionResultShape::Unit))
         }
+        WorkerActionCommand::DoubleClick { node_ref } => Ok((
+            PageCommand::DoubleClick { node_ref },
+            ActionResultShape::Unit,
+        )),
+        WorkerActionCommand::Hover { node_ref } => {
+            Ok((PageCommand::Hover { node_ref }, ActionResultShape::Unit))
+        }
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }

@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 15);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 16);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -565,6 +565,37 @@ fn node_reads_are_bounded_read_only_commands() {
         .is_valid(),
         "a present but empty node reference is out of bounds"
     );
+}
+
+#[test]
+fn node_ref_mutations_are_typed_mutations() {
+    for (command, tag) in [
+        (
+            WorkerActionCommand::Click {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "click",
+        ),
+        (
+            WorkerActionCommand::DoubleClick {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "double_click",
+        ),
+        (
+            WorkerActionCommand::Hover {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "hover",
+        ),
+    ] {
+        assert_eq!(
+            serde_json::to_value(&command).ok(),
+            Some(serde_json::json!({"type": tag, "node_ref": "0000000000000001"})),
+        );
+        assert!(command.is_valid());
+        assert_eq!(command.kind(), ActionKind::Mutating);
+    }
 }
 
 #[test]

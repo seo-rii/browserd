@@ -2276,6 +2276,66 @@ async fn click_of_a_node_without_a_content_box_is_rejected() {
 }
 
 #[tokio::test]
+async fn hover_moves_the_pointer_to_the_node_center() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 400).await;
+
+    let hover = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"hover","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let quads = read_command(&mut page.reader).await;
+    assert_eq!(quads["method"], "DOM.getContentQuads");
+    respond(
+        &mut page.writer,
+        &quads,
+        json!({"quads": [[0, 0, 40, 0, 40, 20, 0, 20]]}),
+    )
+    .await;
+    let moved = read_command(&mut page.reader).await;
+    assert_eq!(moved["method"], "Input.dispatchMouseEvent");
+    assert_eq!(moved["params"]["type"], "mouseMoved");
+    assert_eq!(moved["params"]["x"].as_f64(), Some(20.0));
+    assert_eq!(moved["params"]["y"].as_f64(), Some(10.0));
+    respond(&mut page.writer, &moved, json!({})).await;
+
+    assert_eq!(hover.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn double_click_dispatches_two_click_sequences() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 401).await;
+
+    let double = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"double_click","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let quads = read_command(&mut page.reader).await;
+    assert_eq!(quads["method"], "DOM.getContentQuads");
+    respond(
+        &mut page.writer,
+        &quads,
+        json!({"quads": [[0, 0, 20, 0, 20, 20, 0, 20]]}),
+    )
+    .await;
+    for expected_count in [1, 1, 2, 2] {
+        let event = read_command(&mut page.reader).await;
+        assert_eq!(event["method"], "Input.dispatchMouseEvent");
+        assert_eq!(event["params"]["clickCount"], expected_count);
+        respond(&mut page.writer, &event, json!({})).await;
+    }
+
+    assert_eq!(double.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn get_text_with_an_unknown_ref_is_rejected_before_cdp() {
     let mut page = owned_page().await;
     let get_text = spawn_action(
