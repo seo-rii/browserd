@@ -139,12 +139,16 @@ impl CdpChromiumDriver {
         proposal: &CanonicalActionProposal,
         deadline: Option<Instant>,
     ) -> Result<LiveApprovalContext, ObservationError> {
+        let node_ref = proposal
+            .node_ref()
+            .map(|node_ref| node_ref.as_str().to_owned());
         let observed = match deadline {
             Some(deadline) => self.backend.observe_page_until(
                 proposal.tenant_id().clone(),
                 session_id.clone(),
                 proposal.session_incarnation(),
                 page_id.clone(),
+                node_ref,
                 deadline,
             ),
             None => self.backend.observe_page(
@@ -152,6 +156,7 @@ impl CdpChromiumDriver {
                 session_id.clone(),
                 proposal.session_incarnation(),
                 page_id.clone(),
+                node_ref,
             ),
         }
         .map_err(|error| match error {
@@ -173,7 +178,7 @@ impl CdpChromiumDriver {
             current_origin: origin,
             url_revision: observed.url_revision,
             node_ref: proposal.node_ref().cloned(),
-            node_valid: proposal.node_ref().is_none(),
+            node_valid: observed.node_valid,
             resolved_ips: Vec::new(),
             credential_refs: Vec::new(),
             chromium_build: self.chromium_build.to_string(),

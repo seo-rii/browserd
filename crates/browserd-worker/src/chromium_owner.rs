@@ -332,8 +332,16 @@ impl ChromiumTargetManagerBackend {
         session_id: SessionId,
         session_incarnation: u64,
         page_id: PageId,
+        node_ref: Option<String>,
     ) -> Result<ObservedPage, OwnerActorError> {
-        self.observe_page_with_deadline(tenant_id, session_id, session_incarnation, page_id, None)
+        self.observe_page_with_deadline(
+            tenant_id,
+            session_id,
+            session_incarnation,
+            page_id,
+            node_ref,
+            None,
+        )
     }
 
     pub(crate) fn observe_page_until(
@@ -342,6 +350,7 @@ impl ChromiumTargetManagerBackend {
         session_id: SessionId,
         session_incarnation: u64,
         page_id: PageId,
+        node_ref: Option<String>,
         deadline: Instant,
     ) -> Result<ObservedPage, OwnerActorError> {
         self.observe_page_with_deadline(
@@ -349,6 +358,7 @@ impl ChromiumTargetManagerBackend {
             session_id,
             session_incarnation,
             page_id,
+            node_ref,
             Some(deadline),
         )
     }
@@ -359,6 +369,7 @@ impl ChromiumTargetManagerBackend {
         session_id: SessionId,
         session_incarnation: u64,
         page_id: PageId,
+        node_ref: Option<String>,
         deadline: Option<Instant>,
     ) -> Result<ObservedPage, OwnerActorError> {
         let build = |response| OwnerRequest::ObservePage {
@@ -366,6 +377,7 @@ impl ChromiumTargetManagerBackend {
             session_id,
             session_incarnation,
             page_id,
+            node_ref,
             deadline,
             response,
         };
@@ -1137,6 +1149,7 @@ enum OwnerRequest {
         session_id: SessionId,
         session_incarnation: u64,
         page_id: PageId,
+        node_ref: Option<String>,
         deadline: Option<Instant>,
         response: std_mpsc::SyncSender<Result<ObservedPage, OwnerActorError>>,
     },
@@ -1252,6 +1265,8 @@ pub(crate) struct ObservedPage {
     pub(crate) frame_document_epoch: u64,
     pub(crate) url_revision: u64,
     pub(crate) origin: String,
+    /// Whether the proposal's node reference still resolves in the observed document.
+    pub(crate) node_valid: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1616,6 +1631,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 session_id,
                 session_incarnation,
                 page_id,
+                node_ref,
                 deadline,
                 response,
             } => {
@@ -1625,6 +1641,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         &session_id,
                         session_incarnation,
                         &page_id,
+                        node_ref.as_deref(),
                         deadline,
                     )
                     .await;
@@ -2674,6 +2691,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         session_id: &SessionId,
         session_incarnation: u64,
         page_id: &PageId,
+        node_ref: Option<&str>,
         deadline: Option<Instant>,
     ) -> Result<ObservedPage, OwnerActorError> {
         let (_, target_id, route) = self.owned_page_route(session_id, page_id)?;
@@ -2703,6 +2721,12 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .filter(|origin| origin.len() <= 8_192 && !origin.chars().any(char::is_control))
             .ok_or(OwnerActorError::OutcomeUncertain)?
             .to_owned();
+        // A node-bearing proposal is valid only if its handle still resolves in this document;
+        // the store enforces the session/target/epoch staleness bound.
+        let node_valid = match node_ref {
+            None => true,
+            Some(node_ref) => self.resolve_node_backend_id(&target_id, node_ref).is_ok(),
+        };
         let route = self
             .routes
             .get(&target_id)
@@ -2718,6 +2742,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             frame_document_epoch: route.frame_document_epoch,
             url_revision: route.url_revision,
             origin,
+            node_valid,
         })
     }
 
