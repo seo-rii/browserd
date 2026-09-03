@@ -321,7 +321,15 @@ pub struct ActionSnapshotFacts {
     pub approval_decision: Option<ApprovalDecision>,
     pub terminal_detail: Option<TerminalDetail>,
     pub resolution: Option<ResolutionAnnotation>,
+    /// Raw result content the worker produced, surfaced only for a succeeded action.
+    ///
+    /// This is the live delivery on the completing receipt; durable re-reads carry only the
+    /// `ResultDigest` in `terminal_detail`, so it is `None` when reconstructed from storage.
+    pub result_content: Option<Vec<u8>>,
 }
+
+/// Maximum size of surfaced action result content, matching the worker's result cap.
+pub const MAX_ACTION_RESULT_CONTENT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionSnapshotReconstructionError;
@@ -345,6 +353,7 @@ pub struct ActionSnapshot {
     pub(crate) approval_decision: Option<ApprovalDecision>,
     pub(crate) terminal_detail: Option<TerminalDetail>,
     pub(crate) resolution: Option<ResolutionAnnotation>,
+    pub(crate) result_content: Option<Vec<u8>>,
 }
 
 impl ActionSnapshot {
@@ -400,6 +409,11 @@ impl ActionSnapshot {
                     facts.state,
                     ActionState::Accepted | ActionState::Queued | ActionState::PendingApproval
                 ))
+            || facts.result_content.as_ref().is_some_and(|content| {
+                content.is_empty()
+                    || content.len() > MAX_ACTION_RESULT_CONTENT_BYTES
+                    || !matches!(facts.terminal_detail, Some(TerminalDetail::Succeeded(_)))
+            })
         {
             return Err(ActionSnapshotReconstructionError);
         }
@@ -417,6 +431,7 @@ impl ActionSnapshot {
             approval_decision: facts.approval_decision,
             terminal_detail: facts.terminal_detail,
             resolution: facts.resolution,
+            result_content: facts.result_content,
         })
     }
 
@@ -465,6 +480,12 @@ impl ActionSnapshot {
         self.resolution.as_ref()
     }
 
+    /// Raw result content the worker produced, present only on a live succeeded receipt.
+    #[must_use]
+    pub fn result_content(&self) -> Option<&[u8]> {
+        self.result_content.as_deref()
+    }
+
     #[must_use]
     pub const fn automatic_replay_allowed(&self) -> bool {
         matches!(
@@ -495,7 +516,7 @@ impl AcceptDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchDecision {
     Dispatch(DispatchPermit),
-    DoNotReplay(ActionSnapshot),
+    DoNotReplay(Box<ActionSnapshot>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

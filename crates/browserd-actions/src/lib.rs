@@ -16,7 +16,7 @@ pub use types::{
     ActionSnapshotFacts, ActionSnapshotReconstructionError, ApprovalDecision, BrowserResult,
     CanonicalRequestHash, DispatchDecision, DispatchId, DispatchPermit, DurableActionJournal,
     IdempotencyKey, JournalEntry, JournalEntryKind, JournalEntryType, JournalError,
-    KnownFailureReason, LedgerSession, OutcomeUnknownReason, RecordOutcome,
-    ReplayableActionJournal, ResolutionAnnotation, ResolutionKind, ResolutionOutcome,
-    ResolutionPolicy, ResultDigest, TerminalDetail, TransportLoss,
+    KnownFailureReason, LedgerSession, MAX_ACTION_RESULT_CONTENT_BYTES, OutcomeUnknownReason,
+    RecordOutcome, ReplayableActionJournal, ResolutionAnnotation, ResolutionKind,
+    ResolutionOutcome, ResolutionPolicy, ResultDigest, TerminalDetail, TransportLoss,
 };

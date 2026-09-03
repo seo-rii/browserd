@@ -710,6 +710,8 @@ fn coordinated_action_snapshot(
         approval_decision,
         terminal_detail,
         resolution: snapshot.resolution().cloned(),
+        // The durable ledger persists only the result digest, not its content.
+        result_content: None,
     })
     .map_err(|_| ApiError::new(ErrorCode::Internal, "durable action state is contradictory"))
 }

@@ -1556,6 +1556,13 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                 )
                 | None => {}
             }
+            // Surface the live result content of a succeeded action as parsed JSON. Absent on
+            // durable re-reads, which retain only the integrity digest.
+            if let Some(content) = envelope.data().result_content()
+                && let Ok(result) = serde_json::from_slice::<serde_json::Value>(content)
+            {
+                data.insert("result".to_owned(), result);
+            }
             (
                 if method == Method::POST && pending {
                     StatusCode::ACCEPTED

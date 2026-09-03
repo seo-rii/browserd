@@ -1,6 +1,7 @@
 use browserd_actions::{
     ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts, ApprovalDecision,
-    CanonicalRequestHash, IdempotencyKey, KnownFailureReason, ResultDigest, TerminalDetail,
+    CanonicalRequestHash, IdempotencyKey, KnownFailureReason, MAX_ACTION_RESULT_CONTENT_BYTES,
+    ResultDigest, TerminalDetail,
 };
 use browserd_core::{ActionId, ActionState};
 
@@ -16,6 +17,7 @@ fn succeeded_facts() -> ActionSnapshotFacts {
         approval_decision: None,
         terminal_detail: Some(TerminalDetail::Succeeded(ResultDigest::new([5; 32]))),
         resolution: None,
+        result_content: None,
     }
 }
 
@@ -39,6 +41,50 @@ fn validated_worker_facts_reconstruct_a_complete_public_snapshot() {
     assert_eq!(snapshot.state(), facts.state);
     assert!(snapshot.dispatch_acknowledged());
     assert_eq!(snapshot.terminal_detail(), facts.terminal_detail);
+    assert_eq!(snapshot.result_content(), None);
+}
+
+#[test]
+fn succeeded_facts_surface_bounded_result_content() {
+    let facts = ActionSnapshotFacts {
+        result_content: Some(br#"{"url":"https://example.test/"}"#.to_vec()),
+        ..succeeded_facts()
+    };
+    let snapshot = ActionSnapshot::from_facts(facts);
+    assert!(snapshot.is_ok());
+    let Some(snapshot) = snapshot.ok() else {
+        return;
+    };
+    assert_eq!(
+        snapshot.result_content(),
+        Some(&br#"{"url":"https://example.test/"}"#[..])
+    );
+}
+
+#[test]
+fn result_content_only_survives_on_a_succeeded_action() {
+    // Content on a non-succeeded action is contradictory.
+    let failed = ActionSnapshotFacts {
+        state: ActionState::FailedKnown,
+        terminal_detail: Some(TerminalDetail::FailedKnown(
+            KnownFailureReason::BrowserRejected,
+        )),
+        result_content: Some(b"{}".to_vec()),
+        ..succeeded_facts()
+    };
+    assert!(ActionSnapshot::from_facts(failed).is_err());
+
+    // Empty and oversized content are out of bounds even when succeeded.
+    let empty = ActionSnapshotFacts {
+        result_content: Some(Vec::new()),
+        ..succeeded_facts()
+    };
+    assert!(ActionSnapshot::from_facts(empty).is_err());
+    let oversized = ActionSnapshotFacts {
+        result_content: Some(vec![b'a'; MAX_ACTION_RESULT_CONTENT_BYTES + 1]),
+        ..succeeded_facts()
+    };
+    assert!(ActionSnapshot::from_facts(oversized).is_err());
 }
 
 #[test]

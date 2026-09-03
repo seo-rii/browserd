@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use browserd_actions::{
     ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts, CanonicalRequestHash,
-    IdempotencyKey, KnownFailureReason, OutcomeUnknownReason, TerminalDetail,
+    IdempotencyKey, KnownFailureReason, OutcomeUnknownReason, ResultDigest, TerminalDetail,
 };
 use browserd_api::{
     ApiEnvelope, ApiError, ApiRequest, ApiResponse, ApiService, InMemoryApiService,
@@ -20,7 +20,9 @@ use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
     ServiceTokenVerifier, VerificationKeySet,
 };
-use browserd_core::{ActionId, ErrorCode, PlacementFence, PrincipalId, SessionId, TenantId};
+use browserd_core::{
+    ActionId, ActionState, ErrorCode, PlacementFence, PrincipalId, SessionId, TenantId,
+};
 use browserd_http::{
     AuthenticationError, Authenticator, ConsumedViewerGrant, HttpConfig, Readiness,
     ViewerAttachError, ViewerGateError, ViewerTransport, router,
@@ -176,6 +178,7 @@ fn terminal_action_snapshot(
         approval_decision: None,
         terminal_detail: Some(terminal_detail),
         resolution: None,
+        result_content: None,
     })?)
 }
 
@@ -428,6 +431,41 @@ async fn outcome_unknown_is_http_200_with_non_retryable_public_reason() -> Resul
     assert_eq!(json["data"]["status"], "outcome_unknown");
     assert_eq!(json["data"]["reason"], "worker_lost");
     assert_eq!(json["data"]["retryable"], false);
+    Ok(())
+}
+
+#[tokio::test]
+async fn succeeded_action_surfaces_parsed_result_content() -> Result<(), Box<dyn Error>> {
+    let session_id = SessionId::new();
+    let action_id = ActionId::new();
+    let snapshot = ActionSnapshot::from_facts(ActionSnapshotFacts {
+        action_id: action_id.clone(),
+        action_sequence: ActionSequence::new(9),
+        idempotency_key: IdempotencyKey::new(Uuid::new_v4().to_string()),
+        canonical_request_hash: CanonicalRequestHash::new([7; 32]),
+        kind: ActionKind::ReadOnly,
+        state: ActionState::Succeeded,
+        dispatch_acknowledged: true,
+        approval_decision: None,
+        terminal_detail: Some(TerminalDetail::Succeeded(ResultDigest::new([9; 32]))),
+        resolution: None,
+        result_content: Some(br#"{"url":"https://example.test/here"}"#.to_vec()),
+    })?;
+    let response = app(
+        Arc::new(ActionSnapshotService(snapshot)),
+        principal(&["session:read"])?,
+    )
+    .oneshot(
+        Request::builder()
+            .uri(format!("/v1/sessions/{session_id}/actions/{action_id}"))
+            .header("authorization", "Bearer valid")
+            .body(Body::empty())?,
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["data"]["status"], "succeeded");
+    assert_eq!(json["data"]["result"]["url"], "https://example.test/here");
     Ok(())
 }
 

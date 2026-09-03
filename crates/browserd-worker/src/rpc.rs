@@ -493,6 +493,8 @@ impl WorkerActionReceipt {
             approval_decision: self.approval_decision,
             terminal_detail: self.terminal_detail,
             resolution: self.resolution.clone(),
+            // Validated above to be Some only for a succeeded action whose bytes match the digest.
+            result_content: self.result.clone(),
         })
         .map_err(|_| WorkerRpcError::Protocol)
     }

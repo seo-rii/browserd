@@ -96,6 +96,7 @@ where
                         approval_decision: None,
                         terminal_detail: None,
                         resolution: None,
+                        result_content: None,
                     };
                     state.last_sequence = action_sequence.get();
                     state.idempotency.insert(idempotency_key, action_id.clone());
@@ -361,6 +362,7 @@ where
             approval_decision: None,
             terminal_detail: None,
             resolution: None,
+            result_content: None,
         };
         self.append(JournalEntry::new(
             &self.session,
@@ -533,7 +535,7 @@ where
         }
 
         if snapshot.dispatch_permit().is_some() || snapshot.state().is_terminal() {
-            return Ok(DispatchDecision::DoNotReplay(snapshot));
+            return Ok(DispatchDecision::DoNotReplay(Box::new(snapshot)));
         }
 
         Err(ActionLedgerError::InvalidTransition {
