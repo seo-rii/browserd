@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 16);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 17);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -587,6 +587,30 @@ fn node_ref_mutations_are_typed_mutations() {
                 node_ref: "0000000000000001".to_owned(),
             },
             "hover",
+        ),
+        (
+            WorkerActionCommand::Focus {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "focus",
+        ),
+        (
+            WorkerActionCommand::Blur {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "blur",
+        ),
+        (
+            WorkerActionCommand::Check {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "check",
+        ),
+        (
+            WorkerActionCommand::Uncheck {
+                node_ref: "0000000000000001".to_owned(),
+            },
+            "uncheck",
         ),
     ] {
         assert_eq!(

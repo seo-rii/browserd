@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 16;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 17;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -131,6 +131,18 @@ pub enum WorkerActionCommand {
     Hover {
         node_ref: String,
     },
+    Focus {
+        node_ref: String,
+    },
+    Blur {
+        node_ref: String,
+    },
+    Check {
+        node_ref: String,
+    },
+    Uncheck {
+        node_ref: String,
+    },
     TypeText {
         text: String,
     },
@@ -179,7 +191,11 @@ impl WorkerActionCommand {
             }
             Self::Click { node_ref }
             | Self::DoubleClick { node_ref }
-            | Self::Hover { node_ref } => valid_worker_node_ref(node_ref),
+            | Self::Hover { node_ref }
+            | Self::Focus { node_ref }
+            | Self::Blur { node_ref }
+            | Self::Check { node_ref }
+            | Self::Uncheck { node_ref } => valid_worker_node_ref(node_ref),
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
@@ -231,6 +247,10 @@ impl WorkerActionCommand {
             | Self::Click { .. }
             | Self::DoubleClick { .. }
             | Self::Hover { .. }
+            | Self::Focus { .. }
+            | Self::Blur { .. }
+            | Self::Check { .. }
+            | Self::Uncheck { .. }
             | Self::TypeText { .. }
             | Self::PressKey { .. }
             | Self::Scroll { .. } => ActionKind::Mutating,

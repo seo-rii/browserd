@@ -53,6 +53,11 @@ const NODE_PROPERTIES_FUNCTION: &str = "function () { const el = this; const out
 const NODE_COMPUTED_STYLE_FUNCTION: &str = "function () { const s = getComputedStyle(this); const out = {}; for (let i = 0; i < s.length; i++) { const p = s[i]; out[p] = s.getPropertyValue(p); } return out; }";
 /// Extracts a table's cells into rows of trimmed text for `extract_table`.
 const NODE_TABLE_FUNCTION: &str = "function () { const rows = this.rows ? Array.from(this.rows) : Array.from(this.querySelectorAll('tr')); return rows.map(r => Array.from(r.cells && r.cells.length ? r.cells : r.querySelectorAll('td,th')).map(c => (c.innerText != null ? c.innerText : (c.textContent || '')).trim())); }";
+/// Blurs a resolved node for `blur`.
+const NODE_BLUR_FUNCTION: &str = "function () { this.blur(); return true; }";
+/// Sets a resolved node's checked state, firing input/change only on a real change, for
+/// `check` and `uncheck`.
+const NODE_SET_CHECKED_FUNCTION: &str = "function (desired) { if (!!this.checked !== desired) { this.checked = desired; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); } return !!this.checked; }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1173,6 +1178,18 @@ pub(crate) enum PageCommand {
         node_ref: String,
     },
     Hover {
+        node_ref: String,
+    },
+    Focus {
+        node_ref: String,
+    },
+    Blur {
+        node_ref: String,
+    },
+    Check {
+        node_ref: String,
+    },
+    Uncheck {
         node_ref: String,
     },
     InsertText {
@@ -2433,6 +2450,60 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(cdp_session_id),
                     None,
                     guarded,
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::Focus { node_ref } => {
+                let backend_node_id = self.resolve_node_backend_id(&target_id, &node_ref)?;
+                self.command_event_first(
+                    "DOM.focus",
+                    json!({ "backendNodeId": backend_node_id }),
+                    Some(cdp_session_id),
+                    None,
+                    guarded,
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::Blur { node_ref } => {
+                self.call_function_on_node(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    &node_ref,
+                    NodeFunctionCall {
+                        declaration: NODE_BLUR_FUNCTION,
+                        arguments: json!([]),
+                    },
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::Check { node_ref } => {
+                self.call_function_on_node(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    &node_ref,
+                    NodeFunctionCall {
+                        declaration: NODE_SET_CHECKED_FUNCTION,
+                        arguments: json!([{ "value": true }]),
+                    },
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::Uncheck { node_ref } => {
+                self.call_function_on_node(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    &node_ref,
+                    NodeFunctionCall {
+                        declaration: NODE_SET_CHECKED_FUNCTION,
+                        arguments: json!([{ "value": false }]),
+                    },
                     deadline,
                 )
                 .await

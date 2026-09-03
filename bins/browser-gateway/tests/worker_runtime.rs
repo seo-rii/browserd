@@ -1765,6 +1765,22 @@ fn pointer_mutations_reach_the_worker_as_typed_node_references() -> Result<(), B
             ActionPayload::Hover { node_ref: node() },
             WorkerActionCommand::Hover { node_ref: node() },
         ),
+        (
+            ActionPayload::Focus { node_ref: node() },
+            WorkerActionCommand::Focus { node_ref: node() },
+        ),
+        (
+            ActionPayload::Blur { node_ref: node() },
+            WorkerActionCommand::Blur { node_ref: node() },
+        ),
+        (
+            ActionPayload::Check { node_ref: node() },
+            WorkerActionCommand::Check { node_ref: node() },
+        ),
+        (
+            ActionPayload::Uncheck { node_ref: node() },
+            WorkerActionCommand::Uncheck { node_ref: node() },
+        ),
     ] {
         let (principal, worker, router, session_id) = resource_fixture()?;
         let submitted = router.execute(

@@ -2336,6 +2336,59 @@ async fn double_click_dispatches_two_click_sequences() {
 }
 
 #[tokio::test]
+async fn focus_focuses_the_resolved_node() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 410).await;
+
+    let focus = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"focus","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "DOM.focus");
+    assert_eq!(command["params"]["backendNodeId"], 410);
+    respond(&mut page.writer, &command, json!({})).await;
+
+    assert_eq!(focus.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn check_sets_the_checked_state_through_the_element() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 411).await;
+
+    let check = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"check","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-c"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    assert_eq!(call["params"]["arguments"][0]["value"], true);
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "boolean", "value": true}}),
+    )
+    .await;
+
+    assert_eq!(check.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn get_text_with_an_unknown_ref_is_rejected_before_cdp() {
     let mut page = owned_page().await;
     let get_text = spawn_action(

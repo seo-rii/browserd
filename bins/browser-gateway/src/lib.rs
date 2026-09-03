@@ -1284,14 +1284,22 @@ where
             ActionPayload::Hover { node_ref } => WorkerActionCommand::Hover {
                 node_ref: node_ref.clone(),
             },
+            ActionPayload::Focus { node_ref } => WorkerActionCommand::Focus {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::Blur { node_ref } => WorkerActionCommand::Blur {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::Check { node_ref } => WorkerActionCommand::Check {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::Uncheck { node_ref } => WorkerActionCommand::Uncheck {
+                node_ref: node_ref.clone(),
+            },
             ActionPayload::Fill { .. }
             | ActionPayload::FillSecret { .. }
             | ActionPayload::SelectOption { .. }
             | ActionPayload::SetFiles { .. }
-            | ActionPayload::Focus { .. }
-            | ActionPayload::Blur { .. }
-            | ActionPayload::Check { .. }
-            | ActionPayload::Uncheck { .. }
             | ActionPayload::HandleDialog { .. }
             | ActionPayload::Snapshot
             | ActionPayload::NewPage { .. }
