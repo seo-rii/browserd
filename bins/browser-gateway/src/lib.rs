@@ -1256,6 +1256,9 @@ where
             ActionPayload::QueryAll { selector } => WorkerActionCommand::QueryAll {
                 selector: selector.clone(),
             },
+            ActionPayload::GetText { node_ref } => WorkerActionCommand::GetText {
+                node_ref: node_ref.clone(),
+            },
             ActionPayload::Click { .. }
             | ActionPayload::DoubleClick { .. }
             | ActionPayload::Hover { .. }
@@ -1269,7 +1272,6 @@ where
             | ActionPayload::Uncheck { .. }
             | ActionPayload::HandleDialog { .. }
             | ActionPayload::Snapshot
-            | ActionPayload::GetText { .. }
             | ActionPayload::GetHtml { .. }
             | ActionPayload::GetAttribute { .. }
             | ActionPayload::GetProperties { .. }

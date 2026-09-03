@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 11;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 12;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -52,6 +52,7 @@ const MAX_WORKER_POINTER_COORDINATE: u64 = 1_000_000;
 const MAX_WORKER_KEY_BYTES: usize = 64;
 const MAX_WORKER_SCROLL_DELTA: u64 = 1_000_000;
 const MAX_WORKER_SELECTOR_BYTES: usize = 8 * 1024;
+const MAX_WORKER_NODE_REF_BYTES: usize = 1024;
 const MAX_WORKER_ACTION_EXECUTION_TIMEOUT_MS: u64 = 300_000;
 const MAX_SESSION_VIEWPORT_PIXELS: u64 = 67_108_864;
 const MAX_SESSION_METADATA_ENTRIES: usize = 64;
@@ -132,6 +133,9 @@ pub enum WorkerActionCommand {
     QueryAll {
         selector: String,
     },
+    GetText {
+        node_ref: String,
+    },
     GetUrl,
     GetTitle,
 }
@@ -167,6 +171,11 @@ impl WorkerActionCommand {
                     && selector.len() <= MAX_WORKER_SELECTOR_BYTES
                     && !selector.chars().any(char::is_control)
             }
+            Self::GetText { node_ref } => {
+                !node_ref.is_empty()
+                    && node_ref.len() <= MAX_WORKER_NODE_REF_BYTES
+                    && !node_ref.chars().any(char::is_control)
+            }
             Self::Reload | Self::GoBack | Self::GoForward | Self::GetUrl | Self::GetTitle => true,
         }
     }
@@ -174,7 +183,9 @@ impl WorkerActionCommand {
     #[must_use]
     pub const fn kind(&self) -> ActionKind {
         match self {
-            Self::GetUrl | Self::GetTitle | Self::QueryAll { .. } => ActionKind::ReadOnly,
+            Self::GetUrl | Self::GetTitle | Self::QueryAll { .. } | Self::GetText { .. } => {
+                ActionKind::ReadOnly
+            }
             Self::Navigate { .. }
             | Self::Reload
             | Self::GoBack

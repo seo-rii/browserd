@@ -12,6 +12,11 @@ impl BackendNodeId {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -62,6 +67,13 @@ pub enum NodeResolutionError {
 pub struct NodeHandle(String);
 
 impl NodeHandle {
+    /// Reconstructs a handle from a caller-presented token. Resolution still validates the
+    /// binding, so this cannot forge access to a node the token was not minted for.
+    #[must_use]
+    pub fn from_token(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
     #[must_use]
     pub fn as_token(&self) -> &str {
         &self.0

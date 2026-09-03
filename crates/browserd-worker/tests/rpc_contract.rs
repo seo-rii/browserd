@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 11);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 12);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -496,5 +496,26 @@ fn query_all_is_a_bounded_read_only_selector() {
         }
         .is_valid(),
         "a control character in a selector is out of bounds"
+    );
+}
+
+#[test]
+fn get_text_is_a_bounded_read_only_node_reference() {
+    let get_text = WorkerActionCommand::GetText {
+        node_ref: "0000000000000001".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&get_text).ok(),
+        Some(serde_json::json!({"type": "get_text", "node_ref": "0000000000000001"})),
+    );
+    assert!(get_text.is_valid());
+    assert_eq!(get_text.kind(), ActionKind::ReadOnly);
+
+    assert!(
+        !WorkerActionCommand::GetText {
+            node_ref: String::new()
+        }
+        .is_valid(),
+        "an empty node reference is out of bounds"
     );
 }

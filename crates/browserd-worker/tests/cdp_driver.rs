@@ -1342,8 +1342,32 @@ fn spawn_action(
     })
 }
 
+fn spawn_action_owned(
+    page: &OwnedPage,
+    payload: Vec<u8>,
+    deadline: Option<Instant>,
+) -> tokio::task::JoinHandle<ActionExecutionResult> {
+    let driver = page.driver.clone();
+    let session_id = page.session_id.clone();
+    let page_id = page.page_id.clone();
+    tokio::task::spawn_blocking(move || match deadline {
+        Some(deadline) => {
+            driver.execute_action_until(&session_id, Some(&page_id), &payload, deadline)
+        }
+        None => driver.execute_action(&session_id, Some(&page_id), &payload),
+    })
+}
+
 fn succeeded() -> ActionExecutionResult {
     ActionExecutionResult::Succeeded(br#"{"ok":true}"#.to_vec())
+}
+
+fn succeeded_bytes(result: ActionExecutionResult) -> Vec<u8> {
+    match result {
+        ActionExecutionResult::Succeeded(bytes) => Some(bytes),
+        _ => None,
+    }
+    .expect("action must succeed with a result")
 }
 
 #[tokio::test]
@@ -2002,6 +2026,85 @@ async fn query_all_mints_an_opaque_ref_per_match() {
         "each match mints a non-empty opaque token"
     );
     assert_ne!(node_refs[0], node_refs[1], "handles are unique per match");
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn get_text_reads_a_minted_node() {
+    let mut page = owned_page().await;
+
+    // Mint a handle for one match.
+    let query = spawn_action(&page, br#"{"type":"query_all","selector":"h1"}"#, None);
+    let document = read_command(&mut page.reader).await;
+    assert_eq!(document["method"], "DOM.getDocument");
+    respond(&mut page.writer, &document, json!({"root": {"nodeId": 1}})).await;
+    let search = read_command(&mut page.reader).await;
+    assert_eq!(search["method"], "DOM.querySelectorAll");
+    respond(&mut page.writer, &search, json!({"nodeIds": [7]})).await;
+    let describe = read_command(&mut page.reader).await;
+    assert_eq!(describe["method"], "DOM.describeNode");
+    respond(
+        &mut page.writer,
+        &describe,
+        json!({"node": {"backendNodeId": 900}}),
+    )
+    .await;
+    let minted: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(query.await.unwrap())).unwrap();
+    let token = minted["node_refs"][0]
+        .as_str()
+        .expect("a minted token")
+        .to_owned();
+
+    // Consume it: resolve the backend node and read its rendered text.
+    let get_text = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"get_text","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    assert_eq!(resolve["params"]["backendNodeId"], 900);
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-1"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    assert_eq!(call["params"]["objectId"], "obj-1");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "string", "value": "Hello world"}}),
+    )
+    .await;
+
+    let text: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(get_text.await.unwrap())).unwrap();
+    assert_eq!(text["text"], "Hello world");
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn get_text_with_an_unknown_ref_is_rejected_before_cdp() {
+    let mut page = owned_page().await;
+    let get_text = spawn_action(
+        &page,
+        br#"{"type":"get_text","node_ref":"deadbeefdeadbeef"}"#,
+        None,
+    );
+    assert_eq!(
+        get_text.await.unwrap(),
+        ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+    );
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "an unresolved node ref must fail before any CDP dispatch"
+    );
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }

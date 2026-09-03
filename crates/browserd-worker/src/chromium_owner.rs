@@ -15,8 +15,9 @@ use browserd_sandbox::{ChromiumCdpPipes, LaunchSpec};
 use browserd_session::OwnershipFence;
 use browserd_targets::{
     BackendNodeId, BootstrapBackend, BootstrapStage, BootstrapStageFailure, DocumentEpoch,
-    NodeBinding, NodeHandleStore, PausedTarget, SessionIncarnation, ShardTaintReason, SnapshotId,
-    TargetIncarnation, TargetKind, TargetTime, UrlRevision,
+    NodeBinding, NodeHandle, NodeHandleStore, NodeResolutionContext, PausedTarget,
+    SessionIncarnation, ShardTaintReason, SnapshotId, TargetIncarnation, TargetKind, TargetTime,
+    UrlRevision,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -44,6 +45,8 @@ const NODE_STORE_CAPACITY: usize = 4096;
 const NODE_STORE_TTL: Duration = Duration::from_secs(300);
 /// Upper bound on the matches a single `query_all` mints, to bound resolution work.
 const MAX_QUERY_ALL_MATCHES: usize = 256;
+/// Extracts a bounded, rendered-text view of a resolved node for `get_text`.
+const NODE_TEXT_FUNCTION: &str = "function () { const value = this.innerText != null ? this.innerText : (this.textContent || ''); return String(value).slice(0, 60000); }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1174,6 +1177,9 @@ pub(crate) enum PageCommand {
     QueryAll {
         selector: String,
     },
+    GetText {
+        node_ref: String,
+    },
     ReadUrl,
     ReadTitle,
 }
@@ -2273,6 +2279,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 self.execute_query_all(&target_id, cdp_session_id, guarded, &selector, deadline)
                     .await
             }
+            PageCommand::GetText { node_ref } => {
+                self.execute_get_text(&target_id, cdp_session_id, guarded, &node_ref, deadline)
+                    .await
+            }
             PageCommand::GoBack => {
                 self.navigate_history(&target_id, cdp_session_id, guarded, -1, deadline)
                     .await
@@ -2702,6 +2712,85 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             node_refs.push(handle.as_token().to_owned());
         }
         Ok(json!({ "node_refs": node_refs }))
+    }
+
+    /// Resolves a caller-presented node handle to its stable backend node id.
+    ///
+    /// Staleness (session/target incarnation, document epoch) is enforced by the store; a
+    /// missing or stale handle is a caller rejection. Actionability is read-appropriate here
+    /// (a hidden element is still readable), so the visibility gates are left permissive.
+    fn resolve_node_backend_id(
+        &mut self,
+        target_id: &str,
+        node_ref: &str,
+    ) -> Result<u64, OwnerActorError> {
+        let document_state = self.node_document_state(target_id)?;
+        let context = NodeResolutionContext {
+            session_incarnation: document_state.session_incarnation,
+            target_incarnation: document_state.target_incarnation,
+            frame_document_epoch: document_state.frame_document_epoch,
+            required_snapshot_id: None,
+            current_url_revision: UrlRevision::new(document_state.url_revision),
+            attached: true,
+            visible: true,
+            obscured: false,
+            disabled: false,
+        };
+        let handle = NodeHandle::from_token(node_ref);
+        let resolved = self
+            .node_store
+            .resolve(&handle, &context, node_store_now())
+            .map_err(|_| OwnerActorError::Rejected)?;
+        Ok(resolved.backend_node_id().get())
+    }
+
+    /// Reads the rendered text of a resolved node handle.
+    async fn execute_get_text(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        node_ref: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let backend_node_id = self.resolve_node_backend_id(target_id, node_ref)?;
+        let resolved = self
+            .command_event_first(
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend_node_id }),
+                Some(cdp_session_id.clone()),
+                None,
+                guarded.clone(),
+                deadline,
+            )
+            .await?;
+        let object_id = resolved
+            .get("object")
+            .and_then(|object| object.get("objectId"))
+            .and_then(Value::as_str)
+            .ok_or(OwnerActorError::OutcomeUncertain)?
+            .to_owned();
+        let evaluated = self
+            .command_event_first(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": NODE_TEXT_FUNCTION,
+                    "returnByValue": true,
+                    "awaitPromise": false,
+                }),
+                Some(cdp_session_id),
+                None,
+                guarded,
+                deadline,
+            )
+            .await?;
+        let text = evaluated
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_str)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        Ok(json!({ "text": text }))
     }
 
     /// Traverses the target's session history by `delta` (`-1` back, `+1` forward).
