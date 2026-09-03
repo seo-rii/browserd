@@ -43,12 +43,14 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 9;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 10;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
 const MAX_WORKER_ACTION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_WORKER_POINTER_COORDINATE: u64 = 1_000_000;
+const MAX_WORKER_KEY_BYTES: usize = 64;
+const MAX_WORKER_SCROLL_DELTA: u64 = 1_000_000;
 const MAX_WORKER_ACTION_EXECUTION_TIMEOUT_MS: u64 = 300_000;
 const MAX_SESSION_VIEWPORT_PIXELS: u64 = 67_108_864;
 const MAX_SESSION_METADATA_ENTRIES: usize = 64;
@@ -119,6 +121,13 @@ pub enum WorkerActionCommand {
     TypeText {
         text: String,
     },
+    PressKey {
+        key: String,
+    },
+    Scroll {
+        delta_x: i64,
+        delta_y: i64,
+    },
     GetUrl,
     GetTitle,
 }
@@ -140,6 +149,15 @@ impl WorkerActionCommand {
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
+            Self::PressKey { key } => {
+                !key.is_empty()
+                    && key.len() <= MAX_WORKER_KEY_BYTES
+                    && !key.chars().any(char::is_control)
+            }
+            Self::Scroll { delta_x, delta_y } => {
+                delta_x.unsigned_abs() <= MAX_WORKER_SCROLL_DELTA
+                    && delta_y.unsigned_abs() <= MAX_WORKER_SCROLL_DELTA
+            }
             Self::Reload | Self::GoBack | Self::GoForward | Self::GetUrl | Self::GetTitle => true,
         }
     }
@@ -153,7 +171,9 @@ impl WorkerActionCommand {
             | Self::GoBack
             | Self::GoForward
             | Self::Click { .. }
-            | Self::TypeText { .. } => ActionKind::Mutating,
+            | Self::TypeText { .. }
+            | Self::PressKey { .. }
+            | Self::Scroll { .. } => ActionKind::Mutating,
         }
     }
 }

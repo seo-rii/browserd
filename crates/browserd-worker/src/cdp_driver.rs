@@ -520,6 +520,13 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }
+        WorkerActionCommand::PressKey { key } => {
+            Ok((PageCommand::PressKey { key }, ActionResultShape::Unit))
+        }
+        WorkerActionCommand::Scroll { delta_x, delta_y } => Ok((
+            PageCommand::Scroll { delta_x, delta_y },
+            ActionResultShape::Unit,
+        )),
         WorkerActionCommand::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
         WorkerActionCommand::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
     }

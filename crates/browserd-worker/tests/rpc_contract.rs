@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 9);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 10);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -425,4 +425,48 @@ fn history_traversal_commands_are_typed_mutations() {
         assert!(command.is_valid());
         assert_eq!(command.kind(), ActionKind::Mutating);
     }
+}
+
+#[test]
+fn raw_input_commands_are_bounded_typed_mutations() {
+    let press = WorkerActionCommand::PressKey {
+        key: "Enter".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&press).ok(),
+        Some(serde_json::json!({"type": "press_key", "key": "Enter"})),
+    );
+    assert!(press.is_valid());
+    assert_eq!(press.kind(), ActionKind::Mutating);
+
+    let scroll = WorkerActionCommand::Scroll {
+        delta_x: 0,
+        delta_y: 240,
+    };
+    assert_eq!(
+        serde_json::to_value(&scroll).ok(),
+        Some(serde_json::json!({"type": "scroll", "delta_x": 0, "delta_y": 240})),
+    );
+    assert!(scroll.is_valid());
+    assert_eq!(scroll.kind(), ActionKind::Mutating);
+
+    assert!(
+        !WorkerActionCommand::PressKey { key: String::new() }.is_valid(),
+        "an empty key is out of bounds"
+    );
+    assert!(
+        !WorkerActionCommand::PressKey {
+            key: "a\nb".to_owned()
+        }
+        .is_valid(),
+        "a control character in a key is out of bounds"
+    );
+    assert!(
+        !WorkerActionCommand::Scroll {
+            delta_x: 5_000_000,
+            delta_y: 0
+        }
+        .is_valid(),
+        "an oversized scroll delta is out of bounds"
+    );
 }

@@ -1246,13 +1246,16 @@ where
             ActionPayload::GetTitle => WorkerActionCommand::GetTitle,
             ActionPayload::GoBack => WorkerActionCommand::GoBack,
             ActionPayload::GoForward => WorkerActionCommand::GoForward,
+            ActionPayload::PressKey { key } => WorkerActionCommand::PressKey { key: key.clone() },
+            ActionPayload::Scroll { delta_x, delta_y } => WorkerActionCommand::Scroll {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+            },
             ActionPayload::Click { .. }
             | ActionPayload::DoubleClick { .. }
             | ActionPayload::Hover { .. }
             | ActionPayload::Fill { .. }
             | ActionPayload::FillSecret { .. }
-            | ActionPayload::PressKey { .. }
-            | ActionPayload::Scroll { .. }
             | ActionPayload::SelectOption { .. }
             | ActionPayload::SetFiles { .. }
             | ActionPayload::Focus { .. }

@@ -1896,3 +1896,64 @@ async fn go_back_to_a_same_document_entry_completes_without_a_load() {
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }
+
+#[tokio::test]
+async fn press_key_dispatches_a_named_key_down_and_up() {
+    let mut page = owned_page().await;
+    let press = spawn_action(&page, br#"{"type":"press_key","key":"Enter"}"#, None);
+
+    let down = read_command(&mut page.reader).await;
+    assert_eq!(down["method"], "Input.dispatchKeyEvent");
+    assert_eq!(down["params"]["type"], "keyDown");
+    assert_eq!(down["params"]["key"], "Enter");
+    assert_eq!(down["params"]["code"], "Enter");
+    assert_eq!(down["params"]["windowsVirtualKeyCode"], 13);
+    assert_eq!(down["params"]["text"], "\r");
+    respond(&mut page.writer, &down, json!({})).await;
+
+    let up = read_command(&mut page.reader).await;
+    assert_eq!(up["method"], "Input.dispatchKeyEvent");
+    assert_eq!(up["params"]["type"], "keyUp");
+    assert_eq!(up["params"]["key"], "Enter");
+    respond(&mut page.writer, &up, json!({})).await;
+
+    assert_eq!(press.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn press_key_with_an_unresolvable_name_is_rejected_before_dispatch() {
+    let mut page = owned_page().await;
+    let press = spawn_action(&page, br#"{"type":"press_key","key":"NotAKey"}"#, None);
+    assert_eq!(
+        press.await.unwrap(),
+        ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+    );
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "an unresolvable key must fail before any CDP dispatch"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn scroll_dispatches_a_wheel_event() {
+    let mut page = owned_page().await;
+    let scroll = spawn_action(
+        &page,
+        br#"{"type":"scroll","delta_x":0,"delta_y":240}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Input.dispatchMouseEvent");
+    assert_eq!(command["params"]["type"], "mouseWheel");
+    assert_eq!(command["params"]["deltaX"], 0);
+    assert_eq!(command["params"]["deltaY"], 240);
+    respond(&mut page.writer, &command, json!({})).await;
+
+    assert_eq!(scroll.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}

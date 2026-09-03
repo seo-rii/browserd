@@ -1158,6 +1158,13 @@ pub(crate) enum PageCommand {
     InsertText {
         text: String,
     },
+    PressKey {
+        key: String,
+    },
+    Scroll {
+        delta_x: i64,
+        delta_y: i64,
+    },
     ReadUrl,
     ReadTitle,
 }
@@ -2291,6 +2298,61 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 )
                 .await
             }
+            PageCommand::PressKey { key } => {
+                let stroke = resolve_key_stroke(&key).ok_or(OwnerActorError::Rejected)?;
+                let mut down = json!({
+                    "type": "keyDown",
+                    "key": stroke.key,
+                    "code": stroke.code,
+                    "windowsVirtualKeyCode": stroke.virtual_key_code,
+                    "nativeVirtualKeyCode": stroke.virtual_key_code,
+                });
+                if let Some(text) = &stroke.text {
+                    down["text"] = json!(text);
+                }
+                self.command_event_first(
+                    "Input.dispatchKeyEvent",
+                    down,
+                    Some(cdp_session_id.clone()),
+                    None,
+                    guarded.clone(),
+                    deadline,
+                )
+                .await?;
+                self.command_event_first(
+                    "Input.dispatchKeyEvent",
+                    json!({
+                        "type": "keyUp",
+                        "key": stroke.key,
+                        "code": stroke.code,
+                        "windowsVirtualKeyCode": stroke.virtual_key_code,
+                        "nativeVirtualKeyCode": stroke.virtual_key_code,
+                    }),
+                    Some(cdp_session_id),
+                    None,
+                    guarded,
+                    deadline,
+                )
+                .await
+                .map_err(|_| OwnerActorError::OutcomeUncertain)
+            }
+            PageCommand::Scroll { delta_x, delta_y } => {
+                self.command_event_first(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseWheel",
+                        "x": 0,
+                        "y": 0,
+                        "deltaX": delta_x,
+                        "deltaY": delta_y,
+                    }),
+                    Some(cdp_session_id),
+                    None,
+                    guarded,
+                    deadline,
+                )
+                .await
+            }
             PageCommand::ReadUrl => {
                 self.command_event_first(
                     "Runtime.evaluate",
@@ -3084,6 +3146,67 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
         Ok(())
     }
+}
+
+/// A resolved keyboard key ready for `Input.dispatchKeyEvent`.
+struct KeyStroke {
+    key: String,
+    code: String,
+    virtual_key_code: i64,
+    text: Option<String>,
+}
+
+/// Resolves a `press_key` key name into the CDP fields a key event needs.
+///
+/// Named keys (Enter, Tab, arrows, editing and navigation keys) carry the virtual key code
+/// Chromium requires to trigger their default action; a single printable character is sent
+/// as inserted text with a best-effort code. Anything else is unresolvable and rejected.
+fn resolve_key_stroke(key: &str) -> Option<KeyStroke> {
+    let named = |code: &str, virtual_key_code: i64, text: Option<&str>| KeyStroke {
+        key: key.to_owned(),
+        code: code.to_owned(),
+        virtual_key_code,
+        text: text.map(str::to_owned),
+    };
+    let stroke = match key {
+        "Enter" => named("Enter", 13, Some("\r")),
+        "Tab" => named("Tab", 9, Some("\t")),
+        "Backspace" => named("Backspace", 8, None),
+        "Delete" => named("Delete", 46, None),
+        "Escape" => named("Escape", 27, None),
+        "ArrowUp" => named("ArrowUp", 38, None),
+        "ArrowDown" => named("ArrowDown", 40, None),
+        "ArrowLeft" => named("ArrowLeft", 37, None),
+        "ArrowRight" => named("ArrowRight", 39, None),
+        "Home" => named("Home", 36, None),
+        "End" => named("End", 35, None),
+        "PageUp" => named("PageUp", 33, None),
+        "PageDown" => named("PageDown", 34, None),
+        " " => named("Space", 32, Some(" ")),
+        other => {
+            let mut chars = other.chars();
+            match (chars.next(), chars.next()) {
+                (Some(character), None) => {
+                    let (code, virtual_key_code) = if character.is_ascii_alphabetic() {
+                        let upper = character.to_ascii_uppercase();
+                        (format!("Key{upper}"), i64::from(u32::from(upper)))
+                    } else if character.is_ascii_digit() {
+                        (format!("Digit{character}"), i64::from(u32::from(character)))
+                    } else {
+                        (String::new(), 0)
+                    };
+                    KeyStroke {
+                        key: other.to_owned(),
+                        code,
+                        virtual_key_code,
+                        text: Some(other.to_owned()),
+                    }
+                }
+                _ => return None,
+            }
+        }
+    };
+    Some(stroke)
 }
 
 /// Resolves the history entry `delta` positions from the current one into its CDP entry id.
