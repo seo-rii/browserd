@@ -1017,7 +1017,9 @@ async fn accepted_pending_approval_action_is_returned_without_dispatching_it() {
             canonical_request_hash: [6; 32],
             kind: ActionKind::Mutating,
             page_id: Some(created.primary_page_id),
-            action: WorkerActionCommand::Click { x: 20, y: 30 },
+            action: WorkerActionCommand::Click {
+                node_ref: "0000000000000001".to_owned(),
+            },
             execution_timeout_ms: WorkerActionExecutionTimeout::DEFAULT,
             approval: Some(Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 1,

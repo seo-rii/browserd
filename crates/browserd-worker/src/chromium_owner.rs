@@ -1167,8 +1167,7 @@ pub(crate) enum PageCommand {
     GoBack,
     GoForward,
     Click {
-        x: f64,
-        y: f64,
+        node_ref: String,
     },
     InsertText {
         text: String,
@@ -2382,7 +2381,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 self.navigate_history(&target_id, cdp_session_id, guarded, 1, deadline)
                     .await
             }
-            PageCommand::Click { x, y } => {
+            PageCommand::Click { node_ref } => {
+                let (x, y) = self
+                    .node_pointer_target(
+                        &target_id,
+                        &cdp_session_id,
+                        guarded.clone(),
+                        &node_ref,
+                        deadline,
+                    )
+                    .await?;
                 self.command_event_first(
                     "Input.dispatchMouseEvent",
                     json!({"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1}),
@@ -2894,6 +2902,52 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .and_then(|result| result.get("value"))
             .cloned()
             .ok_or(OwnerActorError::OutcomeUncertain)
+    }
+
+    /// Resolves a node handle to the pointer coordinates of its first content box.
+    ///
+    /// An element with no content box (not rendered or hidden) has no actionable point and is
+    /// rejected, which gives the click family a basic visibility gate on top of the store's
+    /// staleness checks.
+    async fn node_pointer_target(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: &str,
+        guarded: Option<GuardedPageExecution>,
+        node_ref: &str,
+        deadline: Option<Instant>,
+    ) -> Result<(f64, f64), OwnerActorError> {
+        let backend_node_id = self.resolve_node_backend_id(target_id, node_ref)?;
+        let response = self
+            .command_event_first(
+                "DOM.getContentQuads",
+                json!({ "backendNodeId": backend_node_id }),
+                Some(cdp_session_id.to_owned()),
+                None,
+                guarded,
+                deadline,
+            )
+            .await?;
+        let quad = response
+            .get("quads")
+            .and_then(Value::as_array)
+            .and_then(|quads| quads.first())
+            .and_then(Value::as_array)
+            .filter(|quad| quad.len() == 8)
+            .ok_or(OwnerActorError::Rejected)?;
+        let mut sum_x = 0.0;
+        let mut sum_y = 0.0;
+        for (index, coordinate) in quad.iter().enumerate() {
+            let coordinate = coordinate
+                .as_f64()
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            if index % 2 == 0 {
+                sum_x += coordinate;
+            } else {
+                sum_y += coordinate;
+            }
+        }
+        Ok((sum_x / 4.0, sum_y / 4.0))
     }
 
     /// Reads the rendered text of a resolved node handle.

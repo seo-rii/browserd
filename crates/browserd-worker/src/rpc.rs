@@ -43,12 +43,11 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 14;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 15;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
 const MAX_WORKER_ACTION_TEXT_BYTES: usize = 16 * 1024;
-const MAX_WORKER_POINTER_COORDINATE: u64 = 1_000_000;
 const MAX_WORKER_KEY_BYTES: usize = 64;
 const MAX_WORKER_SCROLL_DELTA: u64 = 1_000_000;
 const MAX_WORKER_SELECTOR_BYTES: usize = 8 * 1024;
@@ -124,8 +123,7 @@ pub enum WorkerActionCommand {
     GoBack,
     GoForward,
     Click {
-        x: i64,
-        y: i64,
+        node_ref: String,
     },
     TypeText {
         text: String,
@@ -173,10 +171,7 @@ impl WorkerActionCommand {
                     && !url.chars().any(char::is_control)
                     && (url.starts_with("https://") || url.starts_with("http://"))
             }
-            Self::Click { x, y } => {
-                x.unsigned_abs() <= MAX_WORKER_POINTER_COORDINATE
-                    && y.unsigned_abs() <= MAX_WORKER_POINTER_COORDINATE
-            }
+            Self::Click { node_ref } => valid_worker_node_ref(node_ref),
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }

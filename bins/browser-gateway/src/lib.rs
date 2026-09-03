@@ -1275,8 +1275,10 @@ where
             ActionPayload::ExtractTable { node_ref } => WorkerActionCommand::ExtractTable {
                 node_ref: node_ref.clone(),
             },
-            ActionPayload::Click { .. }
-            | ActionPayload::DoubleClick { .. }
+            ActionPayload::Click { node_ref } => WorkerActionCommand::Click {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::DoubleClick { .. }
             | ActionPayload::Hover { .. }
             | ActionPayload::Fill { .. }
             | ActionPayload::FillSecret { .. }

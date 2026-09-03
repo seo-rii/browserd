@@ -2214,6 +2214,68 @@ async fn extract_table_returns_rows_of_cell_text() {
 }
 
 #[tokio::test]
+async fn click_dispatches_at_the_resolved_content_box_center() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 300).await;
+
+    let click = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"click","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let quads = read_command(&mut page.reader).await;
+    assert_eq!(quads["method"], "DOM.getContentQuads");
+    assert_eq!(quads["params"]["backendNodeId"], 300);
+    respond(
+        &mut page.writer,
+        &quads,
+        json!({"quads": [[10, 20, 30, 20, 30, 40, 10, 40]]}),
+    )
+    .await;
+
+    let press = read_command(&mut page.reader).await;
+    assert_eq!(press["method"], "Input.dispatchMouseEvent");
+    assert_eq!(press["params"]["type"], "mousePressed");
+    assert_eq!(press["params"]["x"].as_f64(), Some(20.0));
+    assert_eq!(press["params"]["y"].as_f64(), Some(30.0));
+    respond(&mut page.writer, &press, json!({})).await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["params"]["type"], "mouseReleased");
+    assert_eq!(release["params"]["x"].as_f64(), Some(20.0));
+    respond(&mut page.writer, &release, json!({})).await;
+
+    assert_eq!(click.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn click_of_a_node_without_a_content_box_is_rejected() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 301).await;
+
+    let click = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"click","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let quads = read_command(&mut page.reader).await;
+    assert_eq!(quads["method"], "DOM.getContentQuads");
+    respond(&mut page.writer, &quads, json!({"quads": []})).await;
+
+    assert_eq!(
+        click.await.unwrap(),
+        ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+    );
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "a node with no content box dispatches no pointer events"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn get_text_with_an_unknown_ref_is_rejected_before_cdp() {
     let mut page = owned_page().await;
     let get_text = spawn_action(

@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 14);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 15);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -70,7 +70,9 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
             canonical_request_hash: [4; 32],
             kind: ActionKind::Mutating,
             page_id: Some(page_id.clone()),
-            action: WorkerActionCommand::Click { x: 20, y: 30 },
+            action: WorkerActionCommand::Click {
+                node_ref: "0000000000000001".to_owned(),
+            },
             execution_timeout_ms: execution_timeout,
             approval: Some(Box::new(WorkerActionApprovalRequirement {
                 target_incarnation: 4,
