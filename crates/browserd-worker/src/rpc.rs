@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 21;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 22;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -195,6 +195,7 @@ pub enum WorkerActionCommand {
         accept: bool,
         prompt_text: Option<String>,
     },
+    Snapshot,
     TypeText {
         text: String,
     },
@@ -293,7 +294,12 @@ impl WorkerActionCommand {
             Self::GetProperties { node_ref }
             | Self::GetComputedStyle { node_ref }
             | Self::ExtractTable { node_ref } => valid_worker_node_ref(node_ref),
-            Self::Reload | Self::GoBack | Self::GoForward | Self::GetUrl | Self::GetTitle => true,
+            Self::Reload
+            | Self::GoBack
+            | Self::GoForward
+            | Self::Snapshot
+            | Self::GetUrl
+            | Self::GetTitle => true,
         }
     }
 
@@ -302,6 +308,7 @@ impl WorkerActionCommand {
         match self {
             Self::GetUrl
             | Self::GetTitle
+            | Self::Snapshot
             | Self::QueryAll { .. }
             | Self::GetText { .. }
             | Self::GetHtml { .. }

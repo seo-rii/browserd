@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 21);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 22);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -727,6 +727,17 @@ fn handle_dialog_is_a_typed_mutation() {
         })),
     );
     assert!(dismiss.is_valid());
+}
+
+#[test]
+fn snapshot_is_a_read_only_observation() {
+    let snapshot = WorkerActionCommand::Snapshot;
+    assert_eq!(
+        serde_json::to_value(&snapshot).ok(),
+        Some(serde_json::json!({ "type": "snapshot" })),
+    );
+    assert!(snapshot.is_valid());
+    assert_eq!(snapshot.kind(), ActionKind::ReadOnly);
 }
 
 #[test]

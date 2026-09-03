@@ -1349,9 +1349,9 @@ where
                 accept: *accept,
                 prompt_text: prompt_text.clone(),
             },
+            ActionPayload::Snapshot => WorkerActionCommand::Snapshot,
             ActionPayload::FillSecret { .. }
             | ActionPayload::SetFiles { .. }
-            | ActionPayload::Snapshot
             | ActionPayload::NewPage { .. }
             | ActionPayload::ClosePage
             | ActionPayload::ActivatePage

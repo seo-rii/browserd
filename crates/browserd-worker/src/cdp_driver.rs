@@ -571,6 +571,7 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             },
             ActionResultShape::Unit,
         )),
+        WorkerActionCommand::Snapshot => Ok((PageCommand::Snapshot, ActionResultShape::Json)),
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }

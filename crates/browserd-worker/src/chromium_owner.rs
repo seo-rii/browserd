@@ -1227,6 +1227,7 @@ pub(crate) enum PageCommand {
         accept: bool,
         prompt_text: Option<String>,
     },
+    Snapshot,
     InsertText {
         text: String,
     },
@@ -2623,6 +2624,23 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     deadline,
                 )
                 .await
+            }
+            PageCommand::Snapshot => {
+                let response = self
+                    .command_event_first(
+                        "Accessibility.getFullAXTree",
+                        json!({}),
+                        Some(cdp_session_id),
+                        None,
+                        guarded,
+                        deadline,
+                    )
+                    .await?;
+                let nodes = response
+                    .get("nodes")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                Ok(json!({ "nodes": nodes }))
             }
             PageCommand::InsertText { text } => {
                 self.command_event_first(

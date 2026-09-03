@@ -2564,6 +2564,27 @@ async fn handle_dialog_accepts_with_prompt_text() {
 }
 
 #[tokio::test]
+async fn snapshot_returns_the_accessibility_tree() {
+    let mut page = owned_page().await;
+    let snapshot = spawn_action(&page, br#"{"type":"snapshot"}"#, None);
+
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Accessibility.getFullAXTree");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"nodes": [{"nodeId": "1", "role": {"value": "RootWebArea"}}]}),
+    )
+    .await;
+
+    let tree: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(snapshot.await.unwrap())).unwrap();
+    assert_eq!(tree["nodes"][0]["role"]["value"], "RootWebArea");
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn evaluate_that_throws_is_rejected() {
     let mut page = owned_page().await;
     let eval = spawn_action(&page, br#"{"type":"evaluate","expression":"boom()"}"#, None);
