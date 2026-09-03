@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 12);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 13);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -517,5 +517,50 @@ fn get_text_is_a_bounded_read_only_node_reference() {
         }
         .is_valid(),
         "an empty node reference is out of bounds"
+    );
+}
+
+#[test]
+fn node_reads_are_bounded_read_only_commands() {
+    let whole_document = WorkerActionCommand::GetHtml { node_ref: None };
+    assert_eq!(
+        serde_json::to_value(&whole_document).ok(),
+        Some(serde_json::json!({"type": "get_html", "node_ref": null})),
+    );
+    assert!(
+        whole_document.is_valid(),
+        "a whole-document get_html is valid"
+    );
+    assert_eq!(whole_document.kind(), ActionKind::ReadOnly);
+
+    let attribute = WorkerActionCommand::GetAttribute {
+        node_ref: "0000000000000001".to_owned(),
+        name: "href".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&attribute).ok(),
+        Some(serde_json::json!({
+            "type": "get_attribute",
+            "node_ref": "0000000000000001",
+            "name": "href",
+        })),
+    );
+    assert!(attribute.is_valid());
+    assert_eq!(attribute.kind(), ActionKind::ReadOnly);
+
+    assert!(
+        !WorkerActionCommand::GetAttribute {
+            node_ref: "0000000000000001".to_owned(),
+            name: String::new(),
+        }
+        .is_valid(),
+        "an empty attribute name is out of bounds"
+    );
+    assert!(
+        !WorkerActionCommand::GetHtml {
+            node_ref: Some(String::new()),
+        }
+        .is_valid(),
+        "a present but empty node reference is out of bounds"
     );
 }

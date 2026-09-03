@@ -1180,6 +1180,13 @@ pub(crate) enum PageCommand {
     GetText {
         node_ref: String,
     },
+    GetHtml {
+        node_ref: Option<String>,
+    },
+    GetAttribute {
+        node_ref: String,
+        name: String,
+    },
     ReadUrl,
     ReadTitle,
 }
@@ -2283,6 +2290,27 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 self.execute_get_text(&target_id, cdp_session_id, guarded, &node_ref, deadline)
                     .await
             }
+            PageCommand::GetHtml { node_ref } => {
+                self.execute_get_html(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    node_ref.as_deref(),
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::GetAttribute { node_ref, name } => {
+                self.execute_get_attribute(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    &node_ref,
+                    &name,
+                    deadline,
+                )
+                .await
+            }
             PageCommand::GoBack => {
                 self.navigate_history(&target_id, cdp_session_id, guarded, -1, deadline)
                     .await
@@ -2744,13 +2772,18 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         Ok(resolved.backend_node_id().get())
     }
 
-    /// Reads the rendered text of a resolved node handle.
-    async fn execute_get_text(
+    /// Resolves a node handle and calls a JS function on the live element by value.
+    ///
+    /// The shared spine of every node read: resolve the handle to its backend node, obtain a
+    /// remote object, then `Runtime.callFunctionOn` returning the value by value. `arguments`
+    /// is a CDP call-argument array (empty for a nullary function).
+    async fn call_function_on_node(
         &mut self,
         target_id: &str,
         cdp_session_id: String,
         guarded: Option<GuardedPageExecution>,
         node_ref: &str,
+        call: NodeFunctionCall<'_>,
         deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
         let backend_node_id = self.resolve_node_backend_id(target_id, node_ref)?;
@@ -2770,27 +2803,134 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .and_then(Value::as_str)
             .ok_or(OwnerActorError::OutcomeUncertain)?
             .to_owned();
+        let mut params = json!({
+            "objectId": object_id,
+            "functionDeclaration": call.declaration,
+            "returnByValue": true,
+            "awaitPromise": false,
+        });
+        if call
+            .arguments
+            .as_array()
+            .is_some_and(|arguments| !arguments.is_empty())
+        {
+            params["arguments"] = call.arguments;
+        }
         let evaluated = self
             .command_event_first(
                 "Runtime.callFunctionOn",
-                json!({
-                    "objectId": object_id,
-                    "functionDeclaration": NODE_TEXT_FUNCTION,
-                    "returnByValue": true,
-                    "awaitPromise": false,
-                }),
+                params,
                 Some(cdp_session_id),
                 None,
                 guarded,
                 deadline,
             )
             .await?;
-        let text = evaluated
+        evaluated
             .get("result")
             .and_then(|result| result.get("value"))
-            .and_then(Value::as_str)
-            .ok_or(OwnerActorError::OutcomeUncertain)?;
+            .cloned()
+            .ok_or(OwnerActorError::OutcomeUncertain)
+    }
+
+    /// Reads the rendered text of a resolved node handle.
+    async fn execute_get_text(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        node_ref: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let text = self
+            .call_function_on_node(
+                target_id,
+                cdp_session_id,
+                guarded,
+                node_ref,
+                NodeFunctionCall {
+                    declaration: NODE_TEXT_FUNCTION,
+                    arguments: json!([]),
+                },
+                deadline,
+            )
+            .await?;
         Ok(json!({ "text": text }))
+    }
+
+    /// Reads the `outerHTML` of a resolved node, or the whole document when no node is given.
+    async fn execute_get_html(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        node_ref: Option<&str>,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let html = match node_ref {
+            Some(node_ref) => {
+                self.call_function_on_node(
+                    target_id,
+                    cdp_session_id,
+                    guarded,
+                    node_ref,
+                    NodeFunctionCall {
+                        declaration: "function () { return this.outerHTML || ''; }",
+                        arguments: json!([]),
+                    },
+                    deadline,
+                )
+                .await?
+            }
+            None => {
+                let response = self
+                    .command_event_first(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": "document.documentElement.outerHTML",
+                            "returnByValue": true,
+                            "awaitPromise": false,
+                        }),
+                        Some(cdp_session_id),
+                        None,
+                        guarded,
+                        deadline,
+                    )
+                    .await?;
+                response
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .cloned()
+                    .ok_or(OwnerActorError::OutcomeUncertain)?
+            }
+        };
+        Ok(json!({ "html": html }))
+    }
+
+    /// Reads a single attribute of a resolved node (`null` when the attribute is absent).
+    async fn execute_get_attribute(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        node_ref: &str,
+        name: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let value = self
+            .call_function_on_node(
+                target_id,
+                cdp_session_id,
+                guarded,
+                node_ref,
+                NodeFunctionCall {
+                    declaration: "function (name) { const value = this.getAttribute(name); return value === null ? null : String(value); }",
+                    arguments: json!([{ "value": name }]),
+                },
+                deadline,
+            )
+            .await?;
+        Ok(json!({ "value": value }))
     }
 
     /// Traverses the target's session history by `delta` (`-1` back, `+1` forward).
@@ -3346,6 +3486,12 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
         Ok(())
     }
+}
+
+/// A JS function and its CDP call arguments to run on a resolved node.
+struct NodeFunctionCall<'a> {
+    declaration: &'a str,
+    arguments: Value,
 }
 
 /// The document identity a node handle is bound to and resolved against.

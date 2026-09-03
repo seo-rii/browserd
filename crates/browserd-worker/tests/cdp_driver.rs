@@ -1370,6 +1370,28 @@ fn succeeded_bytes(result: ActionExecutionResult) -> Vec<u8> {
     .expect("action must succeed with a result")
 }
 
+/// Mints a single node handle for `backend` via query_all and returns its opaque token.
+async fn mint_node(page: &mut OwnedPage, backend: i64) -> String {
+    let query = spawn_action(page, br#"{"type":"query_all","selector":"*"}"#, None);
+    let document = read_command(&mut page.reader).await;
+    respond(&mut page.writer, &document, json!({"root": {"nodeId": 1}})).await;
+    let search = read_command(&mut page.reader).await;
+    respond(&mut page.writer, &search, json!({"nodeIds": [1]})).await;
+    let describe = read_command(&mut page.reader).await;
+    respond(
+        &mut page.writer,
+        &describe,
+        json!({"node": {"backendNodeId": backend}}),
+    )
+    .await;
+    let minted: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(query.await.unwrap())).unwrap();
+    minted["node_refs"][0]
+        .as_str()
+        .expect("a minted token")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn navigate_domcontentloaded_completes_on_the_committed_loader_without_load() {
     let mut page = owned_page().await;
@@ -2085,6 +2107,66 @@ async fn get_text_reads_a_minted_node() {
     let text: serde_json::Value =
         serde_json::from_slice(&succeeded_bytes(get_text.await.unwrap())).unwrap();
     assert_eq!(text["text"], "Hello world");
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn get_attribute_reads_a_named_attribute_by_argument() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 900).await;
+
+    let get_attr = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"get_attribute","node_ref":"{token}","name":"href"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    assert_eq!(resolve["params"]["backendNodeId"], 900);
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-1"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    assert_eq!(call["params"]["arguments"][0]["value"], "href");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "string", "value": "https://example.test/x"}}),
+    )
+    .await;
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(get_attr.await.unwrap())).unwrap();
+    assert_eq!(parsed["value"], "https://example.test/x");
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn get_html_without_a_node_reads_the_whole_document() {
+    let mut page = owned_page().await;
+    let get_html = spawn_action(&page, br#"{"type":"get_html","node_ref":null}"#, None);
+    let evaluate = read_command(&mut page.reader).await;
+    assert_eq!(evaluate["method"], "Runtime.evaluate");
+    assert_eq!(
+        evaluate["params"]["expression"],
+        "document.documentElement.outerHTML"
+    );
+    respond(
+        &mut page.writer,
+        &evaluate,
+        json!({"result": {"type": "string", "value": "<html></html>"}}),
+    )
+    .await;
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(get_html.await.unwrap())).unwrap();
+    assert_eq!(parsed["html"], "<html></html>");
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }

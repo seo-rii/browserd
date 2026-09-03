@@ -1259,6 +1259,13 @@ where
             ActionPayload::GetText { node_ref } => WorkerActionCommand::GetText {
                 node_ref: node_ref.clone(),
             },
+            ActionPayload::GetHtml { node_ref } => WorkerActionCommand::GetHtml {
+                node_ref: node_ref.clone(),
+            },
+            ActionPayload::GetAttribute { node_ref, name } => WorkerActionCommand::GetAttribute {
+                node_ref: node_ref.clone(),
+                name: name.clone(),
+            },
             ActionPayload::Click { .. }
             | ActionPayload::DoubleClick { .. }
             | ActionPayload::Hover { .. }
@@ -1272,8 +1279,6 @@ where
             | ActionPayload::Uncheck { .. }
             | ActionPayload::HandleDialog { .. }
             | ActionPayload::Snapshot
-            | ActionPayload::GetHtml { .. }
-            | ActionPayload::GetAttribute { .. }
             | ActionPayload::GetProperties { .. }
             | ActionPayload::GetComputedStyle { .. }
             | ActionPayload::ExtractTable { .. }
