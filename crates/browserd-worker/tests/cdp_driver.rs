@@ -1515,6 +1515,9 @@ async fn navigate_superseded_by_another_loader_is_a_known_failure() {
         json!({"frameId": "frame", "loaderId": "loader-c"}),
     )
     .await;
+    // Commit the navigate's own loader first and let the lifecycle wait observe it, so the
+    // superseding loader that follows is deterministically seen as an interruption rather
+    // than racing the navigate response.
     write_message(
         &mut page.writer,
         frame_navigated(
@@ -1525,6 +1528,11 @@ async fn navigate_superseded_by_another_loader_is_a_known_failure() {
         ),
     )
     .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !navigate.is_finished(),
+        "the committed loader has not reached load yet"
+    );
     write_message(
         &mut page.writer,
         frame_navigated(
