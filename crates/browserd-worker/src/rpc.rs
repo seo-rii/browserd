@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 17;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 18;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -53,6 +53,7 @@ const MAX_WORKER_SCROLL_DELTA: u64 = 1_000_000;
 const MAX_WORKER_SELECTOR_BYTES: usize = 8 * 1024;
 const MAX_WORKER_NODE_REF_BYTES: usize = 1024;
 const MAX_WORKER_ATTRIBUTE_NAME_BYTES: usize = 256;
+const MAX_WORKER_SELECT_VALUES: usize = 1024;
 
 fn valid_worker_node_ref(node_ref: &str) -> bool {
     !node_ref.is_empty()
@@ -143,6 +144,14 @@ pub enum WorkerActionCommand {
     Uncheck {
         node_ref: String,
     },
+    Fill {
+        node_ref: String,
+        value: String,
+    },
+    SelectOption {
+        node_ref: String,
+        values: Vec<String>,
+    },
     TypeText {
         text: String,
     },
@@ -196,6 +205,16 @@ impl WorkerActionCommand {
             | Self::Blur { node_ref }
             | Self::Check { node_ref }
             | Self::Uncheck { node_ref } => valid_worker_node_ref(node_ref),
+            Self::Fill { node_ref, value } => {
+                valid_worker_node_ref(node_ref) && value.len() <= MAX_WORKER_ACTION_TEXT_BYTES
+            }
+            Self::SelectOption { node_ref, values } => {
+                valid_worker_node_ref(node_ref)
+                    && values.len() <= MAX_WORKER_SELECT_VALUES
+                    && values
+                        .iter()
+                        .all(|value| value.len() <= MAX_WORKER_ACTION_TEXT_BYTES)
+            }
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
@@ -251,6 +270,8 @@ impl WorkerActionCommand {
             | Self::Blur { .. }
             | Self::Check { .. }
             | Self::Uncheck { .. }
+            | Self::Fill { .. }
+            | Self::SelectOption { .. }
             | Self::TypeText { .. }
             | Self::PressKey { .. }
             | Self::Scroll { .. } => ActionKind::Mutating,

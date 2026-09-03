@@ -1781,6 +1781,26 @@ fn pointer_mutations_reach_the_worker_as_typed_node_references() -> Result<(), B
             ActionPayload::Uncheck { node_ref: node() },
             WorkerActionCommand::Uncheck { node_ref: node() },
         ),
+        (
+            ActionPayload::Fill {
+                node_ref: node(),
+                value: "hi".to_owned(),
+            },
+            WorkerActionCommand::Fill {
+                node_ref: node(),
+                value: "hi".to_owned(),
+            },
+        ),
+        (
+            ActionPayload::SelectOption {
+                node_ref: node(),
+                values: vec!["a".to_owned()],
+            },
+            WorkerActionCommand::SelectOption {
+                node_ref: node(),
+                values: vec!["a".to_owned()],
+            },
+        ),
     ] {
         let (principal, worker, router, session_id) = resource_fixture()?;
         let submitted = router.execute(

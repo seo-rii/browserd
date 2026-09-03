@@ -537,6 +537,14 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
         WorkerActionCommand::Uncheck { node_ref } => {
             Ok((PageCommand::Uncheck { node_ref }, ActionResultShape::Unit))
         }
+        WorkerActionCommand::Fill { node_ref, value } => Ok((
+            PageCommand::Fill { node_ref, value },
+            ActionResultShape::Unit,
+        )),
+        WorkerActionCommand::SelectOption { node_ref, values } => Ok((
+            PageCommand::SelectOption { node_ref, values },
+            ActionResultShape::Unit,
+        )),
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }

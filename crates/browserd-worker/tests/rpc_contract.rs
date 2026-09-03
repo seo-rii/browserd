@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 17);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 18);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -620,6 +620,47 @@ fn node_ref_mutations_are_typed_mutations() {
         assert!(command.is_valid());
         assert_eq!(command.kind(), ActionKind::Mutating);
     }
+}
+
+#[test]
+fn form_value_mutations_are_typed_and_bounded() {
+    let fill = WorkerActionCommand::Fill {
+        node_ref: "0000000000000001".to_owned(),
+        value: "hello".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&fill).ok(),
+        Some(serde_json::json!({
+            "type": "fill",
+            "node_ref": "0000000000000001",
+            "value": "hello",
+        })),
+    );
+    assert!(fill.is_valid());
+    assert!(
+        WorkerActionCommand::Fill {
+            node_ref: "0000000000000001".to_owned(),
+            value: String::new(),
+        }
+        .is_valid(),
+        "clearing a field with an empty value is valid"
+    );
+    assert_eq!(fill.kind(), ActionKind::Mutating);
+
+    let select = WorkerActionCommand::SelectOption {
+        node_ref: "0000000000000001".to_owned(),
+        values: vec!["a".to_owned(), "b".to_owned()],
+    };
+    assert_eq!(
+        serde_json::to_value(&select).ok(),
+        Some(serde_json::json!({
+            "type": "select_option",
+            "node_ref": "0000000000000001",
+            "values": ["a", "b"],
+        })),
+    );
+    assert!(select.is_valid());
+    assert_eq!(select.kind(), ActionKind::Mutating);
 }
 
 #[test]

@@ -58,6 +58,10 @@ const NODE_BLUR_FUNCTION: &str = "function () { this.blur(); return true; }";
 /// Sets a resolved node's checked state, firing input/change only on a real change, for
 /// `check` and `uncheck`.
 const NODE_SET_CHECKED_FUNCTION: &str = "function (desired) { if (!!this.checked !== desired) { this.checked = desired; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); } return !!this.checked; }";
+/// Sets a resolved node's value and fires input/change for `fill`.
+const NODE_FILL_FUNCTION: &str = "function (value) { this.focus(); if ('value' in this) { this.value = value; } else { this.textContent = value; } this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
+/// Selects the requested option values in a resolved <select> for `select_option`.
+const NODE_SELECT_FUNCTION: &str = "function (values) { const wanted = new Set(values); for (const option of Array.from(this.options || [])) { option.selected = wanted.has(option.value); } this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return Array.from(this.selectedOptions || []).map(o => o.value); }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1191,6 +1195,14 @@ pub(crate) enum PageCommand {
     },
     Uncheck {
         node_ref: String,
+    },
+    Fill {
+        node_ref: String,
+        value: String,
+    },
+    SelectOption {
+        node_ref: String,
+        values: Vec<String>,
     },
     InsertText {
         text: String,
@@ -2503,6 +2515,34 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     NodeFunctionCall {
                         declaration: NODE_SET_CHECKED_FUNCTION,
                         arguments: json!([{ "value": false }]),
+                    },
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::Fill { node_ref, value } => {
+                self.call_function_on_node(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    &node_ref,
+                    NodeFunctionCall {
+                        declaration: NODE_FILL_FUNCTION,
+                        arguments: json!([{ "value": value }]),
+                    },
+                    deadline,
+                )
+                .await
+            }
+            PageCommand::SelectOption { node_ref, values } => {
+                self.call_function_on_node(
+                    &target_id,
+                    cdp_session_id,
+                    guarded,
+                    &node_ref,
+                    NodeFunctionCall {
+                        declaration: NODE_SELECT_FUNCTION,
+                        arguments: json!([{ "value": values }]),
                     },
                     deadline,
                 )

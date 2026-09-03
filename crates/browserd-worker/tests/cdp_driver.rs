@@ -2389,6 +2389,73 @@ async fn check_sets_the_checked_state_through_the_element() {
 }
 
 #[tokio::test]
+async fn fill_sets_the_value_through_the_element() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 420).await;
+
+    let fill = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"fill","node_ref":"{token}","value":"hello world"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-f"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    assert_eq!(call["params"]["arguments"][0]["value"], "hello world");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "boolean", "value": true}}),
+    )
+    .await;
+
+    assert_eq!(fill.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn select_option_passes_the_requested_values() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 421).await;
+
+    let select = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"select_option","node_ref":"{token}","values":["a","b"]}}"#)
+            .into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-s"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    assert_eq!(call["params"]["arguments"][0]["value"], json!(["a", "b"]));
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "object", "value": ["a", "b"]}}),
+    )
+    .await;
+
+    assert_eq!(select.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn get_text_with_an_unknown_ref_is_rejected_before_cdp() {
     let mut page = owned_page().await;
     let get_text = spawn_action(

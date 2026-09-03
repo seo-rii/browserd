@@ -1296,9 +1296,15 @@ where
             ActionPayload::Uncheck { node_ref } => WorkerActionCommand::Uncheck {
                 node_ref: node_ref.clone(),
             },
-            ActionPayload::Fill { .. }
-            | ActionPayload::FillSecret { .. }
-            | ActionPayload::SelectOption { .. }
+            ActionPayload::Fill { node_ref, value } => WorkerActionCommand::Fill {
+                node_ref: node_ref.clone(),
+                value: value.clone(),
+            },
+            ActionPayload::SelectOption { node_ref, values } => WorkerActionCommand::SelectOption {
+                node_ref: node_ref.clone(),
+                values: values.clone(),
+            },
+            ActionPayload::FillSecret { .. }
             | ActionPayload::SetFiles { .. }
             | ActionPayload::HandleDialog { .. }
             | ActionPayload::Snapshot
