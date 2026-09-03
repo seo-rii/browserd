@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc as std_mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use browserd_cdp::{CdpClient, CdpCommandError, CdpIncoming};
@@ -14,8 +14,9 @@ use browserd_core::{IsolationProfile, PageId, SessionId, ShardFence, TenantId};
 use browserd_sandbox::{ChromiumCdpPipes, LaunchSpec};
 use browserd_session::OwnershipFence;
 use browserd_targets::{
-    BootstrapBackend, BootstrapStage, BootstrapStageFailure, PausedTarget, ShardTaintReason,
-    TargetKind,
+    BackendNodeId, BootstrapBackend, BootstrapStage, BootstrapStageFailure, DocumentEpoch,
+    NodeBinding, NodeHandleStore, PausedTarget, SessionIncarnation, ShardTaintReason, SnapshotId,
+    TargetIncarnation, TargetKind, TargetTime, UrlRevision,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -38,6 +39,11 @@ const MAX_RETIRED_TARGETS: usize = 4_096;
 /// Lifecycle waits answer this far ahead of the action deadline so the reply reaches the
 /// mailbox before its own deadline expires; a mailbox timeout fails the whole owner closed.
 const LIFECYCLE_DEADLINE_RESPONSE_MARGIN: Duration = Duration::from_millis(50);
+/// Capacity and lifetime of the per-owner opaque node-handle store.
+const NODE_STORE_CAPACITY: usize = 4096;
+const NODE_STORE_TTL: Duration = Duration::from_secs(300);
+/// Upper bound on the matches a single `query_all` mints, to bound resolution work.
+const MAX_QUERY_ALL_MATCHES: usize = 256;
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1165,6 +1171,9 @@ pub(crate) enum PageCommand {
         delta_x: i64,
         delta_y: i64,
     },
+    QueryAll {
+        selector: String,
+    },
     ReadUrl,
     ReadTitle,
 }
@@ -1260,6 +1269,7 @@ struct ChromiumOwnerActor<D> {
     closed_page_tombstones: BTreeMap<PageId, SessionId>,
     retired_targets: BTreeMap<String, String>,
     next_target_incarnation: u64,
+    node_store: NodeHandleStore,
 }
 
 struct OwnerActorContext<D> {
@@ -1291,6 +1301,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             closed_page_tombstones: BTreeMap::new(),
             retired_targets: BTreeMap::new(),
             next_target_incarnation: 1,
+            node_store: NodeHandleStore::new(NODE_STORE_CAPACITY, NODE_STORE_TTL),
         }
     }
 
@@ -2258,6 +2269,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await?;
                 Ok(result)
             }
+            PageCommand::QueryAll { selector } => {
+                self.execute_query_all(&target_id, cdp_session_id, guarded, &selector, deadline)
+                    .await
+            }
             PageCommand::GoBack => {
                 self.navigate_history(&target_id, cdp_session_id, guarded, -1, deadline)
                     .await
@@ -2591,6 +2606,102 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 }
             }
         }
+    }
+
+    /// Resolves the document state a node handle binds to, read from the owned route.
+    fn node_document_state(&self, target_id: &str) -> Result<NodeDocumentState, OwnerActorError> {
+        let entry = self
+            .routes
+            .get(target_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        Ok(NodeDocumentState {
+            session_incarnation: SessionIncarnation::new(
+                entry.route.ownership_fence.session_incarnation(),
+            ),
+            target_incarnation: TargetIncarnation::new(entry.target_incarnation),
+            frame_document_epoch: DocumentEpoch::new(entry.frame_document_epoch),
+            url_revision: entry.url_revision,
+        })
+    }
+
+    /// Resolves a selector against the live document and mints an opaque handle per match.
+    ///
+    /// Each match's stable `backendNodeId` is bound to the document state observed here, so a
+    /// later navigation invalidates the handle. An invalid selector is a caller rejection, not
+    /// an ownership fault.
+    async fn execute_query_all(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        selector: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let document = self
+            .command_event_first(
+                "DOM.getDocument",
+                json!({ "depth": 0 }),
+                Some(cdp_session_id.clone()),
+                None,
+                guarded.clone(),
+                deadline,
+            )
+            .await?;
+        let root_node_id = document
+            .get("root")
+            .and_then(|root| root.get("nodeId"))
+            .and_then(Value::as_i64)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let matches = self
+            .command_event_first(
+                "DOM.querySelectorAll",
+                json!({ "nodeId": root_node_id, "selector": selector }),
+                Some(cdp_session_id.clone()),
+                None,
+                guarded.clone(),
+                deadline,
+            )
+            .await?;
+        let node_ids = matches
+            .get("nodeIds")
+            .and_then(Value::as_array)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let mut backend_ids = Vec::new();
+        for node_id in node_ids.iter().take(MAX_QUERY_ALL_MATCHES) {
+            let node_id = node_id.as_i64().ok_or(OwnerActorError::OutcomeUncertain)?;
+            let described = self
+                .command_event_first(
+                    "DOM.describeNode",
+                    json!({ "nodeId": node_id }),
+                    Some(cdp_session_id.clone()),
+                    None,
+                    guarded.clone(),
+                    deadline,
+                )
+                .await?;
+            let backend_node_id = described
+                .get("node")
+                .and_then(|node| node.get("backendNodeId"))
+                .and_then(Value::as_u64)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            backend_ids.push(backend_node_id);
+        }
+        let document_state = self.node_document_state(target_id)?;
+        let now = node_store_now();
+        let mut node_refs = Vec::with_capacity(backend_ids.len());
+        for backend_node_id in backend_ids {
+            let binding = NodeBinding {
+                session_incarnation: document_state.session_incarnation,
+                target_incarnation: document_state.target_incarnation,
+                frame_document_epoch: document_state.frame_document_epoch,
+                backend_node_id: BackendNodeId::new(backend_node_id),
+                snapshot_id: SnapshotId::new(0),
+                url_revision: UrlRevision::new(document_state.url_revision),
+            };
+            let handle = self.node_store.insert(binding, now);
+            node_refs.push(handle.as_token().to_owned());
+        }
+        Ok(json!({ "node_refs": node_refs }))
     }
 
     /// Traverses the target's session history by `delta` (`-1` back, `+1` forward).
@@ -3146,6 +3257,23 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
         Ok(())
     }
+}
+
+/// The document identity a node handle is bound to and resolved against.
+struct NodeDocumentState {
+    session_incarnation: SessionIncarnation,
+    target_incarnation: TargetIncarnation,
+    frame_document_epoch: DocumentEpoch,
+    url_revision: u64,
+}
+
+/// Wall-clock milliseconds for the node-handle store's coarse TTL and LRU accounting.
+fn node_store_now() -> TargetTime {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    TargetTime::new(millis)
 }
 
 /// A resolved keyboard key ready for `Input.dispatchKeyEvent`.

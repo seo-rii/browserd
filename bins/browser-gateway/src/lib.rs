@@ -1253,6 +1253,9 @@ where
                 delta_x: *delta_x,
                 delta_y: *delta_y,
             },
+            ActionPayload::QueryAll { selector } => WorkerActionCommand::QueryAll {
+                selector: selector.clone(),
+            },
             ActionPayload::Click { .. }
             | ActionPayload::DoubleClick { .. }
             | ActionPayload::Hover { .. }
@@ -1271,7 +1274,6 @@ where
             | ActionPayload::GetAttribute { .. }
             | ActionPayload::GetProperties { .. }
             | ActionPayload::GetComputedStyle { .. }
-            | ActionPayload::QueryAll { .. }
             | ActionPayload::ExtractTable { .. }
             | ActionPayload::NewPage { .. }
             | ActionPayload::ClosePage

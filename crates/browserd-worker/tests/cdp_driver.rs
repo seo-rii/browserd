@@ -1957,3 +1957,51 @@ async fn scroll_dispatches_a_wheel_event() {
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }
+
+#[tokio::test]
+async fn query_all_mints_an_opaque_ref_per_match() {
+    let mut page = owned_page().await;
+    let query = spawn_action(&page, br#"{"type":"query_all","selector":"a.link"}"#, None);
+
+    let document = read_command(&mut page.reader).await;
+    assert_eq!(document["method"], "DOM.getDocument");
+    respond(&mut page.writer, &document, json!({"root": {"nodeId": 1}})).await;
+
+    let search = read_command(&mut page.reader).await;
+    assert_eq!(search["method"], "DOM.querySelectorAll");
+    assert_eq!(search["params"]["nodeId"], 1);
+    assert_eq!(search["params"]["selector"], "a.link");
+    respond(&mut page.writer, &search, json!({"nodeIds": [2, 3]})).await;
+
+    for (node_id, backend) in [(2, 100), (3, 101)] {
+        let describe = read_command(&mut page.reader).await;
+        assert_eq!(describe["method"], "DOM.describeNode");
+        assert_eq!(describe["params"]["nodeId"], node_id);
+        respond(
+            &mut page.writer,
+            &describe,
+            json!({"node": {"backendNodeId": backend}}),
+        )
+        .await;
+    }
+
+    let bytes = match query.await.unwrap() {
+        ActionExecutionResult::Succeeded(bytes) => Some(bytes),
+        _ => None,
+    }
+    .expect("query_all must succeed with a result");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let node_refs = parsed["node_refs"]
+        .as_array()
+        .expect("result carries a node_refs array");
+    assert_eq!(node_refs.len(), 2);
+    assert!(
+        node_refs
+            .iter()
+            .all(|token| token.as_str().is_some_and(|token| !token.is_empty())),
+        "each match mints a non-empty opaque token"
+    );
+    assert_ne!(node_refs[0], node_refs[1], "handles are unique per match");
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}

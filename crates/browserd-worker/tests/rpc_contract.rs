@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 10);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 11);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -468,5 +468,33 @@ fn raw_input_commands_are_bounded_typed_mutations() {
         }
         .is_valid(),
         "an oversized scroll delta is out of bounds"
+    );
+}
+
+#[test]
+fn query_all_is_a_bounded_read_only_selector() {
+    let query = WorkerActionCommand::QueryAll {
+        selector: "a.link".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&query).ok(),
+        Some(serde_json::json!({"type": "query_all", "selector": "a.link"})),
+    );
+    assert!(query.is_valid());
+    assert_eq!(query.kind(), ActionKind::ReadOnly);
+
+    assert!(
+        !WorkerActionCommand::QueryAll {
+            selector: String::new()
+        }
+        .is_valid(),
+        "an empty selector is out of bounds"
+    );
+    assert!(
+        !WorkerActionCommand::QueryAll {
+            selector: "a\nb".to_owned()
+        }
+        .is_valid(),
+        "a control character in a selector is out of bounds"
     );
 }

@@ -101,6 +101,9 @@ impl CdpChromiumDriver {
                             json!({"title": value})
                         }
                     }
+                    // The command already produced its caller-facing result; the size cap below
+                    // is the only gate.
+                    ActionResultShape::Json => result,
                 };
                 match serde_json::to_vec(&safe_result) {
                     Ok(encoded) if encoded.len() <= MAX_ACTION_RESULT_BYTES => {
@@ -486,6 +489,8 @@ enum ActionResultShape {
     Unit,
     Url,
     Title,
+    /// The command already produced its final, caller-facing JSON result.
+    Json,
 }
 
 enum ObservationError {
@@ -527,6 +532,9 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             PageCommand::Scroll { delta_x, delta_y },
             ActionResultShape::Unit,
         )),
+        WorkerActionCommand::QueryAll { selector } => {
+            Ok((PageCommand::QueryAll { selector }, ActionResultShape::Json))
+        }
         WorkerActionCommand::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
         WorkerActionCommand::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
     }
