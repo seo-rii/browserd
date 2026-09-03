@@ -20,7 +20,7 @@ use browserd_api::{
     ActionSubmitRequest, ApiRequest, ApiResponse, ApiRouter, ApiService, ApprovalDecisionBody,
     ApprovalDecisionRequest, ApprovalListQuery, ArtifactRequest, PageActivateRequest,
     PageCreateBody, PageCreateRequest, PageDeleteRequest, PageListRequest, ResolutionRequestKind,
-    WaitUntil, decode_session_create,
+    WaitCondition, WaitUntil, decode_session_create,
 };
 use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
@@ -38,7 +38,7 @@ use browserd_worker::{
     WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerRpcCompletionError, WorkerRpcEnqueueError,
     WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
     WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1, WorkerSessionReceipt,
-    WorkerViewport,
+    WorkerViewport, WorkerWaitCondition,
 };
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
@@ -1751,6 +1751,50 @@ fn click_reaches_the_worker_as_a_mutating_node_reference() -> Result<(), Box<dyn
             node_ref: "0000000000000001".to_owned(),
         }
     );
+    Ok(())
+}
+
+#[test]
+fn wait_for_reaches_the_worker_with_a_typed_condition() -> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let submitted = router.execute(
+        &principal,
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key: Uuid::new_v4(),
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 30_000,
+                action: ActionPayload::WaitFor {
+                    condition: WaitCondition::SelectorVisible {
+                        selector: "#ready".to_owned(),
+                    },
+                },
+            },
+        }),
+    )?;
+    let ApiResponse::Action(submitted) = submitted else {
+        return Err("unexpected wait_for submit response".into());
+    };
+    assert_eq!(submitted.data().request().kind(), ActionKind::Mutating);
+
+    let requests = worker
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?;
+    let found = requests.iter().any(|request| {
+        matches!(
+            request,
+            WorkerRpcRequest::SubmitAction { action, .. }
+                if action == &WorkerActionCommand::WaitFor {
+                    condition: WorkerWaitCondition::SelectorVisible {
+                        selector: "#ready".to_owned(),
+                    },
+                }
+        )
+    });
+    assert!(found, "wait_for did not reach the worker");
     Ok(())
 }
 

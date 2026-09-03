@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 19;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 20;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -55,6 +55,7 @@ const MAX_WORKER_NODE_REF_BYTES: usize = 1024;
 const MAX_WORKER_ATTRIBUTE_NAME_BYTES: usize = 256;
 const MAX_WORKER_SELECT_VALUES: usize = 1024;
 const MAX_WORKER_EVALUATE_BYTES: usize = 64 * 1024;
+const MAX_WORKER_WAIT_QUIET_MS: u64 = 300_000;
 
 fn valid_worker_node_ref(node_ref: &str) -> bool {
     !node_ref.is_empty()
@@ -114,6 +115,37 @@ pub enum WorkerNavigateWaitUntil {
     Load,
 }
 
+/// The condition a `wait_for` action polls until satisfied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerWaitCondition {
+    SelectorAttached { selector: String },
+    SelectorVisible { selector: String },
+    SelectorHidden { selector: String },
+    UrlMatches { pattern: String },
+    LoadState { state: WorkerNavigateWaitUntil },
+    NetworkQuiet { quiet_ms: u64 },
+}
+
+impl WorkerWaitCondition {
+    #[must_use]
+    fn is_valid(&self) -> bool {
+        let bounded = |value: &str| {
+            !value.is_empty()
+                && value.len() <= MAX_WORKER_SELECTOR_BYTES
+                && !value.chars().any(char::is_control)
+        };
+        match self {
+            Self::SelectorAttached { selector }
+            | Self::SelectorVisible { selector }
+            | Self::SelectorHidden { selector } => bounded(selector),
+            Self::UrlMatches { pattern } => bounded(pattern),
+            Self::LoadState { .. } => true,
+            Self::NetworkQuiet { quiet_ms } => *quiet_ms <= MAX_WORKER_WAIT_QUIET_MS,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkerActionCommand {
@@ -155,6 +187,9 @@ pub enum WorkerActionCommand {
     },
     Evaluate {
         expression: String,
+    },
+    WaitFor {
+        condition: WorkerWaitCondition,
     },
     TypeText {
         text: String,
@@ -222,6 +257,7 @@ impl WorkerActionCommand {
             Self::Evaluate { expression } => {
                 !expression.is_empty() && expression.len() <= MAX_WORKER_EVALUATE_BYTES
             }
+            Self::WaitFor { condition } => condition.is_valid(),
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
@@ -280,6 +316,7 @@ impl WorkerActionCommand {
             | Self::Fill { .. }
             | Self::SelectOption { .. }
             | Self::Evaluate { .. }
+            | Self::WaitFor { .. }
             | Self::TypeText { .. }
             | Self::PressKey { .. }
             | Self::Scroll { .. } => ActionKind::Mutating,

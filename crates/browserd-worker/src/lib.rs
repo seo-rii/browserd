@@ -30,7 +30,7 @@ pub use rpc::{
     WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError,
     WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
     WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle,
-    WorkerSessionOptionsV1, WorkerSessionReceipt, WorkerViewport,
+    WorkerSessionOptionsV1, WorkerSessionReceipt, WorkerViewport, WorkerWaitCondition,
 };
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,

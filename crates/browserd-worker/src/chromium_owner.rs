@@ -1220,6 +1220,9 @@ pub(crate) enum PageCommand {
     Evaluate {
         expression: String,
     },
+    WaitFor {
+        predicate: String,
+    },
     InsertText {
         text: String,
     },
@@ -2594,6 +2597,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .unwrap_or(Value::Null);
                 Ok(json!({ "value": value }))
             }
+            PageCommand::WaitFor { predicate } => {
+                self.await_condition(&cdp_session_id, guarded, &predicate, deadline)
+                    .await
+            }
             PageCommand::InsertText { text } => {
                 self.command_event_first(
                     "Input.insertText",
@@ -3366,6 +3373,51 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     self.handle_incoming(incoming, None)?;
                 }
             }
+        }
+    }
+
+    /// Polls a boolean JS predicate until it holds or the action deadline elapses.
+    async fn await_condition(
+        &mut self,
+        cdp_session_id: &str,
+        guarded: Option<GuardedPageExecution>,
+        predicate: &str,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let poll_interval = Duration::from_millis(100);
+        let expires_at = match deadline {
+            Some(deadline) => deadline
+                .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
+                .unwrap_or(deadline),
+            None => Instant::now() + self.command_timeout,
+        };
+        loop {
+            let response = self
+                .command_event_first(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": predicate,
+                        "returnByValue": true,
+                        "awaitPromise": false,
+                    }),
+                    Some(cdp_session_id.to_owned()),
+                    None,
+                    guarded.clone(),
+                    deadline,
+                )
+                .await?;
+            let satisfied = response
+                .get("result")
+                .and_then(|result| result.get("value"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if satisfied {
+                return Ok(json!({ "ok": true }));
+            }
+            if Instant::now() + poll_interval >= expires_at {
+                return Err(OwnerActorError::NavigationTimeout);
+            }
+            tokio::time::sleep(poll_interval).await;
         }
     }
 

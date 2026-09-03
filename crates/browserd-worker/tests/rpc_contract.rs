@@ -11,7 +11,7 @@ use browserd_worker::{
     WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
     WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
     WorkerCanonicalActionProposal, WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerProbeReceipt,
-    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence,
+    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerWaitCondition,
 };
 
 fn fence() -> WorkerSessionFence {
@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 19);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 20);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -661,6 +661,40 @@ fn form_value_mutations_are_typed_and_bounded() {
     );
     assert!(select.is_valid());
     assert_eq!(select.kind(), ActionKind::Mutating);
+}
+
+#[test]
+fn wait_for_carries_a_typed_bounded_condition() {
+    let attached = WorkerActionCommand::WaitFor {
+        condition: WorkerWaitCondition::SelectorAttached {
+            selector: "#ready".to_owned(),
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&attached).ok(),
+        Some(serde_json::json!({
+            "type": "wait_for",
+            "condition": {"type": "selector_attached", "selector": "#ready"},
+        })),
+    );
+    assert!(attached.is_valid());
+    assert_eq!(attached.kind(), ActionKind::Mutating);
+
+    assert!(
+        WorkerActionCommand::WaitFor {
+            condition: WorkerWaitCondition::NetworkQuiet { quiet_ms: 500 },
+        }
+        .is_valid()
+    );
+    assert!(
+        !WorkerActionCommand::WaitFor {
+            condition: WorkerWaitCondition::SelectorVisible {
+                selector: String::new(),
+            },
+        }
+        .is_valid(),
+        "an empty selector condition is out of bounds"
+    );
 }
 
 #[test]

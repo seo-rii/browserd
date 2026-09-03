@@ -23,7 +23,7 @@ use browserd_api::{
     ArtifactRequest, CreateAuthority, IsolationRequest, PageActivateRequest, PageCreateRequest,
     PageDeleteRequest, PageListRequest, PageResource, RuntimeApiBackend, RuntimeCreateResult,
     SessionCatalog, SessionCreateDispatch, SessionCreateRequest, SessionResource,
-    WaitUntil as ApiWaitUntil, public_approval_id,
+    WaitCondition as ApiWaitCondition, WaitUntil as ApiWaitUntil, public_approval_id,
 };
 use browserd_artifacts::{
     ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactKey, ArtifactState,
@@ -51,7 +51,7 @@ use browserd_worker::{
     WorkerIsolationProfile, WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerRpcBlockingClient,
     WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcFailureCode,
     WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
-    WorkerSessionOptionsV1, WorkerViewport,
+    WorkerSessionOptionsV1, WorkerViewport, WorkerWaitCondition,
 };
 use chrono::Utc;
 use jsonwebtoken::Algorithm;
@@ -1307,6 +1307,41 @@ where
             ActionPayload::Evaluate { expression } => WorkerActionCommand::Evaluate {
                 expression: expression.clone(),
             },
+            ActionPayload::WaitFor { condition } => WorkerActionCommand::WaitFor {
+                condition: match condition {
+                    ApiWaitCondition::SelectorAttached { selector } => {
+                        WorkerWaitCondition::SelectorAttached {
+                            selector: selector.clone(),
+                        }
+                    }
+                    ApiWaitCondition::SelectorVisible { selector } => {
+                        WorkerWaitCondition::SelectorVisible {
+                            selector: selector.clone(),
+                        }
+                    }
+                    ApiWaitCondition::SelectorHidden { selector } => {
+                        WorkerWaitCondition::SelectorHidden {
+                            selector: selector.clone(),
+                        }
+                    }
+                    ApiWaitCondition::UrlMatches { pattern } => WorkerWaitCondition::UrlMatches {
+                        pattern: pattern.clone(),
+                    },
+                    ApiWaitCondition::LoadState { state } => WorkerWaitCondition::LoadState {
+                        state: match state {
+                            ApiWaitUntil::Domcontentloaded => {
+                                WorkerNavigateWaitUntil::Domcontentloaded
+                            }
+                            ApiWaitUntil::Load => WorkerNavigateWaitUntil::Load,
+                        },
+                    },
+                    ApiWaitCondition::NetworkQuiet { quiet_ms } => {
+                        WorkerWaitCondition::NetworkQuiet {
+                            quiet_ms: *quiet_ms,
+                        }
+                    }
+                },
+            },
             ActionPayload::FillSecret { .. }
             | ActionPayload::SetFiles { .. }
             | ActionPayload::HandleDialog { .. }
@@ -1314,7 +1349,6 @@ where
             | ActionPayload::NewPage { .. }
             | ActionPayload::ClosePage
             | ActionPayload::ActivatePage
-            | ActionPayload::WaitFor { .. }
             | ActionPayload::Screenshot
             | ActionPayload::Pdf
             | ActionPayload::Scrape

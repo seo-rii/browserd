@@ -2478,6 +2478,73 @@ async fn evaluate_returns_the_expression_value() {
 }
 
 #[tokio::test]
+async fn wait_for_polls_until_the_condition_holds() {
+    let mut page = owned_page().await;
+    let wait = spawn_action(
+        &page,
+        br#"{"type":"wait_for","condition":{"type":"selector_attached","selector":".ready"}}"#,
+        None,
+    );
+
+    let first = read_command(&mut page.reader).await;
+    assert_eq!(first["method"], "Runtime.evaluate");
+    assert!(
+        first["params"]["expression"]
+            .as_str()
+            .is_some_and(|expression| expression.contains("querySelector")),
+        "the condition compiles to a querySelector predicate"
+    );
+    respond(
+        &mut page.writer,
+        &first,
+        json!({"result": {"type": "boolean", "value": false}}),
+    )
+    .await;
+
+    // The next poll fires after the interval; report the condition satisfied.
+    let second = read_command(&mut page.reader).await;
+    assert_eq!(second["method"], "Runtime.evaluate");
+    respond(
+        &mut page.writer,
+        &second,
+        json!({"result": {"type": "boolean", "value": true}}),
+    )
+    .await;
+
+    assert_eq!(wait.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn wait_for_times_out_when_the_condition_never_holds() {
+    let mut page = owned_page().await;
+    let wait = spawn_action(
+        &page,
+        br#"{"type":"wait_for","condition":{"type":"load_state","state":"load"}}"#,
+        Some(Instant::now() + Duration::from_millis(150)),
+    );
+    let poll = read_command(&mut page.reader).await;
+    assert_eq!(poll["method"], "Runtime.evaluate");
+    respond(
+        &mut page.writer,
+        &poll,
+        json!({"result": {"type": "boolean", "value": false}}),
+    )
+    .await;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("the action deadline must end the wait")
+            .unwrap(),
+        ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn evaluate_that_throws_is_rejected() {
     let mut page = owned_page().await;
     let eval = spawn_action(&page, br#"{"type":"evaluate","expression":"boom()"}"#, None);

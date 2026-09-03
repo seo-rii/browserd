@@ -11,7 +11,8 @@ use crate::chromium_owner::{
 };
 use crate::{
     ActionExecutionResult, ApprovedActionError, ChromiumDriver, DependencyError,
-    LiveApprovalContext, WorkerActionCommand, WorkerSessionOptionsV1,
+    LiveApprovalContext, WorkerActionCommand, WorkerNavigateWaitUntil, WorkerSessionOptionsV1,
+    WorkerWaitCondition,
 };
 
 const MAX_ACTION_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -554,6 +555,12 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             PageCommand::Evaluate { expression },
             ActionResultShape::Json,
         )),
+        WorkerActionCommand::WaitFor { condition } => Ok((
+            PageCommand::WaitFor {
+                predicate: wait_predicate(&condition),
+            },
+            ActionResultShape::Unit,
+        )),
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }
@@ -591,6 +598,41 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
         )),
         WorkerActionCommand::GetUrl => Ok((PageCommand::ReadUrl, ActionResultShape::Url)),
         WorkerActionCommand::GetTitle => Ok((PageCommand::ReadTitle, ActionResultShape::Title)),
+    }
+}
+
+/// Serializes a string as a JS string literal (JSON escaping is a safe subset of JS).
+fn js_string_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+/// Builds the boolean JS predicate a `wait_for` condition polls.
+fn wait_predicate(condition: &WorkerWaitCondition) -> String {
+    match condition {
+        WorkerWaitCondition::SelectorAttached { selector } => {
+            format!("!!document.querySelector({})", js_string_literal(selector))
+        }
+        WorkerWaitCondition::SelectorVisible { selector } => format!(
+            "(() => {{ const el = document.querySelector({}); if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; }})()",
+            js_string_literal(selector)
+        ),
+        WorkerWaitCondition::SelectorHidden { selector } => format!(
+            "(() => {{ const el = document.querySelector({}); if (!el) return true; const r = el.getBoundingClientRect(); return !(r.width > 0 && r.height > 0) || getComputedStyle(el).visibility === 'hidden'; }})()",
+            js_string_literal(selector)
+        ),
+        WorkerWaitCondition::UrlMatches { pattern } => {
+            format!("location.href.includes({})", js_string_literal(pattern))
+        }
+        WorkerWaitCondition::LoadState { state } => match state {
+            WorkerNavigateWaitUntil::Load => "document.readyState === 'complete'".to_owned(),
+            WorkerNavigateWaitUntil::Domcontentloaded => {
+                "(document.readyState === 'interactive' || document.readyState === 'complete')"
+                    .to_owned()
+            }
+        },
+        WorkerWaitCondition::NetworkQuiet { quiet_ms } => format!(
+            "(() => {{ const e = performance.getEntriesByType('resource'); if (!e.length) return true; const last = e[e.length - 1]; const end = last.responseEnd || last.startTime; return (performance.now() - end) >= {quiet_ms}; }})()"
+        ),
     }
 }
 
