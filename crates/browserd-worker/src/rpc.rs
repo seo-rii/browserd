@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 8;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 9;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -110,6 +110,8 @@ pub enum WorkerActionCommand {
         wait_until: WorkerNavigateWaitUntil,
     },
     Reload,
+    GoBack,
+    GoForward,
     Click {
         x: i64,
         y: i64,
@@ -138,7 +140,7 @@ impl WorkerActionCommand {
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
-            Self::Reload | Self::GetUrl | Self::GetTitle => true,
+            Self::Reload | Self::GoBack | Self::GoForward | Self::GetUrl | Self::GetTitle => true,
         }
     }
 
@@ -146,9 +148,12 @@ impl WorkerActionCommand {
     pub const fn kind(&self) -> ActionKind {
         match self {
             Self::GetUrl | Self::GetTitle => ActionKind::ReadOnly,
-            Self::Navigate { .. } | Self::Reload | Self::Click { .. } | Self::TypeText { .. } => {
-                ActionKind::Mutating
-            }
+            Self::Navigate { .. }
+            | Self::Reload
+            | Self::GoBack
+            | Self::GoForward
+            | Self::Click { .. }
+            | Self::TypeText { .. } => ActionKind::Mutating,
         }
     }
 }

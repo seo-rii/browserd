@@ -1149,6 +1149,8 @@ pub(crate) enum PageCommand {
         wait_until: WorkerNavigateWaitUntil,
     },
     Reload,
+    GoBack,
+    GoForward,
     Click {
         x: f64,
         y: f64,
@@ -2249,6 +2251,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await?;
                 Ok(result)
             }
+            PageCommand::GoBack => {
+                self.navigate_history(&target_id, cdp_session_id, guarded, -1, deadline)
+                    .await
+            }
+            PageCommand::GoForward => {
+                self.navigate_history(&target_id, cdp_session_id, guarded, 1, deadline)
+                    .await
+            }
             PageCommand::Click { x, y } => {
                 self.command_event_first(
                     "Input.dispatchMouseEvent",
@@ -2508,6 +2518,104 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         .await_document_lifecycle(target_id, &fresh, wait_until, deadline)
                         .await;
                 }
+                _ => {}
+            }
+            tokio::select! {
+                biased;
+                () = &mut expires => return Err(OwnerActorError::NavigationTimeout),
+                incoming = self.events.recv() => {
+                    let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_incoming(incoming, None)?;
+                }
+            }
+        }
+    }
+
+    /// Traverses the target's session history by `delta` (`-1` back, `+1` forward).
+    ///
+    /// The current history is read first so the destination entry can be named; a `delta`
+    /// that falls outside the recorded entries is a rejection because no such entry exists.
+    /// The read is unguarded, but the mutating `Page.navigateToHistoryEntry` carries the
+    /// execution fence, so a page that navigated between the read and the traversal trips the
+    /// fence rather than acting on a stale entry.
+    async fn navigate_history(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        delta: i64,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let history = self
+            .command_event_first(
+                "Page.getNavigationHistory",
+                json!({}),
+                Some(cdp_session_id.clone()),
+                None,
+                None,
+                deadline,
+            )
+            .await?;
+        let entry_id = select_history_entry(&history, delta)?;
+        let (prior_loader, prior_url_revision) = {
+            let route = self
+                .routes
+                .get(target_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            (route.document.loader_id.clone(), route.url_revision)
+        };
+        let result = self
+            .command_event_first(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": entry_id }),
+                Some(cdp_session_id),
+                None,
+                guarded,
+                deadline,
+            )
+            .await?;
+        self.await_history_lifecycle(
+            target_id,
+            prior_loader.as_deref(),
+            prior_url_revision,
+            WorkerNavigateWaitUntil::Load,
+            deadline,
+        )
+        .await?;
+        Ok(result)
+    }
+
+    /// Awaits the document a `Page.navigateToHistoryEntry` produces.
+    ///
+    /// Like reload, the traversal returns no `loaderId`. A cross-document entry commits a
+    /// fresh loader and is awaited through the shared lifecycle wait; a same-document entry
+    /// fires `Page.navigatedWithinDocument`, which advances `url_revision` without a new
+    /// document and completes with no lifecycle to observe. The browser itself signals which
+    /// occurred, so no URL heuristic is needed.
+    async fn await_history_lifecycle(
+        &mut self,
+        target_id: &str,
+        prior_loader: Option<&str>,
+        prior_url_revision: u64,
+        wait_until: WorkerNavigateWaitUntil,
+        deadline: Option<Instant>,
+    ) -> Result<(), OwnerActorError> {
+        let expires_at = self.lifecycle_deadline(deadline);
+        let expires = tokio::time::sleep_until(expires_at.into());
+        tokio::pin!(expires);
+        loop {
+            let route = self
+                .routes
+                .get(target_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            match route.document.loader_id.as_deref() {
+                Some(fresh) if Some(fresh) != prior_loader => {
+                    let fresh = fresh.to_owned();
+                    return self
+                        .await_document_lifecycle(target_id, &fresh, wait_until, deadline)
+                        .await;
+                }
+                _ if route.url_revision != prior_url_revision => return Ok(()),
                 _ => {}
             }
             tokio::select! {
@@ -2976,6 +3084,41 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
         Ok(())
     }
+}
+
+/// Resolves the history entry `delta` positions from the current one into its CDP entry id.
+///
+/// Returns `Rejected` when no entry exists in that direction (the caller asked to go back
+/// from the first entry or forward from the last), and `OutcomeUncertain` when the history
+/// payload is malformed.
+fn select_history_entry(history: &Value, delta: i64) -> Result<i64, OwnerActorError> {
+    let object = history
+        .as_object()
+        .ok_or(OwnerActorError::OutcomeUncertain)?;
+    let current_index = object
+        .get("currentIndex")
+        .and_then(Value::as_i64)
+        .ok_or(OwnerActorError::OutcomeUncertain)?;
+    let entries = object
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or(OwnerActorError::OutcomeUncertain)?;
+    let len = i64::try_from(entries.len()).map_err(|_| OwnerActorError::OutcomeUncertain)?;
+    if current_index < 0 || current_index >= len {
+        return Err(OwnerActorError::OutcomeUncertain);
+    }
+    let target_index = current_index
+        .checked_add(delta)
+        .ok_or(OwnerActorError::OutcomeUncertain)?;
+    if target_index < 0 || target_index >= len {
+        return Err(OwnerActorError::Rejected);
+    }
+    let index = usize::try_from(target_index).map_err(|_| OwnerActorError::OutcomeUncertain)?;
+    entries
+        .get(index)
+        .and_then(|entry| entry.get("id"))
+        .and_then(Value::as_i64)
+        .ok_or(OwnerActorError::OutcomeUncertain)
 }
 
 fn parse_target_info(value: &Value) -> Result<(PausedTarget, String), OwnerActorError> {

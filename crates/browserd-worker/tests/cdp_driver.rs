@@ -1748,3 +1748,151 @@ async fn reload_lifecycle_deadline_is_a_known_timeout() {
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }
+
+fn navigation_history(current_index: i64, entries: &[(i64, &str)]) -> Value {
+    json!({
+        "currentIndex": current_index,
+        "entries": entries
+            .iter()
+            .map(|(id, url)| json!({
+                "id": id,
+                "url": url,
+                "userTypedURL": url,
+                "title": url,
+                "transitionType": "link",
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[tokio::test]
+async fn go_back_traverses_to_the_prior_entry_and_awaits_load() {
+    let mut page = owned_page().await;
+    let go_back = spawn_action(&page, br#"{"type":"go_back"}"#, None);
+
+    let history = read_command(&mut page.reader).await;
+    assert_eq!(history["method"], "Page.getNavigationHistory");
+    respond(
+        &mut page.writer,
+        &history,
+        navigation_history(
+            1,
+            &[
+                (10, "https://example.test/a"),
+                (11, "https://example.test/b"),
+            ],
+        ),
+    )
+    .await;
+
+    let traverse = read_command(&mut page.reader).await;
+    assert_eq!(traverse["method"], "Page.navigateToHistoryEntry");
+    assert_eq!(traverse["params"]["entryId"], 10);
+    respond(&mut page.writer, &traverse, json!({})).await;
+
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame",
+            "loader-back",
+            "https://example.test/a",
+        ),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.domContentEventFired"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !go_back.is_finished(),
+        "a cross-document traversal must await the entry's full load"
+    );
+
+    write_message(
+        &mut page.writer,
+        lifecycle_event("flat-primary", "Page.loadEventFired"),
+    )
+    .await;
+    assert_eq!(go_back.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn go_forward_past_the_last_entry_is_a_known_failure() {
+    let mut page = owned_page().await;
+    let go_forward = spawn_action(&page, br#"{"type":"go_forward"}"#, None);
+
+    let history = read_command(&mut page.reader).await;
+    assert_eq!(history["method"], "Page.getNavigationHistory");
+    respond(
+        &mut page.writer,
+        &history,
+        navigation_history(
+            1,
+            &[
+                (10, "https://example.test/a"),
+                (11, "https://example.test/b"),
+            ],
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        go_forward.await.unwrap(),
+        ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+    );
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "a traversal with no destination entry must not issue navigateToHistoryEntry"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn go_back_to_a_same_document_entry_completes_without_a_load() {
+    let mut page = owned_page().await;
+    let go_back = spawn_action(&page, br#"{"type":"go_back"}"#, None);
+
+    let history = read_command(&mut page.reader).await;
+    assert_eq!(history["method"], "Page.getNavigationHistory");
+    respond(
+        &mut page.writer,
+        &history,
+        navigation_history(
+            1,
+            &[
+                (10, "https://example.test/a"),
+                (11, "https://example.test/a#section"),
+            ],
+        ),
+    )
+    .await;
+
+    let traverse = read_command(&mut page.reader).await;
+    assert_eq!(traverse["method"], "Page.navigateToHistoryEntry");
+    assert_eq!(traverse["params"]["entryId"], 10);
+    respond(&mut page.writer, &traverse, json!({})).await;
+
+    // A same-document entry fires navigatedWithinDocument and commits no new loader.
+    write_message(
+        &mut page.writer,
+        json!({
+            "method": "Page.navigatedWithinDocument",
+            "sessionId": "flat-primary",
+            "params": {"frameId": "frame", "url": "https://example.test/a"}
+        }),
+    )
+    .await;
+    assert_eq!(go_back.await.unwrap(), succeeded());
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "a same-document traversal issues no further CDP effects"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}

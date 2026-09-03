@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 8);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 9);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -406,4 +406,23 @@ fn navigate_command_requires_a_typed_wait_until_lifecycle() {
         wait_until: WorkerNavigateWaitUntil::Load,
     };
     assert!(!unsafe_scheme.is_valid());
+}
+
+#[test]
+fn history_traversal_commands_are_typed_mutations() {
+    for (command, tag) in [
+        (WorkerActionCommand::GoBack, "go_back"),
+        (WorkerActionCommand::GoForward, "go_forward"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(&command).ok(),
+            Some(serde_json::json!({ "type": tag })),
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkerActionCommand>(serde_json::json!({ "type": tag })).ok(),
+            Some(command.clone()),
+        );
+        assert!(command.is_valid());
+        assert_eq!(command.kind(), ActionKind::Mutating);
+    }
 }

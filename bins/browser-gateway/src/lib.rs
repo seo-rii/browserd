@@ -1244,9 +1244,9 @@ where
             }
             ActionPayload::GetUrl => WorkerActionCommand::GetUrl,
             ActionPayload::GetTitle => WorkerActionCommand::GetTitle,
-            ActionPayload::GoBack
-            | ActionPayload::GoForward
-            | ActionPayload::Click { .. }
+            ActionPayload::GoBack => WorkerActionCommand::GoBack,
+            ActionPayload::GoForward => WorkerActionCommand::GoForward,
+            ActionPayload::Click { .. }
             | ActionPayload::DoubleClick { .. }
             | ActionPayload::Hover { .. }
             | ActionPayload::Fill { .. }

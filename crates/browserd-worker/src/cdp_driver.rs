@@ -508,6 +508,8 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             ActionResultShape::Unit,
         )),
         WorkerActionCommand::Reload => Ok((PageCommand::Reload, ActionResultShape::Unit)),
+        WorkerActionCommand::GoBack => Ok((PageCommand::GoBack, ActionResultShape::Unit)),
+        WorkerActionCommand::GoForward => Ok((PageCommand::GoForward, ActionResultShape::Unit)),
         WorkerActionCommand::Click { x, y } => Ok((
             PageCommand::Click {
                 x: x as f64,
