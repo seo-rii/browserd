@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 20);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 21);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -695,6 +695,38 @@ fn wait_for_carries_a_typed_bounded_condition() {
         .is_valid(),
         "an empty selector condition is out of bounds"
     );
+}
+
+#[test]
+fn handle_dialog_is_a_typed_mutation() {
+    let accept = WorkerActionCommand::HandleDialog {
+        accept: true,
+        prompt_text: Some("name".to_owned()),
+    };
+    assert_eq!(
+        serde_json::to_value(&accept).ok(),
+        Some(serde_json::json!({
+            "type": "handle_dialog",
+            "accept": true,
+            "prompt_text": "name",
+        })),
+    );
+    assert!(accept.is_valid());
+    assert_eq!(accept.kind(), ActionKind::Mutating);
+
+    let dismiss = WorkerActionCommand::HandleDialog {
+        accept: false,
+        prompt_text: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&dismiss).ok(),
+        Some(serde_json::json!({
+            "type": "handle_dialog",
+            "accept": false,
+            "prompt_text": null,
+        })),
+    );
+    assert!(dismiss.is_valid());
 }
 
 #[test]

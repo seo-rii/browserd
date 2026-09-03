@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 20;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 21;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -191,6 +191,10 @@ pub enum WorkerActionCommand {
     WaitFor {
         condition: WorkerWaitCondition,
     },
+    HandleDialog {
+        accept: bool,
+        prompt_text: Option<String>,
+    },
     TypeText {
         text: String,
     },
@@ -258,6 +262,9 @@ impl WorkerActionCommand {
                 !expression.is_empty() && expression.len() <= MAX_WORKER_EVALUATE_BYTES
             }
             Self::WaitFor { condition } => condition.is_valid(),
+            Self::HandleDialog { prompt_text, .. } => prompt_text
+                .as_ref()
+                .is_none_or(|text| text.len() <= MAX_WORKER_ACTION_TEXT_BYTES),
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
@@ -317,6 +324,7 @@ impl WorkerActionCommand {
             | Self::SelectOption { .. }
             | Self::Evaluate { .. }
             | Self::WaitFor { .. }
+            | Self::HandleDialog { .. }
             | Self::TypeText { .. }
             | Self::PressKey { .. }
             | Self::Scroll { .. } => ActionKind::Mutating,

@@ -561,6 +561,16 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             },
             ActionResultShape::Unit,
         )),
+        WorkerActionCommand::HandleDialog {
+            accept,
+            prompt_text,
+        } => Ok((
+            PageCommand::HandleDialog {
+                accept,
+                prompt_text,
+            },
+            ActionResultShape::Unit,
+        )),
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }

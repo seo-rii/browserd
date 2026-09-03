@@ -1223,6 +1223,10 @@ pub(crate) enum PageCommand {
     WaitFor {
         predicate: String,
     },
+    HandleDialog {
+        accept: bool,
+        prompt_text: Option<String>,
+    },
     InsertText {
         text: String,
     },
@@ -2600,6 +2604,25 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             PageCommand::WaitFor { predicate } => {
                 self.await_condition(&cdp_session_id, guarded, &predicate, deadline)
                     .await
+            }
+            PageCommand::HandleDialog {
+                accept,
+                prompt_text,
+            } => {
+                let mut params = json!({ "accept": accept });
+                if let Some(prompt_text) = prompt_text {
+                    params["promptText"] = json!(prompt_text);
+                }
+                // Fails closed if no dialog is showing (CDP reports the error).
+                self.command_event_first(
+                    "Page.handleJavaScriptDialog",
+                    params,
+                    Some(cdp_session_id),
+                    None,
+                    guarded,
+                    deadline,
+                )
+                .await
             }
             PageCommand::InsertText { text } => {
                 self.command_event_first(

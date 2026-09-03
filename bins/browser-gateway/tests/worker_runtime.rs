@@ -1799,6 +1799,48 @@ fn wait_for_reaches_the_worker_with_a_typed_condition() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn handle_dialog_reaches_the_worker_as_a_mutation() -> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let submitted = router.execute(
+        &principal,
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key: Uuid::new_v4(),
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 30_000,
+                action: ActionPayload::HandleDialog {
+                    accept: true,
+                    prompt_text: None,
+                },
+            },
+        }),
+    )?;
+    let ApiResponse::Action(submitted) = submitted else {
+        return Err("unexpected handle_dialog submit response".into());
+    };
+    assert_eq!(submitted.data().request().kind(), ActionKind::Mutating);
+
+    let requests = worker
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?;
+    let found = requests.iter().any(|request| {
+        matches!(
+            request,
+            WorkerRpcRequest::SubmitAction { action, .. }
+                if action == &WorkerActionCommand::HandleDialog {
+                    accept: true,
+                    prompt_text: None,
+                }
+        )
+    });
+    assert!(found, "handle_dialog did not reach the worker");
+    Ok(())
+}
+
+#[test]
 fn evaluate_reaches_the_worker_as_a_mutation() -> Result<(), Box<dyn Error>> {
     let (principal, worker, router, session_id) = resource_fixture()?;
     let submitted = router.execute(

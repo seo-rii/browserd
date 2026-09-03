@@ -1342,9 +1342,15 @@ where
                     }
                 },
             },
+            ActionPayload::HandleDialog {
+                accept,
+                prompt_text,
+            } => WorkerActionCommand::HandleDialog {
+                accept: *accept,
+                prompt_text: prompt_text.clone(),
+            },
             ActionPayload::FillSecret { .. }
             | ActionPayload::SetFiles { .. }
-            | ActionPayload::HandleDialog { .. }
             | ActionPayload::Snapshot
             | ActionPayload::NewPage { .. }
             | ActionPayload::ClosePage

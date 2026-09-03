@@ -2545,6 +2545,25 @@ async fn wait_for_times_out_when_the_condition_never_holds() {
 }
 
 #[tokio::test]
+async fn handle_dialog_accepts_with_prompt_text() {
+    let mut page = owned_page().await;
+    let handle = spawn_action(
+        &page,
+        br#"{"type":"handle_dialog","accept":true,"prompt_text":"Ada"}"#,
+        None,
+    );
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Page.handleJavaScriptDialog");
+    assert_eq!(command["params"]["accept"], true);
+    assert_eq!(command["params"]["promptText"], "Ada");
+    respond(&mut page.writer, &command, json!({})).await;
+
+    assert_eq!(handle.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
 async fn evaluate_that_throws_is_rejected() {
     let mut page = owned_page().await;
     let eval = spawn_action(&page, br#"{"type":"evaluate","expression":"boom()"}"#, None);
