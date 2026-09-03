@@ -37,7 +37,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 18);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 19);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -661,6 +661,26 @@ fn form_value_mutations_are_typed_and_bounded() {
     );
     assert!(select.is_valid());
     assert_eq!(select.kind(), ActionKind::Mutating);
+}
+
+#[test]
+fn evaluate_is_a_bounded_mutation() {
+    let evaluate = WorkerActionCommand::Evaluate {
+        expression: "document.title".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(&evaluate).ok(),
+        Some(serde_json::json!({"type": "evaluate", "expression": "document.title"})),
+    );
+    assert!(evaluate.is_valid());
+    assert_eq!(evaluate.kind(), ActionKind::Mutating);
+    assert!(
+        !WorkerActionCommand::Evaluate {
+            expression: String::new(),
+        }
+        .is_valid(),
+        "an empty expression is out of bounds"
+    );
 }
 
 #[test]

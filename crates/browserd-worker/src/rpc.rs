@@ -43,7 +43,7 @@ use crate::{
     WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 18;
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 19;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -54,6 +54,7 @@ const MAX_WORKER_SELECTOR_BYTES: usize = 8 * 1024;
 const MAX_WORKER_NODE_REF_BYTES: usize = 1024;
 const MAX_WORKER_ATTRIBUTE_NAME_BYTES: usize = 256;
 const MAX_WORKER_SELECT_VALUES: usize = 1024;
+const MAX_WORKER_EVALUATE_BYTES: usize = 64 * 1024;
 
 fn valid_worker_node_ref(node_ref: &str) -> bool {
     !node_ref.is_empty()
@@ -152,6 +153,9 @@ pub enum WorkerActionCommand {
         node_ref: String,
         values: Vec<String>,
     },
+    Evaluate {
+        expression: String,
+    },
     TypeText {
         text: String,
     },
@@ -215,6 +219,9 @@ impl WorkerActionCommand {
                         .iter()
                         .all(|value| value.len() <= MAX_WORKER_ACTION_TEXT_BYTES)
             }
+            Self::Evaluate { expression } => {
+                !expression.is_empty() && expression.len() <= MAX_WORKER_EVALUATE_BYTES
+            }
             Self::TypeText { text } => {
                 !text.is_empty() && text.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
@@ -272,6 +279,7 @@ impl WorkerActionCommand {
             | Self::Uncheck { .. }
             | Self::Fill { .. }
             | Self::SelectOption { .. }
+            | Self::Evaluate { .. }
             | Self::TypeText { .. }
             | Self::PressKey { .. }
             | Self::Scroll { .. } => ActionKind::Mutating,

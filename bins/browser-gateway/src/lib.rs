@@ -1304,6 +1304,9 @@ where
                 node_ref: node_ref.clone(),
                 values: values.clone(),
             },
+            ActionPayload::Evaluate { expression } => WorkerActionCommand::Evaluate {
+                expression: expression.clone(),
+            },
             ActionPayload::FillSecret { .. }
             | ActionPayload::SetFiles { .. }
             | ActionPayload::HandleDialog { .. }
@@ -1312,7 +1315,6 @@ where
             | ActionPayload::ClosePage
             | ActionPayload::ActivatePage
             | ActionPayload::WaitFor { .. }
-            | ActionPayload::Evaluate { .. }
             | ActionPayload::Screenshot
             | ActionPayload::Pdf
             | ActionPayload::Scrape

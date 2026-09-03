@@ -617,6 +617,7 @@ fn authenticated_principal(tenant_id: TenantId) -> Result<AuthenticatedPrincipal
             "session:read".to_owned(),
             "session:close".to_owned(),
             "browser:act".to_owned(),
+            "browser:evaluate".to_owned(),
             "artifact:read".to_owned(),
             "approval:read".to_owned(),
             "approval:decide".to_owned(),
@@ -1750,6 +1751,46 @@ fn click_reaches_the_worker_as_a_mutating_node_reference() -> Result<(), Box<dyn
             node_ref: "0000000000000001".to_owned(),
         }
     );
+    Ok(())
+}
+
+#[test]
+fn evaluate_reaches_the_worker_as_a_mutation() -> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let submitted = router.execute(
+        &principal,
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key: Uuid::new_v4(),
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 30_000,
+                action: ActionPayload::Evaluate {
+                    expression: "document.title".to_owned(),
+                },
+            },
+        }),
+    )?;
+    let ApiResponse::Action(submitted) = submitted else {
+        return Err("unexpected evaluate submit response".into());
+    };
+    assert_eq!(submitted.data().request().kind(), ActionKind::Mutating);
+
+    let requests = worker
+        .requests
+        .lock()
+        .map_err(|_| "request lock poisoned")?;
+    let found = requests.iter().any(|request| {
+        matches!(
+            request,
+            WorkerRpcRequest::SubmitAction { action, .. }
+                if action == &WorkerActionCommand::Evaluate {
+                    expression: "document.title".to_owned(),
+                }
+        )
+    });
+    assert!(found, "evaluate did not reach the worker");
     Ok(())
 }
 

@@ -1204,6 +1204,9 @@ pub(crate) enum PageCommand {
         node_ref: String,
         values: Vec<String>,
     },
+    Evaluate {
+        expression: String,
+    },
     InsertText {
         text: String,
     },
@@ -2547,6 +2550,32 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     deadline,
                 )
                 .await
+            }
+            PageCommand::Evaluate { expression } => {
+                let response = self
+                    .command_event_first(
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": expression,
+                            "returnByValue": true,
+                            "awaitPromise": true,
+                        }),
+                        Some(cdp_session_id),
+                        None,
+                        guarded,
+                        deadline,
+                    )
+                    .await?;
+                // A thrown expression is a caller error, not an ownership fault.
+                if response.get("exceptionDetails").is_some() {
+                    return Err(OwnerActorError::Rejected);
+                }
+                let value = response
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                Ok(json!({ "value": value }))
             }
             PageCommand::InsertText { text } => {
                 self.command_event_first(

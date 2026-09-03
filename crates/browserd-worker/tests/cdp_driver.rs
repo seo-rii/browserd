@@ -1181,7 +1181,7 @@ async fn page_lifecycle_and_bounded_actions_use_the_owned_flattened_route() {
         driver.execute_action(
             &session_id,
             Some(&page_id),
-            br#"{"type":"evaluate","expression":"steal()"}"#,
+            br#"{"type":"not_a_supported_action"}"#,
         ),
         ActionExecutionResult::FailedKnown(_)
     ));
@@ -2451,6 +2451,49 @@ async fn select_option_passes_the_requested_values() {
     .await;
 
     assert_eq!(select.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn evaluate_returns_the_expression_value() {
+    let mut page = owned_page().await;
+    let eval = spawn_action(&page, br#"{"type":"evaluate","expression":"1 + 2"}"#, None);
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Runtime.evaluate");
+    assert_eq!(command["params"]["expression"], "1 + 2");
+    assert_eq!(command["params"]["awaitPromise"], true);
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"result": {"type": "number", "value": 3}}),
+    )
+    .await;
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&succeeded_bytes(eval.await.unwrap())).unwrap();
+    assert_eq!(parsed["value"], 3);
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn evaluate_that_throws_is_rejected() {
+    let mut page = owned_page().await;
+    let eval = spawn_action(&page, br#"{"type":"evaluate","expression":"boom()"}"#, None);
+    let command = read_command(&mut page.reader).await;
+    assert_eq!(command["method"], "Runtime.evaluate");
+    respond(
+        &mut page.writer,
+        &command,
+        json!({"result": {"type": "object"}, "exceptionDetails": {"text": "Uncaught"}}),
+    )
+    .await;
+
+    assert_eq!(
+        eval.await.unwrap(),
+        ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+    );
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }

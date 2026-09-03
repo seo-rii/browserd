@@ -545,6 +545,10 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             PageCommand::SelectOption { node_ref, values },
             ActionResultShape::Unit,
         )),
+        WorkerActionCommand::Evaluate { expression } => Ok((
+            PageCommand::Evaluate { expression },
+            ActionResultShape::Json,
+        )),
         WorkerActionCommand::TypeText { text } => {
             Ok((PageCommand::InsertText { text }, ActionResultShape::Unit))
         }
