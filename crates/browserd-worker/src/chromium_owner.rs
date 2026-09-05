@@ -1454,7 +1454,27 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         match request {
             OwnerRequest::Shutdown => return Ok(()),
             OwnerRequest::Health { response } => {
-                if response.send(Ok(())).is_err() {
+                let expected = self.driver.version().clone();
+                let result = self
+                    .command_event_first("Browser.getVersion", json!({}), None, None, None, None)
+                    .await
+                    .map_err(|_| OwnerActorError::OutcomeUncertain)
+                    .and_then(|response| {
+                        for (field, expected) in [
+                            ("protocolVersion", expected.protocol_version.as_str()),
+                            ("product", expected.product.as_str()),
+                            ("revision", expected.revision.as_str()),
+                            ("userAgent", expected.user_agent.as_str()),
+                            ("jsVersion", expected.js_version.as_str()),
+                        ] {
+                            if response.get(field).and_then(Value::as_str) != Some(expected) {
+                                return Err(OwnerActorError::OutcomeUncertain);
+                            }
+                        }
+                        Ok(())
+                    });
+                let failed = result.is_err();
+                if response.send(result).is_err() || failed {
                     return Err(());
                 }
             }

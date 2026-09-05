@@ -225,6 +225,7 @@ struct ProductionSessionShardLifecycle<B> {
 }
 
 struct LifecycleCoordination {
+    liveness_lease_gate: Mutex<()>,
     ownership: Mutex<LifecycleOwnership>,
     changed: Condvar,
 }
@@ -301,11 +302,11 @@ fn spawn_qualification_cleanup(
     Ok((task, receiver))
 }
 
-impl<B> SessionShardLifecycle for ProductionSessionShardLifecycle<B>
+impl<B> ProductionSessionShardLifecycle<B>
 where
     B: ProductionSandboxControl,
 {
-    fn qualify(&self) -> Result<(), DependencyError> {
+    fn qualify_active(&self) -> Result<(), DependencyError> {
         if self.drain.0.load(Ordering::Acquire) {
             return Err(DependencyError::OutcomeUncertain);
         }
@@ -320,9 +321,28 @@ where
         drop(ownership);
         self.driver.qualify()
     }
+}
+
+impl<B> SessionShardLifecycle for ProductionSessionShardLifecycle<B>
+where
+    B: ProductionSandboxControl,
+{
+    fn qualify(&self) -> Result<(), DependencyError> {
+        let _liveness_lease = self
+            .coordination
+            .liveness_lease_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.qualify_active()
+    }
 
     fn heartbeat(&self) -> Result<(), DependencyError> {
-        self.qualify()?;
+        let _liveness_lease = self
+            .coordination
+            .liveness_lease_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
+        self.qualify_active()?;
         let result = self.runtime.block_on(self.sandbox.renew_owner_lease(
             self.shard_fence.shard_id(),
             self.shard_fence.owner().worker_epoch().get(),
@@ -336,6 +356,11 @@ where
         if fence != &self.expected_fence {
             return Err(DependencyError::Rejected);
         }
+        let _liveness_lease = self
+            .coordination
+            .liveness_lease_gate
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?;
         let runtime_flavor = Handle::try_current()
             .ok()
             .map(|runtime| runtime.runtime_flavor());
@@ -852,6 +877,7 @@ where
             drain,
             cleanup_timeout: self.config.qualification_bounds.cleanup_timeout,
             coordination: Arc::new(LifecycleCoordination {
+                liveness_lease_gate: Mutex::new(()),
                 ownership: Mutex::new(LifecycleOwnership {
                     phase: LifecyclePhase::Active,
                     task: Some(task),

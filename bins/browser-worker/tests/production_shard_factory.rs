@@ -345,6 +345,85 @@ impl ProductionSandboxControl for ScriptedSandbox {
     }
 }
 
+struct GatedRenewSandbox {
+    inner: ScriptedSandbox,
+    renewal_entered: Mutex<Option<mpsc::SyncSender<()>>>,
+    renewal_release: CancellationToken,
+}
+
+#[async_trait]
+impl SandboxShardRpc for GatedRenewSandbox {
+    async fn create_shard(
+        &self,
+        spec: LaunchSpec,
+        lease_ttl: Duration,
+    ) -> Result<CreateShardOutcome, ShardRuntimeError> {
+        self.inner.create_shard(spec, lease_ttl).await
+    }
+
+    async fn cancel_or_kill_shard(
+        &self,
+        spec: &LaunchSpec,
+        reason: CleanupReason,
+    ) -> Result<KillShardOutcome, ShardRuntimeError> {
+        self.inner.cancel_or_kill_shard(spec, reason).await
+    }
+
+    async fn claim_cdp_pipes(
+        &self,
+        shard_id: &ShardId,
+        worker_id: &WorkerId,
+        worker_epoch: u64,
+        launch_generation: LaunchGeneration,
+    ) -> Result<ChromiumCdpPipes, ShardRuntimeError> {
+        self.inner
+            .claim_cdp_pipes(shard_id, worker_id, worker_epoch, launch_generation)
+            .await
+    }
+
+    async fn renew_owner_lease(
+        &self,
+        _shard_id: &ShardId,
+        _worker_epoch: u64,
+        _launch_generation: LaunchGeneration,
+        _lease_ttl: Duration,
+    ) -> Result<(), ShardRuntimeError> {
+        self.renewal_entered
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .take()
+            .ok_or(ShardRuntimeError::Rejected)?
+            .send(())
+            .map_err(|_| ShardRuntimeError::Cancelled)?;
+        self.renewal_release.cancelled().await;
+        self.inner.renewals.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn kill_shard(
+        &self,
+        shard_id: &ShardId,
+        worker_epoch: u64,
+        launch_generation: LaunchGeneration,
+        reason: CleanupReason,
+    ) -> Result<KillShardOutcome, ShardRuntimeError> {
+        self.inner
+            .kill_shard(shard_id, worker_epoch, launch_generation, reason)
+            .await
+    }
+}
+
+#[async_trait]
+impl ProductionSandboxControl for GatedRenewSandbox {
+    async fn probe_daemon_epoch(
+        &self,
+        _worker_id: &WorkerId,
+        _worker_epoch: u64,
+    ) -> Result<u64, ShardRuntimeError> {
+        Ok(self.inner.daemon_epoch)
+    }
+}
+
 struct RejectArtifacts;
 
 struct FixedShardFactory {
@@ -421,6 +500,8 @@ async fn respond(writer: &mut Sender, command: &Value, result: Value) {
 async fn qualify_protocol(reader: &mut Receiver, writer: &mut Sender) {
     let version = read_command(reader).await;
     assert_eq!(version["method"], "Browser.getVersion");
+    assert_eq!(version["params"], json!({}));
+    assert!(version.get("sessionId").is_none());
     respond(
         writer,
         &version,
@@ -438,6 +519,7 @@ async fn qualify_protocol(reader: &mut Receiver, writer: &mut Sender) {
 #[derive(Clone, Copy)]
 enum CleanupProbe {
     ForcedClose,
+    HealthyThenDriftedHealth,
     DisposeOnly,
     Clean,
     OrphanTarget,
@@ -476,6 +558,7 @@ async fn run_scripted_protocol_with_pipes(
     mut writer: Sender,
     cleanup_probe: CleanupProbe,
 ) {
+    qualify_protocol(&mut reader, &mut writer).await;
     qualify_protocol(&mut reader, &mut writer).await;
 
     for method in [
@@ -543,7 +626,28 @@ async fn run_scripted_protocol_with_pipes(
         respond(&mut writer, &command, json!({})).await;
     }
 
-    if !matches!(cleanup_probe, CleanupProbe::ForcedClose) {
+    if matches!(cleanup_probe, CleanupProbe::HealthyThenDriftedHealth) {
+        qualify_protocol(&mut reader, &mut writer).await;
+        let drift = read_command(&mut reader).await;
+        assert_eq!(drift["method"], "Browser.getVersion");
+        respond(
+            &mut writer,
+            &drift,
+            json!({
+                "protocolVersion": "1.3",
+                "product": "HeadlessChrome/149.0.7827.55",
+                "revision": "r1234567",
+                "userAgent": "drifted-runtime-identity",
+                "jsVersion": "14.9",
+            }),
+        )
+        .await;
+    }
+
+    if !matches!(
+        cleanup_probe,
+        CleanupProbe::ForcedClose | CleanupProbe::HealthyThenDriftedHealth
+    ) {
         let dispose = read_command(&mut reader).await;
         assert_eq!(dispose["method"], "Target.disposeBrowserContext");
         if matches!(
@@ -594,7 +698,9 @@ async fn run_scripted_protocol_with_pipes(
             CleanupProbe::Clean
             | CleanupProbe::DelayedDispose(_)
             | CleanupProbe::DelayedVerify(_) => json!([]),
-            CleanupProbe::ForcedClose | CleanupProbe::DisposeOnly => {
+            CleanupProbe::ForcedClose
+            | CleanupProbe::HealthyThenDriftedHealth
+            | CleanupProbe::DisposeOnly => {
                 unreachable!("this cleanup mode skips context verification")
             }
         };
@@ -1872,7 +1978,7 @@ fn runtime_owned_concurrent_closes_do_not_starve_cleanup() {
 }
 
 #[test]
-fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
+fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -1884,17 +1990,23 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
     let daemon_epoch = 11;
     let (readiness_peer_tx, readiness_peer_rx) = oneshot::channel();
     let (session_peer_tx, session_peer_rx) = oneshot::channel();
-    let sandbox = Arc::new(ScriptedSandbox {
-        daemon_epoch,
-        cancel_delay: Mutex::new(Duration::ZERO),
-        peer_termination: None,
-        panic_next_cancel: AtomicBool::new(false),
-        peers: Mutex::new(VecDeque::from([readiness_peer_tx, session_peer_tx])),
-        launches: AtomicUsize::new(0),
-        claims: AtomicUsize::new(0),
-        renewals: AtomicUsize::new(0),
-        kills: AtomicUsize::new(0),
-        cancelled_specs: Mutex::new(Vec::new()),
+    let (renewal_entered, renewal_observed) = mpsc::sync_channel(1);
+    let renewal_release = CancellationToken::new();
+    let sandbox = Arc::new(GatedRenewSandbox {
+        inner: ScriptedSandbox {
+            daemon_epoch,
+            cancel_delay: Mutex::new(Duration::ZERO),
+            peer_termination: None,
+            panic_next_cancel: AtomicBool::new(false),
+            peers: Mutex::new(VecDeque::from([readiness_peer_tx, session_peer_tx])),
+            launches: AtomicUsize::new(0),
+            claims: AtomicUsize::new(0),
+            renewals: AtomicUsize::new(0),
+            kills: AtomicUsize::new(0),
+            cancelled_specs: Mutex::new(Vec::new()),
+        },
+        renewal_entered: Mutex::new(Some(renewal_entered)),
+        renewal_release: renewal_release.clone(),
     });
     let connection = ChromiumConnectionConfig {
         transport: CdpTransportConfig {
@@ -1929,10 +2041,10 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
     assert_eq!(factory.qualify_daemon(), Ok(()));
     assert_eq!(factory.qualify_daemon(), Ok(()));
     wait_protocol(&runtime, readiness_protocol).expect("readiness CDP peer should not panic");
-    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 1);
-    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.inner.launches.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.inner.claims.load(Ordering::SeqCst), 1);
     assert_eq!(
-        sandbox.kills.load(Ordering::SeqCst),
+        sandbox.inner.kills.load(Ordering::SeqCst),
         1,
         "lifecycle and runtime cleanup owners must share the probe shard terminal proof"
     );
@@ -1948,7 +2060,7 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
     );
     let protocol = runtime.spawn(run_scripted_protocol(
         session_peer_rx,
-        CleanupProbe::ForcedClose,
+        CleanupProbe::HealthyThenDriftedHealth,
     ));
 
     let tenant_id = TenantId::new();
@@ -1958,15 +2070,55 @@ fn successful_shard_owns_cdp_bootstrap_lease_and_bounded_shutdown() {
         .create_context_owned(&tenant_id, &session_id, &fence)
         .expect("production factory should create a bootstrapped primary page");
     assert!(!primary.to_string().is_empty());
-    assert_eq!(router.heartbeat(&worker_id, worker_epoch), Ok(()));
-    assert_eq!(sandbox.renewals.load(Ordering::SeqCst), 1);
+    let first_heartbeat = std::thread::spawn({
+        let router = Arc::clone(&router);
+        let worker_id = worker_id.clone();
+        move || router.heartbeat(&worker_id, worker_epoch)
+    });
+    assert_eq!(
+        renewal_observed.recv_timeout(Duration::from_millis(500)),
+        Ok(()),
+        "the first healthy heartbeat must reach lease renewal",
+    );
+    let (second_result_sender, second_result) = mpsc::sync_channel(1);
+    let second_heartbeat = std::thread::spawn({
+        let router = Arc::clone(&router);
+        let worker_id = worker_id.clone();
+        move || {
+            let _ = second_result_sender.send(router.heartbeat(&worker_id, worker_epoch));
+        }
+    });
+    let second_before_release = second_result.recv_timeout(Duration::from_millis(200));
+    let heartbeats_were_serialized = second_before_release.is_err();
+    renewal_release.cancel();
+    let first_result = first_heartbeat.join();
+    let second_after_release = match second_before_release {
+        Ok(result) => result,
+        Err(_) => second_result
+            .recv_timeout(Duration::from_millis(500))
+            .expect("the drifted heartbeat should finish after renewal is released"),
+    };
+    let second_join = second_heartbeat.join();
+
+    assert!(matches!(first_result, Ok(Ok(()))));
+    assert!(second_join.is_ok());
+    assert_eq!(second_after_release, Err(DependencyError::OutcomeUncertain));
+    assert_eq!(
+        sandbox.inner.renewals.load(Ordering::SeqCst),
+        1,
+        "an unproven Chromium liveness result must not renew the sandbox lease",
+    );
     assert_eq!(router.close_context_fenced(&session_id, &fence), Ok(()));
     assert_eq!(router.close_context_fenced(&session_id, &fence), Ok(()));
     wait_protocol(&runtime, protocol).expect("scripted CDP peer should not panic");
-    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 2);
-    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 2);
+    assert!(
+        heartbeats_were_serialized,
+        "a second liveness result must not overtake an admitted lease renewal",
+    );
+    assert_eq!(sandbox.inner.launches.load(Ordering::SeqCst), 2);
+    assert_eq!(sandbox.inner.claims.load(Ordering::SeqCst), 2);
     assert_eq!(
-        sandbox.kills.load(Ordering::SeqCst),
+        sandbox.inner.kills.load(Ordering::SeqCst),
         2,
         "readiness and session shards must each use one exact cleanup flight"
     );

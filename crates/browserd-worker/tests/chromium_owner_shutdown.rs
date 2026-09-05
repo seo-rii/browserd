@@ -194,7 +194,48 @@ async fn explicit_shutdown_joins_the_owner_thread_once_for_concurrent_callers() 
     .expect("the dedicated Chromium owner thread should be observable before shutdown");
 
     let driver = owner.chromium_driver(IsolationProfile::SharedContext);
-    assert_eq!(driver.qualify(), Ok(()));
+    let health = tokio::task::spawn_blocking({
+        let driver = driver.clone();
+        move || driver.qualify()
+    });
+    let mut command_bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let read = command_reader
+            .read(&mut byte)
+            .await
+            .expect("health command should be readable");
+        if read == 0 || byte[0] == 0 {
+            break;
+        }
+        command_bytes.push(byte[0]);
+    }
+    let health_command: Value =
+        serde_json::from_slice(&command_bytes).expect("health command should be valid JSON");
+    assert_eq!(health_command["method"], "Browser.getVersion");
+    let health_response = json!({
+        "id": health_command["id"]
+            .as_u64()
+            .expect("health command ID should exist"),
+        "result": {
+            "protocolVersion": "1.3",
+            "product": "HeadlessChrome/149.0.7827.55",
+            "revision": "r1234567",
+            "userAgent": "browserd-owner-shutdown-test",
+            "jsVersion": "14.9"
+        }
+    });
+    let health_response =
+        serde_json::to_vec(&health_response).expect("health response should encode");
+    event_writer
+        .write_all(&health_response)
+        .await
+        .expect("health response should write");
+    event_writer
+        .write_all(&[0])
+        .await
+        .expect("health response terminator should write");
+    assert_eq!(health.await.expect("health task should join"), Ok(()));
 
     let mut shutdowns = Vec::new();
     for _ in 0..8 {

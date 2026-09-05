@@ -431,6 +431,78 @@ async fn process_scoped_emulation_is_rejected_in_shared_context_isolation() {
 }
 
 #[tokio::test]
+async fn active_health_round_trips_the_exact_chromium_identity_and_fails_closed_on_drift() {
+    let drain = Arc::new(Drain(AtomicBool::new(false)));
+    let (owner, manager) = ChromiumConnectionOwner::new_bounded(
+        identity(),
+        connection_config(),
+        shard_fence(),
+        16,
+        drain.clone(),
+    )
+    .unwrap();
+    let driver = owner.chromium_driver(IsolationProfile::SharedContext);
+    let (pipes, mut reader, mut writer) = pipe_pair();
+    let accept = tokio::spawn({
+        let owner = owner.clone();
+        async move { owner.accept_cdp_pipes(pipes).await }
+    });
+    qualify(&mut reader, &mut writer).await;
+    assert_eq!(accept.await.unwrap(), Ok(()));
+
+    let health = tokio::task::spawn_blocking({
+        let driver = driver.clone();
+        move || driver.qualify()
+    });
+    let command = tokio::time::timeout(Duration::from_millis(500), read_command(&mut reader))
+        .await
+        .expect("active health must perform a real CDP roundtrip");
+    assert_eq!(command["method"], "Browser.getVersion");
+    assert_eq!(command["params"], json!({}));
+    assert!(command.get("sessionId").is_none());
+    assert!(!health.is_finished());
+    respond(
+        &mut writer,
+        &command,
+        json!({
+            "protocolVersion": "1.3",
+            "product": "HeadlessChrome/149.0.7827.55",
+            "revision": "r1234567",
+            "userAgent": "browserd-test",
+            "jsVersion": "14.9",
+        }),
+    )
+    .await;
+    assert_eq!(health.await.unwrap(), Ok(()));
+    assert!(!drain.0.load(Ordering::SeqCst));
+
+    let drift = tokio::task::spawn_blocking(move || driver.qualify());
+    let command = read_command(&mut reader).await;
+    assert_eq!(command["method"], "Browser.getVersion");
+    respond(
+        &mut writer,
+        &command,
+        json!({
+            "protocolVersion": "1.3",
+            "product": "HeadlessChrome/149.0.7827.55",
+            "revision": "r1234567",
+            "userAgent": "changed-runtime-identity",
+            "jsVersion": "14.9",
+        }),
+    )
+    .await;
+    assert_eq!(drift.await.unwrap(), Err(DependencyError::OutcomeUncertain));
+    tokio::time::timeout(Duration::from_millis(200), async {
+        while !drain.0.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime identity drift must drain the shard");
+    assert!(manager.is_tainted());
+}
+
+#[tokio::test]
 async fn primary_target_owns_process_emulation_and_children_fail_closed() {
     let drain = Arc::new(Drain(AtomicBool::new(false)));
     let (owner, manager) = ChromiumConnectionOwner::new_bounded(
