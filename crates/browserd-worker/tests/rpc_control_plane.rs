@@ -15,12 +15,13 @@ use browserd_session::{LeasePolicy, OwnershipFence, SessionTime, SessionTimeoutP
 use browserd_worker::{
     ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
     ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
-    LiveApprovalContext, SandboxClient, UnavailableChromiumDriver, UnavailableSandboxClient,
-    WORKER_SESSION_OPTIONS_VERSION, WorkerActionApprovalRequirement, WorkerActionCommand,
-    WorkerActionExecutionTimeout, WorkerActionStatus, WorkerApprovalActionType, WorkerClock,
-    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
-    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
+    LiveApprovalContext, SandboxClient, SessionOptionSupport, UnavailableChromiumDriver,
+    UnavailableSandboxClient, WORKER_SESSION_OPTIONS_VERSION, WorkerActionApprovalRequirement,
+    WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionStatus,
+    WorkerApprovalActionType, WorkerClock, WorkerConfig, WorkerControlPlane,
+    WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError, WorkerIsolationProfile,
+    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
+    WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
 };
 
 fn session_options() -> WorkerSessionOptionsV1 {
@@ -400,6 +401,101 @@ impl ChromiumDriver for BlockingActionDriver {
     }
 }
 
+/// A ready driver whose effective isolation is `DedicatedProcess`, used to exercise isolation
+/// negotiation (BRD-001) against a worker that provides stronger isolation than `SharedContext`.
+struct DedicatedProcessDriver;
+
+impl ChromiumDriver for DedicatedProcessDriver {
+    fn qualify(&self) -> Result<(), DependencyError> {
+        ReadyDriver.qualify()
+    }
+
+    fn effective_isolation(&self) -> WorkerIsolationProfile {
+        WorkerIsolationProfile::DedicatedProcess
+    }
+
+    fn create_context(&self, session_id: &SessionId) -> Result<PageId, DependencyError> {
+        ReadyDriver.create_context(session_id)
+    }
+
+    fn create_context_owned_with_options(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: &WorkerSessionOptionsV1,
+    ) -> Result<PageId, DependencyError> {
+        ReadyDriver.create_context_owned_with_options(tenant_id, session_id, fence, options)
+    }
+
+    fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError> {
+        ReadyDriver.close_context(session_id)
+    }
+
+    fn create_page(&self, session_id: &SessionId) -> Result<PageId, DependencyError> {
+        ReadyDriver.create_page(session_id)
+    }
+
+    fn close_page(&self, session_id: &SessionId, page_id: &PageId) -> Result<(), DependencyError> {
+        ReadyDriver.close_page(session_id, page_id)
+    }
+
+    fn activate_page(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+    ) -> Result<(), DependencyError> {
+        ReadyDriver.activate_page(session_id, page_id)
+    }
+
+    fn execute_action(
+        &self,
+        session_id: &SessionId,
+        page_id: Option<&PageId>,
+        payload: &[u8],
+    ) -> ActionExecutionResult {
+        ReadyDriver.execute_action(session_id, page_id, payload)
+    }
+
+    fn inspect_approval_context(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        proposal: &CanonicalActionProposal,
+    ) -> Result<LiveApprovalContext, DependencyError> {
+        ReadyDriver.inspect_approval_context(session_id, page_id, proposal)
+    }
+
+    fn execute_approved_action(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        payload: &[u8],
+        proposal: &CanonicalActionProposal,
+        inspected: &LiveApprovalContext,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        ReadyDriver.execute_approved_action(
+            session_id,
+            page_id,
+            payload,
+            proposal,
+            inspected,
+            authorize_and_commit,
+        )
+    }
+
+    fn cancel_action(
+        &self,
+        session_id: &SessionId,
+        action_id: &ActionId,
+    ) -> Result<bool, DependencyError> {
+        ReadyDriver.cancel_action(session_id, action_id)
+    }
+}
+
 struct ReadySandbox;
 
 impl SandboxClient for ReadySandbox {
@@ -475,7 +571,8 @@ async fn action_rpc_fixture<D: ChromiumDriver, S: SandboxClient>(
         Duration::from_secs(60),
         journal,
     )
-    .map_err(|error| std::io::Error::other(format!("invalid worker config: {error:?}")))?;
+    .map_err(|error| std::io::Error::other(format!("invalid worker config: {error:?}")))?
+    .with_session_option_support(SessionOptionSupport::single_host_default());
     let tenant_id = TenantId::new();
     let worker = Arc::new(WorkerControlPlane::new_with_clock(
         config,
@@ -1244,5 +1341,118 @@ async fn gateway_forward_action_sequence_gap_is_accepted_without_poisoning_the_s
                 && receipt.action_sequence == ActionSequence::new(2)
                 && receipt.status == WorkerActionStatus::Succeeded
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_session_rpc_negotiates_isolation_against_worker_capability()
+-> Result<(), Box<dyn Error>> {
+    let fixture = action_rpc_fixture(
+        Arc::new(DedicatedProcessDriver),
+        Arc::new(ReadySandbox),
+        19071,
+    )
+    .await?;
+    let tenant_id = fixture.fence.tenant_id.clone();
+    let options = session_options();
+
+    // A request for exactly the isolation the worker provides is accepted, and the effective
+    // placement is reported back (BRD-001) rather than rejected as "not implemented".
+    let accepted = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(
+            WorkerCreateSessionRequest {
+                operation_id: OperationId::new(),
+                tenant_id: tenant_id.clone(),
+                idempotency_key: "isolation-dedicated-process".to_owned(),
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::DedicatedProcess),
+                expected_worker_epoch: fixture.fence.worker_epoch,
+                placement_version: 1,
+                session_incarnation: 1,
+                requested_isolation: WorkerIsolationProfile::DedicatedProcess,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options: options.clone(),
+                now_unix_millis: 10,
+            },
+        ))
+        .await;
+    let WorkerRpcResponse::SessionCreated(receipt) = accepted else {
+        return Err("a request matching the worker's isolation must be accepted".into());
+    };
+    assert_eq!(
+        receipt.effective_isolation,
+        WorkerIsolationProfile::DedicatedProcess
+    );
+
+    // A request for isolation stronger than the worker can deliver is rejected before any effect.
+    let rejected = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(
+            WorkerCreateSessionRequest {
+                operation_id: OperationId::new(),
+                tenant_id,
+                idempotency_key: "isolation-dedicated-worker".to_owned(),
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::DedicatedWorker),
+                expected_worker_epoch: fixture.fence.worker_epoch,
+                placement_version: 1,
+                session_incarnation: 1,
+                requested_isolation: WorkerIsolationProfile::DedicatedWorker,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
+                now_unix_millis: 11,
+            },
+        ))
+        .await;
+    assert!(matches!(
+        rejected,
+        WorkerRpcResponse::Failure(failure)
+            if failure.code == WorkerRpcFailureCode::InvalidRequest
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_session_rpc_rejects_unsupported_options_before_allocation()
+-> Result<(), Box<dyn Error>> {
+    // A worker that supports only the single-host option set must reject a create carrying an
+    // unsupported option with a precise, non-opaque failure before touching any resource
+    // (BRD-022). The fixture already declares single-host option support.
+    let driver = Arc::new(OptionsRecordingDriver::new(PageId::new()));
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19081).await?;
+    let calls_after_fixture = driver.calls.load(Ordering::Acquire);
+
+    let unsupported = WorkerSessionOptionsV1 {
+        feature_profile: "privileged".to_owned(),
+        ..session_options()
+    };
+    let response = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(
+            WorkerCreateSessionRequest {
+                operation_id: OperationId::new(),
+                tenant_id: fixture.fence.tenant_id.clone(),
+                idempotency_key: "unsupported-feature-profile".to_owned(),
+                canonical_request_hash: unsupported
+                    .canonical_request_hash(WorkerIsolationProfile::SharedContext),
+                expected_worker_epoch: fixture.fence.worker_epoch,
+                placement_version: 1,
+                session_incarnation: 1,
+                requested_isolation: WorkerIsolationProfile::SharedContext,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options: unsupported,
+                now_unix_millis: 5,
+            },
+        ))
+        .await;
+
+    assert!(matches!(
+        response,
+        WorkerRpcResponse::Failure(failure)
+            if failure.code == WorkerRpcFailureCode::InvalidRequest
+    ));
+    // The unsupported request was rejected before the driver was asked to allocate a context.
+    assert_eq!(driver.calls.load(Ordering::Acquire), calls_after_fixture);
     Ok(())
 }

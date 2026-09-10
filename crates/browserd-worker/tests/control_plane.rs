@@ -6,7 +6,9 @@ use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
-use browserd_actions::{ActionJournalLimits, ActionKind, ResolutionKind};
+use browserd_actions::{
+    ActionJournalLimits, ActionKind, KnownFailureReason, ResolutionKind, TerminalDetail,
+};
 use browserd_artifacts::{ArtifactChecksum, ArtifactContentSource, ArtifactObjectGeneration};
 use browserd_core::{
     ArtifactId, IsolationProfile, LeaseId, PageId, PrincipalId, TenantId, WorkerId,
@@ -2219,5 +2221,157 @@ fn page_close_cannot_invalidate_an_admitted_action_target() {
             .ok()
             .map(|snapshot| snapshot.active_targets),
         Some(1)
+    );
+}
+
+fn session_options(feature_profile: &str) -> WorkerSessionOptionsV1 {
+    WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: None,
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: feature_profile.to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn standard_profile_session_denies_evaluate_before_dispatch() {
+    // BRD-004 / SPEC D-18: a standard-profile session must not run `evaluate`, and the denial
+    // must be a deterministic policy failure raised before the browser is ever dispatched.
+    let Some((worker, peer, driver, _sandbox)) = ready_worker(1) else {
+        return;
+    };
+    let Some(created) = create_ready_session(&worker, &peer, "evaluate-standard") else {
+        return;
+    };
+    // Preload a would-be success so a dispatched action would report success; the gate must skip
+    // it entirely and leave the queued result untouched.
+    if let Ok(mut executions) = driver.executions.lock() {
+        executions.push_back(ActionExecutionResult::Succeeded(b"should-not-run".to_vec()));
+    }
+    let action_id = worker.submit_action(
+        &peer,
+        PrincipalId::new(),
+        &created.session_id,
+        &created.fence,
+        "evaluate-standard",
+        [7; 32],
+        ActionKind::Mutating,
+        Some(BuiltinFeature::PrivilegedEvaluate),
+        Some(created.primary_page_id.clone()),
+        br#"{"type":"evaluate"}"#.to_vec(),
+        None,
+        SessionTime::new(1),
+    );
+    assert!(action_id.is_ok());
+    let Some(action_id) = action_id.ok() else {
+        return;
+    };
+    assert!(
+        worker
+            .run_next_action(
+                &peer,
+                &created.session_id,
+                &created.fence,
+                SessionTime::new(2)
+            )
+            .is_ok()
+    );
+    let snapshot = worker.get_action(&peer, &created.session_id, &action_id, &created.fence);
+    assert!(snapshot.is_ok());
+    let Some(snapshot) = snapshot.ok() else {
+        return;
+    };
+    assert_eq!(snapshot.status, ActionStatus::FailedKnown);
+    assert_eq!(
+        snapshot.terminal_detail,
+        Some(TerminalDetail::FailedKnown(
+            KnownFailureReason::PolicyDenied
+        ))
+    );
+    // The browser was never dispatched: the preloaded execution result is still queued.
+    assert_eq!(
+        driver
+            .executions
+            .lock()
+            .ok()
+            .map(|executions| executions.len()),
+        Some(1)
+    );
+}
+
+#[test]
+fn privileged_profile_session_allows_evaluate_dispatch() {
+    // The same command in a privileged-profile session passes the gate and dispatches normally.
+    let Some((worker, peer, driver, _sandbox)) = ready_worker(1) else {
+        return;
+    };
+    let created = worker.create_session_with_options(
+        &peer,
+        create_command(TenantId::new(), "evaluate-privileged", 62),
+        &session_options("privileged"),
+        SessionTime::new(0),
+    );
+    assert!(created.is_ok());
+    let Some(created) = created.ok() else {
+        return;
+    };
+    if let Ok(mut executions) = driver.executions.lock() {
+        executions.push_back(ActionExecutionResult::Succeeded(br#"{"ok":true}"#.to_vec()));
+    }
+    let action_id = worker.submit_action(
+        &peer,
+        PrincipalId::new(),
+        &created.session_id,
+        &created.fence,
+        "evaluate-privileged",
+        [8; 32],
+        ActionKind::Mutating,
+        Some(BuiltinFeature::PrivilegedEvaluate),
+        Some(created.primary_page_id.clone()),
+        br#"{"type":"evaluate"}"#.to_vec(),
+        None,
+        SessionTime::new(1),
+    );
+    assert!(action_id.is_ok());
+    let Some(action_id) = action_id.ok() else {
+        return;
+    };
+    assert!(
+        worker
+            .run_next_action(
+                &peer,
+                &created.session_id,
+                &created.fence,
+                SessionTime::new(2)
+            )
+            .is_ok()
+    );
+    let snapshot = worker.get_action(&peer, &created.session_id, &action_id, &created.fence);
+    assert!(snapshot.is_ok());
+    let Some(snapshot) = snapshot.ok() else {
+        return;
+    };
+    assert_eq!(snapshot.status, ActionStatus::Succeeded);
+    // The browser WAS dispatched: the preloaded execution result was consumed.
+    assert_eq!(
+        driver
+            .executions
+            .lock()
+            .ok()
+            .map(|executions| executions.len()),
+        Some(0)
     );
 }

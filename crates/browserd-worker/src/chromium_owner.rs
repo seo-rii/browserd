@@ -3034,6 +3034,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .get("nodeIds")
             .and_then(Value::as_array)
             .ok_or(OwnerActorError::OutcomeUncertain)?;
+        // Preserve the total match count before bounding so the caller can tell a complete result
+        // from one this owner truncated to `MAX_QUERY_ALL_MATCHES` (BRD-026).
+        let total_matches = node_ids.len();
+        let truncated = total_matches > MAX_QUERY_ALL_MATCHES;
         let mut backend_ids = Vec::new();
         for node_id in node_ids.iter().take(MAX_QUERY_ALL_MATCHES) {
             let node_id = node_id.as_i64().ok_or(OwnerActorError::OutcomeUncertain)?;
@@ -3069,7 +3073,17 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             let handle = self.node_store.insert(binding, now);
             node_refs.push(handle.as_token().to_owned());
         }
-        Ok(json!({ "node_refs": node_refs }))
+        // Surface the truncation state and document provenance so the caller can detect a partial
+        // result and reason about which document version these handles were minted against
+        // (BRD-026). `snapshot_id` provenance is deferred to the normalized snapshot work.
+        Ok(json!({
+            "node_refs": node_refs,
+            "returned_count": node_refs.len(),
+            "limit": MAX_QUERY_ALL_MATCHES,
+            "truncated": truncated,
+            "document_epoch": document_state.frame_document_epoch.get(),
+            "url_revision": document_state.url_revision,
+        }))
     }
 
     /// Resolves a caller-presented node handle to its stable backend node id.
@@ -3150,13 +3164,30 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .command_event_first(
                 "Runtime.callFunctionOn",
                 params,
-                Some(cdp_session_id),
+                Some(cdp_session_id.clone()),
                 None,
-                guarded,
+                guarded.clone(),
                 deadline,
             )
-            .await?;
-        evaluated
+            .await;
+        // Release the remote object wrapper the resolve minted so repeated node reads on a live
+        // document do not accumulate CDP remote objects until the context is destroyed (BRD-010).
+        // Only released after a successful call (a healthy context); a failed release is ignored
+        // and never changes the action outcome. A failing call taints the context, which recycles
+        // its objects. A deferred cleanup queue could remove this per-read round-trip later.
+        if evaluated.is_ok() {
+            let _ = self
+                .command_event_first(
+                    "Runtime.releaseObject",
+                    json!({ "objectId": object_id }),
+                    Some(cdp_session_id),
+                    None,
+                    guarded,
+                    deadline,
+                )
+                .await;
+        }
+        evaluated?
             .get("result")
             .and_then(|result| result.get("value"))
             .cloned()
@@ -3210,6 +3241,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     }
 
     /// Dispatches a left mouse press/release pair at a point with the given click count.
+    ///
+    /// Once the press lands, a mouse-down effect is already exposed on the page. From that point
+    /// on any failure of the release is effect-uncertain, so it is mapped to
+    /// [`OwnerActorError::OutcomeUncertain`] and never surfaced as a deterministic
+    /// not-dispatched/rejected failure. This keeps a compound sequence (double click) from being
+    /// recorded as a clean known failure while a button-down effect may persist (BRD-005). The
+    /// press itself still reports `DeadlineBeforeDispatch` when it was never submitted, because no
+    /// effect can have occurred yet.
     async fn dispatch_mouse_click(
         &mut self,
         cdp_session_id: &str,
@@ -3237,6 +3276,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             deadline,
         )
         .await
+        .map_err(|_| OwnerActorError::OutcomeUncertain)
     }
 
     /// Reads the rendered text of a resolved node handle.

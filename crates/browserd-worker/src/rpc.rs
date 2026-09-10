@@ -19,6 +19,7 @@ use browserd_core::{
     ActionId, ApprovalId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId,
     TenantId, WorkerId,
 };
+use browserd_features::BuiltinFeature;
 use browserd_operations::CanonicalRequestHash as CreateCanonicalRequestHash;
 use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalDecision, ApprovalState, CanonicalActionProposal,
@@ -337,6 +338,19 @@ impl WorkerActionCommand {
             | Self::Scroll { .. } => ActionKind::Mutating,
         }
     }
+
+    /// The privileged built-in feature this command requires, if any.
+    ///
+    /// `evaluate` maps to [`BuiltinFeature::PrivilegedEvaluate`] so the worker can gate it on the
+    /// session's feature profile before dispatch (SPEC D-18). Other commands are covered by the
+    /// core navigation/input features and need no privileged-profile gate here.
+    #[must_use]
+    pub const fn required_feature(&self) -> Option<BuiltinFeature> {
+        match self {
+            Self::Evaluate { .. } => Some(BuiltinFeature::PrivilegedEvaluate),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -346,6 +360,29 @@ pub enum WorkerIsolationProfile {
     TenantDedicatedShard,
     DedicatedProcess,
     DedicatedWorker,
+}
+
+impl WorkerIsolationProfile {
+    /// Isolation strength ranking. A stronger profile provides at least the guarantees of every
+    /// weaker one, so placements can only be strengthened relative to a request, never weakened.
+    const fn strength(self) -> u8 {
+        match self {
+            Self::SharedContext => 0,
+            Self::TenantDedicatedShard => 1,
+            Self::DedicatedProcess => 2,
+            Self::DedicatedWorker => 3,
+        }
+    }
+
+    /// Whether a session actually placed at `effective` isolation satisfies a request for `self`.
+    ///
+    /// A worker may place a session more strongly than requested (a safe strengthening), so a
+    /// request is satisfiable exactly when the effective placement is at least as strong. A
+    /// request for isolation stronger than the worker provides cannot be honored (BRD-001).
+    #[must_use]
+    pub const fn satisfied_by(self, effective: Self) -> bool {
+        self.strength() <= effective.strength()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1433,10 +1470,30 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         "create request does not match this worker epoch",
                     ));
                 }
-                if request.requested_isolation != WorkerIsolationProfile::SharedContext {
+                // Negotiate isolation against what this worker actually provides rather than a
+                // hardcoded profile: accept a request the effective placement satisfies (equal or
+                // a safe strengthening), and reject only a request for stronger isolation than the
+                // worker can deliver (BRD-001). Both requested and effective are recorded durably
+                // by the gateway session resource.
+                let effective_isolation = self.worker.driver.effective_isolation();
+                if !request
+                    .requested_isolation
+                    .satisfied_by(effective_isolation)
+                {
                     return Err(WorkerRpcFailure::new(
                         WorkerRpcFailureCode::InvalidRequest,
-                        "requested isolation profile is not implemented by this worker",
+                        "requested isolation profile is stronger than this worker provides",
+                    ));
+                }
+                // Reject unsupported session options before claiming the operation or touching any
+                // session resource, with a precise reason rather than an opaque late failure from
+                // the factory (BRD-022). The factory re-validates as defense in depth.
+                if let Some(support) = &self.worker.config.session_option_support
+                    && let Some(unsupported) = support.unsupported_option(&request.options)
+                {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        format!("session option is not supported by this worker: {unsupported}"),
                     ));
                 }
                 if let Some(receipt) = self.bind_operation(&request)? {
@@ -1651,6 +1708,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         "action command is invalid or its kind does not match",
                     ));
                 }
+                let required_feature = action.required_feature();
                 let payload = serde_json::to_vec(&action).map_err(|_| {
                     WorkerRpcFailure::new(
                         WorkerRpcFailureCode::InvalidRequest,
@@ -1697,7 +1755,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         &idempotency_key,
                         canonical_request_hash,
                         kind,
-                        None,
+                        required_feature,
                         page_id,
                         payload,
                         approval,

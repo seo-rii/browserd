@@ -69,7 +69,7 @@ use browserd_core::{
     ActionId, ActionState, ArtifactId, IsolationProfile, OperationId, PageId, PrincipalId,
     SessionExecution, SessionId, TenantId, WorkerId,
 };
-use browserd_features::{BuiltinFeature, FeatureRegistry};
+use browserd_features::{BuiltinFeature, FeatureProfile, FeatureRegistry};
 use browserd_fleet::WorkerEpochRegistry;
 use browserd_operations::{
     CanonicalRequestHash, IdempotencyClaim, IdempotencyKey, IdempotencyRegistry,
@@ -146,6 +146,18 @@ pub enum DependencyError {
     Unavailable,
     Rejected,
     OutcomeUncertain,
+}
+
+/// Derives the session's effective feature profile from the trusted create options.
+///
+/// Only the exact `privileged` profile grants privileged features; every other value, and the
+/// absence of options, is `Standard`. Production factories reject non-standard profiles at
+/// creation, so production sessions are always `Standard` and cannot run `evaluate`.
+fn feature_profile_from_options(options: Option<&WorkerSessionOptionsV1>) -> FeatureProfile {
+    match options.map(|options| options.feature_profile.as_str()) {
+        Some("privileged") => FeatureProfile::Privileged,
+        _ => FeatureProfile::Standard,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -437,6 +449,62 @@ impl ActionJournalConfig {
     }
 }
 
+/// The set of session-option values a worker actually supports, so a create request carrying an
+/// unsupported option is rejected early with a precise reason instead of failing opaquely deep in
+/// the factory after resources have been touched (BRD-022).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionOptionSupport {
+    network_classes: BTreeSet<String>,
+    dialog_policies: BTreeSet<String>,
+    feature_profiles: BTreeSet<String>,
+    supports_checkpoint: bool,
+}
+
+impl SessionOptionSupport {
+    #[must_use]
+    pub fn new(
+        network_classes: impl IntoIterator<Item = String>,
+        dialog_policies: impl IntoIterator<Item = String>,
+        feature_profiles: impl IntoIterator<Item = String>,
+        supports_checkpoint: bool,
+    ) -> Self {
+        Self {
+            network_classes: network_classes.into_iter().collect(),
+            dialog_policies: dialog_policies.into_iter().collect(),
+            feature_profiles: feature_profiles.into_iter().collect(),
+            supports_checkpoint,
+        }
+    }
+
+    /// The single-host production capability: public network, auto-dismiss dialogs, the standard
+    /// feature profile, and no checkpoint restore.
+    #[must_use]
+    pub fn single_host_default() -> Self {
+        Self::new(
+            ["public".to_owned()],
+            ["auto_dismiss".to_owned()],
+            ["standard".to_owned()],
+            false,
+        )
+    }
+
+    /// The name of the first option in `options` this worker does not support, if any.
+    #[must_use]
+    pub fn unsupported_option(&self, options: &WorkerSessionOptionsV1) -> Option<&'static str> {
+        if !self.network_classes.contains(&options.network_class) {
+            Some("network_class")
+        } else if !self.dialog_policies.contains(&options.dialog_policy) {
+            Some("dialog_policy")
+        } else if !self.feature_profiles.contains(&options.feature_profile) {
+            Some("feature_profile")
+        } else if options.checkpoint_ref.is_some() && !self.supports_checkpoint {
+            Some("checkpoint_ref")
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkerConfig {
     worker_id: WorkerId,
@@ -450,6 +518,7 @@ pub struct WorkerConfig {
     approval_timeout_millis: u64,
     action_journal: ActionJournalConfig,
     artifact_limits: WorkerArtifactLimits,
+    session_option_support: Option<SessionOptionSupport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -530,12 +599,22 @@ impl WorkerConfig {
             approval_timeout_millis,
             action_journal,
             artifact_limits: WorkerArtifactLimits::default(),
+            session_option_support: None,
         })
     }
 
     #[must_use]
     pub const fn with_artifact_limits(mut self, limits: WorkerArtifactLimits) -> Self {
         self.artifact_limits = limits;
+        self
+    }
+
+    /// Declares which session-option values this worker supports. When set, a create request
+    /// carrying an unsupported option is rejected before any session resource is allocated
+    /// (BRD-022). Left unset, option support is validated only by the driver/factory.
+    #[must_use]
+    pub fn with_session_option_support(mut self, support: SessionOptionSupport) -> Self {
+        self.session_option_support = Some(support);
         self
     }
 
@@ -873,6 +952,11 @@ type ActionIdempotencyRecord = (
 
 struct SessionState {
     tenant_id: TenantId,
+    /// Effective feature profile fixed at session creation from the trusted create options.
+    ///
+    /// This gates privileged features (notably `evaluate`) at dispatch so a caller cannot enable
+    /// them by placing a profile string on a per-action RPC. See SPEC D-18.
+    feature_profile: FeatureProfile,
     machine: SessionMachine,
     occupies_capacity: bool,
     primary_page_id: PageId,
@@ -1098,6 +1182,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
     ) -> Result<CreateSessionOutcome, WorkerError> {
         self.authorize(peer)?;
+        let feature_profile = feature_profile_from_options(options);
         let timeout_policy = match options {
             Some(options) if options.is_valid() => SessionTimeoutPolicy::new(
                 Duration::from_secs(options.ttl_seconds),
@@ -1305,6 +1390,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             let executor = Arc::new(SessionExecutor {
                 state: Mutex::new(SessionState {
                     tenant_id: command.tenant_id,
+                    feature_profile,
                     machine,
                     occupies_capacity: true,
                     primary_page_id: primary_page_id.clone(),
@@ -2287,7 +2373,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
         executor: &Arc<SessionExecutor>,
     ) -> Result<Option<WorkerActionSnapshot>, WorkerError> {
-        let (action_id, page_id, payload, execution_timeout, permit, approval_request) = {
+        let (
+            action_id,
+            page_id,
+            payload,
+            execution_timeout,
+            permit,
+            approval_request,
+            action_feature,
+            feature_profile,
+        ) = {
             let mut session = executor
                 .state
                 .lock()
@@ -2303,21 +2398,29 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             {
                 return Ok(None);
             }
-            let (page_id, payload, execution_timeout, approval_id, requester_principal_id) =
-                session
-                    .actions
-                    .get(&action_id)
-                    .filter(|action| action.snapshot.status == ActionStatus::Queued)
-                    .map(|action| {
-                        (
-                            action.page_id.clone(),
-                            action.payload.clone(),
-                            action.execution_timeout,
-                            action.approval_id.clone(),
-                            action.requester_principal_id.clone(),
-                        )
-                    })
-                    .ok_or(WorkerError::InvalidActionTransition)?;
+            let feature_profile = session.feature_profile;
+            let (
+                page_id,
+                payload,
+                execution_timeout,
+                approval_id,
+                requester_principal_id,
+                action_feature,
+            ) = session
+                .actions
+                .get(&action_id)
+                .filter(|action| action.snapshot.status == ActionStatus::Queued)
+                .map(|action| {
+                    (
+                        action.page_id.clone(),
+                        action.payload.clone(),
+                        action.execution_timeout,
+                        action.approval_id.clone(),
+                        action.requester_principal_id.clone(),
+                        action.snapshot.feature,
+                    )
+                })
+                .ok_or(WorkerError::InvalidActionTransition)?;
             let approval_request = approval_id
                 .as_ref()
                 .map(|approval_id| {
@@ -2388,141 +2491,157 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 execution_timeout,
                 permit,
                 approval_request,
+                action_feature,
+                feature_profile,
             )
         };
         let execution_deadline = Instant::now()
             .checked_add(execution_timeout)
             .ok_or(WorkerError::InvalidConfiguration)?;
-        let (outcome, response_error, known_failure_reason) =
-            if let Some((request, feature, requester_principal_id)) = approval_request {
-                let proposal = request.proposal().clone();
-                let inspected = page_id
-                    .as_ref()
-                    .ok_or(WorkerError::StateUnavailable)
-                    .and_then(|page_id| {
-                        self.driver
-                            .inspect_approval_context(session_id, page_id, &proposal)
-                            .map_err(|_| WorkerError::DependencyUnavailable)
-                    });
-                match inspected {
-                    Ok(live) => {
-                        let page_id = page_id.as_ref().ok_or(WorkerError::StateUnavailable)?;
-                        let mut admission_error = None;
-                        let driver_entered = executor
-                            .approved_dispatch_phase
-                            .compare_exchange(
-                                APPROVED_DISPATCH_INSPECTING,
-                                APPROVED_DISPATCH_DRIVER_PENDING,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok();
-                        let execution = if driver_entered {
-                            self.driver.execute_approved_action_until(
-                                session_id,
-                                page_id,
-                                &payload,
-                                &proposal,
-                                &live,
-                                execution_deadline,
-                                &mut |observed| {
-                                    if executor
-                                        .approved_dispatch_phase
-                                        .compare_exchange(
-                                            APPROVED_DISPATCH_DRIVER_PENDING,
-                                            APPROVED_DISPATCH_AUTHORIZING,
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_err()
+        let (outcome, response_error, known_failure_reason) = if action_feature
+            == Some(BuiltinFeature::PrivilegedEvaluate)
+            && feature_profile != FeatureProfile::Privileged
+        {
+            // BRD-004 / SPEC D-18: a standard-profile session must not run `evaluate`. Deny it
+            // before any dispatch as a deterministic policy failure with no browser effect,
+            // never as an ambiguous outcome, and regardless of whether approval was attached.
+            // The dispatch phase may have been armed to inspecting for an approval-bound action;
+            // reset it since no approved dispatch will run.
+            executor
+                .approved_dispatch_phase
+                .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
+            (
+                ActionExecutionResult::FailedKnown(
+                    "policy: evaluate requires the privileged feature profile".to_owned(),
+                ),
+                None,
+                Some(KnownFailureReason::PolicyDenied),
+            )
+        } else if let Some((request, feature, requester_principal_id)) = approval_request {
+            let proposal = request.proposal().clone();
+            let inspected = page_id
+                .as_ref()
+                .ok_or(WorkerError::StateUnavailable)
+                .and_then(|page_id| {
+                    self.driver
+                        .inspect_approval_context(session_id, page_id, &proposal)
+                        .map_err(|_| WorkerError::DependencyUnavailable)
+                });
+            match inspected {
+                Ok(live) => {
+                    let page_id = page_id.as_ref().ok_or(WorkerError::StateUnavailable)?;
+                    let mut admission_error = None;
+                    let driver_entered = executor
+                        .approved_dispatch_phase
+                        .compare_exchange(
+                            APPROVED_DISPATCH_INSPECTING,
+                            APPROVED_DISPATCH_DRIVER_PENDING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok();
+                    let execution = if driver_entered {
+                        self.driver.execute_approved_action_until(
+                            session_id,
+                            page_id,
+                            &payload,
+                            &proposal,
+                            &live,
+                            execution_deadline,
+                            &mut |observed| {
+                                if executor
+                                    .approved_dispatch_phase
+                                    .compare_exchange(
+                                        APPROVED_DISPATCH_DRIVER_PENDING,
+                                        APPROVED_DISPATCH_AUTHORIZING,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_err()
+                                {
+                                    return Err(ApprovedActionError::DispatchRevoked);
+                                }
+                                let admission = (|| {
+                                    let session = executor
+                                        .state
+                                        .lock()
+                                        .map_err(|_| WorkerError::StateUnavailable)?;
+                                    validate_fence(&session, fence)?;
+                                    if session.machine.lifecycle() != SessionLifecycle::Ready
+                                        || session.machine.snapshot().execution
+                                            != SessionExecution::Running(action_id.clone())
                                     {
-                                        return Err(ApprovedActionError::DispatchRevoked);
+                                        return Err(WorkerError::InvalidActionTransition);
                                     }
-                                    let admission = (|| {
-                                        let session = executor
-                                            .state
-                                            .lock()
-                                            .map_err(|_| WorkerError::StateUnavailable)?;
-                                        validate_fence(&session, fence)?;
-                                        if session.machine.lifecycle() != SessionLifecycle::Ready
-                                            || session.machine.snapshot().execution
-                                                != SessionExecution::Running(action_id.clone())
-                                        {
-                                            return Err(WorkerError::InvalidActionTransition);
-                                        }
-                                        let action = session
-                                            .actions
-                                            .get(&action_id)
-                                            .ok_or(WorkerError::ActionNotFound)?;
-                                        if action.snapshot.status != ActionStatus::Running
-                                            || action.dispatch_permit.as_ref() != Some(&permit)
-                                        {
-                                            return Err(WorkerError::InvalidActionTransition);
-                                        }
-                                        let mut context = ExecutionContext {
-                                            tenant_id: proposal.tenant_id().clone(),
-                                            requester_principal_id: requester_principal_id.clone(),
-                                            session_id: proposal.session_id().clone(),
-                                            session_incarnation: proposal.session_incarnation(),
-                                            page_id: proposal.page_id().clone(),
-                                            target_incarnation: observed.target_incarnation,
-                                            frame_document_epoch: observed.frame_document_epoch,
-                                            current_origin: observed.current_origin.clone(),
-                                            url_revision: observed.url_revision,
-                                            node_ref: observed.node_ref.clone(),
-                                            node_valid: observed.node_valid,
-                                            placement_owned: true,
-                                            resolved_ips: observed.resolved_ips.clone(),
-                                            credential_refs: observed.credential_refs.clone(),
-                                            feature: feature.clone(),
-                                            chromium_build: observed.chromium_build.clone(),
-                                            effective_isolation: observed.effective_isolation,
-                                        };
-                                        let authorization_floor =
-                                            now.max(session.machine.last_observed_at());
-                                        let authorization = request
-                                            .authorize_and_dispatch_with_clock(
-                                                &self.emergency_policy,
-                                                &context,
-                                                || {
-                                                    let authorization_now = self
-                                                        .clock
-                                                        .now()
-                                                        .map_err(ApprovalAdmissionClockError::Clock)
-                                                        .map(|trusted_now| {
-                                                            authorization_floor.max(trusted_now)
-                                                        })?;
-                                                    let snapshot = session.machine.snapshot();
-                                                    let deadline_elapsed = [
-                                                        snapshot.lease_expires_at,
-                                                        snapshot.session_expires_at,
-                                                        snapshot.idle_expires_at,
-                                                    ]
-                                                    .into_iter()
-                                                    .flatten()
-                                                    .any(|deadline| authorization_now >= deadline);
-                                                    if snapshot.owner_fence != *fence
-                                                        || snapshot.lifecycle
-                                                            != SessionLifecycle::Ready
-                                                        || snapshot.execution
-                                                            != SessionExecution::Running(
-                                                                action_id.clone(),
-                                                            )
-                                                        || !session.occupies_capacity
-                                                        || deadline_elapsed
-                                                    {
-                                                        return Err(
+                                    let action = session
+                                        .actions
+                                        .get(&action_id)
+                                        .ok_or(WorkerError::ActionNotFound)?;
+                                    if action.snapshot.status != ActionStatus::Running
+                                        || action.dispatch_permit.as_ref() != Some(&permit)
+                                    {
+                                        return Err(WorkerError::InvalidActionTransition);
+                                    }
+                                    let mut context = ExecutionContext {
+                                        tenant_id: proposal.tenant_id().clone(),
+                                        requester_principal_id: requester_principal_id.clone(),
+                                        session_id: proposal.session_id().clone(),
+                                        session_incarnation: proposal.session_incarnation(),
+                                        page_id: proposal.page_id().clone(),
+                                        target_incarnation: observed.target_incarnation,
+                                        frame_document_epoch: observed.frame_document_epoch,
+                                        current_origin: observed.current_origin.clone(),
+                                        url_revision: observed.url_revision,
+                                        node_ref: observed.node_ref.clone(),
+                                        node_valid: observed.node_valid,
+                                        placement_owned: true,
+                                        resolved_ips: observed.resolved_ips.clone(),
+                                        credential_refs: observed.credential_refs.clone(),
+                                        feature: feature.clone(),
+                                        chromium_build: observed.chromium_build.clone(),
+                                        effective_isolation: observed.effective_isolation,
+                                    };
+                                    let authorization_floor =
+                                        now.max(session.machine.last_observed_at());
+                                    let authorization = request.authorize_and_dispatch_with_clock(
+                                        &self.emergency_policy,
+                                        &context,
+                                        || {
+                                            let authorization_now = self
+                                                .clock
+                                                .now()
+                                                .map_err(ApprovalAdmissionClockError::Clock)
+                                                .map(|trusted_now| {
+                                                    authorization_floor.max(trusted_now)
+                                                })?;
+                                            let snapshot = session.machine.snapshot();
+                                            let deadline_elapsed = [
+                                                snapshot.lease_expires_at,
+                                                snapshot.session_expires_at,
+                                                snapshot.idle_expires_at,
+                                            ]
+                                            .into_iter()
+                                            .flatten()
+                                            .any(|deadline| authorization_now >= deadline);
+                                            if snapshot.owner_fence != *fence
+                                                || snapshot.lifecycle != SessionLifecycle::Ready
+                                                || snapshot.execution
+                                                    != SessionExecution::Running(action_id.clone())
+                                                || !session.occupies_capacity
+                                                || deadline_elapsed
+                                            {
+                                                return Err(
                                                             ApprovalAdmissionClockError::
                                                                 PlacementOwnershipInvalid(
                                                                     authorization_now,
                                                                 ),
                                                         );
-                                                    }
-                                                    Ok(authorization_now.get())
-                                                },
-                                                || {},
-                                            );
-                                        match authorization {
+                                            }
+                                            Ok(authorization_now.get())
+                                        },
+                                        || {},
+                                    );
+                                    match authorization {
                                         Ok(()) => Ok(()),
                                         Err(ApprovalAuthorizationError::Approval(error)) => {
                                             Err(WorkerError::ApprovalPolicy(error))
@@ -2556,123 +2675,121 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                                             }
                                         }
                                     }
-                                    })();
-                                    match admission {
-                                        Ok(()) => {
-                                            executor.approved_dispatch_phase.store(
-                                                APPROVED_DISPATCH_STARTED,
-                                                Ordering::Release,
-                                            );
-                                            Ok(())
-                                        }
-                                        Err(error) => {
-                                            executor.approved_dispatch_phase.store(
-                                                APPROVED_DISPATCH_AUTHORIZATION_REJECTED,
-                                                Ordering::Release,
-                                            );
-                                            admission_error = Some(error);
-                                            Err(ApprovedActionError::DispatchRevoked)
-                                        }
+                                })();
+                                match admission {
+                                    Ok(()) => {
+                                        executor
+                                            .approved_dispatch_phase
+                                            .store(APPROVED_DISPATCH_STARTED, Ordering::Release);
+                                        Ok(())
                                     }
-                                },
-                            )
-                        } else {
-                            Err(ApprovedActionError::DispatchRevoked)
-                        };
-                        let dispatch_phase =
-                            executor.approved_dispatch_phase.load(Ordering::Acquire);
-                        let effect_started = dispatch_phase == APPROVED_DISPATCH_STARTED;
-                        if driver_entered {
-                            let returned_phase = if !effect_started
-                                && matches!(
-                                    &execution,
-                                    Err(ApprovedActionError::ApprovalStale(_)
-                                        | ApprovedActionError::DispatchRevoked)
-                                ) {
-                                APPROVED_DISPATCH_STOPPED
-                            } else {
-                                APPROVED_DISPATCH_RETURNED_UNCERTAIN
-                            };
-                            let completion_guard = executor.approved_dispatch_wait.lock().ok();
-                            executor
-                                .approved_dispatch_phase
-                                .store(returned_phase, Ordering::Release);
-                            executor.approved_dispatch_changed.notify_all();
-                            drop(completion_guard);
-                        }
-                        match execution {
-                            Ok(outcome) if effect_started => (outcome, None, None),
-                            Ok(_) => (ActionExecutionResult::OutcomeUnknown, None, None),
-                            Err(_) if effect_started => {
-                                (ActionExecutionResult::OutcomeUnknown, None, None)
-                            }
-                            Err(ApprovedActionError::ApprovalStale(reason)) => {
-                                let error = ApprovalError::ApprovalStale(reason);
-                                (
-                                    ActionExecutionResult::FailedKnown(format!(
-                                        "approval policy: {error:?}"
-                                    )),
-                                    Some(WorkerError::ApprovalPolicy(error)),
-                                    Some(KnownFailureReason::PolicyDenied),
-                                )
-                            }
-                            Err(ApprovedActionError::DispatchRevoked) => match admission_error {
-                                Some(WorkerError::ApprovalPolicy(error)) => (
-                                    ActionExecutionResult::FailedKnown(format!(
-                                        "approval policy: {error:?}"
-                                    )),
-                                    Some(WorkerError::ApprovalPolicy(error)),
-                                    Some(KnownFailureReason::PolicyDenied),
-                                ),
-                                Some(error) => (
-                                    ActionExecutionResult::FailedKnown(format!(
-                                        "approval dispatch admission failed: {error:?}"
-                                    )),
-                                    Some(error),
-                                    Some(KnownFailureReason::NotDispatched),
-                                ),
-                                None => (
-                                    ActionExecutionResult::FailedKnown(
-                                        "approval dispatch revoked before authorization".to_owned(),
-                                    ),
-                                    Some(WorkerError::InvalidActionTransition),
-                                    Some(KnownFailureReason::NotDispatched),
-                                ),
+                                    Err(error) => {
+                                        executor.approved_dispatch_phase.store(
+                                            APPROVED_DISPATCH_AUTHORIZATION_REJECTED,
+                                            Ordering::Release,
+                                        );
+                                        admission_error = Some(error);
+                                        Err(ApprovedActionError::DispatchRevoked)
+                                    }
+                                }
                             },
-                            Err(ApprovedActionError::DeadlineBeforeDispatch) => (
-                                ActionExecutionResult::FailedKnown("action_timeout".to_owned()),
-                                None,
-                                Some(KnownFailureReason::ExecutionTimedOut),
-                            ),
-                            Err(
-                                ApprovedActionError::Unavailable
-                                | ApprovedActionError::OutcomeUncertain,
-                            ) => (ActionExecutionResult::OutcomeUnknown, None, None),
-                        }
+                        )
+                    } else {
+                        Err(ApprovedActionError::DispatchRevoked)
+                    };
+                    let dispatch_phase = executor.approved_dispatch_phase.load(Ordering::Acquire);
+                    let effect_started = dispatch_phase == APPROVED_DISPATCH_STARTED;
+                    if driver_entered {
+                        let returned_phase = if !effect_started
+                            && matches!(
+                                &execution,
+                                Err(ApprovedActionError::ApprovalStale(_)
+                                    | ApprovedActionError::DispatchRevoked)
+                            ) {
+                            APPROVED_DISPATCH_STOPPED
+                        } else {
+                            APPROVED_DISPATCH_RETURNED_UNCERTAIN
+                        };
+                        let completion_guard = executor.approved_dispatch_wait.lock().ok();
+                        executor
+                            .approved_dispatch_phase
+                            .store(returned_phase, Ordering::Release);
+                        executor.approved_dispatch_changed.notify_all();
+                        drop(completion_guard);
                     }
-                    Err(error) => (
-                        ActionExecutionResult::FailedKnown(
-                            "approval context inspection failed".to_owned(),
+                    match execution {
+                        Ok(outcome) if effect_started => (outcome, None, None),
+                        Ok(_) => (ActionExecutionResult::OutcomeUnknown, None, None),
+                        Err(_) if effect_started => {
+                            (ActionExecutionResult::OutcomeUnknown, None, None)
+                        }
+                        Err(ApprovedActionError::ApprovalStale(reason)) => {
+                            let error = ApprovalError::ApprovalStale(reason);
+                            (
+                                ActionExecutionResult::FailedKnown(format!(
+                                    "approval policy: {error:?}"
+                                )),
+                                Some(WorkerError::ApprovalPolicy(error)),
+                                Some(KnownFailureReason::PolicyDenied),
+                            )
+                        }
+                        Err(ApprovedActionError::DispatchRevoked) => match admission_error {
+                            Some(WorkerError::ApprovalPolicy(error)) => (
+                                ActionExecutionResult::FailedKnown(format!(
+                                    "approval policy: {error:?}"
+                                )),
+                                Some(WorkerError::ApprovalPolicy(error)),
+                                Some(KnownFailureReason::PolicyDenied),
+                            ),
+                            Some(error) => (
+                                ActionExecutionResult::FailedKnown(format!(
+                                    "approval dispatch admission failed: {error:?}"
+                                )),
+                                Some(error),
+                                Some(KnownFailureReason::NotDispatched),
+                            ),
+                            None => (
+                                ActionExecutionResult::FailedKnown(
+                                    "approval dispatch revoked before authorization".to_owned(),
+                                ),
+                                Some(WorkerError::InvalidActionTransition),
+                                Some(KnownFailureReason::NotDispatched),
+                            ),
+                        },
+                        Err(ApprovedActionError::DeadlineBeforeDispatch) => (
+                            ActionExecutionResult::FailedKnown("action_timeout".to_owned()),
+                            None,
+                            Some(KnownFailureReason::ExecutionTimedOut),
                         ),
-                        Some(error),
-                        Some(KnownFailureReason::NotDispatched),
-                    ),
+                        Err(
+                            ApprovedActionError::Unavailable
+                            | ApprovedActionError::OutcomeUncertain,
+                        ) => (ActionExecutionResult::OutcomeUnknown, None, None),
+                    }
                 }
-            } else {
-                let outcome = self.driver.execute_action_until(
-                    session_id,
-                    page_id.as_ref(),
-                    &payload,
-                    execution_deadline,
-                );
-                let known_failure_reason = matches!(
-                    &outcome,
-                    ActionExecutionResult::FailedKnown(reason)
-                        if reason == "action_timeout" || reason == "navigation_timeout"
-                )
-                .then_some(KnownFailureReason::ExecutionTimedOut);
-                (outcome, None, known_failure_reason)
-            };
+                Err(error) => (
+                    ActionExecutionResult::FailedKnown(
+                        "approval context inspection failed".to_owned(),
+                    ),
+                    Some(error),
+                    Some(KnownFailureReason::NotDispatched),
+                ),
+            }
+        } else {
+            let outcome = self.driver.execute_action_until(
+                session_id,
+                page_id.as_ref(),
+                &payload,
+                execution_deadline,
+            );
+            let known_failure_reason = matches!(
+                &outcome,
+                ActionExecutionResult::FailedKnown(reason)
+                    if reason == "action_timeout" || reason == "navigation_timeout"
+            )
+            .then_some(KnownFailureReason::ExecutionTimedOut);
+            (outcome, None, known_failure_reason)
+        };
         let mut session = executor
             .state
             .lock()

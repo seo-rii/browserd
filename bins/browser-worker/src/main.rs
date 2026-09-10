@@ -17,8 +17,8 @@ use browserd_sandbox::{EgressPolicyBinding, SandboxRpcClient};
 use browserd_session::{LeasePolicy, SessionTimeoutPolicy};
 use browserd_worker::{
     ActionJournalConfig, ArtifactStoreReceipt, ArtifactStoreRequest, AuthenticatedPeer,
-    DependencyError, DurableWorkerEpoch, InternalEndpoint, WorkerConfig, WorkerControlPlane,
-    WorkerRpcConfig,
+    DependencyError, DurableWorkerEpoch, InternalEndpoint, SessionOptionSupport, WorkerConfig,
+    WorkerControlPlane, WorkerRpcConfig,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -146,7 +146,8 @@ fn run(runtime: &tokio::runtime::Runtime) -> Result<(), String> {
         Duration::from_secs(5 * 60),
         action_journal,
     )
-    .map_err(|_| "invalid worker configuration".to_owned())?;
+    .map_err(|_| "invalid worker configuration".to_owned())?
+    .with_session_option_support(SessionOptionSupport::single_host_default());
     let shard_config = ProductionSessionShardConfig::new(
         worker_id.clone(),
         worker_epoch,

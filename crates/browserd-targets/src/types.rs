@@ -54,6 +54,12 @@ impl DocumentEpoch {
         Self(value)
     }
 
+    /// The raw monotonic epoch, for provenance reporting in action results.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn checked_next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }

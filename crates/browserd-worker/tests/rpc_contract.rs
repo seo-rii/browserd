@@ -5,6 +5,7 @@ use browserd_actions::{
 use browserd_core::{
     ActionId, ApprovalId, ArtifactId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
 };
+use browserd_features::BuiltinFeature;
 use browserd_worker::{
     WORKER_RPC_PROTOCOL_VERSION, WorkerActionApprovalRequirement, WorkerActionCommand,
     WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerActionStatus,
@@ -789,4 +790,95 @@ fn node_ref_reads_are_read_only_and_bounded() {
         assert!(command.is_valid());
         assert_eq!(command.kind(), ActionKind::ReadOnly);
     }
+}
+
+#[test]
+fn evaluate_requires_the_privileged_feature_and_other_commands_do_not() {
+    // The RPC layer maps `evaluate` to the privileged feature so the worker can gate it on the
+    // session profile before dispatch (BRD-004 / SPEC D-18).
+    assert_eq!(
+        WorkerActionCommand::Evaluate {
+            expression: "1 + 1".to_owned(),
+        }
+        .required_feature(),
+        Some(BuiltinFeature::PrivilegedEvaluate),
+    );
+    for command in [
+        WorkerActionCommand::GetTitle,
+        WorkerActionCommand::Reload,
+        WorkerActionCommand::Click {
+            node_ref: "0000000000000001".to_owned(),
+        },
+    ] {
+        assert_eq!(command.required_feature(), None);
+    }
+}
+
+#[test]
+fn isolation_requests_are_satisfied_only_by_equal_or_stronger_placement() {
+    use browserd_worker::WorkerIsolationProfile::{
+        DedicatedProcess, DedicatedWorker, SharedContext, TenantDedicatedShard,
+    };
+    // A placement equal to or stronger than the request satisfies it (a safe strengthening).
+    assert!(SharedContext.satisfied_by(SharedContext));
+    assert!(SharedContext.satisfied_by(DedicatedProcess));
+    assert!(TenantDedicatedShard.satisfied_by(DedicatedWorker));
+    assert!(DedicatedProcess.satisfied_by(DedicatedProcess));
+    // A request for isolation stronger than the placement cannot be honored.
+    assert!(!DedicatedProcess.satisfied_by(SharedContext));
+    assert!(!DedicatedWorker.satisfied_by(DedicatedProcess));
+    assert!(!TenantDedicatedShard.satisfied_by(SharedContext));
+}
+
+#[test]
+fn session_option_support_flags_the_first_unsupported_option() {
+    use browserd_worker::{SessionOptionSupport, WorkerSessionOptionsV1, WorkerViewport};
+    let support = SessionOptionSupport::single_host_default();
+    let supported = WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "en-US".to_owned(),
+        timezone: "UTC".to_owned(),
+        user_agent: None,
+        network_policy_id: "public-web-default".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 60,
+        idle_timeout_seconds: 30,
+        metadata: std::collections::BTreeMap::new(),
+    };
+    assert_eq!(support.unsupported_option(&supported), None);
+
+    let privileged = WorkerSessionOptionsV1 {
+        feature_profile: "privileged".to_owned(),
+        ..supported.clone()
+    };
+    assert_eq!(
+        support.unsupported_option(&privileged),
+        Some("feature_profile")
+    );
+
+    let private_network = WorkerSessionOptionsV1 {
+        network_class: "private".to_owned(),
+        ..supported.clone()
+    };
+    assert_eq!(
+        support.unsupported_option(&private_network),
+        Some("network_class")
+    );
+
+    let with_checkpoint = WorkerSessionOptionsV1 {
+        checkpoint_ref: Some("chk-1".to_owned()),
+        ..supported
+    };
+    assert_eq!(
+        support.unsupported_option(&with_checkpoint),
+        Some("checkpoint_ref")
+    );
 }

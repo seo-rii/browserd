@@ -2128,7 +2128,54 @@ async fn query_all_mints_an_opaque_ref_per_match() {
         "each match mints a non-empty opaque token"
     );
     assert_ne!(node_refs[0], node_refs[1], "handles are unique per match");
+    // BRD-026: a complete result reports its count, the bound, and no truncation, plus the
+    // document provenance the handles were minted against.
+    assert_eq!(parsed["returned_count"], 2);
+    assert_eq!(parsed["limit"], 256);
+    assert_eq!(parsed["truncated"], false);
+    assert!(parsed["document_epoch"].is_u64());
+    assert!(parsed["url_revision"].is_u64());
     assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn query_all_reports_truncation_when_matches_exceed_the_limit() {
+    let mut page = owned_page().await;
+    let query = spawn_action(&page, br#"{"type":"query_all","selector":"div"}"#, None);
+
+    let document = read_command(&mut page.reader).await;
+    assert_eq!(document["method"], "DOM.getDocument");
+    respond(&mut page.writer, &document, json!({"root": {"nodeId": 1}})).await;
+
+    // One more match than the owner will mint handles for, so the result must be truncated.
+    let total = 257;
+    let node_ids: Vec<i64> = (2..2 + total).collect();
+    let search = read_command(&mut page.reader).await;
+    assert_eq!(search["method"], "DOM.querySelectorAll");
+    respond(&mut page.writer, &search, json!({ "nodeIds": node_ids })).await;
+
+    // The owner describes only the first 256 matches.
+    for offset in 0..256 {
+        let describe = read_command(&mut page.reader).await;
+        assert_eq!(describe["method"], "DOM.describeNode");
+        respond(
+            &mut page.writer,
+            &describe,
+            json!({"node": {"backendNodeId": 1_000 + offset}}),
+        )
+        .await;
+    }
+
+    let bytes = succeeded_bytes(query.await.unwrap());
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let node_refs = parsed["node_refs"]
+        .as_array()
+        .expect("result carries a node_refs array");
+    assert_eq!(node_refs.len(), 256);
+    assert_eq!(parsed["returned_count"], 256);
+    assert_eq!(parsed["limit"], 256);
+    assert_eq!(parsed["truncated"], true);
     assert!(!page.manager.is_tainted());
 }
 
@@ -2183,6 +2230,11 @@ async fn get_text_reads_a_minted_node() {
         json!({"result": {"type": "string", "value": "Hello world"}}),
     )
     .await;
+    // BRD-010: the remote object minted by the resolve is released after a successful read.
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    assert_eq!(release["params"]["objectId"], "obj-1");
+    respond(&mut page.writer, &release, json!({})).await;
 
     let text: serde_json::Value =
         serde_json::from_slice(&succeeded_bytes(get_text.await.unwrap())).unwrap();
@@ -2219,6 +2271,9 @@ async fn get_attribute_reads_a_named_attribute_by_argument() {
         json!({"result": {"type": "string", "value": "https://example.test/x"}}),
     )
     .await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
 
     let parsed: serde_json::Value =
         serde_json::from_slice(&succeeded_bytes(get_attr.await.unwrap())).unwrap();
@@ -2277,6 +2332,9 @@ async fn extract_table_returns_rows_of_cell_text() {
         json!({"result": {"type": "object", "value": [["a", "b"], ["c", "d"]]}}),
     )
     .await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
 
     let parsed: serde_json::Value =
         serde_json::from_slice(&succeeded_bytes(extract.await.unwrap())).unwrap();
@@ -2408,6 +2466,49 @@ async fn double_click_dispatches_two_click_sequences() {
 }
 
 #[tokio::test]
+async fn double_click_release_failure_after_a_landed_press_is_outcome_unknown() {
+    // BRD-005: the first click's press lands (a mouse-down effect is exposed), then its release
+    // is rejected. The compound action must be outcome-unknown, not a clean known failure that
+    // implies nothing happened, because a button-down effect may persist.
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 402).await;
+
+    let double = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"double_click","node_ref":"{token}"}}"#).into_bytes(),
+        None,
+    );
+    let quads = read_command(&mut page.reader).await;
+    assert_eq!(quads["method"], "DOM.getContentQuads");
+    respond(
+        &mut page.writer,
+        &quads,
+        json!({"quads": [[0, 0, 20, 0, 20, 20, 0, 20]]}),
+    )
+    .await;
+
+    let press = read_command(&mut page.reader).await;
+    assert_eq!(press["method"], "Input.dispatchMouseEvent");
+    assert_eq!(press["params"]["type"], "mousePressed");
+    assert_eq!(press["params"]["clickCount"], 1);
+    respond(&mut page.writer, &press, json!({})).await;
+
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Input.dispatchMouseEvent");
+    assert_eq!(release["params"]["type"], "mouseReleased");
+    write_message(
+        &mut page.writer,
+        json!({
+            "id": release["id"].as_u64().unwrap(),
+            "error": {"code": -32000, "message": "release rejected"}
+        }),
+    )
+    .await;
+
+    assert_eq!(double.await.unwrap(), ActionExecutionResult::OutcomeUnknown);
+}
+
+#[tokio::test]
 async fn focus_focuses_the_resolved_node() {
     let mut page = owned_page().await;
     let token = mint_node(&mut page, 410).await;
@@ -2455,6 +2556,10 @@ async fn check_sets_the_checked_state_through_the_element() {
     )
     .await;
 
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
+
     assert_eq!(check.await.unwrap(), succeeded());
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
@@ -2487,6 +2592,10 @@ async fn fill_sets_the_value_through_the_element() {
         json!({"result": {"type": "boolean", "value": true}}),
     )
     .await;
+
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
 
     assert_eq!(fill.await.unwrap(), succeeded());
     assert!(!page.drain.0.load(Ordering::SeqCst));
@@ -2521,6 +2630,10 @@ async fn select_option_passes_the_requested_values() {
         json!({"result": {"type": "object", "value": ["a", "b"]}}),
     )
     .await;
+
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
 
     assert_eq!(select.await.unwrap(), succeeded());
     assert!(!page.drain.0.load(Ordering::SeqCst));
