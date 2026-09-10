@@ -2,8 +2,8 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -943,5 +943,163 @@ async fn opaque_capabilities_are_presented_only_through_the_injected_adapter()
         body_json(download).await["data"]["download_token"],
         "download-capability"
     );
+    Ok(())
+}
+
+#[derive(Default)]
+struct AdmissionGate {
+    state: Mutex<AdmissionGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct AdmissionGateState {
+    create_entered: bool,
+    released: bool,
+}
+
+/// Blocks inside `CreateSession` until released, so a test can hold a mutation admission slot and
+/// observe how the ingress admits or rejects concurrent requests. `GetAction` returns immediately
+/// so the read lane can be exercised while the mutation lane is saturated.
+struct BlockingCreateService {
+    gate: Arc<AdmissionGate>,
+    snapshot: ActionSnapshot,
+}
+
+impl ApiService for BlockingCreateService {
+    fn execute(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+    ) -> Result<ApiResponse, ApiError> {
+        request.authorize(principal)?;
+        request.validate()?;
+        match request {
+            ApiRequest::CreateSession { .. } => {
+                let mut state = self.gate.state.lock().expect("gate lock");
+                state.create_entered = true;
+                self.gate.changed.notify_all();
+                while !state.released {
+                    state = self.gate.changed.wait(state).expect("gate wait");
+                }
+                Err(ApiError::new(ErrorCode::Internal, "released"))
+            }
+            ApiRequest::GetAction(_) => {
+                Ok(ApiResponse::Action(ApiEnvelope::new(self.snapshot.clone())))
+            }
+            _ => Err(ApiError::new(ErrorCode::Internal, "unexpected request")),
+        }
+    }
+}
+
+fn admission_app(
+    service: Arc<dyn ApiService>,
+    principal: AuthenticatedPrincipal,
+) -> Result<axum::Router, Box<dyn Error>> {
+    Ok(router(
+        HttpConfig::default().with_admission_limits(4, 1, 1)?,
+        service,
+        Arc::new(StaticAuth { principal }),
+        Arc::new(RejectViewer),
+        Arc::new(StaticReadiness(true)),
+    ))
+}
+
+#[tokio::test]
+async fn ingress_admission_rejects_overflow_mutations_but_keeps_the_read_lane_open()
+-> Result<(), Box<dyn Error>> {
+    // A single mutation slot is held by an in-flight create, so a concurrent create overflows and
+    // is rejected with 503 before reaching the service, while a read stays admitted on its own
+    // reserved lane (BRD-019).
+    let gate = Arc::new(AdmissionGate::default());
+    let snapshot = terminal_action_snapshot(
+        ActionId::new(),
+        TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::WorkerLost),
+    )?;
+    let service = Arc::new(BlockingCreateService {
+        gate: Arc::clone(&gate),
+        snapshot,
+    });
+    let principal = principal(&["session:create", "session:read"])?;
+    let app = admission_app(service, principal)?;
+
+    let create_body = include_str!("../../browserd-api/tests/session_create_fixture.json");
+    let held_app = app.clone();
+    let held_body = create_body.to_owned();
+    let held = tokio::spawn(async move {
+        held_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/sessions")
+                    .header("authorization", "Bearer valid")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(held_body))
+                    .expect("request builds"),
+            )
+            .await
+    });
+
+    // Wait until the held create is inside the service, holding the only mutation slot.
+    loop {
+        if gate.state.lock().expect("gate lock").create_entered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // A second create cannot be admitted while the mutation lane is saturated.
+    let overflow = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions")
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(create_body))?,
+        )
+        .await?;
+    assert_eq!(overflow.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // A read is still admitted on its reserved lane even though mutations are saturated.
+    let read = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v1/sessions/{}/actions/{}",
+                    SessionId::new(),
+                    ActionId::new()
+                ))
+                .header("authorization", "Bearer valid")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_ne!(read.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Release the held create; its slot frees and the ingress accepts a fresh mutation again.
+    {
+        let mut state = gate.state.lock().expect("gate lock");
+        state.released = true;
+        gate.changed.notify_all();
+    }
+    let _held = held.await.expect("held create task joins");
+
+    let after = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions")
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(create_body))?,
+        )
+        .await?;
+    assert_ne!(after.status(), StatusCode::SERVICE_UNAVAILABLE);
     Ok(())
 }

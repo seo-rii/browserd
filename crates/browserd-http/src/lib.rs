@@ -2,9 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -31,7 +32,7 @@ use browserd_artifacts::DownloadToken;
 use browserd_auth::AuthenticatedPrincipal;
 use browserd_core::{
     ActionId, ArtifactId, CreateOperationState, IsolationProfile, OperationId, PageId,
-    PlacementFence, RetryClass, SessionId, SessionLifecycle, WorkerId,
+    PlacementFence, RetryClass, SessionId, SessionLifecycle, TenantId, WorkerId,
 };
 use browserd_session::{ClientBinding, OwnershipFence, ReconnectToken, SessionTime};
 use browserd_viewer::{ViewerConnection, ViewerFrame, ViewerTicket};
@@ -47,6 +48,133 @@ const SESSION_BODY_LIMIT: usize = 65_536;
 const ACTION_BODY_LIMIT: usize = browserd_api::MAX_ACTION_BODY_BYTES;
 const SMALL_BODY_LIMIT: usize = 16_384;
 const VIEWER_PROTOCOL: &str = "browser-viewer.v1";
+
+/// Default global cap on authenticated mutating requests admitted for downstream service work at
+/// once. Bounds how many requests (and their decoded bodies) can queue in front of the blocking
+/// worker/DB path (BRD-019).
+const DEFAULT_MAX_IN_FLIGHT_MUTATIONS: usize = 256;
+/// Default per-tenant cap on concurrent mutating requests, so one tenant cannot consume the whole
+/// global mutation budget and starve others.
+const DEFAULT_MAX_IN_FLIGHT_PER_TENANT: usize = 32;
+/// Default cap on concurrent read-only requests. Reads use a lane reserved from the mutation
+/// budget so receipt/status lookups stay responsive even while mutations are saturated.
+const DEFAULT_MAX_IN_FLIGHT_READS: usize = 512;
+
+/// Per-tenant and global in-flight accounting for mutating requests, held under one lock so the
+/// two limits are enforced consistently. The map only holds tenants with live requests.
+#[derive(Default)]
+struct MutationAdmissionState {
+    global: usize,
+    per_tenant: HashMap<TenantId, usize>,
+}
+
+/// Bounded admission control applied after authentication and before body processing and
+/// downstream service work. Read-only requests occupy a separate reserved lane from mutating
+/// requests, and mutating requests are bounded both globally and per tenant (BRD-019).
+struct IngressAdmission {
+    reads: Mutex<usize>,
+    max_reads: usize,
+    mutations: Mutex<MutationAdmissionState>,
+    max_mutations_global: usize,
+    max_mutations_per_tenant: usize,
+}
+
+impl IngressAdmission {
+    fn new(max_reads: usize, max_mutations_global: usize, max_mutations_per_tenant: usize) -> Self {
+        Self {
+            reads: Mutex::new(0),
+            max_reads,
+            mutations: Mutex::new(MutationAdmissionState::default()),
+            max_mutations_global,
+            max_mutations_per_tenant,
+        }
+    }
+
+    /// Admits a read-only request into the reserved read lane, or returns `None` when the lane is
+    /// saturated. The returned guard releases the slot on drop.
+    fn admit_read(self: &Arc<Self>) -> Option<AdmissionGuard> {
+        let mut reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *reads >= self.max_reads {
+            return None;
+        }
+        *reads += 1;
+        Some(AdmissionGuard::Read(Arc::clone(self)))
+    }
+
+    /// Admits a mutating request when both the global and the tenant's budget have room, or
+    /// returns `None` otherwise. The returned guard releases both slots on drop.
+    fn admit_mutation(self: &Arc<Self>, tenant: &TenantId) -> Option<AdmissionGuard> {
+        let mut state = self
+            .mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tenant_in_flight = state.per_tenant.get(tenant).copied().unwrap_or(0);
+        if state.global >= self.max_mutations_global
+            || tenant_in_flight >= self.max_mutations_per_tenant
+        {
+            return None;
+        }
+        state.global += 1;
+        *state.per_tenant.entry(tenant.clone()).or_insert(0) += 1;
+        Some(AdmissionGuard::Mutation {
+            admission: Arc::clone(self),
+            tenant: tenant.clone(),
+        })
+    }
+
+    fn release_read(&self) {
+        let mut reads = self
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reads = reads.saturating_sub(1);
+    }
+
+    fn release_mutation(&self, tenant: &TenantId) {
+        let mut state = self
+            .mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.global = state.global.saturating_sub(1);
+        if let Some(count) = state.per_tenant.get_mut(tenant) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.per_tenant.remove(tenant);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked_tenants(&self) -> usize {
+        self.mutations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .per_tenant
+            .len()
+    }
+}
+
+/// Releases its admission slot(s) when dropped, so a request holds capacity for exactly as long
+/// as it is being processed.
+enum AdmissionGuard {
+    Read(Arc<IngressAdmission>),
+    Mutation {
+        admission: Arc<IngressAdmission>,
+        tenant: TenantId,
+    },
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        match self {
+            Self::Read(admission) => admission.release_read(),
+            Self::Mutation { admission, tenant } => admission.release_mutation(tenant),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthenticationError;
@@ -255,6 +383,9 @@ pub trait Readiness: Send + Sync {
 pub struct HttpConfig {
     global_body_limit: usize,
     viewer_socket_limits: ViewerSocketLimits,
+    max_in_flight_reads: usize,
+    max_in_flight_mutations: usize,
+    max_in_flight_per_tenant: usize,
 }
 
 impl Default for HttpConfig {
@@ -262,6 +393,9 @@ impl Default for HttpConfig {
         Self {
             global_body_limit: GLOBAL_BODY_LIMIT,
             viewer_socket_limits: ViewerSocketLimits::default(),
+            max_in_flight_reads: DEFAULT_MAX_IN_FLIGHT_READS,
+            max_in_flight_mutations: DEFAULT_MAX_IN_FLIGHT_MUTATIONS,
+            max_in_flight_per_tenant: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
         }
     }
 }
@@ -273,7 +407,7 @@ impl HttpConfig {
         }
         Ok(Self {
             global_body_limit,
-            viewer_socket_limits: ViewerSocketLimits::default(),
+            ..Self::default()
         })
     }
 
@@ -281,6 +415,25 @@ impl HttpConfig {
     pub const fn with_viewer_socket_limits(mut self, limits: ViewerSocketLimits) -> Self {
         self.viewer_socket_limits = limits;
         self
+    }
+
+    /// Sets the ingress admission limits: the read-only lane cap, the global mutation cap, and the
+    /// per-tenant mutation cap. The per-tenant cap is clamped to the global cap, and every limit
+    /// must be non-zero so the ingress never wedges itself closed (BRD-019).
+    pub fn with_admission_limits(
+        mut self,
+        max_in_flight_reads: usize,
+        max_in_flight_mutations: usize,
+        max_in_flight_per_tenant: usize,
+    ) -> Result<Self, ApiError> {
+        if max_in_flight_reads == 0 || max_in_flight_mutations == 0 || max_in_flight_per_tenant == 0
+        {
+            return Err(ApiError::invalid_request("invalid admission limit"));
+        }
+        self.max_in_flight_reads = max_in_flight_reads;
+        self.max_in_flight_mutations = max_in_flight_mutations;
+        self.max_in_flight_per_tenant = max_in_flight_per_tenant.min(max_in_flight_mutations);
+        Ok(self)
     }
 }
 
@@ -292,6 +445,7 @@ struct HttpState {
     readiness: Arc<dyn Readiness>,
     global_body_limit: usize,
     viewer_socket_limits: ViewerSocketLimits,
+    admission: Arc<IngressAdmission>,
 }
 
 pub fn router(
@@ -313,6 +467,11 @@ pub fn router(
             readiness,
             global_body_limit: config.global_body_limit,
             viewer_socket_limits: config.viewer_socket_limits,
+            admission: Arc::new(IngressAdmission::new(
+                config.max_in_flight_reads,
+                config.max_in_flight_mutations,
+                config.max_in_flight_per_tenant,
+            )),
         })
         .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(from_fn(request_id_middleware))
@@ -821,6 +980,20 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
     let principal = match state.authenticator.authenticate(bearer) {
         Ok(value) => value,
         Err(_) => return transport_error(StatusCode::UNAUTHORIZED, "unauthenticated"),
+    };
+    // Admit the request into a bounded in-flight lane before decoding its body or handing it to
+    // the blocking service path, so requests and their decoded payloads cannot pile up without
+    // limit when the worker or database stalls. Read-only requests use a reserved lane; mutating
+    // requests are bounded globally and per tenant. The guard holds the slot until this handler
+    // returns (BRD-019).
+    let _admission = if method == Method::GET {
+        state.admission.admit_read()
+    } else {
+        state.admission.admit_mutation(principal.tenant_id())
+    };
+    let _admission = match _admission {
+        Some(guard) => guard,
+        None => return transport_error(StatusCode::SERVICE_UNAVAILABLE, "overloaded"),
     };
     let query = request.uri().query().unwrap_or_default().to_owned();
     if query.len() > 4_096
@@ -1621,4 +1794,90 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
         ),
     };
     json_response(status, json!({"data":data,"trace_id":trace_id}))
+}
+
+#[cfg(test)]
+mod admission_tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn read_lane_bounds_and_releases_reads() {
+        let admission = Arc::new(IngressAdmission::new(1, 4, 4));
+        let held = admission.admit_read().expect("first read is admitted");
+        assert!(
+            admission.admit_read().is_none(),
+            "the read lane is saturated at its cap"
+        );
+        drop(held);
+        assert!(
+            admission.admit_read().is_some(),
+            "releasing a read frees the slot"
+        );
+    }
+
+    #[test]
+    fn mutation_global_cap_bounds_across_tenants() {
+        let admission = Arc::new(IngressAdmission::new(4, 2, 2));
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let _first = admission.admit_mutation(&tenant_a).expect("first admitted");
+        let _second = admission
+            .admit_mutation(&tenant_b)
+            .expect("second admitted");
+        assert!(
+            admission.admit_mutation(&tenant_a).is_none(),
+            "the global mutation cap is reached regardless of tenant"
+        );
+    }
+
+    #[test]
+    fn per_tenant_cap_does_not_starve_other_tenants() {
+        let admission = Arc::new(IngressAdmission::new(4, 8, 1));
+        let noisy = TenantId::new();
+        let quiet = TenantId::new();
+        let _held = admission
+            .admit_mutation(&noisy)
+            .expect("noisy tenant admitted");
+        assert!(
+            admission.admit_mutation(&noisy).is_none(),
+            "the noisy tenant is capped"
+        );
+        assert!(
+            admission.admit_mutation(&quiet).is_some(),
+            "a different tenant still has global capacity"
+        );
+    }
+
+    #[test]
+    fn releasing_a_mutation_frees_capacity_and_prunes_the_tenant() {
+        let admission = Arc::new(IngressAdmission::new(4, 1, 1));
+        let tenant = TenantId::new();
+        let held = admission.admit_mutation(&tenant).expect("admitted");
+        assert!(admission.admit_mutation(&tenant).is_none());
+        assert_eq!(admission.tracked_tenants(), 1);
+        drop(held);
+        assert_eq!(
+            admission.tracked_tenants(),
+            0,
+            "a fully released tenant is pruned from the map"
+        );
+        assert!(
+            admission.admit_mutation(&tenant).is_some(),
+            "released capacity is reusable"
+        );
+    }
+
+    #[test]
+    fn reads_and_mutations_use_independent_lanes() {
+        let admission = Arc::new(IngressAdmission::new(1, 1, 1));
+        let tenant = TenantId::new();
+        let _read = admission.admit_read().expect("read admitted");
+        let _mutation = admission
+            .admit_mutation(&tenant)
+            .expect("a saturated read lane does not block mutations");
+        assert!(admission.admit_read().is_none());
+        assert!(admission.admit_mutation(&tenant).is_none());
+    }
 }
