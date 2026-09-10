@@ -1192,3 +1192,85 @@ async fn redis_read_only_unknown_can_be_resolved_without_a_mutation_lane() {
     assert_eq!(resolved.resolution(), Some(&annotation));
     delete_fixture(&fixture).await;
 }
+
+#[tokio::test]
+async fn redis_succeeded_result_body_survives_serialization_and_a_store_restart() {
+    // R01: a succeeded action's result body must round-trip through Redis and be readable by a
+    // separate store instance (a restarted gateway), not only its digest.
+    let Some(fixture) = redis_fixture("result-body-durability").await else {
+        return;
+    };
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let action_id = ActionId::new();
+    let placement = placement(17, 61);
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim(
+                tenant_id.clone(),
+                session_id.clone(),
+                action_id.clone(),
+                "result-body-durability",
+                9,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("claim should persist");
+    let action_sequence = claimed.snapshot().action_sequence();
+    let dispatch_id = DispatchId::new();
+    let armed = fixture
+        .store
+        .arm_dispatch(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            claimed.snapshot().revision(),
+            &placement,
+            dispatch_id.clone(),
+            at(2),
+        )
+        .await
+        .expect("dispatch must arm before a worker result");
+
+    let body = br#"{"text":"durable result body via redis"}"#.to_vec();
+    let digest = ResultDigest::new([7; 32]);
+    let recorded = fixture
+        .store
+        .record_worker_result(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            armed.revision(),
+            &placement,
+            &dispatch_id,
+            action_sequence,
+            BrowserResult::Succeeded(digest),
+            Some(body.clone()),
+            at(3),
+        )
+        .await
+        .expect("worker result should record");
+    assert_eq!(recorded.result_content(), Some(body.as_slice()));
+
+    let restarted = RedisGatewayActionStore::connect(fixture.config.clone())
+        .await
+        .expect("a separate Redis action store should connect");
+    let recovered = restarted
+        .get_effective_action(&tenant_id, &session_id, &action_id)
+        .await
+        .expect("persisted action lookup should succeed")
+        .expect("persisted action should be visible after a restart");
+    assert_eq!(
+        recovered.result_content(),
+        Some(body.as_slice()),
+        "the result body, not just its digest, survives Redis and a store restart"
+    );
+    assert_eq!(
+        recovered.terminal().map(|terminal| terminal.detail()),
+        Some(TerminalDetail::Succeeded(digest))
+    );
+    delete_fixture(&fixture).await;
+}
