@@ -986,3 +986,44 @@ fn succeeded_result_body_is_durable_across_get_and_same_key_resubmission()
     assert_eq!(fixture.worker.enqueue_count.load(Ordering::Acquire), 1);
     Ok(())
 }
+
+#[test]
+fn terminal_action_is_retrievable_after_a_gateway_restart_without_a_live_session()
+-> Result<(), Box<dyn Error>> {
+    // Complete a succeeded action so the durable action store holds its terminal result body.
+    let fixture = Fixture::new(EnqueueMode::Succeed)?;
+    let completed = submit_after_releasing_pending(&fixture, fixture.command(Uuid::new_v4()))?;
+    assert_eq!(completed.state(), ActionState::Succeeded);
+    assert_eq!(completed.result_content(), Some(SUCCEEDED_RESULT_BODY));
+    let action_id = completed.action_id().clone();
+
+    // A restarted gateway: a fresh runtime with an empty in-memory session map, sharing only the
+    // durable action store. The session placement is not hydrated, so a terminal GET must succeed
+    // from durable state alone rather than failing SessionNotFound (BRD-002).
+    let actor_config =
+        CoordinationActorConfig::new(256, 32, Duration::from_secs(2), Duration::from_secs(5))?;
+    let placement =
+        GatewayWorkerPlacement::new(WorkerId::new("durable-action-worker")?, 41, 7, 29)?;
+    let restarted = Arc::new(GatewayWorkerRuntime::with_action_coordination(
+        Arc::clone(&fixture.worker),
+        placement,
+        Arc::clone(&fixture.store),
+        actor_config,
+    )?);
+    let restarted_router = ApiRouter::new(restarted);
+
+    let fetched = action_snapshot(restarted_router.execute(
+        &fixture.principal,
+        ApiRequest::GetAction(ActionGetRequest {
+            session_id: fixture.session_id.clone(),
+            action_id,
+        }),
+    )?)?;
+    assert_eq!(fetched.state(), ActionState::Succeeded);
+    assert_eq!(
+        fetched.result_content(),
+        Some(SUCCEEDED_RESULT_BODY),
+        "a restarted gateway returns the terminal action and its body from durable state"
+    );
+    Ok(())
+}

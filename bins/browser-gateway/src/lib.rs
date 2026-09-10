@@ -1631,7 +1631,11 @@ where
         principal: &browserd_auth::AuthenticatedPrincipal,
         command: ActionGetRequest,
     ) -> Result<ApiResponse, ApiError> {
-        let record = self.session_record(principal.tenant_id(), &command.session_id)?;
+        // Read the durable action before requiring a live session record, so a terminal action
+        // (including its persisted result body) is retrievable even after a gateway restart or
+        // from another gateway that has not hydrated this session's placement (BRD-002). A live
+        // worker query is only needed, and the session record only required, when the action is
+        // still non-terminal.
         let durable = self
             .actions
             .get_effective_action(
@@ -1648,6 +1652,7 @@ where
                 .map(ApiEnvelope::new)
                 .map(ApiResponse::Action);
         }
+        let record = self.session_record(principal.tenant_id(), &command.session_id)?;
         let dispatch_id = match durable.delivery() {
             ActionDeliveryEvidence::DispatchArmed(dispatch_id)
             | ActionDeliveryEvidence::ExposurePossible(dispatch_id) => dispatch_id.clone(),
