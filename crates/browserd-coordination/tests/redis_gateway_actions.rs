@@ -568,6 +568,7 @@ async fn redis_worker_result_and_loss_write_have_one_stable_winner() {
                     &result_dispatch,
                     ActionSequence::new(1),
                     BrowserResult::Succeeded(ResultDigest::new([9; 32])),
+                    None,
                     at(3),
                 )
                 .await

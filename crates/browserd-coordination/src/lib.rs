@@ -32,8 +32,8 @@ pub use gateway_action_actor::GatewayActionBlockingClient;
 pub use gateway_actions::{
     ClaimGatewayAction, GatewayActionClaimOutcome, GatewayActionCoordination,
     GatewayActionCoordinationError, GatewayActionPlacement, GatewayActionSnapshot,
-    MemoryGatewayActionStore, RedisGatewayActionConfig, RedisGatewayActionStore, SessionLossClaim,
-    SessionLossOutcome,
+    MAX_DURABLE_RESULT_CONTENT_BYTES, MemoryGatewayActionStore, RedisGatewayActionConfig,
+    RedisGatewayActionStore, SessionLossClaim, SessionLossOutcome,
 };
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
 pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};

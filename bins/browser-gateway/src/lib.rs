@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use browserd_actions::{
     ActionDeliveryEvidence, ActionKind, ActionSnapshot, ActionSnapshotFacts, ApprovalDecision,
-    CanonicalRequestHash as ActionCanonicalRequestHash, DispatchId, IdempotencyKey,
+    BrowserResult, CanonicalRequestHash as ActionCanonicalRequestHash, DispatchId, IdempotencyKey,
     KnownFailureReason, OutcomeUnknownReason, ResolutionAnnotation, TerminalDetail, TransportLoss,
 };
 use browserd_api::{
@@ -710,8 +710,9 @@ fn coordinated_action_snapshot(
         approval_decision,
         terminal_detail,
         resolution: snapshot.resolution().cloned(),
-        // The durable ledger persists only the result digest, not its content.
-        result_content: None,
+        // The durable ledger persists a succeeded action's result body alongside its digest, so
+        // GET, same-key resubmission, and restart all return the same bytes as the live receipt.
+        result_content: snapshot.result_content().map(<[u8]>::to_vec),
     })
     .map_err(|_| ApiError::new(ErrorCode::Internal, "durable action state is contradictory"))
 }
@@ -1154,17 +1155,37 @@ where
         let Some(detail) = terminal_detail else {
             return Ok(worker_snapshot);
         };
-        let effective = match self.actions.record_worker_terminal(
-            tenant_id,
-            session_id,
-            durable.action_id(),
-            durable.revision(),
-            &record.action_placement,
-            dispatch_id,
-            durable.action_sequence(),
-            detail,
-            Utc::now(),
-        ) {
+        // Persist a succeeded action's result body durably so every later read path (GET,
+        // same-key resubmission, gateway/worker restart) returns the same bytes the completing
+        // receipt carried, instead of only the digest.
+        let recorded = match detail {
+            TerminalDetail::Succeeded(digest) if worker_snapshot.result_content().is_some() => {
+                self.actions.record_worker_result(
+                    tenant_id,
+                    session_id,
+                    durable.action_id(),
+                    durable.revision(),
+                    &record.action_placement,
+                    dispatch_id,
+                    durable.action_sequence(),
+                    BrowserResult::Succeeded(digest),
+                    worker_snapshot.result_content().map(<[u8]>::to_vec),
+                    Utc::now(),
+                )
+            }
+            _ => self.actions.record_worker_terminal(
+                tenant_id,
+                session_id,
+                durable.action_id(),
+                durable.revision(),
+                &record.action_placement,
+                dispatch_id,
+                durable.action_sequence(),
+                detail,
+                Utc::now(),
+            ),
+        };
+        let effective = match recorded {
             Ok(effective) => effective,
             Err(error) => {
                 self.effective_action_after_race(tenant_id, session_id, durable.action_id(), error)?

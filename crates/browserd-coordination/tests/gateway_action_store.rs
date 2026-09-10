@@ -9,8 +9,9 @@ use browserd_actions::{
 };
 use browserd_coordination::{
     ClaimGatewayAction, DirectoryFence, GatewayActionClaimOutcome, GatewayActionCoordination,
-    GatewayActionCoordinationError, GatewayActionPlacement, MemoryCoordinationDatabase,
-    MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome, StoreConfig,
+    GatewayActionCoordinationError, GatewayActionPlacement, MAX_DURABLE_RESULT_CONTENT_BYTES,
+    MemoryCoordinationDatabase, MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome,
+    StoreConfig,
 };
 use browserd_core::{ActionId, ActionState, SessionId, TenantId, WorkerId};
 use chrono::{TimeZone, Utc};
@@ -345,6 +346,7 @@ async fn session_loss_fence_drives_queries_before_bounded_materialization() {
                 &dispatch_id,
                 ActionSequence::new(12),
                 BrowserResult::Succeeded(ResultDigest::new([9; 32])),
+                None,
                 at(4),
             )
             .await,
@@ -486,6 +488,7 @@ async fn worker_result_and_loss_fence_have_one_stable_linearization_winner() {
                     &result_dispatch,
                     ActionSequence::new(1),
                     BrowserResult::Succeeded(ResultDigest::new([8; 32])),
+                    None,
                     at(3),
                 )
                 .await
@@ -593,4 +596,183 @@ async fn worker_terminal_receipts_preserve_worker_evidence_source() {
             Some(ActionTerminalSource::Worker)
         );
     }
+}
+
+/// Arms a fresh dispatched action and returns the state needed to record its worker result.
+async fn armed_action(
+    store: &MemoryGatewayActionStore,
+    tenant_id: &TenantId,
+    session_id: &SessionId,
+    action_id: &ActionId,
+    idempotency_key: &str,
+    placement: &GatewayActionPlacement,
+) -> (DispatchId, ActionSequence, u64) {
+    let claimed = store
+        .claim_action(
+            claim(
+                tenant_id.clone(),
+                session_id.clone(),
+                action_id.clone(),
+                idempotency_key,
+                9,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("claim should succeed");
+    let action_sequence = claimed.snapshot().action_sequence();
+    let dispatch_id = DispatchId::new();
+    let armed = store
+        .arm_dispatch(
+            tenant_id,
+            session_id,
+            action_id,
+            claimed.snapshot().revision(),
+            placement,
+            dispatch_id.clone(),
+            at(2),
+        )
+        .await
+        .expect("dispatch should arm");
+    (dispatch_id, action_sequence, armed.revision())
+}
+
+#[tokio::test]
+async fn record_worker_result_persists_result_body_across_reads() {
+    let database = MemoryCoordinationDatabase::default();
+    let store = MemoryGatewayActionStore::attach(database, StoreConfig::default());
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let action_id = ActionId::new();
+    let placement = placement(3, 5);
+    let (dispatch_id, action_sequence, revision) = armed_action(
+        &store,
+        &tenant_id,
+        &session_id,
+        &action_id,
+        "result-body-durability",
+        &placement,
+    )
+    .await;
+
+    let body = br#"{"text":"durable result body"}"#.to_vec();
+    let digest = ResultDigest::new([7; 32]);
+    let recorded = store
+        .record_worker_result(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            revision,
+            &placement,
+            &dispatch_id,
+            action_sequence,
+            BrowserResult::Succeeded(digest),
+            Some(body.clone()),
+            at(3),
+        )
+        .await
+        .expect("worker result should be recorded");
+    assert_eq!(recorded.result_content(), Some(body.as_slice()));
+    assert_eq!(
+        recorded.terminal().map(|evidence| evidence.detail()),
+        Some(TerminalDetail::Succeeded(digest))
+    );
+
+    // A durable re-read (the GET / same-key / restart path) returns the same body, not just the
+    // digest. This is the regression guard for the gateway dropping successful result content.
+    let reread = store
+        .get_effective_action(&tenant_id, &session_id, &action_id)
+        .await
+        .expect("effective lookup should succeed")
+        .expect("action should exist");
+    assert_eq!(reread.result_content(), Some(body.as_slice()));
+
+    // Recording the same result again is idempotent and preserves the stored body.
+    let replay = store
+        .record_worker_result(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            revision,
+            &placement,
+            &dispatch_id,
+            action_sequence,
+            BrowserResult::Succeeded(digest),
+            Some(body.clone()),
+            at(4),
+        )
+        .await
+        .expect("idempotent replay should succeed");
+    assert_eq!(replay.result_content(), Some(body.as_slice()));
+    assert_eq!(replay.revision(), recorded.revision());
+}
+
+#[tokio::test]
+async fn record_worker_result_rejects_oversized_or_mismatched_body() {
+    let database = MemoryCoordinationDatabase::default();
+    let store = MemoryGatewayActionStore::attach(database, StoreConfig::default());
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let placement = placement(3, 5);
+
+    let oversized_id = ActionId::new();
+    let (oversized_dispatch, oversized_sequence, oversized_revision) = armed_action(
+        &store,
+        &tenant_id,
+        &session_id,
+        &oversized_id,
+        "result-body-oversized",
+        &placement,
+    )
+    .await;
+    let oversized = vec![b'a'; MAX_DURABLE_RESULT_CONTENT_BYTES + 1];
+    assert_eq!(
+        store
+            .record_worker_result(
+                &tenant_id,
+                &session_id,
+                &oversized_id,
+                oversized_revision,
+                &placement,
+                &oversized_dispatch,
+                oversized_sequence,
+                BrowserResult::Succeeded(ResultDigest::new([7; 32])),
+                Some(oversized),
+                at(3),
+            )
+            .await,
+        Err(GatewayActionCoordinationError::CorruptState)
+    );
+
+    // A result body only pairs with a succeeded action; anything else is a fail-closed rejection.
+    // Use a fresh session so the still-in-flight oversized action does not hold the dispatch lane.
+    let mismatch_session = SessionId::new();
+    let mismatch_id = ActionId::new();
+    let (mismatch_dispatch, mismatch_sequence, mismatch_revision) = armed_action(
+        &store,
+        &tenant_id,
+        &mismatch_session,
+        &mismatch_id,
+        "result-body-mismatch",
+        &placement,
+    )
+    .await;
+    assert_eq!(
+        store
+            .record_worker_result(
+                &tenant_id,
+                &mismatch_session,
+                &mismatch_id,
+                mismatch_revision,
+                &placement,
+                &mismatch_dispatch,
+                mismatch_sequence,
+                BrowserResult::FailedKnown(KnownFailureReason::BrowserRejected),
+                Some(b"body-without-success".to_vec()),
+                at(3),
+            )
+            .await,
+        Err(GatewayActionCoordinationError::CorruptState)
+    );
 }

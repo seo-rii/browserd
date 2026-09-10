@@ -21,7 +21,8 @@ use uuid::{Uuid, Version};
 use super::{
     ClaimGatewayAction, GatewayActionClaimOutcome, GatewayActionCoordination,
     GatewayActionCoordinationError, GatewayActionPlacement, GatewayActionSnapshot,
-    MAX_MATERIALIZATION_LIMIT, SessionLossClaim, SessionLossOutcome, validated_idempotency_key,
+    MAX_DURABLE_RESULT_CONTENT_BYTES, MAX_MATERIALIZATION_LIMIT, SessionLossClaim,
+    SessionLossOutcome, validate_durable_result_body, validated_idempotency_key,
 };
 use crate::{DirectoryFence, StoreConfig};
 
@@ -488,6 +489,8 @@ struct PersistedGatewayAction {
     placement: PersistedPlacement,
     evidence: ActionEvidence,
     resolution: Option<ResolutionAnnotation>,
+    #[serde(default)]
+    result_content: Option<Vec<u8>>,
     revision: u64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -510,6 +513,7 @@ impl PersistedGatewayAction {
             placement: PersistedPlacement::from(claim.placement()),
             evidence: ActionEvidence::new(),
             resolution: None,
+            result_content: None,
             revision: 0,
             created_at: now,
             updated_at: now,
@@ -528,6 +532,7 @@ impl PersistedGatewayAction {
             placement: PersistedPlacement::from(&snapshot.placement),
             evidence: snapshot.evidence.clone(),
             resolution: snapshot.resolution.clone(),
+            result_content: snapshot.result_content.clone(),
             revision: snapshot.revision,
             created_at: snapshot.created_at,
             updated_at: snapshot.updated_at,
@@ -542,6 +547,13 @@ impl PersistedGatewayAction {
         if action_sequence.get() == 0 || self.retain_until <= self.created_at {
             return Err(GatewayActionCoordinationError::InvalidRedisResponse);
         }
+        if self
+            .result_content
+            .as_ref()
+            .is_some_and(|body| body.is_empty() || body.len() > MAX_DURABLE_RESULT_CONTENT_BYTES)
+        {
+            return Err(GatewayActionCoordinationError::InvalidRedisResponse);
+        }
         Ok(GatewayActionSnapshot {
             tenant_id: self.tenant_id,
             session_id: self.session_id,
@@ -553,6 +565,7 @@ impl PersistedGatewayAction {
             placement: self.placement.into_placement()?,
             evidence: self.evidence,
             resolution: self.resolution,
+            result_content: self.result_content,
             action_sequence,
             revision: self.revision,
             created_at: self.created_at,
@@ -1142,8 +1155,10 @@ impl GatewayActionCoordination for RedisGatewayActionStore {
         dispatch_id: &DispatchId,
         action_sequence: ActionSequence,
         result: BrowserResult,
+        result_body: Option<Vec<u8>>,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        validate_durable_result_body(result, &result_body)?;
         self.mutate_action(
             tenant_id,
             session_id,
@@ -1152,16 +1167,20 @@ impl GatewayActionCoordination for RedisGatewayActionStore {
             placement,
             now,
             false,
-            |snapshot| {
+            move |snapshot| {
                 if action_sequence.get() == 0 {
                     return Err(GatewayActionCoordinationError::InvalidActionSequence);
                 }
                 if snapshot.action_sequence() != action_sequence {
                     return Err(GatewayActionCoordinationError::ActionSequenceConflict);
                 }
-                Ok(snapshot
+                let mutation = snapshot
                     .evidence
-                    .record_worker_result(dispatch_id, result)?)
+                    .record_worker_result(dispatch_id, result)?;
+                if matches!(mutation, ActionEvidenceMutation::Recorded) {
+                    snapshot.result_content = result_body.clone();
+                }
+                Ok(mutation)
             },
         )
         .await

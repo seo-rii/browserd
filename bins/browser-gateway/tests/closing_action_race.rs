@@ -217,6 +217,7 @@ impl GatewayActionCoordination for ClaimProbeStore {
         _dispatch_id: &DispatchId,
         _action_sequence: ActionSequence,
         _result: BrowserResult,
+        _result_body: Option<Vec<u8>>,
         _now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
         self.reject()

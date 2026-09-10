@@ -54,6 +54,7 @@ enum Command {
         dispatch_id: DispatchId,
         action_sequence: ActionSequence,
         result: BrowserResult,
+        result_body: Option<Vec<u8>>,
         now: DateTime<Utc>,
         response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
     },
@@ -221,6 +222,7 @@ impl GatewayActionBlockingClient {
                                 dispatch_id,
                                 action_sequence,
                                 result,
+                                result_body,
                                 now,
                                 response,
                             } => {
@@ -235,6 +237,7 @@ impl GatewayActionBlockingClient {
                                             &dispatch_id,
                                             action_sequence,
                                             result,
+                                            result_body,
                                             now,
                                         )
                                         .await,
@@ -469,6 +472,7 @@ impl GatewayActionBlockingClient {
         dispatch_id: &DispatchId,
         action_sequence: ActionSequence,
         result: BrowserResult,
+        result_body: Option<Vec<u8>>,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
         self.submit(
@@ -481,6 +485,7 @@ impl GatewayActionBlockingClient {
                 dispatch_id: dispatch_id.clone(),
                 action_sequence,
                 result,
+                result_body,
                 now,
                 response,
             },

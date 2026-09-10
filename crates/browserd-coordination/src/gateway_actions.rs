@@ -19,6 +19,33 @@ pub use redis::{RedisGatewayActionConfig, RedisGatewayActionStore};
 
 const MAX_MATERIALIZATION_LIMIT: usize = 1_000;
 
+/// Upper bound on the durable result body persisted with a succeeded action, matching the
+/// worker's action result cap. Bodies larger than this are not produced by the current result
+/// set; capture artifacts are stored by reference rather than inlined here.
+pub const MAX_DURABLE_RESULT_CONTENT_BYTES: usize = 64 * 1024;
+
+/// Validates that a durable result body is paired only with a succeeded action and stays within
+/// [`MAX_DURABLE_RESULT_CONTENT_BYTES`]. Bodies are validated against the digest upstream (on the
+/// worker receipt), so this is a fail-closed boundary guard, not the primary integrity check.
+fn validate_durable_result_body(
+    result: BrowserResult,
+    result_body: &Option<Vec<u8>>,
+) -> Result<(), GatewayActionCoordinationError> {
+    match result_body {
+        None => Ok(()),
+        Some(body) => {
+            if !matches!(result, BrowserResult::Succeeded(_))
+                || body.is_empty()
+                || body.len() > MAX_DURABLE_RESULT_CONTENT_BYTES
+            {
+                Err(GatewayActionCoordinationError::CorruptState)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayActionPlacement {
     directory_fence: DirectoryFence,
@@ -143,6 +170,7 @@ pub struct GatewayActionSnapshot {
     placement: GatewayActionPlacement,
     evidence: ActionEvidence,
     resolution: Option<ResolutionAnnotation>,
+    result_content: Option<Vec<u8>>,
     action_sequence: ActionSequence,
     revision: u64,
     created_at: DateTime<Utc>,
@@ -204,6 +232,16 @@ impl GatewayActionSnapshot {
     #[must_use]
     pub const fn resolution(&self) -> Option<&ResolutionAnnotation> {
         self.resolution.as_ref()
+    }
+
+    /// Durable copy of a succeeded action's result body.
+    ///
+    /// Persisted alongside the terminal evidence so that GET, same-key resubmission, and
+    /// gateway/worker restart all return the same result bytes the completing receipt carried,
+    /// not just the `ResultDigest`. Bounded by [`MAX_DURABLE_RESULT_CONTENT_BYTES`].
+    #[must_use]
+    pub fn result_content(&self) -> Option<&[u8]> {
+        self.result_content.as_deref()
     }
 
     #[must_use]
@@ -437,6 +475,7 @@ pub trait GatewayActionCoordination: Send + Sync {
         dispatch_id: &DispatchId,
         action_sequence: ActionSequence,
         result: BrowserResult,
+        result_body: Option<Vec<u8>>,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError>;
 
@@ -763,6 +802,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             placement: claim.placement.clone(),
             evidence: ActionEvidence::new(),
             resolution: None,
+            result_content: None,
             action_sequence: ActionSequence::new(action_sequence),
             revision: 0,
             created_at: now,
@@ -868,8 +908,10 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
         dispatch_id: &DispatchId,
         action_sequence: ActionSequence,
         result: BrowserResult,
+        result_body: Option<Vec<u8>>,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        validate_durable_result_body(result, &result_body)?;
         self.mutate_action(
             tenant_id,
             session_id,
@@ -878,7 +920,7 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
             placement,
             now,
             false,
-            |snapshot| {
+            move |snapshot| {
                 if action_sequence.get() == 0 {
                     return Err(GatewayActionCoordinationError::InvalidActionSequence);
                 }
@@ -888,6 +930,9 @@ impl GatewayActionCoordination for MemoryGatewayActionStore {
                 let mutation = snapshot
                     .evidence
                     .record_worker_result(dispatch_id, result)?;
+                if matches!(mutation, ActionEvidenceMutation::Recorded) {
+                    snapshot.result_content = result_body;
+                }
                 Ok(mutation)
             },
         )

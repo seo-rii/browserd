@@ -112,6 +112,7 @@ impl GatewayActionCoordination for SlowClaimStore {
         dispatch_id: &DispatchId,
         action_sequence: ActionSequence,
         result: BrowserResult,
+        result_body: Option<Vec<u8>>,
         now: chrono::DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
         self.inner
@@ -124,6 +125,7 @@ impl GatewayActionCoordination for SlowClaimStore {
                 dispatch_id,
                 action_sequence,
                 result,
+                result_body,
                 now,
             )
             .await

@@ -13,10 +13,10 @@ use browser_gateway::{
 };
 use browserd_actions::{
     ActionKind, ActionSequence, ActionSnapshot, KnownFailureReason, OutcomeUnknownReason,
-    ResolutionAnnotation, ResolutionKind, TerminalDetail,
+    ResolutionAnnotation, ResolutionKind, ResultDigest, TerminalDetail,
 };
 use browserd_api::{
-    ActionPayload, ActionResolveBody, ActionResolveRequest, ActionSubmitCommand,
+    ActionGetRequest, ActionPayload, ActionResolveBody, ActionResolveRequest, ActionSubmitCommand,
     ActionSubmitRequest, ApiRequest, ApiResponse, ApiRouter, ApiService, ResolutionRequestKind,
     decode_session_create,
 };
@@ -38,7 +38,11 @@ use browserd_worker::{
 };
 use chrono::Utc;
 use jsonwebtoken::Algorithm;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+/// Result body a `Succeed` completion returns; the receipt's digest is `sha256` of these bytes.
+const SUCCEEDED_RESULT_BODY: &[u8] = br#"{"title":"durable result body"}"#;
 
 const CREATE_JSON: &str = r#"{
   "isolation":"shared_context",
@@ -60,6 +64,7 @@ const CREATE_JSON: &str = r#"{
 #[derive(Clone, Copy)]
 enum EnqueueMode {
     Queued,
+    Succeed,
     Full,
     Timeout,
     ExchangeTimeout,
@@ -139,6 +144,23 @@ impl GatewayWorkerPending for ControlledPending {
                 WorkerRpcError::InvalidRequest,
             ));
         };
+        if matches!(self.mode, EnqueueMode::Succeed) {
+            let digest = ResultDigest::new(Sha256::digest(SUCCEEDED_RESULT_BODY).into());
+            return Ok(WorkerRpcResponse::Action(WorkerActionReceipt {
+                fence,
+                action_id,
+                action_sequence,
+                idempotency_key,
+                canonical_request_hash,
+                kind,
+                status: WorkerActionStatus::Succeeded,
+                dispatch_acknowledged: true,
+                approval_decision: None,
+                terminal_detail: Some(TerminalDetail::Succeeded(digest)),
+                result: Some(SUCCEEDED_RESULT_BODY.to_vec()),
+                resolution: None,
+            }));
+        }
         Ok(WorkerRpcResponse::Action(WorkerActionReceipt {
             fence,
             action_id,
@@ -916,5 +938,51 @@ fn exact_resolution_retry_preserves_the_original_server_timestamp() -> Result<()
     )?)?;
     assert_eq!(retried.resolution(), Some(&annotation));
     assert_eq!(fixture.worker.request_count.load(Ordering::Acquire), 0);
+    Ok(())
+}
+
+#[test]
+fn succeeded_result_body_is_durable_across_get_and_same_key_resubmission()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Fixture::new(EnqueueMode::Succeed)?;
+    let idempotency_key = Uuid::new_v4();
+
+    // Live completion path: the reconciled snapshot the submit returns carries the result body,
+    // not just its digest. This is the direct regression guard for R01 (gateway result loss).
+    let completed = submit_after_releasing_pending(&fixture, fixture.command(idempotency_key))?;
+    assert_eq!(completed.state(), ActionState::Succeeded);
+    assert_eq!(completed.result_content(), Some(SUCCEEDED_RESULT_BODY));
+    let action_id = completed.action_id().clone();
+
+    // The durable store persists the body (the GET / same-key / restart source of truth).
+    let stored = stored_action(
+        &fixture.store,
+        fixture.principal.tenant_id(),
+        &fixture.session_id,
+        &action_id,
+    )?;
+    assert_eq!(stored.result_content(), Some(SUCCEEDED_RESULT_BODY));
+
+    // The API GET path surfaces the same bytes.
+    let fetched = action_snapshot(fixture.router.execute(
+        &fixture.principal,
+        ApiRequest::GetAction(ActionGetRequest {
+            session_id: fixture.session_id.clone(),
+            action_id: action_id.clone(),
+        }),
+    )?)?;
+    assert_eq!(fetched.state(), ActionState::Succeeded);
+    assert_eq!(fetched.result_content(), Some(SUCCEEDED_RESULT_BODY));
+
+    // Same-key resubmission returns the cached terminal result with the same body and does not
+    // re-enqueue the action against the worker.
+    let resubmitted = action_snapshot(fixture.router.execute(
+        &fixture.principal,
+        ApiRequest::SubmitAction(fixture.command(idempotency_key)),
+    )?)?;
+    assert_eq!(resubmitted.action_id(), &action_id);
+    assert_eq!(resubmitted.state(), ActionState::Succeeded);
+    assert_eq!(resubmitted.result_content(), Some(SUCCEEDED_RESULT_BODY));
+    assert_eq!(fixture.worker.enqueue_count.load(Ordering::Acquire), 1);
     Ok(())
 }
