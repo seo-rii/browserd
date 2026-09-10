@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::Context;
 use browser_gateway::config::GatewayProcessConfig;
 use browser_gateway::{
-    GatewayAuthenticator, GatewayReadiness, GatewayViewer, GatewayWorkerPlacement,
-    GatewayWorkerRuntime,
+    DependencyHealthGate, GatewayAuthenticator, GatewayReadiness, GatewayViewer,
+    GatewayWorkerPlacement, GatewayWorkerRuntime,
 };
 use browserd_api::{ApiService, DurableApiRouter};
 use browserd_coordination::{
@@ -19,11 +19,16 @@ use tokio_util::sync::CancellationToken;
 const WORKER_RPC_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const VIEWER_MAX_TTL: Duration = Duration::from_secs(5 * 60);
 const VIEWER_MAX_OUTSTANDING_TICKETS: usize = 16_384;
-/// How often the gateway drives an autonomous reconcile pass over pending create operations that
-/// no client is polling, so they still terminalize (BRD-016).
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the gateway probes its dependencies (worker liveness, coordination) and drives an
+/// autonomous reconcile pass over pending create operations no client is polling (BRD-014,
+/// BRD-016).
+const MONITOR_INTERVAL: Duration = Duration::from_secs(15);
 /// Maximum create operations reconciled per pass, bounding each pass's work.
 const RECONCILE_SCAN_LIMIT: usize = 64;
+/// Consecutive healthy probes required to advertise a dependency ready again after an outage.
+const HEALTHY_THRESHOLD: u32 = 2;
+/// Consecutive failed probes required to fail a dependency closed, absorbing transient blips.
+const UNHEALTHY_THRESHOLD: u32 = 2;
 const REDIS_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
@@ -114,28 +119,43 @@ async fn main() -> anyhow::Result<()> {
     readiness.set_worker_ready(true);
     readiness.set_coordination_ready(true);
 
-    // Autonomously recover create operations that no client is polling: on a fixed interval, drive
-    // a bounded reconcile pass so pending/creating operations still terminalize (BRD-016). The
-    // loop stops when the shutdown token is cancelled, so it never outlives graceful drain.
+    // Supervise dependencies and recover stranded work on a fixed interval (BRD-014, BRD-016):
+    // probe the worker for liveness and drive a bounded reconcile pass whose success or failure
+    // doubles as the coordination-health signal, then update advertised readiness through a
+    // hysteresis gate so a dependency that dies after startup is reflected (failing closed on a
+    // sustained outage) without flapping on a transient blip. The loop stops when the shutdown
+    // token is cancelled, so it never outlives graceful drain.
     let shutdown_token = CancellationToken::new();
-    let reconcile = {
+    let monitor = {
         let api = Arc::clone(&api);
+        let readiness = Arc::clone(&readiness);
         let shutdown = shutdown_token.clone();
+        let worker_probe = worker_rpc.clone();
+        let worker_epoch = config.worker_epoch();
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
+            let mut ticker = tokio::time::interval(MONITOR_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The first tick fires immediately; skip it so startup isn't perturbed.
             ticker.tick().await;
+            let mut worker_gate =
+                DependencyHealthGate::new(HEALTHY_THRESHOLD, UNHEALTHY_THRESHOLD, true);
+            let mut coordination_gate =
+                DependencyHealthGate::new(HEALTHY_THRESHOLD, UNHEALTHY_THRESHOLD, true);
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = ticker.tick() => {
+                        let worker_healthy = worker_probe.probe(worker_epoch).await.is_ok();
+                        readiness.set_worker_ready(worker_gate.record(worker_healthy));
+
                         let api = Arc::clone(&api);
-                        match tokio::task::spawn_blocking(move || {
+                        let reconcile = tokio::task::spawn_blocking(move || {
                             api.reconcile_pending(RECONCILE_SCAN_LIMIT)
                         })
-                        .await
-                        {
+                        .await;
+                        let coordination_healthy = matches!(reconcile, Ok(Ok(_)));
+                        readiness.set_coordination_ready(coordination_gate.record(coordination_healthy));
+                        match reconcile {
                             Ok(Ok(_)) => {}
                             Ok(Err(error)) => {
                                 eprintln!("browser gateway reconcile pass failed: {error:?}");
@@ -192,8 +212,8 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown)
         .await
         .context("browser gateway server failed");
-    // Stop and drain the reconcile loop before returning, so a failed serve does not leak it.
+    // Stop and drain the monitor loop before returning, so a failed serve does not leak it.
     shutdown_token.cancel();
-    let _ = reconcile.await;
+    let _ = monitor.await;
     served
 }

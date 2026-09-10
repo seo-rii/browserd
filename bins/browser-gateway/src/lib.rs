@@ -366,6 +366,61 @@ impl Readiness for GatewayReadiness {
     }
 }
 
+/// Turns a stream of dependency probe outcomes into a stable readiness bit with hysteresis.
+///
+/// A single transient probe failure does not flip a ready dependency to unready; it takes
+/// `unhealthy_threshold` consecutive failures. Recovery takes `healthy_threshold` consecutive
+/// successes. This keeps advertised readiness from flapping on an isolated error while still
+/// failing closed on a sustained outage, so a dependency that dies after startup is reflected
+/// instead of remaining stuck ready (BRD-014). The counters saturate, so a long healthy or
+/// unhealthy run never overflows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DependencyHealthGate {
+    healthy_threshold: u32,
+    unhealthy_threshold: u32,
+    consecutive_successes: u32,
+    consecutive_failures: u32,
+    ready: bool,
+}
+
+impl DependencyHealthGate {
+    /// Creates a gate. Thresholds below one are clamped to one so the gate can always move.
+    #[must_use]
+    pub fn new(healthy_threshold: u32, unhealthy_threshold: u32, initially_ready: bool) -> Self {
+        Self {
+            healthy_threshold: healthy_threshold.max(1),
+            unhealthy_threshold: unhealthy_threshold.max(1),
+            consecutive_successes: 0,
+            consecutive_failures: 0,
+            ready: initially_ready,
+        }
+    }
+
+    /// Records one probe outcome and returns the (possibly updated) readiness.
+    pub fn record(&mut self, healthy: bool) -> bool {
+        if healthy {
+            self.consecutive_failures = 0;
+            self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+            if !self.ready && self.consecutive_successes >= self.healthy_threshold {
+                self.ready = true;
+            }
+        } else {
+            self.consecutive_successes = 0;
+            self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+            if self.ready && self.consecutive_failures >= self.unhealthy_threshold {
+                self.ready = false;
+            }
+        }
+        self.ready
+    }
+
+    /// The current readiness the gate advertises.
+    #[must_use]
+    pub const fn ready(&self) -> bool {
+        self.ready
+    }
+}
+
 pub trait GatewayWorkerPending: Send {
     fn wait(self) -> Result<WorkerRpcResponse, WorkerRpcCompletionError>;
 }
