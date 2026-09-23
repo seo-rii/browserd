@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 use uuid::{Uuid, Version};
 
-use crate::{DirectoryFence, MemoryCoordinationDatabase, StoreConfig};
+use crate::{DirectoryFence, MemoryCoordinationDatabase, OutboxAppend, StoreConfig};
 
 mod redis;
 
@@ -267,6 +267,25 @@ impl GatewayActionSnapshot {
     #[must_use]
     pub const fn retain_until(&self) -> DateTime<Utc> {
         self.retain_until
+    }
+
+    /// Project this snapshot into the event-outbox append that records its terminal transition, or
+    /// `None` while the action has not yet reached a terminal outcome.
+    ///
+    /// The append carries the durable [`GatewayActionSnapshot::revision`] as the aggregate
+    /// revision, so re-projecting the same terminal snapshot — as the gateway's reconcile pass
+    /// does when recovering an append that a crash dropped between the durable commit and the
+    /// outbox write — appends the same event idempotently rather than a duplicate.
+    #[must_use]
+    pub fn terminal_outbox_append(&self) -> Option<OutboxAppend> {
+        self.terminal().map(|_| {
+            OutboxAppend::action_terminal(
+                self.tenant_id.clone(),
+                self.session_id.clone(),
+                self.action_id.clone(),
+                self.revision,
+            )
+        })
     }
 
     fn derive_worker_loss(&mut self) -> Result<(), GatewayActionCoordinationError> {

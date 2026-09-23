@@ -8,10 +8,11 @@ use browserd_actions::{
     DispatchId, KnownFailureReason, OutcomeUnknownReason, ResultDigest, TerminalDetail,
 };
 use browserd_coordination::{
-    ClaimGatewayAction, DirectoryFence, GatewayActionClaimOutcome, GatewayActionCoordination,
-    GatewayActionCoordinationError, GatewayActionPlacement, MAX_DURABLE_RESULT_CONTENT_BYTES,
-    MemoryCoordinationDatabase, MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome,
-    StoreConfig,
+    ClaimGatewayAction, DirectoryFence, EventCursor, EventOutbox, GatewayActionClaimOutcome,
+    GatewayActionCoordination, GatewayActionCoordinationError, GatewayActionPlacement,
+    MAX_DURABLE_RESULT_CONTENT_BYTES, MemoryCoordinationDatabase, MemoryEventOutbox,
+    MemoryGatewayActionStore, OutboxAggregate, OutboxEventKind, SessionLossClaim,
+    SessionLossOutcome, StoreConfig,
 };
 use browserd_core::{ActionId, ActionState, SessionId, TenantId, WorkerId};
 use chrono::{TimeZone, Utc};
@@ -706,6 +707,96 @@ async fn record_worker_result_persists_result_body_across_reads() {
         .expect("idempotent replay should succeed");
     assert_eq!(replay.result_content(), Some(body.as_slice()));
     assert_eq!(replay.revision(), recorded.revision());
+}
+
+#[tokio::test]
+async fn terminal_action_projects_into_the_event_outbox_idempotently() {
+    // BRD-017: a durable terminal transition of the real action authority projects into exactly
+    // one durable outbox event, and re-projecting it (the reconcile recovery path) is idempotent.
+    let store = MemoryGatewayActionStore::default();
+    let outbox = MemoryEventOutbox::default();
+    let tenant_id = TenantId::new();
+    let session_id = SessionId::new();
+    let action_id = ActionId::new();
+    let placement = placement(3, 5);
+    let (dispatch_id, action_sequence, revision) = armed_action(
+        &store,
+        &tenant_id,
+        &session_id,
+        &action_id,
+        "outbox-projection",
+        &placement,
+    )
+    .await;
+
+    // An armed-but-not-terminal action projects to nothing: the outbox records terminals only.
+    let armed = store
+        .get_effective_action(&tenant_id, &session_id, &action_id)
+        .await
+        .expect("effective lookup should succeed")
+        .expect("action should exist");
+    assert!(armed.terminal_outbox_append().is_none());
+
+    let digest = ResultDigest::new([4; 32]);
+    let terminal = store
+        .record_worker_result(
+            &tenant_id,
+            &session_id,
+            &action_id,
+            revision,
+            &placement,
+            &dispatch_id,
+            action_sequence,
+            BrowserResult::Succeeded(digest),
+            None,
+            at(3),
+        )
+        .await
+        .expect("worker result should be recorded");
+
+    let append = terminal
+        .terminal_outbox_append()
+        .expect("terminal action should project an append");
+    let event = outbox
+        .append(append, at(3))
+        .await
+        .expect("append to outbox");
+    assert_eq!(
+        event.aggregate(),
+        &OutboxAggregate::Action {
+            session_id: session_id.clone(),
+            action_id: action_id.clone(),
+        }
+    );
+    assert_eq!(event.aggregate_revision(), terminal.revision());
+    assert_eq!(event.kind(), OutboxEventKind::ActionTerminal);
+    assert_eq!(event.cursor().position(), 1);
+
+    // Re-projecting the same terminal snapshot — as a reconcile pass does when recovering an
+    // append a crash dropped — appends the same event, so the stream does not advance.
+    let reconciled = store
+        .get_effective_action(&tenant_id, &session_id, &action_id)
+        .await
+        .expect("effective lookup should succeed")
+        .expect("action should still exist");
+    let replay = outbox
+        .append(
+            reconciled
+                .terminal_outbox_append()
+                .expect("reconciled action is still terminal"),
+            at(9),
+        )
+        .await
+        .expect("idempotent re-append should succeed");
+    assert_eq!(replay, event);
+
+    let page = outbox
+        .read_from(&tenant_id, EventCursor::start(), 10, at(9))
+        .await
+        .expect("resume should succeed");
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].event_id(), event.event_id());
+    assert!(!page.cursor_expired());
 }
 
 #[tokio::test]
