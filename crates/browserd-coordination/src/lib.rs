@@ -1,5 +1,6 @@
 mod actor;
 mod ephemeral;
+mod event_outbox;
 mod gateway_action_actor;
 mod gateway_actions;
 mod memory;
@@ -27,6 +28,10 @@ pub use ephemeral::{
     WorkerReadiness, WorkerRegistration, WorkerRegistrationQuery, WorkerRegistrationSnapshot,
     WorkerReservationGrant, WorkerReservationMutation, WorkerReservationOutcome,
     WorkerReservationRequest, WorkerReservationSnapshot, WorkerReservationStore,
+};
+pub use event_outbox::{
+    EventCursor, EventOutbox, EventOutboxError, MAX_EVENT_PAGE_LIMIT, MINIMUM_EVENT_RETENTION,
+    MemoryEventOutbox, OutboxAggregate, OutboxAppend, OutboxEvent, OutboxEventKind, OutboxPage,
 };
 pub use gateway_action_actor::GatewayActionBlockingClient;
 pub use gateway_actions::{
