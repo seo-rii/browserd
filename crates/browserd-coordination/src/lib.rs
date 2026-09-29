@@ -32,7 +32,7 @@ pub use ephemeral::{
 pub use event_outbox::{
     EventCursor, EventOutbox, EventOutboxBlockingClient, EventOutboxError, MAX_EVENT_PAGE_LIMIT,
     MINIMUM_EVENT_RETENTION, MemoryEventOutbox, OutboxAggregate, OutboxAppend, OutboxEvent,
-    OutboxEventKind, OutboxPage,
+    OutboxEventKind, OutboxPage, RedisEventOutbox, RedisEventOutboxConfig,
 };
 pub use gateway_action_actor::GatewayActionBlockingClient;
 pub use gateway_actions::{

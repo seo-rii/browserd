@@ -35,8 +35,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use browserd_core::{ActionId, SessionId, TenantId};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+
+mod redis;
+
+pub use redis::{RedisEventOutbox, RedisEventOutboxConfig};
 
 /// Minimum event retention, matching the durable action/idempotency retention floor: a consumer
 /// that reconnects within a day must never observe a pruned-prefix gap for a transition it had
@@ -79,7 +84,7 @@ impl EventCursor {
 }
 
 /// The durable aggregate whose terminal transition an event records.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum OutboxAggregate {
     /// An action reached a terminal outcome within its session.
     Action {
@@ -93,7 +98,7 @@ pub enum OutboxAggregate {
 /// The class of terminal transition an event records. Kept intentionally narrow: the outbox
 /// records only durable *terminal* transitions of the coordination authority, which a consumer
 /// maps to the richer public event taxonomy when serving a resume request.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum OutboxEventKind {
     /// An action settled into a terminal state (succeeded, failed, or otherwise resolved).
     ActionTerminal,
