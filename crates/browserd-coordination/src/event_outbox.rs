@@ -39,8 +39,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod postgres;
 mod redis;
 
+pub use postgres::PostgresEventOutbox;
 pub use redis::{RedisEventOutbox, RedisEventOutboxConfig};
 
 /// Minimum event retention, matching the durable action/idempotency retention floor: a consumer
@@ -261,6 +263,10 @@ pub enum EventOutboxError {
     RedisTimedOut,
     #[error("Redis event outbox returned invalid state")]
     InvalidRedisResponse,
+    #[error("Postgres event outbox is unavailable")]
+    PostgresUnavailable,
+    #[error("Postgres event outbox returned invalid state")]
+    InvalidPostgresState,
 }
 
 /// A durable, ordered, per-tenant event outbox providing at-least-once notification.
