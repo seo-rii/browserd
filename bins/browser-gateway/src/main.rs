@@ -9,8 +9,9 @@ use browser_gateway::{
 };
 use browserd_api::{ApiService, DurableApiRouter};
 use browserd_coordination::{
-    CoordinationActorConfig, CoordinationBlockingClient, PostgresCreateSessionStore,
-    RedisGatewayActionConfig, RedisGatewayActionStore, StoreConfig,
+    CoordinationActorConfig, CoordinationBlockingClient, EventOutbox, EventOutboxBlockingClient,
+    PostgresCreateSessionStore, RedisEventOutbox, RedisEventOutboxConfig, RedisGatewayActionConfig,
+    RedisGatewayActionStore, StoreConfig,
 };
 use browserd_http::{HttpConfig, router};
 use browserd_worker::WorkerRpcClient;
@@ -93,23 +94,48 @@ async fn main() -> anyhow::Result<()> {
             .context("Redis action coordination connection failed")?,
     );
 
+    // Durable event outbox (BRD-017): the same Redis-backed store feeds both the runtime (which
+    // records each terminal transition) and the router (which serves ResumeEvents from it), so the
+    // at-least-once notification stream is connected to durable transitions and survives restarts.
+    let outbox_config = RedisEventOutboxConfig::new(
+        config.redis_url(),
+        config.redis_prefix(),
+        store_config,
+        config.coordination_in_flight(),
+        REDIS_COMMAND_TIMEOUT,
+    )?;
+    let event_outbox: Arc<dyn EventOutbox> = Arc::new(
+        RedisEventOutbox::connect(outbox_config)
+            .await
+            .context("Redis event outbox connection failed")?,
+    );
+    let outbox_client =
+        EventOutboxBlockingClient::spawn(event_outbox, config.coordination_in_flight().max(1))
+            .context("event outbox blocking client failed to start")?;
+
     let placement = GatewayWorkerPlacement::new(
         probe.worker_id,
         config.worker_epoch(),
         config.placement_version(),
         config.placement_version(),
     )?;
-    let runtime = Arc::new(GatewayWorkerRuntime::with_action_coordination(
-        worker_client,
-        placement,
-        action_store,
-        actor_config,
-    )?);
-    let api = Arc::new(DurableApiRouter::with_dispatch_lease_duration(
-        runtime,
-        coordination,
-        config.create_lease_duration(),
-    )?);
+    let runtime = Arc::new(
+        GatewayWorkerRuntime::with_action_coordination(
+            worker_client,
+            placement,
+            action_store,
+            actor_config,
+        )?
+        .with_terminal_event_outbox(outbox_client.clone()),
+    );
+    let api = Arc::new(
+        DurableApiRouter::with_dispatch_lease_duration(
+            runtime,
+            coordination,
+            config.create_lease_duration(),
+        )?
+        .with_event_outbox(outbox_client),
+    );
     let viewer = GatewayViewer::new(
         VIEWER_MAX_TTL,
         config.viewer_origins().iter().cloned(),
