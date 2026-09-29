@@ -30,9 +30,9 @@ use browserd_artifacts::{
 };
 use browserd_auth::{AuthConfig, RevocationRegistry, ServiceTokenVerifier, VerificationKeySet};
 use browserd_coordination::{
-    ClaimGatewayAction, CoordinationActorConfig, DirectoryFence, GatewayActionBlockingClient,
-    GatewayActionCoordination, GatewayActionCoordinationError, GatewayActionPlacement,
-    GatewayActionSnapshot, MemoryGatewayActionStore,
+    ClaimGatewayAction, CoordinationActorConfig, DirectoryFence, EventOutboxBlockingClient,
+    GatewayActionBlockingClient, GatewayActionCoordination, GatewayActionCoordinationError,
+    GatewayActionPlacement, GatewayActionSnapshot, MemoryGatewayActionStore,
 };
 use browserd_core::{
     ActionId, ApprovalId, ErrorCode, IsolationProfile, PlacementFence, SessionId, SessionLifecycle,
@@ -501,6 +501,9 @@ pub struct GatewayWorkerRuntime<C> {
     placement: GatewayWorkerPlacement,
     sessions: Mutex<HashMap<(TenantId, SessionId), GatewaySessionRecord>>,
     actions: GatewayActionBlockingClient,
+    /// Optional durable event outbox (BRD-017). When present, each terminal action transition is
+    /// recorded here for at-least-once tenant notification; absent, the runtime behaves as before.
+    outbox: Option<EventOutboxBlockingClient>,
     catalog: SessionCatalog,
 }
 
@@ -626,8 +629,37 @@ impl<C> GatewayWorkerRuntime<C> {
             placement,
             sessions: Mutex::new(HashMap::new()),
             actions,
+            outbox: None,
             catalog: SessionCatalog::default(),
         })
+    }
+
+    /// Attach a durable event outbox so terminal action transitions are recorded for at-least-once
+    /// tenant notification (BRD-017). Best-effort: an outbox failure never fails an action, since
+    /// the durable action store remains the source of truth.
+    #[must_use]
+    pub fn with_terminal_event_outbox(mut self, outbox: EventOutboxBlockingClient) -> Self {
+        self.outbox = Some(outbox);
+        self
+    }
+
+    /// Best-effort record of a freshly-committed terminal transition to the event outbox. A
+    /// non-terminal snapshot is ignored, and an outbox error is logged and swallowed — the action
+    /// response is driven by the durable store, and a dropped event is recoverable by re-projecting
+    /// the durable terminal action.
+    fn note_terminal_transition(&self, snapshot: &GatewayActionSnapshot) {
+        let Some(outbox) = &self.outbox else {
+            return;
+        };
+        let Some(append) = snapshot.terminal_outbox_append() else {
+            return;
+        };
+        if let Err(error) = outbox.append(append, Utc::now()) {
+            eprintln!(
+                "gateway event outbox append failed for action {} (durable state unaffected): {error:?}",
+                snapshot.action_id()
+            );
+        }
     }
 }
 
@@ -1154,6 +1186,7 @@ where
                 error,
             )?,
         };
+        self.note_terminal_transition(&effective);
         coordinated_action_snapshot(&effective)
     }
 
@@ -1246,6 +1279,7 @@ where
                 self.effective_action_after_race(tenant_id, session_id, durable.action_id(), error)?
             }
         };
+        self.note_terminal_transition(&effective);
         coordinated_action_snapshot(&effective)
     }
 
@@ -1516,6 +1550,7 @@ where
                             durable.action_id(),
                             error,
                         )?;
+                        self.note_terminal_transition(&effective);
                         return coordinated_action_snapshot(&effective)
                             .map(ApiEnvelope::new)
                             .map(ApiResponse::Action);
@@ -1584,6 +1619,7 @@ where
                             if current == &dispatch_id
                     )
                 {
+                    self.note_terminal_transition(&effective);
                     return coordinated_action_snapshot(&effective)
                         .map(ApiEnvelope::new)
                         .map(ApiResponse::Action);
@@ -1714,6 +1750,7 @@ where
                         error,
                     )?,
                 };
+                self.note_terminal_transition(&effective);
                 return coordinated_action_snapshot(&effective)
                     .map(ApiEnvelope::new)
                     .map(ApiResponse::Action);
@@ -1863,6 +1900,7 @@ where
             }
             Err(error) => return Err(action_coordination_api_error(error)),
         };
+        self.note_terminal_transition(&resolved);
         coordinated_action_snapshot(&resolved)
             .map(ApiEnvelope::new)
             .map(ApiResponse::Action)

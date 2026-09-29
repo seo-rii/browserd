@@ -25,8 +25,9 @@ use browserd_auth::{
     ServiceTokenVerifier, VerificationKeySet,
 };
 use browserd_coordination::{
-    CoordinationActorConfig, GatewayActionCoordination, GatewayActionSnapshot,
-    MemoryGatewayActionStore,
+    CoordinationActorConfig, EventCursor, EventOutboxBlockingClient, GatewayActionCoordination,
+    GatewayActionSnapshot, MemoryEventOutbox, MemoryGatewayActionStore, OutboxAggregate,
+    OutboxEventKind,
 };
 use browserd_core::{
     ActionId, ActionState, ErrorCode, PageId, PrincipalId, SessionId, TenantId, WorkerId,
@@ -307,12 +308,29 @@ struct Fixture {
     worker: Arc<ActionWorker>,
     router: Arc<ActionRouter>,
     store: Arc<MemoryGatewayActionStore>,
+    outbox: Option<EventOutboxBlockingClient>,
     session_id: SessionId,
     pending_entered: mpsc::Receiver<()>,
 }
 
 impl Fixture {
     fn new(mode: EnqueueMode) -> Result<Self, Box<dyn Error>> {
+        Self::build(mode, None)
+    }
+
+    /// A fixture whose runtime records terminal transitions to a durable event outbox (BRD-017);
+    /// the returned [`Fixture::outbox`] is a handle for asserting the recorded stream.
+    fn new_with_outbox(mode: EnqueueMode) -> Result<Self, Box<dyn Error>> {
+        let outbox: Arc<dyn browserd_coordination::EventOutbox> =
+            Arc::new(MemoryEventOutbox::default());
+        let client = EventOutboxBlockingClient::spawn(outbox, 2)?;
+        Self::build(mode, Some(client))
+    }
+
+    fn build(
+        mode: EnqueueMode,
+        outbox: Option<EventOutboxBlockingClient>,
+    ) -> Result<Self, Box<dyn Error>> {
         let tenant_id = TenantId::new();
         let principal = authenticated_principal(tenant_id.clone())?;
         let (pending_entered_sender, pending_entered) = mpsc::channel();
@@ -332,12 +350,16 @@ impl Fixture {
             CoordinationActorConfig::new(256, 32, Duration::from_secs(2), Duration::from_secs(5))?;
         let placement =
             GatewayWorkerPlacement::new(WorkerId::new("durable-action-worker")?, 41, 7, 29)?;
-        let runtime = Arc::new(GatewayWorkerRuntime::with_action_coordination(
+        let mut runtime = GatewayWorkerRuntime::with_action_coordination(
             Arc::clone(&worker),
             placement,
             Arc::clone(&store),
             actor_config,
-        )?);
+        )?;
+        if let Some(client) = outbox.clone() {
+            runtime = runtime.with_terminal_event_outbox(client);
+        }
+        let runtime = Arc::new(runtime);
         let router = Arc::new(ApiRouter::new(runtime));
         let response = router.execute(
             &principal,
@@ -364,6 +386,7 @@ impl Fixture {
             worker,
             router,
             store,
+            outbox,
             session_id,
             pending_entered,
         })
@@ -1025,5 +1048,61 @@ fn terminal_action_is_retrievable_after_a_gateway_restart_without_a_live_session
         Some(SUCCEEDED_RESULT_BODY),
         "a restarted gateway returns the terminal action and its body from durable state"
     );
+    Ok(())
+}
+
+#[test]
+fn succeeded_action_records_a_single_terminal_event_in_the_outbox() -> Result<(), Box<dyn Error>> {
+    // BRD-017 end-to-end: completing an action drives the runtime's terminal path, which records
+    // exactly one durable event for at-least-once notification. A same-key resubmission is served
+    // from durable state and must not double-record.
+    let fixture = Fixture::new_with_outbox(EnqueueMode::Succeed)?;
+    let outbox = fixture
+        .outbox
+        .clone()
+        .ok_or("fixture is missing its event outbox")?;
+    let tenant_id = fixture.principal.tenant_id().clone();
+    let idempotency_key = Uuid::new_v4();
+
+    let completed = submit_after_releasing_pending(&fixture, fixture.command(idempotency_key))?;
+    assert_eq!(completed.state(), ActionState::Succeeded);
+    let action_id = completed.action_id().clone();
+
+    // The terminal transition landed in the outbox as one event carrying the action aggregate.
+    let page = outbox.read_from(&tenant_id, EventCursor::start(), 16, Utc::now())?;
+    assert_eq!(
+        page.events().len(),
+        1,
+        "one terminal event should be recorded"
+    );
+    let event = &page.events()[0];
+    assert_eq!(event.kind(), OutboxEventKind::ActionTerminal);
+    match event.aggregate() {
+        OutboxAggregate::Action {
+            session_id,
+            action_id: recorded,
+        } => {
+            assert_eq!(session_id, &fixture.session_id);
+            assert_eq!(recorded, &action_id);
+        }
+        other => panic!("unexpected outbox aggregate: {other:?}"),
+    }
+    assert_eq!(event.cursor().position(), 1);
+    assert!(!page.cursor_expired());
+
+    // Same-key resubmission is served from durable state (a read path), so the stream is unchanged.
+    let resubmitted = action_snapshot(fixture.router.execute(
+        &fixture.principal,
+        ApiRequest::SubmitAction(fixture.command(idempotency_key)),
+    )?)?;
+    assert_eq!(resubmitted.action_id(), &action_id);
+    assert_eq!(resubmitted.state(), ActionState::Succeeded);
+    let after = outbox.read_from(&tenant_id, EventCursor::start(), 16, Utc::now())?;
+    assert_eq!(
+        after.events().len(),
+        1,
+        "resubmission must not double-record"
+    );
+    assert_eq!(after.events()[0].event_id(), event.event_id());
     Ok(())
 }

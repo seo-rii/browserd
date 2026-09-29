@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -245,6 +246,8 @@ pub enum EventOutboxError {
     RetentionTimestampOverflow,
     #[error("event outbox state lock is unavailable")]
     LockUnavailable,
+    #[error("event outbox blocking client could not start")]
+    ClientSpawn,
     #[error("Redis event outbox configuration is invalid")]
     InvalidRedisConfig,
     #[error("Redis event outbox is unavailable")]
@@ -503,5 +506,73 @@ impl EventOutbox for MemoryEventOutbox {
         Ok(state.get(tenant_id).map_or(EventCursor::start(), |tenant| {
             EventCursor(tenant.delivered_through)
         }))
+    }
+}
+
+/// A synchronous facade over an async [`EventOutbox`], for callers on a blocking execution path
+/// (the gateway records terminal transitions from inside `spawn_blocking`, where it cannot `await`).
+///
+/// It owns a dedicated multi-threaded Tokio runtime and drives each call to completion on it with
+/// `block_on`. That runtime is never entered reentrantly — the outbox futures do not call back into
+/// it — and the caller is always a blocking thread (a `spawn_blocking` worker or a plain thread),
+/// so `block_on` neither panics nor deadlocks. Cloning shares the one runtime and outbox.
+#[derive(Clone)]
+pub struct EventOutboxBlockingClient {
+    runtime: Arc<tokio::runtime::Runtime>,
+    outbox: Arc<dyn EventOutbox>,
+}
+
+impl EventOutboxBlockingClient {
+    /// Build a blocking client backed by `worker_threads` runtime threads (at least one).
+    pub fn spawn(
+        outbox: Arc<dyn EventOutbox>,
+        worker_threads: usize,
+    ) -> Result<Self, EventOutboxError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads.max(1))
+            .enable_all()
+            .build()
+            .map_err(|_| EventOutboxError::ClientSpawn)?;
+        Ok(Self {
+            runtime: Arc::new(runtime),
+            outbox,
+        })
+    }
+
+    /// Blocking [`EventOutbox::append`].
+    pub fn append(
+        &self,
+        append: OutboxAppend,
+        now: DateTime<Utc>,
+    ) -> Result<OutboxEvent, EventOutboxError> {
+        self.runtime.block_on(self.outbox.append(append, now))
+    }
+
+    /// Blocking [`EventOutbox::read_from`].
+    pub fn read_from(
+        &self,
+        tenant_id: &TenantId,
+        after: EventCursor,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<OutboxPage, EventOutboxError> {
+        self.runtime
+            .block_on(self.outbox.read_from(tenant_id, after, limit, now))
+    }
+
+    /// Blocking [`EventOutbox::mark_delivered`].
+    pub fn mark_delivered(
+        &self,
+        tenant_id: &TenantId,
+        cursor: EventCursor,
+    ) -> Result<(), EventOutboxError> {
+        self.runtime
+            .block_on(self.outbox.mark_delivered(tenant_id, cursor))
+    }
+
+    /// Blocking [`EventOutbox::delivered_cursor`].
+    pub fn delivered_cursor(&self, tenant_id: &TenantId) -> Result<EventCursor, EventOutboxError> {
+        self.runtime
+            .block_on(self.outbox.delivered_cursor(tenant_id))
     }
 }
