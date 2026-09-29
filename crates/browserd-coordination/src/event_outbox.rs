@@ -283,6 +283,21 @@ pub trait EventOutbox: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<OutboxPage, EventOutboxError>;
 
+    /// Resume after the event named by the stable id `after` (or from the beginning when `None`).
+    ///
+    /// This is the anchor a public API keyed on an opaque event id uses, while the store keeps the
+    /// ordered sequence internally for exact resumption. When `after` names an event that retention
+    /// has pruned — or one that never existed for this tenant — the page is flagged
+    /// [`OutboxPage::cursor_expired`] and returns from the oldest retained event, so a lagging
+    /// consumer recovers forward rather than stalling on a cursor the store can no longer place.
+    async fn read_after_event_id(
+        &self,
+        tenant_id: &TenantId,
+        after: Option<Uuid>,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<OutboxPage, EventOutboxError>;
+
     /// Advance the tenant's delivered watermark to `cursor` (a no-op when it is already at or past
     /// it). A consumer commits its progress here after a successful dispatch; on restart it
     /// resumes from [`EventOutbox::delivered_cursor`], redelivering any un-acked tail.
@@ -478,6 +493,60 @@ impl EventOutbox for MemoryEventOutbox {
         })
     }
 
+    async fn read_after_event_id(
+        &self,
+        tenant_id: &TenantId,
+        after: Option<Uuid>,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<OutboxPage, EventOutboxError> {
+        let limit = validated_limit(limit)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| EventOutboxError::LockUnavailable)?;
+        let Some(tenant) = state.get_mut(tenant_id) else {
+            return Ok(OutboxPage {
+                events: Vec::new(),
+                next_cursor: EventCursor::start(),
+                cursor_expired: false,
+            });
+        };
+        tenant.prune(self.retention, now)?;
+
+        // Resolve the opaque event id to an ordered position.
+        let (after_seq, cursor_expired) = match after {
+            // From the beginning: a gap only if retention already dropped the earliest events.
+            None => (0, tenant.pruned_through > 0),
+            Some(event_id) => match tenant
+                .events
+                .iter()
+                .find(|event| event.event_id == event_id)
+            {
+                // The anchor is still retained: resume strictly after it, no gap.
+                Some(event) => (event.tenant_seq, false),
+                // Pruned or unknown: recover from the oldest retained event and report the gap.
+                None => (0, true),
+            },
+        };
+
+        let events: Vec<OutboxEvent> = tenant
+            .events
+            .iter()
+            .filter(|event| event.tenant_seq > after_seq)
+            .take(limit)
+            .cloned()
+            .collect();
+        let next_cursor = events.last().map_or(EventCursor(after_seq), |event| {
+            EventCursor(event.tenant_seq)
+        });
+        Ok(OutboxPage {
+            events,
+            next_cursor,
+            cursor_expired,
+        })
+    }
+
     async fn mark_delivered(
         &self,
         tenant_id: &TenantId,
@@ -558,6 +627,20 @@ impl EventOutboxBlockingClient {
     ) -> Result<OutboxPage, EventOutboxError> {
         self.runtime
             .block_on(self.outbox.read_from(tenant_id, after, limit, now))
+    }
+
+    /// Blocking [`EventOutbox::read_after_event_id`].
+    pub fn read_after_event_id(
+        &self,
+        tenant_id: &TenantId,
+        after: Option<Uuid>,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<OutboxPage, EventOutboxError> {
+        self.runtime.block_on(
+            self.outbox
+                .read_after_event_id(tenant_id, after, limit, now),
+        )
     }
 
     /// Blocking [`EventOutbox::mark_delivered`].

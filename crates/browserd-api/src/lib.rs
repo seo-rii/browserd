@@ -20,7 +20,8 @@ use browserd_coordination::{
     CanonicalRequestHash as DurableRequestHash, ClaimCreateOperation, ClaimOutcome,
     CoordinationBlockingClient, CoordinationError, CreateOperationError, CreateOperationResult,
     CreateOperationSnapshot as DurableOperationSnapshot, DispatchLeaseToken, DownstreamDedupeKey,
-    OperationMutation, RecoverableCreateIntent,
+    EventOutboxBlockingClient, OperationMutation, OutboxAggregate, OutboxEvent, OutboxEventKind,
+    RecoverableCreateIntent,
 };
 use browserd_core::{
     ActionId, ApprovalId, ArtifactId, CreateOperationState, ErrorCode, IsolationProfile,
@@ -1990,6 +1991,9 @@ pub struct DurableApiRouter<B> {
     coordination: CoordinationBlockingClient,
     runtime: Arc<B>,
     auxiliary: InMemoryApiService,
+    /// Durable event outbox (BRD-017). When present, `ResumeEvents` is served from it — the source
+    /// connected to durable terminal transitions — instead of the in-memory auxiliary store.
+    event_outbox: Option<EventOutboxBlockingClient>,
     dispatch_lease_duration: StdDuration,
     runtime_create_timeout: StdDuration,
     dispatch_slots: Arc<AtomicUsize>,
@@ -2013,10 +2017,20 @@ where
             coordination,
             runtime,
             auxiliary: InMemoryApiService::default(),
+            event_outbox: None,
             dispatch_lease_duration: StdDuration::from_secs(30),
             runtime_create_timeout: StdDuration::from_secs(25),
             dispatch_slots: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Serve `ResumeEvents` from the durable event outbox (BRD-017) rather than the in-memory
+    /// auxiliary store, so a consumer resumes over the events connected to durable terminal
+    /// transitions. Pass the same outbox the runtime records into.
+    #[must_use]
+    pub fn with_event_outbox(mut self, outbox: EventOutboxBlockingClient) -> Self {
+        self.event_outbox = Some(outbox);
+        self
     }
 
     pub fn with_dispatch_lease_duration(
@@ -2038,6 +2052,7 @@ where
             coordination,
             runtime,
             auxiliary: InMemoryApiService::default(),
+            event_outbox: None,
             dispatch_lease_duration: duration,
             runtime_create_timeout,
             dispatch_slots: Arc::new(AtomicUsize::new(0)),
@@ -2604,6 +2619,40 @@ where
         })
     }
 
+    fn resume_events(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        last_event_id: Option<Uuid>,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<ApiResponse, ApiError> {
+        let Some(outbox) = &self.event_outbox else {
+            // No durable outbox configured: preserve prior behavior via the in-memory store.
+            return self.auxiliary.execute(
+                principal,
+                ApiRequest::ResumeEvents {
+                    last_event_id,
+                    limit,
+                    now,
+                },
+            );
+        };
+        if !(1..=100).contains(&limit) {
+            return Err(ApiError::invalid_request("event limit must be 1..=100"));
+        }
+        let page = outbox
+            .read_after_event_id(principal.tenant_id(), last_event_id, limit, now)
+            .map_err(|_| ApiError::new(ErrorCode::WorkerUnavailable, "event outbox unavailable"))?;
+        let events: Vec<EventRecord> = page.events().iter().map(map_outbox_event).collect();
+        // The public cursor is the opaque event id; the store keeps the ordered sequence internally.
+        let next_cursor = events.last().map(EventRecord::event_id).or(last_event_id);
+        Ok(ApiResponse::Events(ApiEnvelope::new(EventPage {
+            events,
+            gap: page.cursor_expired(),
+            next_cursor,
+        })))
+    }
+
     fn map_coordination_error(error: CoordinationError) -> ApiError {
         match error {
             CoordinationError::IdempotencyConflict { .. } => {
@@ -2617,6 +2666,27 @@ where
                 "durable coordination unavailable",
             ),
         }
+    }
+}
+
+/// Map a coordination-layer durable outbox event to the public event record. A terminal action
+/// transition surfaces as an action state change; a session-lost fence as a session lifecycle
+/// change. The stable event id is carried through as the public resume cursor.
+fn map_outbox_event(event: &OutboxEvent) -> EventRecord {
+    let kind = match event.kind() {
+        OutboxEventKind::ActionTerminal => EventKind::ActionStateChanged,
+        OutboxEventKind::SessionLost => EventKind::SessionLifecycleChanged,
+    };
+    let resource = match event.aggregate() {
+        OutboxAggregate::Action { action_id, .. } => EventResource::Action(action_id.clone()),
+        OutboxAggregate::Session { session_id } => EventResource::Session(session_id.clone()),
+    };
+    EventRecord {
+        event_id: event.event_id(),
+        tenant_id: event.tenant_id().clone(),
+        kind,
+        resource,
+        created_at: event.created_at(),
     }
 }
 
@@ -2645,7 +2715,11 @@ where
             ApiRequest::CancelOperation(operation_id) => self
                 .cancel_operation_for_tenant(principal.tenant_id(), &operation_id)
                 .map(ApiResponse::Operation),
-            resume @ ApiRequest::ResumeEvents { .. } => self.auxiliary.execute(principal, resume),
+            ApiRequest::ResumeEvents {
+                last_event_id,
+                limit,
+                now,
+            } => self.resume_events(principal, last_event_id, limit, now),
             runtime_request => self.runtime.execute_runtime(principal, runtime_request),
         }
     }

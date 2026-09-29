@@ -264,6 +264,82 @@ async fn read_from_validates_page_limit_and_unknown_tenant_is_empty() {
 }
 
 #[tokio::test]
+async fn read_after_event_id_resolves_the_anchor_and_flags_a_missing_one() {
+    let outbox = MemoryEventOutbox::default();
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+
+    let mut ids = Vec::new();
+    for revision in 0..4u64 {
+        let (append, _) = action_terminal(&tenant, &session, revision);
+        let event = outbox
+            .append(append, at(revision as i64))
+            .await
+            .expect("append");
+        ids.push(event.event_id());
+    }
+
+    // From the beginning: the whole stream, no gap.
+    let page = outbox
+        .read_after_event_id(&tenant, None, 10, at(100))
+        .await
+        .expect("from start");
+    assert_eq!(page.events().len(), 4);
+    assert!(!page.cursor_expired());
+
+    // Anchored on a known event: resume strictly after it, no gap.
+    let page = outbox
+        .read_after_event_id(&tenant, Some(ids[1]), 10, at(100))
+        .await
+        .expect("after known");
+    assert_eq!(
+        page.events()
+            .iter()
+            .map(|event| event.cursor().position())
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert!(!page.cursor_expired());
+
+    // An unknown anchor (never issued for this tenant) recovers from the oldest event and flags the
+    // gap, so a consumer with a stale or bogus cursor moves forward instead of stalling.
+    let page = outbox
+        .read_after_event_id(&tenant, Some(uuid::Uuid::now_v7()), 10, at(100))
+        .await
+        .expect("after unknown");
+    assert!(page.cursor_expired());
+    assert_eq!(page.events().len(), 4);
+}
+
+#[tokio::test]
+async fn read_after_event_id_flags_a_gap_when_the_anchor_prefix_was_pruned() {
+    let outbox = MemoryEventOutbox::new(DAY).expect("outbox");
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+
+    let (early, _) = action_terminal(&tenant, &session, 1);
+    let early = outbox.append(early, at(0)).await.expect("early");
+    let early_id = early.event_id();
+
+    let (later, _) = action_terminal(&tenant, &session, 2);
+    let later_seconds = DAY.as_secs() as i64 + 10;
+    outbox
+        .append(later, at(later_seconds))
+        .await
+        .expect("later");
+
+    // The anchor event has aged out of retention. Resuming from it reports the gap and recovers
+    // from the oldest surviving event.
+    let page = outbox
+        .read_after_event_id(&tenant, Some(early_id), 10, at(later_seconds))
+        .await
+        .expect("after pruned anchor");
+    assert!(page.cursor_expired());
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.events()[0].cursor().position(), 2);
+}
+
+#[tokio::test]
 async fn session_lost_and_action_terminal_are_distinct_aggregates() {
     let outbox = MemoryEventOutbox::default();
     let tenant = TenantId::new();

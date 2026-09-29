@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use browserd_api::{
-    ApiError, ApiRequest, ApiResponse, ApiService, CreateAuthority, DurableApiRouter,
-    RuntimeApiBackend, RuntimeCreateResult, SessionCreateDispatch, SessionCreateRequest,
-    SessionResource, decode_session_create,
+    ApiError, ApiRequest, ApiResponse, ApiService, CreateAuthority, DurableApiRouter, EventKind,
+    EventResource, RuntimeApiBackend, RuntimeCreateResult, SessionCreateDispatch,
+    SessionCreateRequest, SessionResource, decode_session_create,
 };
 use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
@@ -19,12 +19,13 @@ use browserd_auth::{
 use browserd_coordination::{
     CanonicalRequestHash, ClaimCreateOperation, ClaimOutcome, CoordinationActorConfig,
     CoordinationBlockingClient, CoordinationError, CreateOperationSnapshot,
-    CreateSessionCoordination, MemoryCoordinationDatabase, MemoryCreateSessionStore,
-    OperationMutation, RecoverableCreateIntent, StoreConfig,
+    CreateSessionCoordination, EventOutbox, EventOutboxBlockingClient, MemoryCoordinationDatabase,
+    MemoryCreateSessionStore, MemoryEventOutbox, OperationMutation, OutboxAppend,
+    RecoverableCreateIntent, StoreConfig,
 };
 use browserd_core::{
-    CreateOperationState, ErrorCode, OperationId, PrincipalId, SessionId, SessionLifecycle,
-    TenantId,
+    ActionId, CreateOperationState, ErrorCode, OperationId, PrincipalId, SessionId,
+    SessionLifecycle, TenantId,
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::Algorithm;
@@ -198,6 +199,66 @@ fn concurrent_retries_dispatch_the_runtime_exactly_once() -> Result<(), Box<dyn 
     };
     assert_eq!(terminal.data().state(), CreateOperationState::Succeeded);
     assert!(terminal.data().session().is_some());
+    Ok(())
+}
+
+#[test]
+fn resume_events_are_served_from_the_durable_outbox() -> Result<(), Box<dyn Error>> {
+    // BRD-017 read path: with a durable outbox attached, ResumeEvents is served from the events
+    // connected to durable terminal transitions, mapped to the public event taxonomy, rather than
+    // from the disconnected in-memory auxiliary store.
+    let database = MemoryCoordinationDatabase::default();
+    let runtime = Arc::new(RecordingRuntime::new());
+    let outbox: Arc<dyn EventOutbox> = Arc::new(MemoryEventOutbox::default());
+    let client = EventOutboxBlockingClient::spawn(outbox, 2)?;
+    let router = DurableApiRouter::new(Arc::clone(&runtime), actor(database))
+        .with_event_outbox(client.clone());
+
+    let tenant_id = TenantId::new();
+    let principal = principal(tenant_id.clone(), &["events:read"])?;
+    let session_id = SessionId::new();
+    let action_id = ActionId::new();
+
+    // A terminal transition recorded to the outbox (as the runtime would on completion).
+    let recorded = client.append(
+        OutboxAppend::action_terminal(tenant_id.clone(), session_id, action_id.clone(), 3),
+        Utc::now(),
+    )?;
+
+    let ApiResponse::Events(page) = router.execute(
+        &principal,
+        ApiRequest::ResumeEvents {
+            last_event_id: None,
+            limit: 10,
+            now: Utc::now(),
+        },
+    )?
+    else {
+        return Err("resume should return events".into());
+    };
+    let page = page.data();
+    assert_eq!(page.events().len(), 1);
+    let event = &page.events()[0];
+    assert_eq!(event.event_id(), recorded.event_id());
+    assert_eq!(event.kind(), EventKind::ActionStateChanged);
+    assert_eq!(event.resource(), &EventResource::Action(action_id));
+    assert!(!page.gap());
+    assert_eq!(page.next_cursor(), Some(recorded.event_id()));
+
+    // Resuming after the last delivered event yields an empty, non-gapped page.
+    let ApiResponse::Events(tail) = router.execute(
+        &principal,
+        ApiRequest::ResumeEvents {
+            last_event_id: Some(recorded.event_id()),
+            limit: 10,
+            now: Utc::now(),
+        },
+    )?
+    else {
+        return Err("resume should return events".into());
+    };
+    assert!(tail.data().events().is_empty());
+    assert!(!tail.data().gap());
     Ok(())
 }
 
