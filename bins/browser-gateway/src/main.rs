@@ -10,7 +10,7 @@ use browser_gateway::{
 use browserd_api::{ApiService, DurableApiRouter};
 use browserd_coordination::{
     CoordinationActorConfig, CoordinationBlockingClient, EventOutbox, EventOutboxBlockingClient,
-    PostgresCreateSessionStore, RedisEventOutbox, RedisEventOutboxConfig, RedisGatewayActionConfig,
+    PostgresCreateSessionStore, PostgresEventOutbox, RedisGatewayActionConfig,
     RedisGatewayActionStore, StoreConfig,
 };
 use browserd_http::{HttpConfig, router};
@@ -94,21 +94,22 @@ async fn main() -> anyhow::Result<()> {
             .context("Redis action coordination connection failed")?,
     );
 
-    // Durable event outbox (BRD-017): the same Redis-backed store feeds both the runtime (which
-    // records each terminal transition) and the router (which serves ResumeEvents from it), so the
-    // at-least-once notification stream is connected to durable transitions and survives restarts.
-    let outbox_config = RedisEventOutboxConfig::new(
-        config.redis_url(),
-        config.redis_prefix(),
+    // Durable event outbox (BRD-017, BRD-003): the same Postgres-backed store feeds both the
+    // runtime (which records each terminal transition) and the router (which serves ResumeEvents
+    // from it), so the at-least-once notification stream is connected to durable transitions and
+    // inherits Postgres's commit and failover durability — the durable authority, not a cache.
+    let event_outbox = PostgresEventOutbox::connect(
+        config.postgres_url(),
+        config.postgres_max_connections(),
         store_config,
-        config.coordination_in_flight(),
-        REDIS_COMMAND_TIMEOUT,
-    )?;
-    let event_outbox: Arc<dyn EventOutbox> = Arc::new(
-        RedisEventOutbox::connect(outbox_config)
-            .await
-            .context("Redis event outbox connection failed")?,
-    );
+    )
+    .await
+    .context("PostgreSQL event outbox connection failed")?;
+    event_outbox
+        .migrate()
+        .await
+        .context("PostgreSQL event outbox migration failed")?;
+    let event_outbox: Arc<dyn EventOutbox> = Arc::new(event_outbox);
     let outbox_client =
         EventOutboxBlockingClient::spawn(event_outbox, config.coordination_in_flight().max(1))
             .context("event outbox blocking client failed to start")?;
