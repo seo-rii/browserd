@@ -53,7 +53,7 @@ use browserd_worker::{
     WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerSessionLifecycle,
     WorkerSessionOptionsV1, WorkerViewport, WorkerWaitCondition,
 };
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
 
@@ -597,6 +597,15 @@ const MAX_SESSION_ADMISSION_WAITERS: usize = 32;
 const ACTION_ADMISSION_WAIT: Duration = Duration::from_secs(1);
 
 impl<C> GatewayWorkerRuntime<C> {
+    /// Reclaim terminal session-listing entries whose last write is older than `retention`
+    /// (BRD-018), keeping the listing catalog bounded under session churn while a recently-closed
+    /// session stays listable for the window. Returns the number reclaimed; a transient catalog
+    /// lock failure yields 0 and is retried on the next maintenance pass.
+    #[must_use]
+    pub fn reclaim_retired_sessions(&self, now: DateTime<Utc>, retention: ChronoDuration) -> usize {
+        self.catalog.reclaim(now, retention).unwrap_or(0)
+    }
+
     pub fn new(
         client: Arc<C>,
         placement: GatewayWorkerPlacement,
@@ -2490,9 +2499,9 @@ where
                 );
             }
         }
-        if let Err(error) = self
-            .catalog
-            .upsert(authority.tenant_id().clone(), resource.clone())
+        if let Err(error) =
+            self.catalog
+                .upsert(authority.tenant_id().clone(), resource.clone(), Utc::now())
         {
             return RuntimeCreateResult::OutcomeUnknown(error);
         }
@@ -2593,7 +2602,7 @@ where
                     }
                 }
                 self.catalog
-                    .upsert(principal.tenant_id().clone(), resource.clone())?;
+                    .upsert(principal.tenant_id().clone(), resource.clone(), Utc::now())?;
                 Ok(ApiResponse::Session(ApiEnvelope::new(resource)))
             }
             ApiRequest::DeleteSession(session_id) => {
@@ -2614,8 +2623,11 @@ where
                     }
                     record.clone()
                 };
-                self.catalog
-                    .upsert(principal.tenant_id().clone(), record.resource.clone())?;
+                self.catalog.upsert(
+                    principal.tenant_id().clone(),
+                    record.resource.clone(),
+                    Utc::now(),
+                )?;
                 if matches!(
                     record.resource.lifecycle,
                     SessionLifecycle::Closed | SessionLifecycle::Failed
@@ -2698,7 +2710,7 @@ where
                     }
                 }
                 self.catalog
-                    .upsert(principal.tenant_id().clone(), resource.clone())?;
+                    .upsert(principal.tenant_id().clone(), resource.clone(), Utc::now())?;
                 Ok(ApiResponse::SessionClosed(ApiEnvelope::new(resource)))
             }
             ApiRequest::ListPages(command) => self.list_pages(principal, command),

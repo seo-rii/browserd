@@ -23,6 +23,7 @@ use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalState, CanonicalActionProposal, CredentialRefsHash,
     Origin,
 };
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
 
@@ -413,9 +414,13 @@ fn session_catalog_pagination_is_deterministic_tenant_scoped_and_filter_bound()
         metadata.insert(format!("item-{index}"), "present".to_owned());
         let resource = session_resource(metadata);
         expected.push(resource.id.clone());
-        catalog.upsert(tenant_a.clone(), resource)?;
+        catalog.upsert(tenant_a.clone(), resource, Utc::now())?;
     }
-    catalog.upsert(tenant_b.clone(), session_resource(BTreeMap::new()))?;
+    catalog.upsert(
+        tenant_b.clone(),
+        session_resource(BTreeMap::new()),
+        Utc::now(),
+    )?;
     expected.sort();
 
     let first = catalog.list(
@@ -443,7 +448,11 @@ fn session_catalog_pagination_is_deterministic_tenant_scoped_and_filter_bound()
     assert!(!token.contains(&expected[1].to_string()));
     let mut late_metadata = BTreeMap::new();
     late_metadata.insert("group".to_owned(), "a".to_owned());
-    catalog.upsert(tenant_a.clone(), session_resource(late_metadata))?;
+    catalog.upsert(
+        tenant_a.clone(),
+        session_resource(late_metadata),
+        Utc::now(),
+    )?;
 
     let second = catalog.list(
         &tenant_a,
@@ -492,6 +501,66 @@ fn session_catalog_pagination_is_deterministic_tenant_scoped_and_filter_bound()
                 },
             )
             .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn session_catalog_reclaims_terminal_entries_after_retention() -> Result<(), Box<dyn Error>> {
+    // BRD-018: the listing catalog drops terminal entries past the retention window, keeps active
+    // ones regardless of age, and keeps a recently-closed one listable within the window.
+    let catalog = SessionCatalog::default();
+    let tenant = TenantId::new();
+    let session = |lifecycle| SessionResource {
+        id: SessionId::new(),
+        lifecycle,
+        incarnation: 1,
+        requested_isolation: IsolationProfile::SharedContext,
+        effective_isolation: IsolationProfile::SharedContext,
+        metadata: BTreeMap::new(),
+    };
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).single().expect("t0");
+    let retention = ChronoDuration::hours(24);
+
+    let ready = session(SessionLifecycle::Ready);
+    let closed = session(SessionLifecycle::Closed);
+    catalog.upsert(tenant.clone(), ready.clone(), t0)?;
+    catalog.upsert(tenant.clone(), closed.clone(), t0)?;
+
+    let query = SessionListQuery {
+        lifecycle: None,
+        isolation: None,
+        metadata_key: None,
+        limit: 50,
+        page_token: None,
+    };
+
+    // Within the retention window the closed entry is still listable.
+    assert_eq!(
+        catalog.reclaim(t0 + ChronoDuration::hours(1), retention)?,
+        0
+    );
+    assert_eq!(catalog.list(&tenant, &query)?.items().len(), 2);
+
+    // Past retention the closed entry is reclaimed; the active one is kept regardless of age.
+    assert_eq!(
+        catalog.reclaim(t0 + ChronoDuration::hours(25), retention)?,
+        1
+    );
+    let survivors = catalog.list(&tenant, &query)?;
+    assert_eq!(
+        survivors
+            .items()
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>(),
+        vec![ready.id.clone()]
+    );
+
+    // Idempotent: a later pass finds nothing more to reclaim.
+    assert_eq!(
+        catalog.reclaim(t0 + ChronoDuration::hours(48), retention)?,
+        0
     );
     Ok(())
 }

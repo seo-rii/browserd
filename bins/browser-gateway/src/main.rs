@@ -15,6 +15,7 @@ use browserd_coordination::{
 };
 use browserd_http::{HttpConfig, router};
 use browserd_worker::WorkerRpcClient;
+use chrono::{Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
 
 const WORKER_RPC_MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -26,6 +27,9 @@ const VIEWER_MAX_OUTSTANDING_TICKETS: usize = 16_384;
 const MONITOR_INTERVAL: Duration = Duration::from_secs(15);
 /// Maximum create operations reconciled per pass, bounding each pass's work.
 const RECONCILE_SCAN_LIMIT: usize = 64;
+/// Retention for terminal session-listing entries before the catalog reclaims them (BRD-018),
+/// matching the durable retention floor so a recently-closed session stays listable that long.
+const SESSION_CATALOG_RETENTION_HOURS: i64 = 24;
 /// Consecutive healthy probes required to advertise a dependency ready again after an outage.
 const HEALTHY_THRESHOLD: u32 = 2;
 /// Consecutive failed probes required to fail a dependency closed, absorbing transient blips.
@@ -131,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let api = Arc::new(
         DurableApiRouter::with_dispatch_lease_duration(
-            runtime,
+            Arc::clone(&runtime),
             coordination,
             config.create_lease_duration(),
         )?
@@ -155,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_token = CancellationToken::new();
     let monitor = {
         let api = Arc::clone(&api);
+        let runtime = Arc::clone(&runtime);
         let readiness = Arc::clone(&readiness);
         let shutdown = shutdown_token.clone();
         let worker_probe = worker_rpc.clone();
@@ -188,6 +193,22 @@ async fn main() -> anyhow::Result<()> {
                                 eprintln!("browser gateway reconcile pass failed: {error:?}");
                             }
                             Err(_) => eprintln!("browser gateway reconcile task panicked"),
+                        }
+
+                        // Reclaim terminal session-listing entries past their retention window so
+                        // the catalog stays bounded under churn (BRD-018). Best-effort and off the
+                        // async worker, so a large sweep never blocks the reactor.
+                        let runtime = Arc::clone(&runtime);
+                        if tokio::task::spawn_blocking(move || {
+                            runtime.reclaim_retired_sessions(
+                                Utc::now(),
+                                ChronoDuration::hours(SESSION_CATALOG_RETENTION_HOURS),
+                            )
+                        })
+                        .await
+                        .is_err()
+                        {
+                            eprintln!("browser gateway session reclamation task panicked");
                         }
                     }
                 }

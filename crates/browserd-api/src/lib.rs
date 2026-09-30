@@ -977,20 +977,60 @@ impl SessionListPage {
     }
 }
 
+struct CatalogEntry {
+    session: SessionResource,
+    /// Last time this entry was written; drives terminal-session reclamation (BRD-018).
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Default)]
 pub struct SessionCatalog {
-    sessions: Mutex<HashMap<(TenantId, SessionId), SessionResource>>,
+    sessions: Mutex<HashMap<(TenantId, SessionId), CatalogEntry>>,
 }
 
 impl SessionCatalog {
-    pub fn upsert(&self, tenant_id: TenantId, session: SessionResource) -> Result<(), ApiError> {
+    pub fn upsert(
+        &self,
+        tenant_id: TenantId,
+        session: SessionResource,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApiError> {
         self.sessions
             .lock()
             .map_err(|_| {
                 ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
             })?
-            .insert((tenant_id, session.id.clone()), session);
+            .insert(
+                (tenant_id, session.id.clone()),
+                CatalogEntry {
+                    session,
+                    updated_at: now,
+                },
+            );
         Ok(())
+    }
+
+    /// Drop terminal (`Closed`/`Failed`) catalog entries whose last write is older than `retention`,
+    /// so the listing store stays bounded under session churn while a recently-closed session stays
+    /// listable for the retention window (BRD-018). Active sessions are never dropped, regardless of
+    /// age. Returns the number of entries reclaimed.
+    pub fn reclaim(
+        &self,
+        now: DateTime<Utc>,
+        retention: ChronoDuration,
+    ) -> Result<usize, ApiError> {
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
+        })?;
+        let before = sessions.len();
+        sessions.retain(|_, entry| {
+            let terminal = matches!(
+                entry.session.lifecycle,
+                SessionLifecycle::Closed | SessionLifecycle::Failed
+            );
+            !(terminal && now.signed_duration_since(entry.updated_at) >= retention)
+        });
+        Ok(before - sessions.len())
     }
 
     pub fn list(
@@ -1052,20 +1092,20 @@ impl SessionCatalog {
         })?;
         let mut matching = sessions
             .iter()
-            .filter(|((stored_tenant, _), session)| {
+            .filter(|((stored_tenant, _), entry)| {
                 stored_tenant == tenant_id
                     && query
                         .lifecycle
-                        .is_none_or(|state| session.lifecycle == state)
+                        .is_none_or(|state| entry.session.lifecycle == state)
                     && query
                         .isolation
-                        .is_none_or(|isolation| session.effective_isolation == isolation)
+                        .is_none_or(|isolation| entry.session.effective_isolation == isolation)
                     && query
                         .metadata_key
                         .as_ref()
-                        .is_none_or(|key| session.metadata.contains_key(key))
+                        .is_none_or(|key| entry.session.metadata.contains_key(key))
             })
-            .map(|(_, session)| session.clone())
+            .map(|(_, entry)| entry.session.clone())
             .collect::<Vec<_>>();
         matching.sort_by(|left, right| left.id.cmp(&right.id));
         let ceiling = ceiling.or_else(|| matching.last().map(|session| session.id.clone()));
