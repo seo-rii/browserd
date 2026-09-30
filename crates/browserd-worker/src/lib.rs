@@ -519,6 +519,8 @@ pub struct WorkerConfig {
     action_journal: ActionJournalConfig,
     artifact_limits: WorkerArtifactLimits,
     session_option_support: Option<SessionOptionSupport>,
+    /// Retention for a fully-closed session's in-memory state before it is reclaimed (BRD-018).
+    session_retention: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -565,6 +567,11 @@ impl Default for WorkerArtifactLimits {
 }
 
 impl WorkerConfig {
+    /// Default closed-session retention (24 hours), matching the durable idempotency/action
+    /// retention floor so a late retry that the durable layer still honors finds the worker's
+    /// terminal session too.
+    pub const DEFAULT_SESSION_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: WorkerId,
@@ -600,12 +607,26 @@ impl WorkerConfig {
             action_journal,
             artifact_limits: WorkerArtifactLimits::default(),
             session_option_support: None,
+            session_retention: Self::DEFAULT_SESSION_RETENTION,
         })
     }
 
     #[must_use]
     pub const fn with_artifact_limits(mut self, limits: WorkerArtifactLimits) -> Self {
         self.artifact_limits = limits;
+        self
+    }
+
+    /// How long a fully-closed session's in-memory state is retained before it is reclaimed
+    /// (BRD-018). A closed session stays queryable for at least this long after cleanup so a late
+    /// read still sees its terminal snapshot; after it, the entry is dropped so retained memory and
+    /// the per-maintenance scan stay bounded under churn. The durable action authority — not this
+    /// in-memory copy — preserves unresolved-action evidence, so reclamation never loses it.
+    #[must_use]
+    pub fn with_session_retention(mut self, retention: Duration) -> Self {
+        if !retention.is_zero() {
+            self.session_retention = retention;
+        }
         self
     }
 
@@ -973,6 +994,11 @@ struct SessionState {
     approvals: HashMap<ApprovalId, ApprovalRecord>,
     action_ledger: ActionLedger<FileActionJournal>,
     durability_degraded: bool,
+    /// When a fully-closed session's in-memory state becomes eligible for reclamation (BRD-018):
+    /// set to `now + session_retention` the first maintenance pass that observes the session
+    /// terminal-and-cleaned, and the entry is dropped once the clock reaches it. `None` while the
+    /// session is active or not yet observed terminal.
+    reclaim_at: Option<SessionTime>,
 }
 
 struct SessionExecutor {
@@ -1407,6 +1433,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     approvals: HashMap::new(),
                     action_ledger,
                     durability_degraded: false,
+                    reclaim_at: None,
                 }),
                 action_owner: AtomicBool::new(false),
                 approved_dispatch_phase: AtomicU8::new(APPROVED_DISPATCH_IDLE),
@@ -3715,6 +3742,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             worker.draining = true;
         }
         refresh_heartbeat_deadline(&mut worker)?;
+        drop(worker);
+        // Reclaim fully-closed sessions past their retention watermark on the same maintenance
+        // cadence, so retained memory and the next scan stay bounded under churn (BRD-018).
+        self.reclaim_retired(now);
         if cleanup_failed {
             Err(WorkerError::CleanupFailed)
         } else if durability_failed {
@@ -3722,6 +3753,88 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         } else {
             Ok(expired)
         }
+    }
+
+    /// Drop the in-memory state of fully-closed sessions once their retention watermark has passed,
+    /// keeping retained memory and the maintenance scan bounded under session churn (BRD-018).
+    ///
+    /// A session becomes eligible only when its lifecycle is terminal (`Closed`/`Failed`) and its
+    /// cleanup receipt is in (`!occupies_capacity`). The first eligible pass stamps a watermark of
+    /// `now + session_retention`; the entry is dropped only once the clock reaches it, so a closed
+    /// session stays queryable for the retention window and a late in-flight caller keeps its own
+    /// `Arc` alive until done. Unresolved-action evidence is preserved by the durable action
+    /// authority, not this in-memory copy, so dropping the entry never loses it. Returns the number
+    /// of sessions reclaimed.
+    pub fn reclaim_retired_sessions(
+        &self,
+        peer: &AuthenticatedPeer,
+        now: SessionTime,
+    ) -> Result<usize, WorkerError> {
+        self.authorize(peer)?;
+        Ok(self.reclaim_retired(now))
+    }
+
+    fn reclaim_retired(&self, now: SessionTime) -> usize {
+        let retention_millis =
+            u64::try_from(self.config.session_retention.as_millis()).unwrap_or(u64::MAX);
+        let Ok(worker) = self.lock_worker() else {
+            return 0;
+        };
+        let candidates = worker
+            .sessions
+            .iter()
+            .map(|(session_id, executor)| (session_id.clone(), Arc::clone(executor)))
+            .collect::<Vec<_>>();
+        drop(worker);
+
+        let mut reclaimable = Vec::new();
+        for (session_id, executor) in candidates {
+            let Ok(mut session) = executor.state.lock() else {
+                continue;
+            };
+            let terminal = matches!(
+                session.machine.lifecycle(),
+                SessionLifecycle::Closed | SessionLifecycle::Failed
+            ) && !session.occupies_capacity;
+            if !terminal {
+                // Not eligible (still active, or cleanup receipt not yet in): reset any watermark.
+                session.reclaim_at = None;
+                continue;
+            }
+            match session.reclaim_at {
+                None => {
+                    session.reclaim_at =
+                        Some(SessionTime::new(now.get().saturating_add(retention_millis)));
+                }
+                Some(reclaim_at) if now >= reclaim_at => reclaimable.push(session_id),
+                Some(_) => {}
+            }
+        }
+
+        if reclaimable.is_empty() {
+            return 0;
+        }
+        let Ok(mut worker) = self.lock_worker() else {
+            return 0;
+        };
+        let mut reclaimed = 0usize;
+        for session_id in reclaimable {
+            // Re-verify under the worker lock that the entry is still the terminal one we observed;
+            // a terminal lifecycle never reverts, so a present entry is safe to drop.
+            if let Some(executor) = worker.sessions.get(&session_id) {
+                let still_terminal = executor.state.lock().is_ok_and(|session| {
+                    matches!(
+                        session.machine.lifecycle(),
+                        SessionLifecycle::Closed | SessionLifecycle::Failed
+                    ) && !session.occupies_capacity
+                });
+                if still_terminal {
+                    worker.sessions.remove(&session_id);
+                    reclaimed = reclaimed.saturating_add(1);
+                }
+            }
+        }
+        reclaimed
     }
 
     pub fn heartbeat_deadline(

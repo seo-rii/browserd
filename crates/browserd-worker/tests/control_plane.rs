@@ -2375,3 +2375,109 @@ fn privileged_profile_session_allows_evaluate_dispatch() {
         Some(0)
     );
 }
+
+#[test]
+fn closed_sessions_are_reclaimed_only_after_the_retention_watermark() {
+    // BRD-018: a fully-closed session's in-memory state is dropped once its retention watermark
+    // passes, bounding retained memory and the maintenance scan under churn, while staying
+    // queryable for the retention window and never reclaiming an active session.
+    let driver = Arc::new(FakeDriver {
+        qualified: true,
+        ..FakeDriver::default()
+    });
+    let sandbox = Arc::new(FakeSandbox {
+        qualified: true,
+        ..FakeSandbox::default()
+    });
+    let Some(config) = config(2) else {
+        return;
+    };
+    let Some(peer) = AuthenticatedPeer::new("gateway-internal").ok() else {
+        return;
+    };
+    let worker = WorkerControlPlane::new_with_clock(
+        config.with_session_retention(Duration::from_millis(100)),
+        driver,
+        sandbox,
+        Arc::new(TestClock),
+    );
+
+    let Some(created) = create_ready_session(&worker, &peer, "reclaim") else {
+        return;
+    };
+
+    // An active session is never reclaimed and stays queryable.
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(1)),
+        Ok(0)
+    );
+    assert!(
+        worker
+            .get_session(&peer, &created.session_id, &created.fence)
+            .is_ok()
+    );
+
+    // Close it: cleanup completes synchronously, so it is terminal-and-reclaimable.
+    assert!(
+        worker
+            .close_session(
+                &peer,
+                &created.session_id,
+                &created.fence,
+                SessionTime::new(5)
+            )
+            .is_ok()
+    );
+
+    // The first eligible pass only stamps the watermark (now + 100); the session stays queryable.
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(5)),
+        Ok(0)
+    );
+    assert!(
+        worker
+            .get_session(&peer, &created.session_id, &created.fence)
+            .is_ok()
+    );
+
+    // Still within the retention window: retained.
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(100)),
+        Ok(0)
+    );
+    assert!(
+        worker
+            .get_session(&peer, &created.session_id, &created.fence)
+            .is_ok()
+    );
+
+    // At/after the watermark (5 + 100 = 105): reclaimed and gone.
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(105)),
+        Ok(1)
+    );
+    assert_eq!(
+        worker.get_session(&peer, &created.session_id, &created.fence),
+        Err(WorkerError::SessionNotFound)
+    );
+
+    // Idempotent: a later pass finds nothing to reclaim.
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(200)),
+        Ok(0)
+    );
+}
+
+#[test]
+fn reclamation_requires_the_trusted_peer() {
+    let Some((worker, _peer, _driver, _sandbox)) = ready_worker(1) else {
+        return;
+    };
+    let Some(attacker) = AuthenticatedPeer::new("attacker").ok() else {
+        return;
+    };
+    assert_eq!(
+        worker.reclaim_retired_sessions(&attacker, SessionTime::new(0)),
+        Err(WorkerError::UnauthorizedPeer)
+    );
+}
