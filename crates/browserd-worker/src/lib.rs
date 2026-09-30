@@ -521,6 +521,10 @@ pub struct WorkerConfig {
     session_option_support: Option<SessionOptionSupport>,
     /// Retention for a fully-closed session's in-memory state before it is reclaimed (BRD-018).
     session_retention: Duration,
+    /// Upper bound on the sessions one tenant may have retained in the worker at once — active plus
+    /// terminal-not-yet-reclaimed — so a single tenant churning create/close cannot accumulate
+    /// unbounded session state ahead of reclamation (BRD-018).
+    max_sessions_per_tenant: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -572,6 +576,10 @@ impl WorkerConfig {
     /// terminal session too.
     pub const DEFAULT_SESSION_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// Default per-tenant retained-session cap. Generous enough not to constrain normal create/close
+    /// churn within the retention window, while still bounding a single tenant's accumulation.
+    pub const DEFAULT_MAX_SESSIONS_PER_TENANT: usize = 4096;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         worker_id: WorkerId,
@@ -608,6 +616,7 @@ impl WorkerConfig {
             artifact_limits: WorkerArtifactLimits::default(),
             session_option_support: None,
             session_retention: Self::DEFAULT_SESSION_RETENTION,
+            max_sessions_per_tenant: Self::DEFAULT_MAX_SESSIONS_PER_TENANT,
         })
     }
 
@@ -626,6 +635,17 @@ impl WorkerConfig {
     pub fn with_session_retention(mut self, retention: Duration) -> Self {
         if !retention.is_zero() {
             self.session_retention = retention;
+        }
+        self
+    }
+
+    /// Bounds the sessions one tenant may have retained at once (active plus terminal-not-yet-
+    /// reclaimed); a create beyond it is rejected with retryable backpressure (BRD-018). A zero
+    /// limit is ignored.
+    #[must_use]
+    pub const fn with_max_sessions_per_tenant(mut self, limit: usize) -> Self {
+        if limit != 0 {
+            self.max_sessions_per_tenant = limit;
         }
         self
     }
@@ -1287,6 +1307,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             }
 
             let operation_id = claim.operation_id().clone();
+            // One scan tallies both the global occupied slots and this tenant's retained sessions
+            // (any lifecycle, so terminal-not-yet-reclaimed entries count toward its bound).
+            let mut tenant_retained = 0usize;
             let occupied = worker.sessions.values().try_fold(
                 worker.creating_sessions,
                 |count, executor| {
@@ -1294,12 +1317,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         .state
                         .lock()
                         .map_err(|_| WorkerError::StateUnavailable)?;
+                    if session.tenant_id == command.tenant_id {
+                        tenant_retained = tenant_retained.saturating_add(1);
+                    }
                     Ok::<_, WorkerError>(
                         count.saturating_add(usize::from(session.occupies_capacity)),
                     )
                 },
             )?;
-            if occupied >= self.config.max_sessions {
+            if occupied >= self.config.max_sessions
+                || tenant_retained >= self.config.max_sessions_per_tenant
+            {
                 worker.create_operations.insert(
                     operation_id,
                     CreateOperationResult::Failed(WorkerError::CapacityExceeded),

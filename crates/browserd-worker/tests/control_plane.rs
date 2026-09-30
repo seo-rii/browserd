@@ -2469,6 +2469,112 @@ fn closed_sessions_are_reclaimed_only_after_the_retention_watermark() {
 }
 
 #[test]
+fn per_tenant_session_cap_backpressures_and_reclamation_frees_a_slot() {
+    // BRD-018: one tenant's retained sessions (active plus terminal-not-yet-reclaimed) are bounded,
+    // so a create beyond the cap is backpressured; a different tenant is unaffected; and reclaiming
+    // a closed session frees a per-tenant slot.
+    let driver = Arc::new(FakeDriver {
+        qualified: true,
+        ..FakeDriver::default()
+    });
+    let sandbox = Arc::new(FakeSandbox {
+        qualified: true,
+        ..FakeSandbox::default()
+    });
+    let Some(config) = config(2) else {
+        return;
+    };
+    let Some(peer) = AuthenticatedPeer::new("gateway-internal").ok() else {
+        return;
+    };
+    let worker = WorkerControlPlane::new_with_clock(
+        config
+            .with_max_sessions_per_tenant(2)
+            .with_session_retention(Duration::from_millis(50)),
+        driver,
+        sandbox,
+        Arc::new(TestClock),
+    );
+    let tenant = TenantId::new();
+    let other = TenantId::new();
+
+    let first = worker.create_session(
+        &peer,
+        create_command(tenant.clone(), "a1", 1),
+        SessionTime::new(0),
+    );
+    assert!(first.is_ok());
+    assert!(
+        worker
+            .create_session(
+                &peer,
+                create_command(tenant.clone(), "a2", 2),
+                SessionTime::new(0)
+            )
+            .is_ok()
+    );
+    // A third session for the same tenant is backpressured at the cap. (Each attempt uses a fresh
+    // idempotency key: a capacity rejection is cached under its operation id, so a same-key retry
+    // would return the cached failure rather than re-evaluating the cap.)
+    assert_eq!(
+        worker.create_session(
+            &peer,
+            create_command(tenant.clone(), "a3", 3),
+            SessionTime::new(0)
+        ),
+        Err(WorkerError::CapacityExceeded)
+    );
+    // A different tenant is unaffected by the first tenant's cap.
+    assert!(
+        worker
+            .create_session(&peer, create_command(other, "b1", 4), SessionTime::new(0))
+            .is_ok()
+    );
+
+    // Closing a session still counts as retained, so the tenant stays at the cap.
+    let Some(created) = first.ok() else {
+        return;
+    };
+    assert!(
+        worker
+            .close_session(
+                &peer,
+                &created.session_id,
+                &created.fence,
+                SessionTime::new(1)
+            )
+            .is_ok()
+    );
+    assert_eq!(
+        worker.create_session(
+            &peer,
+            create_command(tenant.clone(), "a4", 5),
+            SessionTime::new(2)
+        ),
+        Err(WorkerError::CapacityExceeded)
+    );
+
+    // Reclaiming the closed session frees a per-tenant slot (watermark stamped, then dropped).
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(1000)),
+        Ok(0)
+    );
+    assert_eq!(
+        worker.reclaim_retired_sessions(&peer, SessionTime::new(1100)),
+        Ok(1)
+    );
+    assert!(
+        worker
+            .create_session(
+                &peer,
+                create_command(tenant, "a5", 6),
+                SessionTime::new(1101)
+            )
+            .is_ok()
+    );
+}
+
+#[test]
 fn reclamation_requires_the_trusted_peer() {
     let Some((worker, _peer, _driver, _sandbox)) = ready_worker(1) else {
         return;
