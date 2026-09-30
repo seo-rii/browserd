@@ -127,7 +127,7 @@ fn prune_removes_elapsed_entries_without_changing_claim_semantics() -> Result<()
 
     // Nothing has elapsed yet, so a prune removes nothing and a retry still resolves to the
     // original operation.
-    assert_eq!(registry.prune(now + Duration::from_secs(1))?, 0);
+    assert!(registry.prune(now + Duration::from_secs(1))?.is_empty());
     let retry = registry.claim(
         tenant.clone(),
         key_one.clone(),
@@ -136,8 +136,11 @@ fn prune_removes_elapsed_entries_without_changing_claim_semantics() -> Result<()
     )?;
     assert_eq!(retry.operation_id(), first.operation_id());
 
-    // Past retention both entries are reclaimed.
-    assert_eq!(registry.prune(now + IDEMPOTENCY_RETENTION)?, 2);
+    // Past retention both entries are reclaimed, and prune reports their operation ids so a caller
+    // can drop the per-operation state it keyed on them.
+    let pruned = registry.prune(now + IDEMPOTENCY_RETENTION)?;
+    assert_eq!(pruned.len(), 2);
+    assert!(pruned.contains(first.operation_id()));
 
     // Pruning is behavior-neutral: a re-claim after it mints a fresh operation, exactly as an
     // unpruned but elapsed entry would.

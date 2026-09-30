@@ -219,19 +219,28 @@ impl IdempotencyRegistry {
     /// churn (each unique key otherwise leaves an entry that is never revisited).
     ///
     /// This is behavior-neutral: [`Self::claim`] already treats an elapsed entry as absent — a
-    /// re-claim mints a fresh operation and overwrites it — so pruning only reclaims memory. Returns
-    /// the number of entries removed.
-    pub fn prune(&self, now: Instant) -> Result<usize, IdempotencyError> {
+    /// re-claim mints a fresh operation and overwrites it — so pruning only reclaims memory.
+    ///
+    /// Returns the operation ids of the removed entries, so a caller can reclaim the matching
+    /// per-operation state it keyed on them (for example the worker's create-operation results).
+    /// This is safe precisely because the entry has elapsed: a later claim for that key mints a new
+    /// operation and never revisits the returned id.
+    pub fn prune(&self, now: Instant) -> Result<Vec<OperationId>, IdempotencyError> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| IdempotencyError::CoordinationUnavailable)?;
-        let before = entries.len();
+        let mut pruned = Vec::new();
         entries.retain(|_, entry| {
-            now.checked_duration_since(entry.created_at)
-                .is_none_or(|elapsed| elapsed < self.retention)
+            let elapsed = now
+                .checked_duration_since(entry.created_at)
+                .is_some_and(|elapsed| elapsed >= self.retention);
+            if elapsed {
+                pruned.push(entry.operation_id.clone());
+            }
+            !elapsed
         });
-        Ok(before - entries.len())
+        Ok(pruned)
     }
 }
 

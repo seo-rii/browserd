@@ -3803,10 +3803,14 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     }
 
     fn reclaim_retired(&self, now: SessionTime) -> usize {
-        // Bound the create idempotency registry alongside session reclamation — both accumulate one
-        // entry per create — by dropping entries whose retention has elapsed. Behavior-neutral, so
-        // this only reclaims memory; best-effort, retried next pass on a transient lock failure.
-        let _ = self.create_idempotency.prune(Instant::now());
+        // Bound the per-create maps alongside session reclamation. Pruning the idempotency registry
+        // is behavior-neutral (claim already treats an elapsed entry as absent); the returned
+        // operation ids are exactly those whose create-operation result can be dropped too, since a
+        // later claim for that key mints a new operation and never revisits them.
+        let pruned_operations = self
+            .create_idempotency
+            .prune(Instant::now())
+            .unwrap_or_default();
 
         let retention_millis =
             u64::try_from(self.config.session_retention.as_millis()).unwrap_or(u64::MAX);
@@ -3844,12 +3848,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             }
         }
 
-        if reclaimable.is_empty() {
+        if reclaimable.is_empty() && pruned_operations.is_empty() {
             return 0;
         }
         let Ok(mut worker) = self.lock_worker() else {
             return 0;
         };
+        // Drop the create-operation results whose idempotency entries just elapsed, bounding that
+        // map the same way (a fresh claim never revisits a pruned operation id).
+        for operation_id in pruned_operations {
+            worker.create_operations.remove(&operation_id);
+        }
         let mut reclaimed = 0usize;
         for session_id in reclaimable {
             // Re-verify under the worker lock that the entry is still the terminal one we observed;
