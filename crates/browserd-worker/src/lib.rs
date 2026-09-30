@@ -3803,6 +3803,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     }
 
     fn reclaim_retired(&self, now: SessionTime) -> usize {
+        // Bound the create idempotency registry alongside session reclamation — both accumulate one
+        // entry per create — by dropping entries whose retention has elapsed. Behavior-neutral, so
+        // this only reclaims memory; best-effort, retried next pass on a transient lock failure.
+        let _ = self.create_idempotency.prune(Instant::now());
+
         let retention_millis =
             u64::try_from(self.config.session_retention.as_millis()).unwrap_or(u64::MAX);
         let Ok(worker) = self.lock_worker() else {

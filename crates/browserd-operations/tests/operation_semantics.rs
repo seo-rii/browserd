@@ -116,6 +116,38 @@ fn mappings_are_retained_for_at_least_24_hours() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn prune_removes_elapsed_entries_without_changing_claim_semantics() -> Result<(), Box<dyn Error>> {
+    let registry = IdempotencyRegistry::new(IDEMPOTENCY_RETENTION)?;
+    let tenant = TenantId::new();
+    let key_one = IdempotencyKey::new("prune-one")?;
+    let key_two = IdempotencyKey::new("prune-two")?;
+    let now = Instant::now();
+    let first = registry.claim(tenant.clone(), key_one.clone(), hash_for(1), now)?;
+    registry.claim(tenant.clone(), key_two.clone(), hash_for(2), now)?;
+
+    // Nothing has elapsed yet, so a prune removes nothing and a retry still resolves to the
+    // original operation.
+    assert_eq!(registry.prune(now + Duration::from_secs(1))?, 0);
+    let retry = registry.claim(
+        tenant.clone(),
+        key_one.clone(),
+        hash_for(1),
+        now + Duration::from_secs(2),
+    )?;
+    assert_eq!(retry.operation_id(), first.operation_id());
+
+    // Past retention both entries are reclaimed.
+    assert_eq!(registry.prune(now + IDEMPOTENCY_RETENTION)?, 2);
+
+    // Pruning is behavior-neutral: a re-claim after it mints a fresh operation, exactly as an
+    // unpruned but elapsed entry would.
+    let after = registry.claim(tenant, key_one, hash_for(1), now + IDEMPOTENCY_RETENTION)?;
+    assert!(matches!(after, IdempotencyClaim::Created(_)));
+    assert_ne!(after.operation_id(), first.operation_id());
+    Ok(())
+}
+
+#[test]
 fn concurrent_retries_linearize_to_one_operation() -> Result<(), Box<dyn Error>> {
     const CALLERS: usize = 32;
     let registry = Arc::new(IdempotencyRegistry::default());

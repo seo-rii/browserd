@@ -214,6 +214,25 @@ impl IdempotencyRegistry {
         );
         Ok(IdempotencyClaim::Created(operation_id))
     }
+
+    /// Remove entries whose retention window has elapsed, bounding the registry under one-shot-key
+    /// churn (each unique key otherwise leaves an entry that is never revisited).
+    ///
+    /// This is behavior-neutral: [`Self::claim`] already treats an elapsed entry as absent — a
+    /// re-claim mints a fresh operation and overwrites it — so pruning only reclaims memory. Returns
+    /// the number of entries removed.
+    pub fn prune(&self, now: Instant) -> Result<usize, IdempotencyError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| IdempotencyError::CoordinationUnavailable)?;
+        let before = entries.len();
+        entries.retain(|_, entry| {
+            now.checked_duration_since(entry.created_at)
+                .is_none_or(|elapsed| elapsed < self.retention)
+        });
+        Ok(before - entries.len())
+    }
 }
 
 impl Default for IdempotencyRegistry {
