@@ -117,7 +117,14 @@ pub struct SupervisorConfig {
     supervisor_lease_ttl: Duration,
     directory_lease_ttl: Duration,
     cleanup_stage_timeout: Duration,
+    terminated_retention: Duration,
 }
+
+/// Default retention for a terminated shard's idempotency-replay guard before the lease sweep
+/// reclaims it. Generous enough to absorb any in-flight create/kill retry for a given shard, yet
+/// bounded so the `terminated` map cannot grow without limit as shards churn over a long-lived
+/// supervisor incarnation.
+const DEFAULT_TERMINATED_RETENTION: Duration = Duration::from_secs(3600);
 
 impl SupervisorConfig {
     pub fn new(
@@ -134,6 +141,7 @@ impl SupervisorConfig {
             supervisor_lease_ttl,
             directory_lease_ttl,
             cleanup_stage_timeout: Duration::from_secs(2),
+            terminated_retention: DEFAULT_TERMINATED_RETENTION,
         })
     }
 
@@ -148,12 +156,29 @@ impl SupervisorConfig {
         Ok(self)
     }
 
+    /// Overrides how long a terminated shard's replay guard is retained before the lease sweep
+    /// reclaims it. A zero retention is rejected so the guard always survives at least one sweep.
+    pub fn with_terminated_retention(
+        mut self,
+        terminated_retention: Duration,
+    ) -> Result<Self, SandboxError> {
+        if terminated_retention.is_zero() {
+            return Err(SandboxError::ZeroLeaseTtl);
+        }
+        self.terminated_retention = terminated_retention;
+        Ok(self)
+    }
+
     pub const fn supervisor_lease_ttl(self) -> Duration {
         self.supervisor_lease_ttl
     }
 
     pub const fn directory_lease_ttl(self) -> Duration {
         self.directory_lease_ttl
+    }
+
+    pub const fn terminated_retention(self) -> Duration {
+        self.terminated_retention
     }
 
     pub const fn cleanup_stage_timeout(self) -> Duration {
@@ -634,6 +659,9 @@ struct TerminatedShard {
     worker_id: WorkerId,
     worker_epoch: u64,
     create_outcome: CreateShardOutcome,
+    /// When this replay guard was recorded, so the lease sweep can reclaim it after the
+    /// configured retention and keep the `terminated` map bounded under shard churn.
+    terminated_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -1274,6 +1302,13 @@ where
     pub async fn expire_leases(&self, now: Instant) -> Vec<(ShardId, CleanupResult)> {
         let expired = {
             let mut state = self.state.lock().await;
+            // Reclaim terminated replay guards past their retention so the `terminated` map stays
+            // bounded under shard churn. A later create/kill for a reclaimed shard id simply falls
+            // through to a fresh launch, exactly as any idempotency window degrades once it lapses.
+            let terminated_retention = self.config.terminated_retention;
+            state.terminated.retain(|_, terminated| {
+                now.saturating_duration_since(terminated.terminated_at) < terminated_retention
+            });
             let mut expired = state
                 .active
                 .iter()
@@ -1497,6 +1532,7 @@ where
                                 worker_id: spec.worker_id.clone(),
                                 worker_epoch: spec.worker_epoch,
                                 create_outcome: CreateShardOutcome::Cancelled,
+                                terminated_at: Instant::now(),
                             },
                         );
                         CancelStep::Return(KillShardOutcome::AlreadyTerminated)
@@ -1582,6 +1618,7 @@ where
                             worker_id: spec.worker_id.clone(),
                             worker_epoch: spec.worker_epoch,
                             create_outcome: CreateShardOutcome::Cancelled,
+                            terminated_at: Instant::now(),
                         },
                     );
                     CancelStep::Return(KillShardOutcome::AlreadyTerminated)
@@ -1852,6 +1889,7 @@ where
                                     worker_id: cleaning.worker_id,
                                     worker_epoch: cleaning.worker_epoch,
                                     create_outcome: cleaning.create_outcome,
+                                    terminated_at: Instant::now(),
                                 },
                             );
                             Ok(KillShardOutcome::Terminated(result))

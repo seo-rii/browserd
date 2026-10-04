@@ -1788,3 +1788,95 @@ async fn supervisor_shutdown_closes_admission_and_cleans_every_active_shard() {
         Err(SandboxError::AdmissionClosed)
     ));
 }
+
+#[tokio::test]
+async fn terminated_replay_guards_are_reclaimed_after_their_retention() {
+    let backend = RecordingBackend::production_capable();
+    let retention = Duration::from_secs(3600);
+    let config = SupervisorConfig::new(Duration::from_secs(10), Duration::from_secs(30))
+        .expect("lease ordering must be valid")
+        .with_terminated_retention(retention)
+        .expect("terminated retention must be valid");
+    let supervisor = SandboxSupervisor::new(config, backend.clone());
+    let shard_id = ShardId::new();
+    // The replay guard only matches an exact binding, and `launch_spec` randomizes its tenant and
+    // session identity per call, so the whole scenario must reuse one spec instance.
+    let spec = launch_spec(shard_id.clone());
+    // `expire_leases` compares its argument against the real-time `terminated_at` stamp, so the
+    // sweep watermarks ride a synthetic timeline anchored here while every ownership lease stays
+    // real-time-relative (`create_shard` validates it against `Instant::now()`).
+    let sweep_base = Instant::now();
+
+    let provisions = |backend: &RecordingBackend| {
+        backend
+            .events()
+            .iter()
+            .filter(|event| event.as_str() == "provision")
+            .count()
+    };
+
+    supervisor
+        .create_shard(
+            spec.clone(),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("the first create must provision the shard");
+    assert!(matches!(
+        supervisor
+            .kill_shard(
+                &shard_id,
+                17,
+                launch_generation(),
+                CleanupReason::Administrative,
+            )
+            .await,
+        Ok(KillShardOutcome::Terminated(_))
+    ));
+    assert_eq!(provisions(&backend), 1);
+
+    // While the guard is live an exact retry replays the terminal outcome, and an intervening sweep
+    // that has not reached the watermark leaves the guard in place — neither re-enters the backend.
+    let replayed = supervisor
+        .create_shard(
+            spec.clone(),
+            WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+        )
+        .await
+        .expect("an exact retry of a terminated shard must replay its outcome");
+    assert!(
+        supervisor
+            .expire_leases(sweep_base + Duration::from_secs(60))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        supervisor
+            .create_shard(
+                spec.clone(),
+                WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+            )
+            .await,
+        Ok(replayed)
+    );
+    assert_eq!(provisions(&backend), 1);
+
+    // Once a sweep crosses the retention watermark the guard is reclaimed, so the next exact create
+    // provisions a fresh shard rather than replaying the now-stale terminal outcome.
+    assert!(
+        supervisor
+            .expire_leases(sweep_base + retention + Duration::from_secs(1))
+            .await
+            .is_empty()
+    );
+    assert_eq!(
+        supervisor
+            .create_shard(
+                spec,
+                WorkerOwnership::new(worker(), 17, Instant::now() + Duration::from_secs(10)),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created)
+    );
+    assert_eq!(provisions(&backend), 2);
+}
