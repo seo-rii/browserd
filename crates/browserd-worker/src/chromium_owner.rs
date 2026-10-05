@@ -1223,6 +1223,9 @@ pub(crate) enum PageCommand {
     WaitFor {
         predicate: String,
     },
+    WaitForNetworkQuiet {
+        quiet_ms: u64,
+    },
     HandleDialog {
         accept: bool,
         prompt_text: Option<String>,
@@ -1329,6 +1332,7 @@ struct TargetRouteEntry {
     frame_document_epoch: u64,
     url_revision: u64,
     document: DocumentLoadState,
+    network: NetworkActivity,
 }
 
 /// Lifecycle of the main-frame document most recently committed on a target.
@@ -1340,6 +1344,65 @@ struct DocumentLoadState {
     loader_id: Option<String>,
     dom_content_loaded: bool,
     loaded: bool,
+}
+
+/// In-flight network request ledger for a target, backing `wait_for(network_quiet)` (BRD-011).
+///
+/// `in_flight` holds the CDP `requestId`s that have seen a `Network.requestWillBeSent` but no
+/// terminal `loadingFinished`/`loadingFailed` yet. `quiet_since` is the instant the ledger last
+/// held zero in-flight requests, and is `Some` exactly when `in_flight` is empty — so a quiescence
+/// check never confuses "no activity" with "activity still pending". A redirect re-uses its
+/// `requestId`, so re-inserting it is a no-op and keeps the request correctly in flight. The ledger
+/// is reset on every new main-frame document so a request torn down by navigation (which never
+/// emits a terminal event) cannot wedge quiescence forever.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NetworkActivity {
+    in_flight: BTreeSet<String>,
+    quiet_since: Option<Instant>,
+}
+
+impl NetworkActivity {
+    /// A ledger with no in-flight requests, quiet since `now`.
+    fn quiet_at(now: Instant) -> Self {
+        Self {
+            in_flight: BTreeSet::new(),
+            quiet_since: Some(now),
+        }
+    }
+
+    /// Records a newly started request, which makes the ledger non-quiet.
+    fn record_request(&mut self, request_id: String) {
+        self.in_flight.insert(request_id);
+        self.quiet_since = None;
+    }
+
+    /// Settles a request; when it drains the last in-flight request the quiet clock starts at `now`.
+    fn settle_request(&mut self, request_id: &str, now: Instant) {
+        if self.in_flight.remove(request_id) && self.in_flight.is_empty() {
+            self.quiet_since = Some(now);
+        }
+    }
+
+    /// Whether the ledger has held zero in-flight requests for at least `quiet` as of `now`,
+    /// counting the quiet window no earlier than `floor` (the instant the wait began). The floor
+    /// gives requests a chance to appear rather than reporting a long-idle page quiet the moment a
+    /// caller starts waiting — the "networkidle" semantics the resource-timing predicate lacked.
+    fn quiet_for(&self, quiet: Duration, now: Instant, floor: Instant) -> bool {
+        self.in_flight.is_empty()
+            && self
+                .quiet_since
+                .is_some_and(|since| now.saturating_duration_since(since.max(floor)) >= quiet)
+    }
+
+    /// The instant quiescence would be reached if no further request arrives, for scheduling the
+    /// next re-check. `None` while requests are in flight, since only an event can make progress.
+    fn quiet_deadline(&self, quiet: Duration, floor: Instant) -> Option<Instant> {
+        if self.in_flight.is_empty() {
+            self.quiet_since.map(|since| since.max(floor) + quiet)
+        } else {
+            None
+        }
+    }
 }
 
 struct ChromiumOwnerActor<D> {
@@ -2626,6 +2689,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 self.await_condition(&cdp_session_id, guarded, &predicate, deadline)
                     .await
             }
+            PageCommand::WaitForNetworkQuiet { quiet_ms } => {
+                self.await_network_quiet(&target_id, guarded, quiet_ms, deadline)
+                    .await
+            }
             PageCommand::HandleDialog {
                 accept,
                 prompt_text,
@@ -3522,6 +3589,64 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
     }
 
+    /// Waits until the target's in-flight network ledger has held zero requests for `quiet_ms`.
+    ///
+    /// Unlike the JS predicate conditions, quiescence is decided from owner-side state fed by the
+    /// `Network.*` events the event pump already observes, so a request that has started but not
+    /// finished keeps the page non-quiet — the resource-timing predicate it replaces could only see
+    /// completed entries (BRD-011). Events are drained directly here (no command is in flight), and
+    /// the same fence guard as `command_event_first` aborts the wait if the document moves under it.
+    async fn await_network_quiet(
+        &mut self,
+        target_id: &str,
+        guarded: Option<GuardedPageExecution>,
+        quiet_ms: u64,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let quiet = Duration::from_millis(quiet_ms);
+        let started = Instant::now();
+        let expires_at = match deadline {
+            Some(deadline) => deadline
+                .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
+                .unwrap_or(deadline),
+            None => started + self.command_timeout,
+        };
+        loop {
+            let route = self
+                .routes
+                .get(target_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            if let Some(guarded) = guarded.as_ref()
+                && (route.target_incarnation != guarded.fence.target_incarnation
+                    || route.frame_document_epoch != guarded.fence.frame_document_epoch
+                    || route.url_revision != guarded.fence.url_revision)
+            {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            let now = Instant::now();
+            if route.network.quiet_for(quiet, now, started) {
+                return Ok(json!({ "ok": true }));
+            }
+            if now >= expires_at {
+                return Err(OwnerActorError::NavigationTimeout);
+            }
+            // Wake when the quiet window would elapse (if currently idle) or at the deadline,
+            // whichever is sooner; an incoming event wakes us earlier to re-evaluate the ledger.
+            let wake = route
+                .network
+                .quiet_deadline(quiet, started)
+                .map_or(expires_at, |ready| ready.min(expires_at));
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(wake.into()) => {}
+                incoming = self.events.recv() => {
+                    let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_incoming(incoming, None)?;
+                }
+            }
+        }
+    }
+
     async fn command_event_first(
         &mut self,
         method: &'static str,
@@ -3688,6 +3813,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     frame_document_epoch: 1,
                     url_revision: 1,
                     document: DocumentLoadState::default(),
+                    network: NetworkActivity::quiet_at(Instant::now()),
                 };
                 if let Some(existing) = self.routes.get(target.target_id()) {
                     if existing.route != entry.route
@@ -3935,6 +4061,9 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         dom_content_loaded: false,
                         loaded: false,
                     };
+                    // A new document abandons any requests the prior document left in flight (they
+                    // never emit a terminal event), so the quiescence ledger restarts from here.
+                    route.network = NetworkActivity::quiet_at(Instant::now());
                 }
             }
             "Page.domContentEventFired" | "Page.loadEventFired" => {
@@ -3972,6 +4101,36 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .url_revision
                     .checked_add(1)
                     .ok_or(OwnerActorError::StateOverflow)?;
+            }
+            "Network.requestWillBeSent" | "Network.loadingFinished" | "Network.loadingFailed" => {
+                // Maintain the per-target in-flight request ledger that `wait_for(network_quiet)`
+                // observes. Events for an unknown or retired session carry no consequence and are
+                // ignored rather than treated as a protocol fault (BRD-011).
+                let Some(session_id) = event_session_id
+                    .as_deref()
+                    .filter(|session_id| valid_identifier(session_id))
+                else {
+                    return Ok(());
+                };
+                let Some(request_id) = params
+                    .as_object()
+                    .and_then(|params| params.get("requestId"))
+                    .and_then(Value::as_str)
+                    .filter(|request_id| !request_id.is_empty())
+                else {
+                    return Ok(());
+                };
+                if let Some(route) = self
+                    .routes
+                    .values_mut()
+                    .find(|route| route.route.session_id == session_id)
+                {
+                    if method == "Network.requestWillBeSent" {
+                        route.network.record_request(request_id.to_owned());
+                    } else {
+                        route.network.settle_request(request_id, Instant::now());
+                    }
+                }
             }
             _ => {}
         }
@@ -4429,5 +4588,43 @@ mod tests {
 
         assert!(!owner.confirm_forced_termination(&proof));
         assert!(!owner.is_terminally_joined_after(&proof));
+    }
+
+    #[test]
+    fn network_activity_ledger_tracks_in_flight_and_quiescence() {
+        let start = Instant::now();
+        let quiet = Duration::from_millis(100);
+        let mut ledger = NetworkActivity::quiet_at(start);
+
+        // A fresh ledger is idle, but quiescence is measured no earlier than the wait floor so a
+        // long-idle page does not report quiet the instant a caller begins waiting.
+        let floor = start + Duration::from_millis(10);
+        assert!(!ledger.quiet_for(quiet, floor, floor));
+        assert_eq!(ledger.quiet_deadline(quiet, floor), Some(floor + quiet));
+        assert!(ledger.quiet_for(quiet, floor + quiet, floor));
+
+        // An in-flight request suspends quiescence and leaves no idle deadline to schedule.
+        ledger.record_request("req-1".to_owned());
+        assert!(!ledger.quiet_for(quiet, floor + quiet * 10, floor));
+        assert_eq!(ledger.quiet_deadline(quiet, floor), None);
+
+        // A redirect re-uses the request id without double-counting it, so one terminal event
+        // settles it and restarts the quiet clock at that instant.
+        ledger.record_request("req-1".to_owned());
+        let settled = floor + Duration::from_millis(50);
+        ledger.settle_request("req-1", settled);
+        assert!(!ledger.quiet_for(quiet, settled, floor));
+        assert_eq!(ledger.quiet_deadline(quiet, floor), Some(settled + quiet));
+        assert!(ledger.quiet_for(quiet, settled + quiet, floor));
+
+        // Settling an unknown request is a no-op; it never underflows or disturbs quiescence.
+        ledger.settle_request("absent", settled + quiet * 2);
+        assert!(ledger.quiet_for(quiet, settled + quiet, floor));
+
+        // A new document resets the ledger, discarding a request the prior document left pending.
+        ledger.record_request("req-2".to_owned());
+        assert!(!ledger.quiet_for(quiet, settled + quiet * 3, floor));
+        ledger = NetworkActivity::quiet_at(settled + quiet * 3);
+        assert!(ledger.quiet_for(quiet, settled + quiet * 4, floor));
     }
 }

@@ -214,6 +214,14 @@ fn lifecycle_event(session_id: &str, method: &str) -> Value {
     })
 }
 
+fn network_event(session_id: &str, method: &str, request_id: &str) -> Value {
+    json!({
+        "method": method,
+        "sessionId": session_id,
+        "params": {"requestId": request_id}
+    })
+}
+
 async fn qualify(reader: &mut Receiver, writer: &mut Sender) {
     let command = read_command(reader).await;
     assert_eq!(command["method"], "Browser.getVersion");
@@ -2726,6 +2734,111 @@ async fn wait_for_times_out_when_the_condition_never_holds() {
         ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
     );
     assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn network_quiet_completes_once_in_flight_requests_settle() {
+    let mut page = owned_page().await;
+    let wait = spawn_action(
+        &page,
+        br#"{"type":"wait_for","condition":{"type":"network_quiet","quiet_ms":80}}"#,
+        Some(Instant::now() + Duration::from_secs(5)),
+    );
+    // A request opens before the quiet window can elapse, so the page is not idle. No CDP command
+    // is issued for network quiet: the owner decides it from the in-flight ledger the events feed.
+    write_message(
+        &mut page.writer,
+        network_event("flat-primary", "Network.requestWillBeSent", "req-1"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    assert!(
+        !wait.is_finished(),
+        "an in-flight request keeps the page from reaching network quiet"
+    );
+
+    // Settling the only in-flight request lets the quiet window elapse and complete the wait.
+    write_message(
+        &mut page.writer,
+        network_event("flat-primary", "Network.loadingFinished", "req-1"),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("quiescence must complete the wait once requests settle")
+            .unwrap(),
+        succeeded()
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn network_quiet_times_out_while_a_request_stays_in_flight() {
+    let mut page = owned_page().await;
+    let wait = spawn_action(
+        &page,
+        br#"{"type":"wait_for","condition":{"type":"network_quiet","quiet_ms":50}}"#,
+        Some(Instant::now() + Duration::from_millis(200)),
+    );
+    // The request never completes, so the page never goes quiet and the action deadline ends it.
+    write_message(
+        &mut page.writer,
+        network_event("flat-primary", "Network.requestWillBeSent", "req-1"),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("the action deadline must end the wait")
+            .unwrap(),
+        ActionExecutionResult::FailedKnown("navigation_timeout".to_owned())
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn network_quiet_treats_a_redirect_as_the_same_in_flight_request() {
+    let mut page = owned_page().await;
+    let wait = spawn_action(
+        &page,
+        br#"{"type":"wait_for","condition":{"type":"network_quiet","quiet_ms":80}}"#,
+        Some(Instant::now() + Duration::from_secs(5)),
+    );
+    // A redirect re-emits `requestWillBeSent` with the same request id; it must count as one still
+    // in-flight request, not a second one and not an early completion.
+    write_message(
+        &mut page.writer,
+        network_event("flat-primary", "Network.requestWillBeSent", "req-1"),
+    )
+    .await;
+    write_message(
+        &mut page.writer,
+        network_event("flat-primary", "Network.requestWillBeSent", "req-1"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(140)).await;
+    assert!(
+        !wait.is_finished(),
+        "the redirected request is still in flight"
+    );
+
+    // A single terminal event settles the redirected request and lets quiescence be reached.
+    write_message(
+        &mut page.writer,
+        network_event("flat-primary", "Network.loadingFinished", "req-1"),
+    )
+    .await;
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("a single loadingFinished settles the redirected request")
+            .unwrap(),
+        succeeded()
+    );
     assert!(!page.manager.is_tainted());
 }
 

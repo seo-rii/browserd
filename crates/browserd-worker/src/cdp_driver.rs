@@ -556,8 +556,15 @@ fn parse_action_payload(payload: &[u8]) -> Result<(PageCommand, ActionResultShap
             ActionResultShape::Json,
         )),
         WorkerActionCommand::WaitFor { condition } => Ok((
-            PageCommand::WaitFor {
-                predicate: wait_predicate(&condition),
+            // `network_quiet` is decided from the owner's in-flight request ledger, not a JS
+            // predicate, so it routes to its own command; every other condition polls JS (BRD-011).
+            match condition {
+                WorkerWaitCondition::NetworkQuiet { quiet_ms } => {
+                    PageCommand::WaitForNetworkQuiet { quiet_ms }
+                }
+                condition => PageCommand::WaitFor {
+                    predicate: wait_predicate(&condition),
+                },
             },
             ActionResultShape::Unit,
         )),
@@ -641,9 +648,11 @@ fn wait_predicate(condition: &WorkerWaitCondition) -> String {
                     .to_owned()
             }
         },
-        WorkerWaitCondition::NetworkQuiet { quiet_ms } => format!(
-            "(() => {{ const e = performance.getEntriesByType('resource'); if (!e.length) return true; const last = e[e.length - 1]; const end = last.responseEnd || last.startTime; return (performance.now() - end) >= {quiet_ms}; }})()"
-        ),
+        // Superseded by the owner's in-flight request ledger (BRD-011): `map_command` routes
+        // `NetworkQuiet` to `PageCommand::WaitForNetworkQuiet` before reaching here, so this arm is
+        // unreachable. It is retained only for match exhaustiveness and polls false (fail-closed, a
+        // timeout rather than a spurious success) should any future caller route through it.
+        WorkerWaitCondition::NetworkQuiet { .. } => "false".to_owned(),
     }
 }
 
