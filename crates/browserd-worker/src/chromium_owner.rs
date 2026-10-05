@@ -43,6 +43,10 @@ const LIFECYCLE_DEADLINE_RESPONSE_MARGIN: Duration = Duration::from_millis(50);
 /// Capacity and lifetime of the per-owner opaque node-handle store.
 const NODE_STORE_CAPACITY: usize = 4096;
 const NODE_STORE_TTL: Duration = Duration::from_secs(300);
+/// Maximum normalized nodes a single snapshot returns before it reports truncation (SPEC §16.5).
+const MAX_SNAPSHOT_NODES: usize = 3_000;
+/// Per-node string byte cap for snapshot `role`/`name` values (SPEC §16.5).
+const MAX_SNAPSHOT_NODE_STRING_BYTES: usize = 4_096;
 /// Upper bound on the matches a single `query_all` mints, to bound resolution work.
 const MAX_QUERY_ALL_MATCHES: usize = 256;
 /// Extracts a bounded, rendered-text view of a resolved node for `get_text`.
@@ -1420,6 +1424,7 @@ struct ChromiumOwnerActor<D> {
     closed_page_tombstones: BTreeMap<PageId, SessionId>,
     retired_targets: BTreeMap<String, String>,
     next_target_incarnation: u64,
+    next_snapshot_id: u64,
     node_store: NodeHandleStore,
 }
 
@@ -1452,6 +1457,9 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             closed_page_tombstones: BTreeMap::new(),
             retired_targets: BTreeMap::new(),
             next_target_incarnation: 1,
+            // Starts at 1 so a minted snapshot id is never the 0 sentinel the node store treats as
+            // "not from a snapshot" (as `query_all` handles are bound).
+            next_snapshot_id: 1,
             node_store: NodeHandleStore::new(NODE_STORE_CAPACITY, NODE_STORE_TTL),
         }
     }
@@ -2713,21 +2721,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await
             }
             PageCommand::Snapshot => {
-                let response = self
-                    .command_event_first(
-                        "Accessibility.getFullAXTree",
-                        json!({}),
-                        Some(cdp_session_id),
-                        None,
-                        guarded,
-                        deadline,
-                    )
-                    .await?;
-                let nodes = response
-                    .get("nodes")
-                    .cloned()
-                    .unwrap_or_else(|| Value::Array(Vec::new()));
-                Ok(json!({ "nodes": nodes }))
+                self.capture_snapshot(page_id, &target_id, cdp_session_id, guarded, deadline)
+                    .await
             }
             PageCommand::InsertText { text } => {
                 self.command_event_first(
@@ -3057,6 +3052,104 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             frame_document_epoch: DocumentEpoch::new(entry.frame_document_epoch),
             url_revision: entry.url_revision,
         })
+    }
+
+    /// Captures a normalized snapshot: accessibility semantics joined with layout bounds, each
+    /// node addressed by an opaque handle bound to the current document (SPEC §16). Raw CDP
+    /// identifiers never reach the response — only the opaque `node_ref` does. Screenshot capture
+    /// and device-pixel-ratio are deferred to the artifact work (BRD-006).
+    async fn capture_snapshot(
+        &mut self,
+        page_id: &PageId,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let before = self.node_document_state(target_id)?;
+        let ax_tree = self
+            .command_event_first(
+                "Accessibility.getFullAXTree",
+                json!({}),
+                Some(cdp_session_id.clone()),
+                None,
+                guarded.clone(),
+                deadline,
+            )
+            .await?;
+        let dom_snapshot = self
+            .command_event_first(
+                "DOMSnapshot.captureSnapshot",
+                json!({ "computedStyles": [] }),
+                Some(cdp_session_id.clone()),
+                None,
+                guarded.clone(),
+                deadline,
+            )
+            .await?;
+        let layout_metrics = self
+            .command_event_first(
+                "Page.getLayoutMetrics",
+                json!({}),
+                Some(cdp_session_id),
+                None,
+                guarded,
+                deadline,
+            )
+            .await?;
+        // Each guarded command aborts on a document change, so reaching here means the three
+        // captures observed one document; compare its state before and after to label consistency.
+        let after = self.node_document_state(target_id)?;
+        let consistency = if before.frame_document_epoch == after.frame_document_epoch
+            && before.url_revision == after.url_revision
+        {
+            "near_consistent"
+        } else {
+            "changed_during_capture"
+        };
+
+        let bounds_by_id = snapshot_bounds_by_backend_id(&dom_snapshot);
+        let (snapshot_nodes, total_nodes) = normalize_snapshot_nodes(&ax_tree, &bounds_by_id);
+
+        let snapshot_counter = self.next_snapshot_id;
+        self.next_snapshot_id = self
+            .next_snapshot_id
+            .checked_add(1)
+            .ok_or(OwnerActorError::StateOverflow)?;
+        let snapshot_id = SnapshotId::new(snapshot_counter);
+
+        let now = node_store_now();
+        let mut nodes = Vec::with_capacity(snapshot_nodes.len());
+        for node in &snapshot_nodes {
+            let binding = NodeBinding {
+                session_incarnation: after.session_incarnation,
+                target_incarnation: after.target_incarnation,
+                frame_document_epoch: after.frame_document_epoch,
+                backend_node_id: BackendNodeId::new(node.backend_node_id),
+                snapshot_id,
+                url_revision: UrlRevision::new(after.url_revision),
+            };
+            let handle = self.node_store.insert(binding, now);
+            nodes.push(snapshot_node_value(node, handle.as_token()));
+        }
+        let returned_nodes = nodes.len();
+
+        // Truncation is surfaced explicitly rather than silently returning a partial tree (§16.5).
+        Ok(json!({
+            "snapshot_id": format!("snap_{snapshot_counter}"),
+            "page_id": page_id,
+            "session_incarnation": after.session_incarnation.get(),
+            "target_incarnation": after.target_incarnation.get(),
+            "document_epoch": after.frame_document_epoch.get(),
+            "url_revision": after.url_revision,
+            "consistency": consistency,
+            "viewport": snapshot_viewport(&layout_metrics),
+            "node_limit": MAX_SNAPSHOT_NODES,
+            "total_nodes": total_nodes,
+            "returned_nodes": returned_nodes,
+            "truncated": total_nodes > returned_nodes,
+            "nodes": nodes,
+        }))
     }
 
     /// Resolves a selector against the live document and mints an opaque handle per match.
@@ -4152,6 +4245,204 @@ struct NodeDocumentState {
     url_revision: u64,
 }
 
+/// The content-box bounds of a snapshot node, in CSS pixels (SPEC §16.3).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SnapshotBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// A normalized snapshot node before an opaque handle is minted for it.
+#[derive(Clone, Debug, PartialEq)]
+struct SnapshotNode {
+    backend_node_id: u64,
+    role: String,
+    name: String,
+    states: Vec<String>,
+    bounds: Option<SnapshotBounds>,
+}
+
+/// Bounds a snapshot string to the per-node byte cap (SPEC §16.5), truncating at a char boundary.
+fn truncate_snapshot_string(value: &str) -> String {
+    if value.len() <= MAX_SNAPSHOT_NODE_STRING_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_SNAPSHOT_NODE_STRING_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// The boolean AX properties set true on a node (e.g. `focusable`, `disabled`, `checked`), which
+/// the normalized schema exposes as the node's `states`.
+fn ax_node_states(ax_node: &Value) -> Vec<String> {
+    let Some(properties) = ax_node.get("properties").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    properties
+        .iter()
+        .filter_map(|property| {
+            let name = property.get("name").and_then(Value::as_str)?;
+            let is_true = property
+                .get("value")
+                .and_then(|value| value.get("value"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            is_true.then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Builds a `backendNodeId -> content-box bounds` map from a `DOMSnapshot.captureSnapshot`
+/// response. Each layout object's `nodeIndex` points into the document's parallel node arrays,
+/// whose `backendNodeId` keys the map; `bounds` is `[x, y, width, height]` in CSS pixels. Missing
+/// or malformed entries are skipped rather than failing the capture, and the first bounds seen for
+/// a backend node wins (its primary layout box).
+fn snapshot_bounds_by_backend_id(dom_snapshot: &Value) -> BTreeMap<u64, SnapshotBounds> {
+    let mut bounds_by_id = BTreeMap::new();
+    let Some(documents) = dom_snapshot.get("documents").and_then(Value::as_array) else {
+        return bounds_by_id;
+    };
+    for document in documents {
+        let backend_ids = document
+            .get("nodes")
+            .and_then(|nodes| nodes.get("backendNodeId"))
+            .and_then(Value::as_array);
+        let layout = document.get("layout");
+        let node_index = layout
+            .and_then(|layout| layout.get("nodeIndex"))
+            .and_then(Value::as_array);
+        let bounds = layout
+            .and_then(|layout| layout.get("bounds"))
+            .and_then(Value::as_array);
+        let (Some(backend_ids), Some(node_index), Some(bounds)) = (backend_ids, node_index, bounds)
+        else {
+            continue;
+        };
+        for (position, index) in node_index.iter().enumerate() {
+            let Some(index) = index.as_u64().and_then(|index| usize::try_from(index).ok()) else {
+                continue;
+            };
+            let Some(rect) = bounds.get(position).and_then(Value::as_array) else {
+                continue;
+            };
+            let (Some(x), Some(y), Some(width), Some(height)) = (
+                rect.first().and_then(Value::as_f64),
+                rect.get(1).and_then(Value::as_f64),
+                rect.get(2).and_then(Value::as_f64),
+                rect.get(3).and_then(Value::as_f64),
+            ) else {
+                continue;
+            };
+            let Some(backend_node_id) = backend_ids.get(index).and_then(Value::as_u64) else {
+                continue;
+            };
+            bounds_by_id
+                .entry(backend_node_id)
+                .or_insert(SnapshotBounds {
+                    x,
+                    y,
+                    width,
+                    height,
+                });
+        }
+    }
+    bounds_by_id
+}
+
+/// Normalizes a raw `Accessibility.getFullAXTree` response into curated semantic nodes paired with
+/// their content-box bounds (SPEC §16.1). Ignored nodes, nodes without a backing DOM node, and
+/// nodes with no role are dropped. Returns the retained nodes (capped at `MAX_SNAPSHOT_NODES`) and
+/// the total number of semantic nodes seen, so the caller can report truncation (SPEC §16.5).
+fn normalize_snapshot_nodes(
+    ax_tree: &Value,
+    bounds_by_id: &BTreeMap<u64, SnapshotBounds>,
+) -> (Vec<SnapshotNode>, usize) {
+    let mut nodes = Vec::new();
+    let mut total = 0usize;
+    let Some(ax_nodes) = ax_tree.get("nodes").and_then(Value::as_array) else {
+        return (nodes, total);
+    };
+    for ax_node in ax_nodes {
+        if ax_node.get("ignored").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(backend_node_id) = ax_node.get("backendDOMNodeId").and_then(Value::as_u64) else {
+            continue;
+        };
+        let role = ax_node
+            .get("role")
+            .and_then(|role| role.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if role.is_empty() {
+            continue;
+        }
+        total = total.saturating_add(1);
+        // Keep counting past the cap so the caller can report the true total, but stop collecting.
+        if nodes.len() >= MAX_SNAPSHOT_NODES {
+            continue;
+        }
+        let name = ax_node
+            .get("name")
+            .and_then(|name| name.get("value"))
+            .and_then(Value::as_str)
+            .map(truncate_snapshot_string)
+            .unwrap_or_default();
+        nodes.push(SnapshotNode {
+            backend_node_id,
+            role: truncate_snapshot_string(role),
+            name,
+            states: ax_node_states(ax_node),
+            bounds: bounds_by_id.get(&backend_node_id).copied(),
+        });
+    }
+    (nodes, total)
+}
+
+/// Extracts the CSS layout viewport from a `Page.getLayoutMetrics` response, defaulting defensively
+/// when a field is absent (SPEC §16.1/§16.3). Device scale factor is reported as 1 until explicit
+/// device-pixel-ratio plumbing lands alongside the screenshot capture (BRD-006).
+fn snapshot_viewport(layout_metrics: &Value) -> Value {
+    let css_viewport = layout_metrics.get("cssLayoutViewport");
+    let width = css_viewport
+        .and_then(|viewport| viewport.get("clientWidth"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let height = css_viewport
+        .and_then(|viewport| viewport.get("clientHeight"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "width": width,
+        "height": height,
+        "device_scale_factor": 1,
+    })
+}
+
+/// Serializes a normalized snapshot node to the public schema, attaching the opaque handle minted
+/// for it. Raw CDP identifiers (the backend node id) never appear; only the opaque `node_ref` does.
+fn snapshot_node_value(node: &SnapshotNode, node_ref: &str) -> Value {
+    let mut value = json!({
+        "node_ref": node_ref,
+        "role": node.role,
+        "name": node.name,
+        "states": node.states,
+    });
+    if let Some(bounds) = node.bounds {
+        value["bounds"] = json!({
+            "x": bounds.x,
+            "y": bounds.y,
+            "width": bounds.width,
+            "height": bounds.height,
+        });
+    }
+    value
+}
+
 /// Wall-clock milliseconds for the node-handle store's coarse TTL and LRU accounting.
 fn node_store_now() -> TargetTime {
     let millis = SystemTime::now()
@@ -4626,5 +4917,143 @@ mod tests {
         assert!(!ledger.quiet_for(quiet, settled + quiet * 3, floor));
         ledger = NetworkActivity::quiet_at(settled + quiet * 3);
         assert!(ledger.quiet_for(quiet, settled + quiet * 4, floor));
+    }
+
+    #[test]
+    fn snapshot_normalization_curates_semantic_nodes_joined_with_bounds() {
+        let dom_snapshot = json!({
+            "documents": [{
+                "nodes": { "backendNodeId": [100, 200, 300] },
+                "layout": {
+                    "nodeIndex": [0, 1, 2],
+                    "bounds": [[10.0, 20.0, 30.0, 40.0], [50.0, 60.0, 70.0, 80.0], [1.0, 2.0, 3.0, 4.0]]
+                }
+            }],
+            "strings": []
+        });
+        let bounds = snapshot_bounds_by_backend_id(&dom_snapshot);
+        assert_eq!(
+            bounds.get(&100).copied(),
+            Some(SnapshotBounds {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 40.0
+            })
+        );
+
+        let ax_tree = json!({
+            "nodes": [
+                {
+                    "ignored": false,
+                    "backendDOMNodeId": 100,
+                    "role": {"value": "button"},
+                    "name": {"value": "Login"},
+                    "properties": [
+                        {"name": "focusable", "value": {"value": true}},
+                        {"name": "disabled", "value": {"value": false}}
+                    ]
+                },
+                {"ignored": true, "backendDOMNodeId": 200, "role": {"value": "generic"}},
+                {"ignored": false, "role": {"value": "link"}},
+                {"ignored": false, "backendDOMNodeId": 300, "role": {"value": ""}},
+                {
+                    "ignored": false,
+                    "backendDOMNodeId": 300,
+                    "role": {"value": "textbox"},
+                    "name": {"value": "Search"},
+                    "properties": [{"name": "focusable", "value": {"value": true}}]
+                }
+            ]
+        });
+        let (nodes, total) = normalize_snapshot_nodes(&ax_tree, &bounds);
+        // The ignored node, the node with no backing DOM node, and the empty-role node are dropped.
+        assert_eq!(total, 2);
+        assert_eq!(
+            nodes,
+            vec![
+                SnapshotNode {
+                    backend_node_id: 100,
+                    role: "button".to_owned(),
+                    name: "Login".to_owned(),
+                    states: vec!["focusable".to_owned()],
+                    bounds: Some(SnapshotBounds {
+                        x: 10.0,
+                        y: 20.0,
+                        width: 30.0,
+                        height: 40.0
+                    }),
+                },
+                SnapshotNode {
+                    backend_node_id: 300,
+                    role: "textbox".to_owned(),
+                    name: "Search".to_owned(),
+                    states: vec!["focusable".to_owned()],
+                    bounds: Some(SnapshotBounds {
+                        x: 1.0,
+                        y: 2.0,
+                        width: 3.0,
+                        height: 4.0
+                    }),
+                },
+            ]
+        );
+
+        // The public node value exposes the opaque handle and never the raw backend node id.
+        let value = snapshot_node_value(&nodes[0], "node_opaque");
+        assert_eq!(value["node_ref"], "node_opaque");
+        assert_eq!(value["bounds"]["width"], 30.0);
+        assert!(value.get("backend_node_id").is_none());
+        assert!(value.get("backendDOMNodeId").is_none());
+    }
+
+    #[test]
+    fn snapshot_normalization_caps_nodes_and_reports_the_true_total() {
+        let ax_nodes: Vec<Value> = (0..MAX_SNAPSHOT_NODES + 5)
+            .map(|index| {
+                json!({
+                    "ignored": false,
+                    "backendDOMNodeId": index + 1,
+                    "role": {"value": "listitem"}
+                })
+            })
+            .collect();
+        let ax_tree = json!({ "nodes": ax_nodes });
+        let (nodes, total) = normalize_snapshot_nodes(&ax_tree, &BTreeMap::new());
+        assert_eq!(nodes.len(), MAX_SNAPSHOT_NODES);
+        assert_eq!(total, MAX_SNAPSHOT_NODES + 5);
+        assert!(
+            total > nodes.len(),
+            "the cap must be reported as truncation"
+        );
+    }
+
+    #[test]
+    fn snapshot_strings_are_bounded_at_a_char_boundary() {
+        let short = "a short label";
+        assert_eq!(truncate_snapshot_string(short), short);
+
+        let oversized = "x".repeat(MAX_SNAPSHOT_NODE_STRING_BYTES - 1) + "\u{20AC}";
+        let truncated = truncate_snapshot_string(&oversized);
+        assert!(truncated.len() <= MAX_SNAPSHOT_NODE_STRING_BYTES);
+        // The 3-byte euro sign would straddle the cap, so it is dropped whole rather than split.
+        assert_eq!(truncated.len(), MAX_SNAPSHOT_NODE_STRING_BYTES - 1);
+        assert!(!truncated.contains('\u{20AC}'));
+    }
+
+    #[test]
+    fn snapshot_viewport_reads_the_css_layout_viewport() {
+        let metrics = json!({
+            "cssLayoutViewport": {"clientWidth": 1280, "clientHeight": 720}
+        });
+        assert_eq!(
+            snapshot_viewport(&metrics),
+            json!({"width": 1280, "height": 720, "device_scale_factor": 1})
+        );
+        // A missing viewport degrades to zeros rather than failing the capture.
+        assert_eq!(
+            snapshot_viewport(&json!({})),
+            json!({"width": 0, "height": 0, "device_scale_factor": 1})
+        );
     }
 }

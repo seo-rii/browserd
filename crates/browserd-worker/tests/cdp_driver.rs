@@ -2862,22 +2862,118 @@ async fn handle_dialog_accepts_with_prompt_text() {
 }
 
 #[tokio::test]
-async fn snapshot_returns_the_accessibility_tree() {
+async fn snapshot_returns_a_normalized_tree_with_opaque_node_refs() {
     let mut page = owned_page().await;
     let snapshot = spawn_action(&page, br#"{"type":"snapshot"}"#, None);
 
-    let command = read_command(&mut page.reader).await;
-    assert_eq!(command["method"], "Accessibility.getFullAXTree");
+    // The capture joins accessibility semantics, layout bounds, and viewport metrics.
+    let ax = read_command(&mut page.reader).await;
+    assert_eq!(ax["method"], "Accessibility.getFullAXTree");
     respond(
         &mut page.writer,
-        &command,
-        json!({"nodes": [{"nodeId": "1", "role": {"value": "RootWebArea"}}]}),
+        &ax,
+        json!({"nodes": [
+            {
+                "ignored": false,
+                "backendDOMNodeId": 100,
+                "role": {"value": "button"},
+                "name": {"value": "Login"},
+                "properties": [{"name": "focusable", "value": {"value": true}}]
+            },
+            {"ignored": true, "backendDOMNodeId": 200, "role": {"value": "generic"}}
+        ]}),
+    )
+    .await;
+
+    let dom = read_command(&mut page.reader).await;
+    assert_eq!(dom["method"], "DOMSnapshot.captureSnapshot");
+    respond(
+        &mut page.writer,
+        &dom,
+        json!({
+            "documents": [{
+                "nodes": {"backendNodeId": [100, 200]},
+                "layout": {"nodeIndex": [0], "bounds": [[1040.0, 30.0, 120.0, 40.0]]}
+            }],
+            "strings": []
+        }),
+    )
+    .await;
+
+    let metrics = read_command(&mut page.reader).await;
+    assert_eq!(metrics["method"], "Page.getLayoutMetrics");
+    respond(
+        &mut page.writer,
+        &metrics,
+        json!({"cssLayoutViewport": {"clientWidth": 1280, "clientHeight": 720}}),
     )
     .await;
 
     let tree: serde_json::Value =
         serde_json::from_slice(&succeeded_bytes(snapshot.await.unwrap())).unwrap();
-    assert_eq!(tree["nodes"][0]["role"]["value"], "RootWebArea");
+    assert!(
+        tree["snapshot_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("snap_")),
+        "the envelope carries an opaque snapshot id"
+    );
+    assert_eq!(tree["consistency"], "near_consistent");
+    assert_eq!(
+        tree["viewport"],
+        json!({"width": 1280, "height": 720, "device_scale_factor": 1})
+    );
+    assert_eq!(tree["total_nodes"], 1);
+    assert_eq!(tree["returned_nodes"], 1);
+    assert_eq!(tree["truncated"], false);
+    // The ignored node is dropped; the one semantic node is normalized with its bounds and states.
+    assert_eq!(tree["nodes"].as_array().map(Vec::len), Some(1));
+    let node = &tree["nodes"][0];
+    assert_eq!(node["role"], "button");
+    assert_eq!(node["name"], "Login");
+    assert_eq!(node["states"], json!(["focusable"]));
+    assert_eq!(
+        node["bounds"],
+        json!({"x": 1040.0, "y": 30.0, "width": 120.0, "height": 40.0})
+    );
+    // No raw CDP identifier leaks; the node is addressed only by its opaque handle.
+    assert!(node.get("backendDOMNodeId").is_none());
+    let node_ref = node["node_ref"]
+        .as_str()
+        .expect("a node carries an opaque ref");
+
+    // The snapshot's node_ref resolves for a follow-up action on the same document.
+    let get_text = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"get_text","node_ref":"{node_ref}"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(
+        resolve["method"], "DOM.resolveNode",
+        "a valid snapshot node_ref is accepted and resolved rather than rejected before CDP"
+    );
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-1"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"value": "Login"}}),
+    )
+    .await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
+    assert!(
+        matches!(get_text.await.unwrap(), ActionExecutionResult::Succeeded(_)),
+        "a read action driven by the snapshot node_ref completes"
+    );
+
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }

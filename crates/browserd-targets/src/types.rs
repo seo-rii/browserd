@@ -33,6 +33,12 @@ impl TargetIncarnation {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    /// The raw monotonic incarnation, for provenance reporting in action results.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -42,6 +48,12 @@ impl SessionIncarnation {
     #[must_use]
     pub const fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    /// The raw monotonic incarnation, for provenance reporting in action results.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
     }
 }
 
