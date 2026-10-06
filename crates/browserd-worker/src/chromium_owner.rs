@@ -73,6 +73,13 @@ const NODE_FILL_FUNCTION: &str = "function (value) { const el = this; const tag 
 /// Selects the requested option values in a resolved `<select>` for `select_option`. Applies only
 /// to an enabled `<select>`; any other element makes no DOM change and returns `false` (BRD-013).
 const NODE_SELECT_FUNCTION: &str = "function (values) { const el = this; if ((el.tagName || '').toUpperCase() !== 'SELECT') { return false; } if (el.disabled) { return false; } const wanted = new Set(values); for (const option of Array.from(el.options || [])) { option.selected = wanted.has(option.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
+/// Computes an actionable pointer point for `click`/`double_click`/`hover`. The element is first
+/// scrolled into view, then rejected (`ok:false`, no point) if it has no layout box, its center
+/// lies outside the viewport, or the topmost element at its center is neither it nor a descendant
+/// (occluded by an overlay). Otherwise it returns the viewport-pixel center `{ok:true, x, y}` so a
+/// pointer action lands on the requested element rather than whatever happens to sit at a stale
+/// coordinate (BRD-012).
+const NODE_ACTIONABLE_POINT_FUNCTION: &str = "function () { const el = this; if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(true); } else if (el.scrollIntoView) { el.scrollIntoView({ block: 'center', inline: 'center' }); } const rect = el.getBoundingClientRect(); if (!(rect.width > 0 && rect.height > 0)) { return { ok: false }; } const x = rect.left + rect.width / 2; const y = rect.top + rect.height / 2; const doc = el.ownerDocument; const view = doc && doc.defaultView; if (view && (x < 0 || y < 0 || x > view.innerWidth || y > view.innerHeight)) { return { ok: false }; } const hit = doc ? doc.elementFromPoint(x, y) : null; if (!hit || !(hit === el || el.contains(hit))) { return { ok: false }; } return { ok: true, x: x, y: y }; }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3384,11 +3391,12 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .ok_or(OwnerActorError::OutcomeUncertain)
     }
 
-    /// Resolves a node handle to the pointer coordinates of its first content box.
+    /// Resolves a node handle to an actionable viewport pointer coordinate.
     ///
-    /// An element with no content box (not rendered or hidden) has no actionable point and is
-    /// rejected, which gives the click family a basic visibility gate on top of the store's
-    /// staleness checks.
+    /// The element is scrolled into view, then rejected before any pointer input if it has no
+    /// layout box, its center falls outside the viewport, or another element occludes its center
+    /// (BRD-012) — on top of the node store's staleness checks. Validating the real geometry needs
+    /// a live browser; the helper's behavior is covered by the review's extracted-JS diagnostics.
     async fn node_pointer_target(
         &mut self,
         target_id: &str,
@@ -3397,37 +3405,33 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         node_ref: &str,
         deadline: Option<Instant>,
     ) -> Result<(f64, f64), OwnerActorError> {
-        let backend_node_id = self.resolve_node_backend_id(target_id, node_ref)?;
-        let response = self
-            .command_event_first(
-                "DOM.getContentQuads",
-                json!({ "backendNodeId": backend_node_id }),
-                Some(cdp_session_id.to_owned()),
-                None,
+        let actionable = self
+            .call_function_on_node(
+                target_id,
+                cdp_session_id.to_owned(),
                 guarded,
+                node_ref,
+                NodeFunctionCall {
+                    declaration: NODE_ACTIONABLE_POINT_FUNCTION,
+                    arguments: json!([]),
+                },
                 deadline,
             )
             .await?;
-        let quad = response
-            .get("quads")
-            .and_then(Value::as_array)
-            .and_then(|quads| quads.first())
-            .and_then(Value::as_array)
-            .filter(|quad| quad.len() == 8)
-            .ok_or(OwnerActorError::Rejected)?;
-        let mut sum_x = 0.0;
-        let mut sum_y = 0.0;
-        for (index, coordinate) in quad.iter().enumerate() {
-            let coordinate = coordinate
-                .as_f64()
-                .ok_or(OwnerActorError::OutcomeUncertain)?;
-            if index % 2 == 0 {
-                sum_x += coordinate;
-            } else {
-                sum_y += coordinate;
-            }
+        // A non-actionable element (no box, off-screen, or occluded) is rejected before any pointer
+        // input, so a click/hover never lands on the wrong element (BRD-012).
+        if actionable.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(OwnerActorError::Rejected);
         }
-        Ok((sum_x / 4.0, sum_y / 4.0))
+        let x = actionable
+            .get("x")
+            .and_then(Value::as_f64)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let y = actionable
+            .get("y")
+            .and_then(Value::as_f64)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        Ok((x, y))
     }
 
     /// Dispatches a left mouse press/release pair at a point with the given click count.
@@ -5095,6 +5099,18 @@ mod tests {
         ] {
             assert!(helper.contains("return false"));
         }
+    }
+
+    #[test]
+    fn actionable_point_helper_scrolls_into_view_and_hit_tests() {
+        // The pointer target must bring the element into view, gate on a visible box, and reject an
+        // occluded element rather than clicking a stale coordinate (BRD-012).
+        assert!(NODE_ACTIONABLE_POINT_FUNCTION.contains("scrollIntoView"));
+        assert!(NODE_ACTIONABLE_POINT_FUNCTION.contains("getBoundingClientRect"));
+        assert!(NODE_ACTIONABLE_POINT_FUNCTION.contains("elementFromPoint"));
+        assert!(NODE_ACTIONABLE_POINT_FUNCTION.contains("contains"));
+        // A non-actionable element yields no point.
+        assert!(NODE_ACTIONABLE_POINT_FUNCTION.contains("ok: false"));
     }
 
     #[test]

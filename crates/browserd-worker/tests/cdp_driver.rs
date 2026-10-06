@@ -2351,8 +2351,55 @@ async fn extract_table_returns_rows_of_cell_text() {
     assert!(!page.manager.is_tainted());
 }
 
+/// Drives the resolve + actionability-helper + release sequence `node_pointer_target` issues,
+/// reporting the actionable point `(x, y)`.
+async fn respond_actionable_point(page: &mut OwnedPage, x: f64, y: f64) {
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-point"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"value": {"ok": true, "x": x, "y": y}}}),
+    )
+    .await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
+}
+
+/// Drives the same sequence but reports the element as not actionable (off-screen/occluded/no box).
+async fn respond_unactionable_point(page: &mut OwnedPage) {
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-point"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"value": {"ok": false}}}),
+    )
+    .await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
+}
+
 #[tokio::test]
-async fn click_dispatches_at_the_resolved_content_box_center() {
+async fn click_dispatches_at_the_actionable_point() {
     let mut page = owned_page().await;
     let token = mint_node(&mut page, 300).await;
 
@@ -2361,15 +2408,7 @@ async fn click_dispatches_at_the_resolved_content_box_center() {
         format!(r#"{{"type":"click","node_ref":"{token}"}}"#).into_bytes(),
         None,
     );
-    let quads = read_command(&mut page.reader).await;
-    assert_eq!(quads["method"], "DOM.getContentQuads");
-    assert_eq!(quads["params"]["backendNodeId"], 300);
-    respond(
-        &mut page.writer,
-        &quads,
-        json!({"quads": [[10, 20, 30, 20, 30, 40, 10, 40]]}),
-    )
-    .await;
+    respond_actionable_point(&mut page, 20.0, 30.0).await;
 
     let press = read_command(&mut page.reader).await;
     assert_eq!(press["method"], "Input.dispatchMouseEvent");
@@ -2388,7 +2427,7 @@ async fn click_dispatches_at_the_resolved_content_box_center() {
 }
 
 #[tokio::test]
-async fn click_of_a_node_without_a_content_box_is_rejected() {
+async fn click_of_an_unactionable_node_is_rejected() {
     let mut page = owned_page().await;
     let token = mint_node(&mut page, 301).await;
 
@@ -2397,9 +2436,8 @@ async fn click_of_a_node_without_a_content_box_is_rejected() {
         format!(r#"{{"type":"click","node_ref":"{token}"}}"#).into_bytes(),
         None,
     );
-    let quads = read_command(&mut page.reader).await;
-    assert_eq!(quads["method"], "DOM.getContentQuads");
-    respond(&mut page.writer, &quads, json!({"quads": []})).await;
+    // The element is off-screen/occluded/zero-area, so no actionable point is produced.
+    respond_unactionable_point(&mut page).await;
 
     assert_eq!(
         click.await.unwrap(),
@@ -2407,7 +2445,7 @@ async fn click_of_a_node_without_a_content_box_is_rejected() {
     );
     assert!(
         has_no_command_bytes(&mut page.reader, false).await,
-        "a node with no content box dispatches no pointer events"
+        "an unactionable node dispatches no pointer events"
     );
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
@@ -2423,14 +2461,7 @@ async fn hover_moves_the_pointer_to_the_node_center() {
         format!(r#"{{"type":"hover","node_ref":"{token}"}}"#).into_bytes(),
         None,
     );
-    let quads = read_command(&mut page.reader).await;
-    assert_eq!(quads["method"], "DOM.getContentQuads");
-    respond(
-        &mut page.writer,
-        &quads,
-        json!({"quads": [[0, 0, 40, 0, 40, 20, 0, 20]]}),
-    )
-    .await;
+    respond_actionable_point(&mut page, 20.0, 10.0).await;
     let moved = read_command(&mut page.reader).await;
     assert_eq!(moved["method"], "Input.dispatchMouseEvent");
     assert_eq!(moved["params"]["type"], "mouseMoved");
@@ -2453,14 +2484,7 @@ async fn double_click_dispatches_two_click_sequences() {
         format!(r#"{{"type":"double_click","node_ref":"{token}"}}"#).into_bytes(),
         None,
     );
-    let quads = read_command(&mut page.reader).await;
-    assert_eq!(quads["method"], "DOM.getContentQuads");
-    respond(
-        &mut page.writer,
-        &quads,
-        json!({"quads": [[0, 0, 20, 0, 20, 20, 0, 20]]}),
-    )
-    .await;
+    respond_actionable_point(&mut page, 10.0, 10.0).await;
     for expected_count in [1, 1, 2, 2] {
         let event = read_command(&mut page.reader).await;
         assert_eq!(event["method"], "Input.dispatchMouseEvent");
@@ -2486,14 +2510,7 @@ async fn double_click_release_failure_after_a_landed_press_is_outcome_unknown() 
         format!(r#"{{"type":"double_click","node_ref":"{token}"}}"#).into_bytes(),
         None,
     );
-    let quads = read_command(&mut page.reader).await;
-    assert_eq!(quads["method"], "DOM.getContentQuads");
-    respond(
-        &mut page.writer,
-        &quads,
-        json!({"quads": [[0, 0, 20, 0, 20, 20, 0, 20]]}),
-    )
-    .await;
+    respond_actionable_point(&mut page, 10.0, 10.0).await;
 
     let press = read_command(&mut page.reader).await;
     assert_eq!(press["method"], "Input.dispatchMouseEvent");
