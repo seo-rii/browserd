@@ -2632,10 +2632,11 @@ async fn select_option_passes_the_requested_values() {
     let call = read_command(&mut page.reader).await;
     assert_eq!(call["method"], "Runtime.callFunctionOn");
     assert_eq!(call["params"]["arguments"][0]["value"], json!(["a", "b"]));
+    // The helper reports whether it applied to a supported `<select>`, not the selected values.
     respond(
         &mut page.writer,
         &call,
-        json!({"result": {"type": "object", "value": ["a", "b"]}}),
+        json!({"result": {"type": "boolean", "value": true}}),
     )
     .await;
 
@@ -2644,6 +2645,46 @@ async fn select_option_passes_the_requested_values() {
     respond(&mut page.writer, &release, json!({})).await;
 
     assert_eq!(select.await.unwrap(), succeeded());
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn fill_on_an_unsupported_element_is_rejected_without_claiming_success() {
+    let mut page = owned_page().await;
+    let token = mint_node(&mut page, 430).await;
+
+    let fill = spawn_action_owned(
+        &page,
+        format!(r#"{{"type":"fill","node_ref":"{token}","value":"x"}}"#).into_bytes(),
+        None,
+    );
+    let resolve = read_command(&mut page.reader).await;
+    assert_eq!(resolve["method"], "DOM.resolveNode");
+    respond(
+        &mut page.writer,
+        &resolve,
+        json!({"object": {"objectId": "obj-div"}}),
+    )
+    .await;
+    let call = read_command(&mut page.reader).await;
+    assert_eq!(call["method"], "Runtime.callFunctionOn");
+    // The helper reports the element is not fillable (e.g. a plain <div>): no DOM change applied.
+    respond(
+        &mut page.writer,
+        &call,
+        json!({"result": {"type": "boolean", "value": false}}),
+    )
+    .await;
+    let release = read_command(&mut page.reader).await;
+    assert_eq!(release["method"], "Runtime.releaseObject");
+    respond(&mut page.writer, &release, json!({})).await;
+
+    // The action is a clean rejection, never a silent success on the wrong element.
+    assert_eq!(
+        fill.await.unwrap(),
+        ActionExecutionResult::FailedKnown("browser_operation_rejected".to_owned())
+    );
     assert!(!page.drain.0.load(Ordering::SeqCst));
     assert!(!page.manager.is_tainted());
 }

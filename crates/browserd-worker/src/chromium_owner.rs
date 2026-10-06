@@ -59,13 +59,20 @@ const NODE_COMPUTED_STYLE_FUNCTION: &str = "function () { const s = getComputedS
 const NODE_TABLE_FUNCTION: &str = "function () { const rows = this.rows ? Array.from(this.rows) : Array.from(this.querySelectorAll('tr')); return rows.map(r => Array.from(r.cells && r.cells.length ? r.cells : r.querySelectorAll('td,th')).map(c => (c.innerText != null ? c.innerText : (c.textContent || '')).trim())); }";
 /// Blurs a resolved node for `blur`.
 const NODE_BLUR_FUNCTION: &str = "function () { this.blur(); return true; }";
-/// Sets a resolved node's checked state, firing input/change only on a real change, for
-/// `check` and `uncheck`.
-const NODE_SET_CHECKED_FUNCTION: &str = "function (desired) { if (!!this.checked !== desired) { this.checked = desired; this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); } return !!this.checked; }";
-/// Sets a resolved node's value and fires input/change for `fill`.
-const NODE_FILL_FUNCTION: &str = "function (value) { this.focus(); if ('value' in this) { this.value = value; } else { this.textContent = value; } this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
-/// Selects the requested option values in a resolved <select> for `select_option`.
-const NODE_SELECT_FUNCTION: &str = "function (values) { const wanted = new Set(values); for (const option of Array.from(this.options || [])) { option.selected = wanted.has(option.value); } this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); return Array.from(this.selectedOptions || []).map(o => o.value); }";
+/// Sets a checkbox/radio input's checked state for `check`/`uncheck`, firing input/change only on
+/// a real change. Applies only to an enabled checkbox or radio input; any other element (or a
+/// disabled one) makes no DOM change and returns `false`, which the caller turns into a rejection
+/// so a `checked` property is never fabricated on an arbitrary node (BRD-013).
+const NODE_SET_CHECKED_FUNCTION: &str = "function (desired) { const el = this; const type = (el.type || '').toLowerCase(); if ((el.tagName || '').toUpperCase() !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) { return false; } if (el.disabled) { return false; } if (!!el.checked !== desired) { el.checked = desired; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } return true; }";
+/// Fills a resolved node's value for `fill`. A text-bearing `<input>` or `<textarea>` is set
+/// through the native value setter so controlled (React-style) inputs observe the change; a
+/// `contenteditable` host has its text replaced. A disabled/readonly target or any other element
+/// (e.g. a plain `<div>`) makes no DOM change and returns `false`, so a mis-targeted fill never
+/// clobbers unrelated content (BRD-013). The value is never echoed back in the result.
+const NODE_FILL_FUNCTION: &str = "function (value) { const el = this; const tag = (el.tagName || '').toUpperCase(); const blocked = ['checkbox','radio','button','submit','reset','image','file','range','color','hidden']; if (tag === 'INPUT' && blocked.includes((el.type || '').toLowerCase())) { return false; } if (tag === 'INPUT' || tag === 'TEXTAREA') { if (el.disabled || el.readOnly) { return false; } el.focus(); const proto = tag === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const desc = Object.getOwnPropertyDescriptor(proto, 'value'); if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; } if (el.isContentEditable) { el.focus(); el.textContent = value; el.dispatchEvent(new Event('input', { bubbles: true })); return true; } return false; }";
+/// Selects the requested option values in a resolved `<select>` for `select_option`. Applies only
+/// to an enabled `<select>`; any other element makes no DOM change and returns `false` (BRD-013).
+const NODE_SELECT_FUNCTION: &str = "function (values) { const el = this; if ((el.tagName || '').toUpperCase() !== 'SELECT') { return false; } if (el.disabled) { return false; } const wanted = new Set(values); for (const option of Array.from(el.options || [])) { option.selected = wanted.has(option.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2612,7 +2619,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await
             }
             PageCommand::Check { node_ref } => {
-                self.call_function_on_node(
+                self.apply_node_mutation(
                     &target_id,
                     cdp_session_id,
                     guarded,
@@ -2626,7 +2633,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await
             }
             PageCommand::Uncheck { node_ref } => {
-                self.call_function_on_node(
+                self.apply_node_mutation(
                     &target_id,
                     cdp_session_id,
                     guarded,
@@ -2640,7 +2647,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await
             }
             PageCommand::Fill { node_ref, value } => {
-                self.call_function_on_node(
+                self.apply_node_mutation(
                     &target_id,
                     cdp_session_id,
                     guarded,
@@ -2654,7 +2661,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await
             }
             PageCommand::SelectOption { node_ref, values } => {
-                self.call_function_on_node(
+                self.apply_node_mutation(
                     &target_id,
                     cdp_session_id,
                     guarded,
@@ -3274,6 +3281,29 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .resolve(&handle, &context, node_store_now())
             .map_err(|_| OwnerActorError::Rejected)?;
         Ok(resolved.backend_node_id().get())
+    }
+
+    /// Runs a node-mutating helper (`fill`/`check`/`select`) that applies only to a supported,
+    /// enabled, editable element and reports `true`; any other element makes no DOM change and
+    /// reports `false`, which becomes a clean caller rejection so a mis-targeted mutation never
+    /// silently changes the wrong node (BRD-013).
+    async fn apply_node_mutation(
+        &mut self,
+        target_id: &str,
+        cdp_session_id: String,
+        guarded: Option<GuardedPageExecution>,
+        node_ref: &str,
+        call: NodeFunctionCall<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let applied = self
+            .call_function_on_node(target_id, cdp_session_id, guarded, node_ref, call, deadline)
+            .await?;
+        if applied == Value::Bool(true) {
+            Ok(json!({ "ok": true }))
+        } else {
+            Err(OwnerActorError::Rejected)
+        }
     }
 
     /// Resolves a node handle and calls a JS function on the live element by value.
@@ -5039,6 +5069,32 @@ mod tests {
         // The 3-byte euro sign would straddle the cap, so it is dropped whole rather than split.
         assert_eq!(truncated.len(), MAX_SNAPSHOT_NODE_STRING_BYTES - 1);
         assert!(!truncated.contains('\u{20AC}'));
+    }
+
+    #[test]
+    fn node_mutation_helpers_gate_on_element_semantics() {
+        // `fill` must gate on element kind and editability rather than blindly writing a value or
+        // overwriting `textContent` on an arbitrary node (BRD-013).
+        assert!(NODE_FILL_FUNCTION.contains("TEXTAREA"));
+        assert!(NODE_FILL_FUNCTION.contains("isContentEditable"));
+        assert!(NODE_FILL_FUNCTION.contains("readOnly"));
+        assert!(NODE_FILL_FUNCTION.contains("disabled"));
+        // The native value setter keeps controlled inputs in sync.
+        assert!(NODE_FILL_FUNCTION.contains("getOwnPropertyDescriptor"));
+        // `check`/`uncheck` apply only to checkbox/radio inputs, never an arbitrary node.
+        assert!(NODE_SET_CHECKED_FUNCTION.contains("checkbox"));
+        assert!(NODE_SET_CHECKED_FUNCTION.contains("radio"));
+        assert!(NODE_SET_CHECKED_FUNCTION.contains("disabled"));
+        // `select_option` applies only to a `<select>`.
+        assert!(NODE_SELECT_FUNCTION.contains("'SELECT'"));
+        // Every mutating helper reports `false` (no DOM change) on an unsupported element.
+        for helper in [
+            NODE_FILL_FUNCTION,
+            NODE_SET_CHECKED_FUNCTION,
+            NODE_SELECT_FUNCTION,
+        ] {
+            assert!(helper.contains("return false"));
+        }
     }
 
     #[test]
