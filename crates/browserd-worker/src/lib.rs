@@ -71,6 +71,7 @@ use browserd_core::{
 };
 use browserd_features::{BuiltinFeature, FeatureProfile, FeatureRegistry};
 use browserd_fleet::WorkerEpochRegistry;
+use browserd_observability::{AppendOutcome, AuditEvent, AuditEventId, AuditWal, AuditWalError};
 use browserd_operations::{
     CanonicalRequestHash, IdempotencyClaim, IdempotencyKey, IdempotencyRegistry,
 };
@@ -1075,6 +1076,11 @@ pub struct WorkerControlPlane<D, S> {
     stopped_dispatch_terminalization_hook: Arc<dyn Fn() -> Result<(), WorkerError> + Send + Sync>,
     _fleet_epochs: WorkerEpochRegistry,
     _features: FeatureRegistry,
+    /// When set, a critical audit intent is written before any action effect is dispatched; a
+    /// full WAL or sink failure fails the dispatch closed so no browser effect occurs without a
+    /// durable audit record (BRD-020). `None` leaves dispatch unaudited (the default for tests and
+    /// deployments that have not wired an audit sink).
+    audit_wal: Option<Arc<AuditWal>>,
 }
 
 impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
@@ -1178,6 +1184,46 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             stopped_dispatch_terminalization_hook,
             _fleet_epochs: fleet_epochs,
             _features: FeatureRegistry::builtin(),
+            audit_wal: None,
+        }
+    }
+
+    /// Requires a critical audit intent to be durably recorded before any action effect dispatches.
+    ///
+    /// Once set, a full WAL (for the critical event) or an audit sink failure blocks the dispatch
+    /// fail-closed rather than letting an un-audited effect run (BRD-020).
+    #[must_use]
+    pub fn with_audit_wal(mut self, audit_wal: Arc<AuditWal>) -> Self {
+        self.audit_wal = Some(audit_wal);
+        self
+    }
+
+    /// Records the mandatory pre-dispatch audit intent for an action about to cause a browser
+    /// effect. A no-op when no audit WAL is configured; otherwise a critical event that, if it
+    /// cannot be made durable (WAL full or sink error), returns an error so the caller fails the
+    /// dispatch closed (BRD-020). The event id is the action id, so a dispatch retry is idempotent.
+    fn audit_dispatch_intent(
+        &self,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        requester_principal_id: &PrincipalId,
+    ) -> Result<(), AuditWalError> {
+        let Some(audit_wal) = self.audit_wal.as_ref() else {
+            return Ok(());
+        };
+        let event_id = AuditEventId::new(format!("action-dispatch:{action_id}"))?;
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "session_id": session_id,
+            "action_id": action_id,
+            "principal_id": requester_principal_id,
+        }))
+        .unwrap_or_default();
+        let event = AuditEvent::new(event_id, "action.dispatch", payload, true);
+        match audit_wal.append(event)? {
+            AppendOutcome::Durable(_) | AppendOutcome::Existing(_) => Ok(()),
+            // A critical event is never silently dropped (the WAL returns `FullCritical`); treat any
+            // non-durable outcome as a failure so a missing record can never precede an effect.
+            AppendOutcome::DroppedNonCritical => Err(AuditWalError::FullCritical),
         }
     }
 
@@ -2437,6 +2483,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             approval_request,
             action_feature,
             feature_profile,
+            requester_principal_id,
         ) = {
             let mut session = executor
                 .state
@@ -2548,6 +2595,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 approval_request,
                 action_feature,
                 feature_profile,
+                requester_principal_id,
             )
         };
         let execution_deadline = Instant::now()
@@ -2571,6 +2619,23 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ),
                 None,
                 Some(KnownFailureReason::PolicyDenied),
+            )
+        } else if let Err(audit_error) =
+            self.audit_dispatch_intent(session_id, &action_id, &requester_principal_id)
+        {
+            // Fail closed: no browser effect runs without a durable audit intent (BRD-020). Reset
+            // the dispatch phase (it may have been armed to inspecting for an approval-bound action)
+            // and finalize as a non-dispatched known failure, which releases the dispatch permit via
+            // the shared completion path below.
+            executor
+                .approved_dispatch_phase
+                .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
+            (
+                ActionExecutionResult::FailedKnown(format!(
+                    "audit: dispatch intent could not be recorded: {audit_error:?}"
+                )),
+                None,
+                Some(KnownFailureReason::NotDispatched),
             )
         } else if let Some((request, feature, requester_principal_id)) = approval_request {
             let proposal = request.proposal().clone();

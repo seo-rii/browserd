@@ -18,6 +18,7 @@ browserd-artifacts = { path = "../browserd-artifacts" }
 browserd-core = { path = "../browserd-core" }
 browserd-features = { path = "../browserd-features" }
 browserd-fleet = { path = "../browserd-fleet" }
+browserd-observability = { path = "../browserd-observability" }
 browserd-operations = { path = "../browserd-operations" }
 browserd-policy = { path = "../browserd-policy" }
 browserd-sandbox = { path = "../browserd-sandbox" }

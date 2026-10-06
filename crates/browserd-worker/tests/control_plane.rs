@@ -14,6 +14,7 @@ use browserd_core::{
     ArtifactId, IsolationProfile, LeaseId, PageId, PrincipalId, TenantId, WorkerId,
 };
 use browserd_features::BuiltinFeature;
+use browserd_observability::{AuditEvent, AuditEventId, AuditWal, AuditWalError, AuditWalPolicy};
 use browserd_policy::{
     ActionArgumentsHash, ActionType, ApprovalDecision, CanonicalActionProposal, CredentialRefsHash,
     Origin,
@@ -414,6 +415,183 @@ fn ready_worker_with_artifact_limits(limits: WorkerArtifactLimits) -> Option<Rea
         Arc::new(TestClock),
     );
     Some((worker, peer, driver, sandbox))
+}
+
+fn ready_worker_with_audit(queue_capacity: usize, audit: Arc<AuditWal>) -> Option<ReadyWorker> {
+    let driver = Arc::new(FakeDriver {
+        qualified: true,
+        ..FakeDriver::default()
+    });
+    let sandbox = Arc::new(FakeSandbox {
+        qualified: true,
+        ..FakeSandbox::default()
+    });
+    let peer = AuthenticatedPeer::new("gateway-internal").ok()?;
+    let worker = WorkerControlPlane::new_with_clock(
+        config(queue_capacity)?,
+        driver.clone(),
+        sandbox.clone(),
+        Arc::new(TestClock),
+    )
+    .with_audit_wal(audit);
+    Some((worker, peer, driver, sandbox))
+}
+
+#[test]
+fn action_dispatch_records_a_critical_audit_intent_before_the_effect() {
+    let Ok(dir) = tempfile::tempdir() else {
+        return;
+    };
+    let Some(policy) = AuditWalPolicy::new(1 << 20, 512).ok() else {
+        return;
+    };
+    let Some(audit) = AuditWal::open(dir.path().join("audit.wal"), policy)
+        .ok()
+        .map(Arc::new)
+    else {
+        return;
+    };
+    let Some((worker, peer, driver, _sandbox)) = ready_worker_with_audit(1, Arc::clone(&audit))
+    else {
+        return;
+    };
+    let Some(created) = create_ready_session(&worker, &peer, "audit-ok") else {
+        return;
+    };
+    let page = created.primary_page_id.clone();
+    let Some(action) = worker
+        .submit_action(
+            &peer,
+            PrincipalId::new(),
+            &created.session_id,
+            &created.fence,
+            "a1",
+            [5; 32],
+            ActionKind::Mutating,
+            Some(BuiltinFeature::CoreInput),
+            Some(page),
+            b"click".to_vec(),
+            None,
+            SessionTime::new(2),
+        )
+        .ok()
+    else {
+        return;
+    };
+    if let Ok(mut executions) = driver.executions.lock() {
+        executions.push_back(ActionExecutionResult::Succeeded(b"ok".to_vec()));
+    }
+    let result = worker.run_next_action(
+        &peer,
+        &created.session_id,
+        &created.fence,
+        SessionTime::new(3),
+    );
+    assert!(result.is_ok());
+    // The effect dispatched to the driver.
+    assert_eq!(
+        worker
+            .get_action(&peer, &created.session_id, &action, &created.fence)
+            .ok()
+            .map(|snapshot| snapshot.status),
+        Some(ActionStatus::Succeeded)
+    );
+    // ...and a critical audit intent for the dispatch was recorded durably first.
+    let pending = audit.pending().unwrap_or_default();
+    assert!(
+        pending
+            .iter()
+            .any(|entry| entry.event().kind() == "action.dispatch" && entry.event().is_critical()),
+        "a critical action.dispatch audit intent must precede the effect"
+    );
+}
+
+#[test]
+fn a_full_audit_wal_fails_the_dispatch_closed_without_a_browser_effect() {
+    let Ok(dir) = tempfile::tempdir() else {
+        return;
+    };
+    let Some(policy) = AuditWalPolicy::new(512, 512).ok() else {
+        return;
+    };
+    let Some(audit) = AuditWal::open(dir.path().join("audit.wal"), policy)
+        .ok()
+        .map(Arc::new)
+    else {
+        return;
+    };
+    // Fill the WAL with tiny critical events so the next (larger) dispatch intent cannot fit; the
+    // leftover gap is smaller than any fill frame, which is far smaller than the dispatch event.
+    let mut filler = 0_u32;
+    loop {
+        let Some(event_id) = AuditEventId::new(format!("f{filler}")).ok() else {
+            return;
+        };
+        match audit.append(AuditEvent::new(event_id, "f", Vec::new(), true)) {
+            Ok(_) => filler = filler.saturating_add(1),
+            Err(AuditWalError::FullCritical) => break,
+            Err(_) => return,
+        }
+        if filler > 10_000 {
+            return;
+        }
+    }
+    let Some((worker, peer, driver, _sandbox)) = ready_worker_with_audit(1, Arc::clone(&audit))
+    else {
+        return;
+    };
+    let Some(created) = create_ready_session(&worker, &peer, "audit-full") else {
+        return;
+    };
+    let page = created.primary_page_id.clone();
+    let Some(action) = worker
+        .submit_action(
+            &peer,
+            PrincipalId::new(),
+            &created.session_id,
+            &created.fence,
+            "a1",
+            [6; 32],
+            ActionKind::Mutating,
+            Some(BuiltinFeature::CoreInput),
+            Some(page),
+            b"click".to_vec(),
+            None,
+            SessionTime::new(2),
+        )
+        .ok()
+    else {
+        return;
+    };
+    // A distinctive scripted effect that must NOT run because the audit intent cannot be recorded.
+    if let Ok(mut executions) = driver.executions.lock() {
+        executions.push_back(ActionExecutionResult::Succeeded(b"should-not-run".to_vec()));
+    }
+    let result = worker.run_next_action(
+        &peer,
+        &created.session_id,
+        &created.fence,
+        SessionTime::new(3),
+    );
+    assert!(result.is_ok());
+    // The dispatch failed closed as a non-dispatched known failure (the permit is released by the
+    // shared completion path), not the scripted success.
+    assert_eq!(
+        worker
+            .get_action(&peer, &created.session_id, &action, &created.fence)
+            .ok()
+            .map(|snapshot| snapshot.status),
+        Some(ActionStatus::FailedKnown)
+    );
+    // The driver effect never ran: its scripted result is still queued, unconsumed.
+    assert_eq!(
+        driver
+            .executions
+            .lock()
+            .map(|queue| queue.len())
+            .unwrap_or(0),
+        1
+    );
 }
 
 fn create_command(tenant_id: TenantId, key: &str, hash_byte: u8) -> CreateSessionCommand {

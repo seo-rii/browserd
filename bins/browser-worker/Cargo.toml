@@ -13,6 +13,7 @@ workspace = true
 async-trait.workspace = true
 browserd-chromium = { path = "../../crates/browserd-chromium" }
 browserd-core = { path = "../../crates/browserd-core" }
+browserd-observability = { path = "../../crates/browserd-observability" }
 browserd-policy = { path = "../../crates/browserd-policy" }
 browserd-sandbox = { path = "../../crates/browserd-sandbox" }
 browserd-session = { path = "../../crates/browserd-session" }

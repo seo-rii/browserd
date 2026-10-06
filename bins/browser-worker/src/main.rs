@@ -13,6 +13,7 @@ use browser_worker::{
 };
 use browserd_chromium::CompatibilityArtifact;
 use browserd_core::WorkerId;
+use browserd_observability::{AuditWal, AuditWalPolicy};
 use browserd_sandbox::{EgressPolicyBinding, SandboxRpcClient};
 use browserd_session::{LeasePolicy, SessionTimeoutPolicy};
 use browserd_worker::{
@@ -172,11 +173,30 @@ fn run(runtime: &tokio::runtime::Runtime) -> Result<(), String> {
         )
         .map_err(|_| "session shard router configuration is invalid".to_owned())?,
     );
-    let worker = Arc::new(WorkerControlPlane::new(
-        worker_config,
-        Arc::clone(&router),
-        Arc::clone(&router),
-    ));
+    // Optional durable audit sink. When `BROWSERD_AUDIT_WAL_FILE` is set, every action effect must
+    // record a critical audit intent before dispatch, and a full WAL or sink failure fails the
+    // dispatch closed (BRD-020). Left unset, dispatch is unaudited (backward-compatible); production
+    // deployments should configure it.
+    let audit_wal = match env::var_os("BROWSERD_AUDIT_WAL_FILE").map(PathBuf::from) {
+        Some(path) => {
+            if !path.is_absolute() {
+                return Err("BROWSERD_AUDIT_WAL_FILE must be absolute".to_owned());
+            }
+            let policy = AuditWalPolicy::new(64 * 1024 * 1024, 64 * 1024)
+                .map_err(|_| "audit WAL policy is invalid".to_owned())?;
+            Some(Arc::new(
+                AuditWal::open(&path, policy)
+                    .map_err(|_| "audit WAL could not be opened".to_owned())?,
+            ))
+        }
+        None => None,
+    };
+    let mut worker =
+        WorkerControlPlane::new(worker_config, Arc::clone(&router), Arc::clone(&router));
+    if let Some(audit_wal) = audit_wal {
+        worker = worker.with_audit_wal(audit_wal);
+    }
+    let worker = Arc::new(worker);
     let lifecycle_bounds = LifecycleBounds::new(
         Duration::from_secs(3),
         Duration::from_secs(1),
