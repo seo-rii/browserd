@@ -374,7 +374,7 @@ export class BrowserdClient {
   }
 
   async activatePage(sessionId: string, pageId: string, options: Pick<RequestOptions, "requestId"> = {}): Promise<PageResource> {
-    return this.request("POST", `/v1/sessions/${this.segment(sessionId)}/pages/${this.segment(pageId)}/activate`, { body: {}, replay: "unsafe", ...options });
+    return this.request("POST", `/v1/sessions/${this.segment(sessionId)}/pages/${this.segment(pageId)}/activate`, { replay: "unsafe", ...options });
   }
 
   async createAction(sessionId: string, body: ActionRequest, options: RequestOptions = {}): Promise<ActionResponse> {

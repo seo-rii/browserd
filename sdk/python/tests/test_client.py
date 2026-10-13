@@ -152,8 +152,9 @@ class ClientTests(unittest.TestCase):
         approval_parameters = __import__("urllib.parse").parse.parse_qs(approval_query)
         self.assertEqual(approval_parameters["limit"], ["20"])
         self.assertEqual(approval_parameters["page_token"], ["next page"])
-        self.assertIsNone(transport.calls[20][3])
-        self.assertNotIn("Content-Type", transport.calls[20][2])
+        for bodiless in (11, 20):
+            self.assertIsNone(transport.calls[bodiless][3])
+            self.assertNotIn("Content-Type", transport.calls[bodiless][2])
         self.assertNotIn("Idempotency-Key", transport.calls[15][2])
         self.assertEqual(
             client.viewer_websocket_url("ses/a"),

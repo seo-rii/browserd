@@ -515,7 +515,6 @@ class BrowserdClient:
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/pages/"
             f"{self._segment(page_id)}/activate",
-            body={},
             replay="unsafe",
             request_id=request_id,
         ))

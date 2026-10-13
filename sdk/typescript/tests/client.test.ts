@@ -105,11 +105,13 @@ test("matches every API public route with escaped identifiers and bounded query 
   assert.equal(new URL(transport.calls[3]!.url).searchParams.get("page_token"), "next token");
   assert.equal(new URL(transport.calls[21]!.url).searchParams.get("limit"), "20");
   assert.equal(new URL(transport.calls[21]!.url).searchParams.get("page_token"), "next page");
-  assert.equal(transport.calls[20]!.init.body, undefined);
-  assert.equal(
-    new Headers(transport.calls[20]!.init.headers).get("content-type"),
-    null,
-  );
+  for (const bodiless of [11, 20]) {
+    assert.equal(transport.calls[bodiless]!.init.body, undefined);
+    assert.equal(
+      new Headers(transport.calls[bodiless]!.init.headers).get("content-type"),
+      null,
+    );
+  }
   assert.equal(
     new Headers(transport.calls[15]!.init.headers).get("idempotency-key"),
     null,
