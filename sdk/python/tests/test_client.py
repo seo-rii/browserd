@@ -1,7 +1,11 @@
 import json
+from copy import deepcopy
+from pathlib import Path
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 from browserd import (
+    ArtifactListPage,
     BrowserdClient,
     BrowserdError,
     DispatchUncertainError,
@@ -27,9 +31,41 @@ def response(status, body, headers=None):
     return Response(status=status, headers=headers or {}, body=json.dumps(body).encode())
 
 
+FIXTURE = json.loads((Path(__file__).resolve().parents[2] / "fixtures/http_contract.json").read_text())
+
+
+def wire(name, changes=None, trace_id=None):
+    value = deepcopy(FIXTURE["responses"][name])
+    wrapper = next((key for key in ("operation", "session", "page", "ownership", "artifact", "approval") if key in value["data"]), None)
+    target = value["data"][wrapper] if wrapper else value["data"]
+    target.update(changes or {})
+    value["trace_id"] = trace_id or FIXTURE["ids"]["trace"]
+    return value
+
+
 class ClientTests(unittest.TestCase):
+    def test_query_all_preserves_frame_paths_without_adding_legacy_fields(self):
+        transport = ScriptedTransport([
+            response(200, wire("action_queued", {"action_id": "act-query", "status": "succeeded"}))
+            for _ in range(3)
+        ])
+        client = BrowserdClient("https://api.example", transport=transport)
+        for action in [
+            {"type": "query_all", "selector": "input"},
+            {"type": "query_all", "selector": "input", "frame_path": []},
+            {"type": "query_all", "selector": "input", "frame_path": ["iframe#outer", "iframe#inner"]},
+        ]:
+            body = {
+                "page_id": "page-1", "if_session_incarnation": 1,
+                "execution_timeout_ms": 30_000, "action": action,
+            }
+            client.create_action("session-1", body)
+            self.assertEqual(json.loads(transport.calls[-1][3]), body)
+        self.assertNotIn("frame_path", json.loads(transport.calls[0][3])["action"])
+
     def test_public_routes_headers_and_escaping(self):
-        transport = ScriptedTransport([response(200, {}) for _ in range(24)])
+        responses = [response(200, wire(name)) for name in ["operation_queued", "operation_queued", "operation_queued", "sessions", "session", "session", "ownership", "ownership", "pages", "page", "page_deleted", "page", "action_queued", "action_queued", "action_queued", "action_queued", "event_page", "viewer_ticket", "artifact", "artifact", "artifact_download", "approvals", "approval", "approval"]]
+        transport = ScriptedTransport(responses)
         client = BrowserdClient("https://api.example/", token="secret", transport=transport)
         client.create_session({}, idempotency_key="idem-session", wait_ms=500)
         client.get_operation("op/a")
@@ -124,7 +160,7 @@ class ClientTests(unittest.TestCase):
             "wss://api.example/v1/sessions/ses%2Fa/viewer",
         )
 
-        read = ScriptedTransport([response(200, {"id": "ses-1"})])
+        read = ScriptedTransport([response(200, wire("session", {"id": "ses-1"}))])
         BrowserdClient("https://api.example", transport=read).get_session(
             "ses-1", request_id="req-read"
         )
@@ -195,11 +231,7 @@ class ClientTests(unittest.TestCase):
             [
                 response(
                     200,
-                    {
-                        "action_id": "act-1",
-                        "status": "outcome_unknown",
-                        "retryable": False,
-                    },
+                    wire("action_unknown", {"action_id": "act-1"}),
                 )
             ]
         )
@@ -225,11 +257,12 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(len(transport.calls), 1)
 
     def test_artifact_metadata_read_is_replay_safe(self):
+        artifact = {"id": "art-1", "state": "available", "display_filename": "첨부 문서.txt"}
         transport = ScriptedTransport(
             [
                 OSError("reset"),
                 response(
-                    200, {"artifact_id": "art-1", "state": "committed"}
+                    200, {"data": {"artifact": artifact}, "trace_id": "trace-artifact"}
                 ),
             ]
         )
@@ -240,9 +273,71 @@ class ClientTests(unittest.TestCase):
             sleep=lambda _: None,
         )
         self.assertEqual(
-            client.get_artifact("ses-1", "art-1")["state"], "committed"
+            client.get_artifact("ses-1", "art-1"), {**artifact, "trace_id": "trace-artifact"}
         )
         self.assertEqual(len(transport.calls), 2)
+
+    def test_artifact_pages_decode_http_envelope_and_encode_cursor(self):
+        first: ArtifactListPage = {
+            "artifacts": [
+                {"id": "art-1", "state": "available", "size_bytes": 0,
+                 "content_type": "application/octet-stream", "display_filename": "한" * 85},
+                {"id": "art-2", "state": "available", "display_filename": None},
+                {"id": "art-3", "state": "available"},
+            ],
+            "next_cursor": "art/a?&after=other +한글",
+        }
+        last: ArtifactListPage = {"artifacts": [], "next_cursor": None}
+        transport = ScriptedTransport([
+            response(200, {"data": first, "trace_id": "trace-1"}),
+            response(200, {"data": last, "trace_id": "trace-2"}),
+        ])
+        client = BrowserdClient("https://api.example/proxy/", transport=transport)
+        page = client.list_artifacts("ses/a?&한글", request_id="req-list")
+        self.assertEqual(page, {**first, "trace_id": "trace-1"})
+        self.assertEqual(client.list_artifacts(
+            "ses/a?&한글", after=page["next_cursor"], limit=100,
+        ), {**last, "trace_id": "trace-2"})
+        initial = urlsplit(transport.calls[0][1])
+        self.assertEqual(initial.path,
+                         "/proxy/v1/sessions/ses%2Fa%3F%26%ED%95%9C%EA%B8%80/artifacts")
+        self.assertEqual(parse_qs(initial.query), {"limit": ["50"]})
+        next_page = urlsplit(transport.calls[1][1])
+        self.assertEqual(parse_qs(next_page.query),
+                         {"after": [first["next_cursor"]], "limit": ["100"]})
+        self.assertEqual(next_page.fragment, "")
+        for method, _, headers, body, _ in transport.calls:
+            self.assertEqual(method, "GET")
+            self.assertIsNone(body)
+            self.assertNotIn("Idempotency-Key", headers)
+        self.assertEqual(transport.calls[0][2]["X-Request-Id"], "req-list")
+
+    def test_invalid_artifact_limits_and_dot_identifiers_never_reach_transport(self):
+        transport = ScriptedTransport([])
+        client = BrowserdClient("https://api.example", transport=transport)
+        for limit in (0, 101, -1, 1.5, float("nan"), float("inf"), True, "50", None):
+            with self.subTest(limit=limit), self.assertRaises(ValueError):
+                client.list_artifacts("ses-1", limit=limit)
+        for session_id in ("", ".", ".."):
+            with self.subTest(session_id=session_id), self.assertRaises(ValueError):
+                client.list_artifacts(session_id)
+        self.assertEqual(transport.calls, [])
+
+    def test_artifact_listing_retries_read_with_same_pagination_and_request_identity(self):
+        page: ArtifactListPage = {"artifacts": [], "next_cursor": None}
+        transport = ScriptedTransport([
+            OSError("reset"), response(200, {"data": page, "trace_id": "trace-list"}),
+        ])
+        client = BrowserdClient("https://api.example", transport=transport,
+                                max_retries=1, sleep=lambda _: None)
+        self.assertEqual(client.list_artifacts(
+            "ses-1", after="art-1", limit=1, request_id="req-list",
+        ), {**page, "trace_id": "trace-list"})
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(transport.calls[0][1], transport.calls[1][1])
+        for _, _, headers, _, _ in transport.calls:
+            self.assertEqual(headers["X-Request-Id"], "req-list")
+            self.assertNotIn("Idempotency-Key", headers)
 
     def test_retries_only_reads_and_explicit_pre_dispatch_errors(self):
         read = ScriptedTransport(
@@ -259,7 +354,7 @@ class ClientTests(unittest.TestCase):
                         }
                     },
                 ),
-                response(200, {"id": "ses-1"}),
+                response(200, wire("session", {"id": "ses-1"})),
             ]
         )
         client = BrowserdClient(
@@ -284,7 +379,7 @@ class ClientTests(unittest.TestCase):
                         }
                     },
                 ),
-                response(202, {"action_id": "act-1", "status": "queued"}),
+                response(202, wire("action_queued", {"action_id": "act-1"})),
             ]
         )
         client = BrowserdClient(
@@ -344,8 +439,8 @@ class ClientTests(unittest.TestCase):
     def test_operation_poll_and_event_resume(self):
         operations = ScriptedTransport(
             [
-                response(200, {"id": "op-1", "state": "creating"}),
-                response(200, {"id": "op-1", "state": "succeeded"}),
+                response(200, wire("operation_queued", {"id": "op-1", "state": "creating"})),
+                response(200, wire("operation_succeeded", {"id": "op-1"})),
             ]
         )
         client = BrowserdClient("https://api.example", transport=operations, sleep=lambda _: None)
@@ -357,11 +452,11 @@ class ClientTests(unittest.TestCase):
             [
                 response(
                     200,
-                    {"events": [{"event_id": "ev-1"}], "next_cursor": "cur-2"},
+                    wire("event_page", {"events": [{**FIXTURE["responses"]["event_page"]["data"]["events"][0], "event_id": "ev-1"}], "next_cursor": "cur-2"}),
                 ),
                 response(
                     200,
-                    {"events": [{"event_id": "ev-2"}], "next_cursor": "cur-3"},
+                    wire("event_page", {"events": [{**FIXTURE["responses"]["event_page"]["data"]["events"][0], "event_id": "ev-2"}], "next_cursor": "cur-3"}),
                 ),
             ]
         )
@@ -382,7 +477,7 @@ class ClientTests(unittest.TestCase):
             [
                 response(
                     200,
-                    {"events": [], "gap": True, "latest_cursor": "cur-latest"},
+                    wire("event_gap", {"next_cursor": "cur-latest"}),
                 )
             ]
         )

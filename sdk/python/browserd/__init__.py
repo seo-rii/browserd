@@ -6,10 +6,12 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Literal, Mapping, Protocol, TypedDict, cast
+from typing import Any, Callable, Iterator, Literal, Mapping, NotRequired, Protocol, TypedDict, cast
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+
+from ._wire import decode_success
 
 JsonObject = dict[str, Any]
 ActionType = Literal[
@@ -45,35 +47,148 @@ class ActionRequest(TypedDict, total=False):
     execution_timeout_ms: int
 
 
-class ActionResponse(TypedDict, total=False):
+class ActionResponse(TypedDict):
     action_id: str
     status: ActionStatus
-    trace_id: str
-    retryable: Literal[False]
+    session_sequence: int
+    trace_id: NotRequired[str]
+    retryable: NotRequired[Literal[False]]
 
 
-class Operation(TypedDict, total=False):
+Isolation = Literal["shared_context", "tenant_dedicated_shard", "dedicated_process", "dedicated_worker"]
+SessionState = Literal["creating", "ready", "closing", "closed", "failed"]
+OperationState = Literal["accepted", "queued", "reserving", "creating", "succeeded", "failed", "timed_out", "cancelled"]
+
+
+class SessionResource(TypedDict):
+    trace_id: NotRequired[str]
     id: str
-    state: str
-    poll_url: str
+    state: SessionState
+    lifecycle: SessionState
+    incarnation: int
+    requested_isolation: Isolation
+    effective_isolation: Isolation
+    metadata: dict[str, str]
+
+
+class SessionListPage(TypedDict):
+    trace_id: NotRequired[str]
+    sessions: list[SessionResource]
+    next_page_token: str | None
+
+
+class PageResource(TypedDict):
+    trace_id: NotRequired[str]
+    id: str
     session_id: str
+    active: bool
+    target_incarnation: int
+    document_epoch: int
+    url_revision: int
 
 
-class Event(TypedDict, total=False):
+class PageList(TypedDict):
+    trace_id: NotRequired[str]
+    pages: list[PageResource]
+
+
+class DeletedPage(TypedDict):
+    trace_id: NotRequired[str]
+    id: str
+    deleted: Literal[True]
+
+
+class Ownership(TypedDict):
+    trace_id: NotRequired[str]
+    worker_id: str
+    worker_epoch: int
+    placement_version: int
+    session_incarnation: int
+
+
+class OperationFailure(TypedDict):
+    trace_id: NotRequired[str]
+    code: str
+    message: str
+    retryable: bool
+    details: dict[str, str]
+
+
+class Operation(TypedDict):
+    trace_id: NotRequired[str]
+    id: str
+    state: OperationState
+    poll_url: str
+    session: SessionResource | None
+    failure: OperationFailure | None
+
+
+EventKind = Literal["operation.state_changed", "session.lifecycle_changed", "session.execution_changed", "action.state_changed", "action.approval_required", "approval.decided", "browser.control.changed", "download.completed", "artifact.state_changed"]
+
+
+class EventResource(TypedDict):
+    type: Literal["operation", "session", "action", "approval", "artifact"]
+    id: str
+
+
+class Event(TypedDict):
     event_id: str
-    type: str
+    kind: EventKind
+    created_at: str
+    resource: EventResource
+    aggregate_revision: int
+    session_id: NotRequired[str]
+    summary: NotRequired[JsonObject]
 
 
-class ArtifactMetadata(TypedDict, total=False):
-    artifact_id: str
-    state: str
-    size_bytes: int
-    content_type: str
+class EventPage(TypedDict):
+    trace_id: NotRequired[str]
+    events: list[Event]
+    gap: bool
+    next_cursor: str | None
 
 
-class ArtifactDownloadToken(TypedDict, total=False):
-    token: str
-    expires_at: str
+ArtifactState = Literal["uploading", "stored", "scanning", "available", "quarantined", "rejected", "generating", "finalizing", "failed", "deleting", "deleted"]
+
+
+class ArtifactMetadata(TypedDict):
+    id: str
+    state: ArtifactState
+    size_bytes: NotRequired[int | None]
+    content_type: NotRequired[str | None]
+    display_filename: NotRequired[str | None]
+    trace_id: NotRequired[str]
+
+
+class ArtifactListPage(TypedDict):
+    trace_id: NotRequired[str]
+    artifacts: list[ArtifactMetadata]
+    next_cursor: str | None
+
+
+class ArtifactDownloadToken(TypedDict):
+    download_token: str
+    trace_id: NotRequired[str]
+
+
+class ViewerTicketIssued(TypedDict):
+    trace_id: NotRequired[str]
+    ticket_issued: Literal[True]
+
+
+class Approval(TypedDict):
+    trace_id: NotRequired[str]
+    id: str
+    session_id: str
+    action_id: str
+    state: Literal["pending", "approved", "denied", "expired"]
+    summary: JsonObject
+
+
+class ApprovalListPage(TypedDict):
+    trace_id: NotRequired[str]
+    approvals: list[Approval]
+    next_page_token: str | None
 
 
 @dataclass(frozen=True)
@@ -241,8 +356,8 @@ class BrowserdClient:
         request_id: str | None = None,
         idempotency_key: str | None = None,
         wait_ms: int | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> Operation:
+        return cast(Operation, self._request(
             "POST",
             "/v1/sessions",
             body=body,
@@ -250,7 +365,7 @@ class BrowserdClient:
             request_id=request_id,
             idempotency_key=idempotency_key,
             wait_ms=wait_ms,
-        )
+        ))
 
     def get_operation(
         self, operation_id: str, *, request_id: str | None = None
@@ -267,13 +382,13 @@ class BrowserdClient:
 
     def cancel_operation(
         self, operation_id: str, *, request_id: str | None = None
-    ) -> JsonObject:
-        return self._request(
+    ) -> Operation:
+        return cast(Operation, self._request(
             "DELETE",
             f"/v1/operations/{self._segment(operation_id)}",
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def list_sessions(
         self,
@@ -284,8 +399,8 @@ class BrowserdClient:
         limit: int | None = None,
         page_token: str | None = None,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> SessionListPage:
+        return cast(SessionListPage, self._request(
             "GET",
             self._query(
                 "/v1/sessions",
@@ -297,27 +412,27 @@ class BrowserdClient:
             ),
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def get_session(
         self, session_id: str, *, request_id: str | None = None
-    ) -> JsonObject:
-        return self._request(
+    ) -> SessionResource:
+        return cast(SessionResource, self._request(
             "GET",
             f"/v1/sessions/{self._segment(session_id)}",
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def close_session(
         self, session_id: str, *, request_id: str | None = None
-    ) -> JsonObject:
-        return self._request(
+    ) -> SessionResource:
+        return cast(SessionResource, self._request(
             "DELETE",
             f"/v1/sessions/{self._segment(session_id)}",
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def reconnect_session(
         self,
@@ -325,14 +440,14 @@ class BrowserdClient:
         body: Mapping[str, Any],
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> Ownership:
+        return cast(Ownership, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/reconnect",
             body=body,
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def transfer_session(
         self,
@@ -340,24 +455,24 @@ class BrowserdClient:
         body: Mapping[str, Any],
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> Ownership:
+        return cast(Ownership, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/transfer",
             body=body,
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def list_pages(
         self, session_id: str, *, request_id: str | None = None
-    ) -> JsonObject:
-        return self._request(
+    ) -> PageList:
+        return cast(PageList, self._request(
             "GET",
             f"/v1/sessions/{self._segment(session_id)}/pages",
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def create_page(
         self,
@@ -365,14 +480,14 @@ class BrowserdClient:
         body: Mapping[str, Any] | None = None,
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> PageResource:
+        return cast(PageResource, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/pages",
             body=body or {},
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def close_page(
         self,
@@ -380,14 +495,14 @@ class BrowserdClient:
         page_id: str,
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> DeletedPage:
+        return cast(DeletedPage, self._request(
             "DELETE",
             f"/v1/sessions/{self._segment(session_id)}/pages/"
             f"{self._segment(page_id)}",
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def activate_page(
         self,
@@ -395,15 +510,15 @@ class BrowserdClient:
         page_id: str,
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> PageResource:
+        return cast(PageResource, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/pages/"
             f"{self._segment(page_id)}/activate",
             body={},
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def create_action(
         self,
@@ -470,15 +585,15 @@ class BrowserdClient:
         body: Mapping[str, Any],
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> ActionResponse:
+        return cast(ActionResponse, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/actions/"
             f"{self._segment(action_id)}/resolve",
             body=body,
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def list_events(
         self,
@@ -486,13 +601,13 @@ class BrowserdClient:
         cursor: str | None = None,
         limit: int | None = None,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> EventPage:
+        return cast(EventPage, self._request(
             "GET",
             self._query("/v1/events", cursor=cursor, limit=limit),
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def create_viewer_ticket(
         self,
@@ -500,14 +615,14 @@ class BrowserdClient:
         body: Mapping[str, Any],
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> ViewerTicketIssued:
+        return cast(ViewerTicketIssued, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/viewer-ticket",
             body=body,
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def viewer_websocket_url(self, session_id: str) -> str:
         parts = urlsplit(f"{self.base_url}/v1/sessions/{self._segment(session_id)}/viewer")
@@ -520,14 +635,14 @@ class BrowserdClient:
         body: Mapping[str, Any],
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> ArtifactMetadata:
+        return cast(ArtifactMetadata, self._request(
             "POST",
             f"/v1/sessions/{self._segment(session_id)}/artifacts/uploads",
             body=body,
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def get_artifact(
         self,
@@ -536,16 +651,36 @@ class BrowserdClient:
         *,
         request_id: str | None = None,
     ) -> ArtifactMetadata:
-        return cast(
-            ArtifactMetadata,
-            self._request(
-                "GET",
-                f"/v1/sessions/{self._segment(session_id)}/artifacts/"
-                f"{self._segment(artifact_id)}",
-                replay="read",
-                request_id=request_id,
+        return cast(ArtifactMetadata, self._request(
+            "GET",
+            f"/v1/sessions/{self._segment(session_id)}/artifacts/"
+            f"{self._segment(artifact_id)}",
+            replay="read",
+            request_id=request_id,
+        ))
+
+    def list_artifacts(
+        self,
+        session_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 50,
+        request_id: str | None = None,
+    ) -> ArtifactListPage:
+        if not session_id or session_id in {".", ".."}:
+            raise ValueError("session_id must be a nonempty identifier, not a dot path segment")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("artifact limit must be an integer from 1 to 100")
+        return cast(ArtifactListPage, self._request(
+            "GET",
+            self._query(
+                f"/v1/sessions/{self._segment(session_id)}/artifacts",
+                after=after,
+                limit=limit,
             ),
-        )
+            replay="read",
+            request_id=request_id,
+        ))
 
     def create_artifact_download_token(
         self,
@@ -573,8 +708,8 @@ class BrowserdClient:
         limit: int | None = None,
         page_token: str | None = None,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> ApprovalListPage:
+        return cast(ApprovalListPage, self._request(
             "GET",
             self._query(
                 "/v1/approvals",
@@ -585,17 +720,17 @@ class BrowserdClient:
             ),
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def get_approval(
         self, approval_id: str, *, request_id: str | None = None
-    ) -> JsonObject:
-        return self._request(
+    ) -> Approval:
+        return cast(Approval, self._request(
             "GET",
             f"/v1/approvals/{self._segment(approval_id)}",
             replay="read",
             request_id=request_id,
-        )
+        ))
 
     def decide_approval(
         self,
@@ -603,14 +738,14 @@ class BrowserdClient:
         body: Mapping[str, Any],
         *,
         request_id: str | None = None,
-    ) -> JsonObject:
-        return self._request(
+    ) -> Approval:
+        return cast(Approval, self._request(
             "POST",
             f"/v1/approvals/{self._segment(approval_id)}/decision",
             body=body,
             replay="unsafe",
             request_id=request_id,
-        )
+        ))
 
     def wait_for_operation(
         self,
@@ -659,23 +794,18 @@ class BrowserdClient:
         while max_polls is None or polls < max_polls:
             page = self.list_events(cursor=cursor, limit=limit)
             polls += 1
-            if page.get("gap") is True:
+            if page["gap"]:
                 raise EventGapError(
                     cast(
                         str | None,
-                        page.get("latest_cursor")
-                        or page.get("next_cursor")
-                        or page.get("cursor"),
+                        page["next_cursor"],
                     )
                 )
-            for event in page.get("events", []):
+            for event in page["events"]:
                 yield cast(Event, event)
             cursor = cast(
                 str | None,
-                page.get("next_cursor")
-                or page.get("latest_cursor")
-                or page.get("cursor")
-                or cursor,
+                page["next_cursor"] or cursor,
             )
             if max_polls is None or polls < max_polls:
                 self.sleep(max(0.0, interval))
@@ -742,16 +872,16 @@ class BrowserdClient:
                 raise TransportError(request_id, cause) from cause
 
             try:
-                decoded: JsonObject = json.loads(response.body) if response.body else {}
+                decoded = json.loads(response.body) if response.body else None
+                if 200 <= response.status < 300:
+                    return decode_success(decoded, method, path)
             except (UnicodeDecodeError, ValueError) as cause:
                 if replay != "read":
                     raise DispatchUncertainError(
                         request_id, idempotency_key, cause
                     ) from cause
                 raise TransportError(request_id, cause) from cause
-            if 200 <= response.status < 300:
-                return decoded
-            raw = decoded.get("error")
+            raw = decoded.get("error") if isinstance(decoded, dict) else None
             envelope = raw if isinstance(raw, dict) else {}
             error = BrowserdError(
                 status=response.status,
@@ -785,7 +915,25 @@ class BrowserdClient:
 
 
 __all__ = [
+    "ArtifactState",
+    "ViewerTicketIssued",
+    "SessionState",
+    "SessionResource",
+    "SessionListPage",
+    "PageResource",
+    "PageList",
+    "Ownership",
+    "OperationState",
+    "OperationFailure",
+    "Isolation",
+    "EventResource",
+    "EventKind",
+    "EventPage",
+    "DeletedPage",
+    "ApprovalListPage",
+    "Approval",
     "ArtifactDownloadToken",
+    "ArtifactListPage",
     "ArtifactMetadata",
     "ActionResponse",
     "Action",
