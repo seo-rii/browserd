@@ -232,10 +232,7 @@ impl TerminalCustodyReceipt {
         }
         if let Some(r) = &self.resolution
             && (!matches!(self.terminal_detail, TerminalDetail::OutcomeUnknown(_))
-                || r.basis().is_empty()
-                || r.basis().len() > 4096
-                || r.basis().trim() != r.basis()
-                || r.basis().chars().any(char::is_control))
+                || !ResolutionAnnotation::is_valid_basis(r.basis()))
         {
             return Err(JournalError::new("custody resolution is invalid"));
         }

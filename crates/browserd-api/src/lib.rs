@@ -27,7 +27,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browserd_actions::{
     AcceptDecision, ActionKind, ActionLedger, ActionLedgerError, ActionRequest, ActionSnapshot,
     CanonicalRequestHash as ActionCanonicalRequestHash, DurableActionJournal,
-    IdempotencyKey as ActionIdempotencyKey, ResolutionKind,
+    IdempotencyKey as ActionIdempotencyKey, ResolutionAnnotation, ResolutionKind,
 };
 use browserd_artifacts::{ArtifactKey, ArtifactState, DownloadToken};
 use browserd_auth::AuthenticatedPrincipal;
@@ -671,7 +671,7 @@ pub struct ActionResolveBody {
 pub fn decode_action_resolve(json: &str) -> Result<ActionResolveBody, ApiError> {
     let request: ActionResolveBody = serde_json::from_str(json)
         .map_err(|_| ApiError::invalid_request("invalid action resolution body"))?;
-    if request.basis.trim().is_empty() || request.basis.len() > 4_096 {
+    if !ResolutionAnnotation::is_valid_basis(&request.basis) {
         return Err(ApiError::invalid_request("resolution basis is invalid"));
     }
     Ok(request)
@@ -2345,7 +2345,7 @@ impl ApiRequest {
                 body.validate()?;
             }
             Self::ResolveAction(command) => {
-                if command.body.basis.trim().is_empty() || command.body.basis.len() > 4_096 {
+                if !ResolutionAnnotation::is_valid_basis(&command.body.basis) {
                     return Err(ApiError::invalid_request("resolution basis is invalid"));
                 }
             }

@@ -963,6 +963,90 @@ fn stale_resolution_time_cannot_replace_durable_audit_evidence() {
 }
 
 #[test]
+fn resolution_basis_rejected_by_terminal_custody_is_never_admitted() {
+    let (worker, peer, driver, _sandbox, journal_root) = worker(64, 8);
+    let session = create_session(&worker, &peer);
+    driver
+        .results
+        .lock()
+        .expect("result lock should work")
+        .push_back(ActionExecutionResult::OutcomeUnknown);
+    let action_id = submit(&worker, &peer, &session, "custody-basis", b"click", false);
+    worker
+        .run_next_action(
+            &peer,
+            &session.session_id,
+            &session.fence,
+            SessionTime::new(2),
+        )
+        .expect("action should run")
+        .expect("action should complete as unknown");
+    for basis in ["ok\n", " x"] {
+        assert_eq!(
+            worker
+                .resolve_action(
+                    &peer,
+                    &session.session_id,
+                    &action_id,
+                    &session.fence,
+                    browserd_actions::ResolutionKind::ConfirmedExecuted,
+                    PrincipalId::new(),
+                    basis,
+                    SessionTime::new(3),
+                )
+                .err(),
+            Some(WorkerError::InvalidActionTransition),
+            "{basis:?}"
+        );
+    }
+    let resolved = worker
+        .resolve_action(
+            &peer,
+            &session.session_id,
+            &action_id,
+            &session.fence,
+            browserd_actions::ResolutionKind::ConfirmedExecuted,
+            PrincipalId::new(),
+            "ok",
+            SessionTime::new(3),
+        )
+        .expect("custody-valid basis should resolve");
+    assert_eq!(
+        resolved
+            .resolution
+            .as_ref()
+            .map(browserd_actions::ResolutionAnnotation::basis),
+        Some("ok")
+    );
+    drop(worker);
+
+    let journal = FileActionJournal::open(
+        journal_root
+            .path()
+            .join(format!("{}.wal", session.session_id)),
+        ActionJournalLimits::new(4 * 1024, 64, 4 * 1024 * 1024),
+    )
+    .expect("session journal should reopen");
+    let ledger = ActionLedger::recover(
+        LedgerSession::new(
+            session.tenant_id.clone(),
+            session.session_id.clone(),
+            session.fence.as_placement_fence(),
+        ),
+        Arc::new(journal),
+    )
+    .expect("session journal should recover");
+    assert_eq!(
+        ledger
+            .snapshot(session.fence.as_placement_fence(), &action_id)
+            .expect("resolved action should recover")
+            .resolution()
+            .map(browserd_actions::ResolutionAnnotation::basis),
+        Some("ok")
+    );
+}
+
+#[test]
 fn browser_mutations_cannot_bypass_the_running_action_owner() {
     let (worker, peer, driver, _sandbox, _journal_root) = worker(64, 8);
     let session = create_session(&worker, &peer);
