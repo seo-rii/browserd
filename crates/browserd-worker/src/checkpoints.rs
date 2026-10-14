@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
-use std::sync::Mutex;
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -1211,10 +1211,18 @@ impl CheckpointStore for FileCheckpointStore {
     ) -> Result<(), CheckpointError> {
         canonical_ref(checkpoint_ref)?;
         check_directory(&self.root, self.owner_uid)?;
-        let mut state = self
-            .state
-            .try_lock()
-            .map_err(|_| CheckpointError::Unavailable)?;
+        // A failed rollback latches worker checkpoint degradation, so a concurrent save, load or
+        // expiry sweep is waited out (bounded) instead of being reported as a failed rollback.
+        let lock_deadline = Instant::now() + RECOVERY_TIMEOUT;
+        let mut state = loop {
+            match self.state.try_lock() {
+                Ok(state) => break state,
+                Err(TryLockError::WouldBlock) if Instant::now() < lock_deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err(CheckpointError::Unavailable),
+            }
+        };
         let Some(record) = state.records.get_mut(checkpoint_ref) else {
             return Ok(());
         };
