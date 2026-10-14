@@ -335,6 +335,16 @@ impl ResolutionAnnotation {
     pub fn basis(&self) -> &str {
         &self.basis
     }
+
+    /// The basis rule terminal custody enforces on persisted receipts. Every admission point
+    /// applies it too, so an accepted resolution can always be carried into custody.
+    #[must_use]
+    pub fn is_valid_basis(basis: &str) -> bool {
+        !basis.is_empty()
+            && basis.len() <= 4096
+            && basis.trim() == basis
+            && !basis.chars().any(char::is_control)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

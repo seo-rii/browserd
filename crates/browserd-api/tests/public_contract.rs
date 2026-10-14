@@ -12,9 +12,10 @@ use browserd_actions::{
     AcceptDecision, ActionLedger, DurableActionJournal, JournalEntry, JournalError, LedgerSession,
 };
 use browserd_api::{
-    ActionSubmissionAdapter, ActionSubmitCommand, ApiEnvelope, ApiError, ApiErrorCode, ApiRequest,
-    ApiResponse, ApiRouter, ApiService, ApiVersion, CreateAuthority, EventKind, EventResource,
-    EventStore, GrpcCode, InMemoryApiService, PUBLIC_ROUTES, ResponseRepresentation,
+    ActionResolveBody, ActionResolveRequest, ActionSubmissionAdapter, ActionSubmitCommand,
+    ApiEnvelope, ApiError, ApiErrorCode, ApiRequest, ApiResponse, ApiRouter, ApiService,
+    ApiVersion, CreateAuthority, EventKind, EventResource, EventStore, GrpcCode,
+    InMemoryApiService, PUBLIC_ROUTES, ResolutionRequestKind, ResponseRepresentation,
     RuntimeApiBackend, RuntimeCreateResult, SessionCreateDispatch, SessionCreateRequest,
     SessionResource, decode_action_resolve, decode_action_submit, decode_session_create,
     decode_viewer_ticket, validate_idempotency_key, validate_last_event_id,
@@ -24,7 +25,7 @@ use browserd_auth::{
     VerificationKeySet,
 };
 use browserd_core::{
-    ErrorCode, IsolationProfile, OperationId, PlacementFence, PrincipalId, SessionId,
+    ActionId, ErrorCode, IsolationProfile, OperationId, PlacementFence, PrincipalId, SessionId,
     SessionLifecycle, TenantId,
 };
 use chrono::{Duration, TimeZone, Utc};
@@ -78,6 +79,52 @@ fn v1_request_models_reject_unknown_fields_at_every_level() {
         r#"{"scopes":{"read":true,"control":false,"admin":false},"ttl_seconds":30,"session_id":"forbidden"}"#
     )
     .is_err());
+}
+
+#[test]
+fn resolution_basis_admission_rejects_what_terminal_custody_rejects() {
+    let resolve = |basis: &str| {
+        ApiRequest::ResolveAction(ActionResolveRequest {
+            session_id: SessionId::new(),
+            action_id: ActionId::new(),
+            body: ActionResolveBody {
+                resolution: ResolutionRequestKind::ConfirmedExecuted,
+                basis: basis.to_owned(),
+                note: None,
+            },
+        })
+    };
+    let body = |basis: &str| {
+        serde_json::json!({"resolution": "confirmed_executed", "basis": basis}).to_string()
+    };
+    let oversized = "x".repeat(4_097);
+    for basis in [
+        "ok\n",
+        " x",
+        "x\t",
+        "a\u{7}b",
+        "",
+        "   ",
+        oversized.as_str(),
+    ] {
+        assert!(decode_action_resolve(&body(basis)).is_err(), "{basis:?}");
+        assert!(resolve(basis).validate().is_err(), "{basis:?}");
+    }
+    let bounded = "x".repeat(4_096);
+    for basis in [
+        "ok",
+        "order page shows the submission",
+        "검증 완료",
+        bounded.as_str(),
+    ] {
+        assert_eq!(
+            decode_action_resolve(&body(basis))
+                .expect("custody-valid basis")
+                .basis,
+            basis
+        );
+        assert!(resolve(basis).validate().is_ok(), "{basis:?}");
+    }
 }
 
 #[test]

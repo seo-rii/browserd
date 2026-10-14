@@ -4746,7 +4746,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
     ) -> Result<WorkerActionSnapshot, WorkerError> {
         self.authorize(peer)?;
-        if basis.trim().is_empty() || basis.len() > 4_096 {
+        if !ResolutionAnnotation::is_valid_basis(basis) {
             return Err(WorkerError::InvalidActionTransition);
         }
         let executor = self.session(session_id)?;
