@@ -41,7 +41,6 @@ pub trait WebhookTransport: Send + Sync {
 enum TransportError {
     PolicyDenied,
     Unavailable,
-    InvalidResponse,
 }
 
 #[async_trait]
@@ -145,39 +144,37 @@ impl PinnedWebhookPoster for ReqwestPinnedPoster {
             .map_err(|_| TransportError::Unavailable)?;
         // The URL keeps its original host for Host/SNI. The only DNS override is
         // numeric and already inspected; any fallback resolution fails closed.
-        let mut response = client
-            .post(&request.url)
-            .header("content-type", "application/json")
-            .header(WEBHOOK_TIMESTAMP_HEADER, &request.timestamp)
-            .header(WEBHOOK_SIGNATURE_HEADER, &request.signature)
-            .header(WEBHOOK_EVENT_ID_HEADER, request.event_id.to_string())
-            .header(WEBHOOK_KEY_ID_HEADER, request.key_id.to_string())
-            .body(request.body)
-            .send()
-            .await
-            .map_err(|_| TransportError::Unavailable)?;
-        let status = response.status().as_u16();
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-        {
-            return Err(TransportError::InvalidResponse);
-        }
-        let mut total = 0_usize;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| TransportError::Unavailable)?
-        {
-            total = total
-                .checked_add(chunk.len())
-                .ok_or(TransportError::InvalidResponse)?;
-            if total > MAX_RESPONSE_BYTES {
-                return Err(TransportError::InvalidResponse);
-            }
-        }
-        Ok(status)
+        post_signed(&client, request).await
     }
+}
+
+async fn post_signed(
+    client: &reqwest::Client,
+    request: PreparedWebhook,
+) -> Result<u16, TransportError> {
+    let mut response = client
+        .post(&request.url)
+        .header("content-type", "application/json")
+        .header(WEBHOOK_TIMESTAMP_HEADER, &request.timestamp)
+        .header(WEBHOOK_SIGNATURE_HEADER, &request.signature)
+        .header(WEBHOOK_EVENT_ID_HEADER, request.event_id.to_string())
+        .header(WEBHOOK_KEY_ID_HEADER, request.key_id.to_string())
+        .body(request.body)
+        .send()
+        .await
+        .map_err(|_| TransportError::Unavailable)?;
+    // The status line is the receiver's answer. The reply body carries no meaning, so
+    // it is drained only up to the cap and its size or a read error never reclassifies
+    // an accepted delivery as a retry.
+    let status = response.status().as_u16();
+    let mut drained = 0_usize;
+    while drained <= MAX_RESPONSE_BYTES {
+        let Ok(Some(chunk)) = response.chunk().await else {
+            break;
+        };
+        drained = drained.saturating_add(chunk.len());
+    }
+    Ok(status)
 }
 
 pub struct ReqwestWebhookTransport {
@@ -228,7 +225,7 @@ impl ReqwestWebhookTransport {
             Ok(Err(TransportError::PolicyDenied)) => {
                 WebhookAttemptOutcome::PermanentFailure { status_code: None }
             }
-            Ok(Err(TransportError::InvalidResponse | TransportError::Unavailable)) | Err(_) => {
+            Ok(Err(TransportError::Unavailable)) | Err(_) => {
                 WebhookAttemptOutcome::TransportUnknown
             }
         }

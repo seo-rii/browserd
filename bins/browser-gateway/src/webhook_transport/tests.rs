@@ -44,6 +44,86 @@ impl PinnedWebhookPoster for RecordingPoster {
     }
 }
 
+/// Sends through the production request path to a plain-HTTP loopback receiver. Such a
+/// receiver can pass neither the public-address policy nor certificate verification, so
+/// only the pinned HTTPS client is swapped out.
+struct LocalReceiverPoster {
+    url: String,
+}
+
+#[async_trait]
+impl PinnedWebhookPoster for LocalReceiverPoster {
+    async fn post(
+        &self,
+        mut request: PreparedWebhook,
+        _plan: ConnectPlan,
+    ) -> Result<u16, TransportError> {
+        request.url = self.url.clone();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        post_signed(&client, request).await
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ReplyBody {
+    Sized(usize),
+    Chunked(usize),
+    /// Declares the length but closes the connection after the first KiB.
+    Truncated(usize),
+}
+
+/// Answers one webhook request and yields the raw request bytes it received.
+async fn local_receiver(status: u16, body: ReplyBody) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/notify", listener.local_addr().unwrap());
+    let served = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(read, 0, "request ended early");
+            received.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&received).to_ascii_lowercase();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .map_or(0, |value| value.parse::<usize>().unwrap());
+                if received.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let mut reply = format!("HTTP/1.1 {status} Reply\r\nconnection: close\r\n").into_bytes();
+        match body {
+            ReplyBody::Sized(len) => {
+                reply.extend(format!("content-length: {len}\r\n\r\n").bytes());
+                reply.extend(std::iter::repeat_n(b'x', len));
+            }
+            ReplyBody::Chunked(len) => {
+                reply.extend(b"transfer-encoding: chunked\r\n\r\n");
+                for _ in 0..len / 1024 {
+                    reply.extend(b"400\r\n");
+                    reply.extend([b'x'; 1024]);
+                    reply.extend(b"\r\n");
+                }
+                reply.extend(b"0\r\n\r\n");
+            }
+            ReplyBody::Truncated(len) => {
+                reply.extend(format!("content-length: {len}\r\n\r\n").bytes());
+                reply.extend([b'x'; 1024]);
+            }
+        }
+        // The sender may stop reading once its cap is reached, so the tail is best effort.
+        let _ = stream.write_all(&reply).await;
+        let _ = stream.shutdown().await;
+        String::from_utf8(received).unwrap()
+    });
+    (url, served)
+}
+
 fn request(url: &str, timestamp: i64) -> PreparedWebhook {
     let body = br#"{"event_id":"019c0000-0000-7000-8000-000000000001","kind":"action.state_changed","resource":{"type":"action","id":"019c0000-0000-7000-8000-000000000002"}}"#.to_vec();
     PreparedWebhook {
@@ -335,4 +415,60 @@ async fn one_total_deadline_bounds_dns_and_an_already_started_http_effect() {
         WebhookAttemptOutcome::TransportUnknown
     );
     assert_eq!(poster.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn the_status_line_alone_classifies_a_reply_whatever_its_body() {
+    const LARGE: usize = 64 * 1024;
+    for (status, body, expected) in [
+        (
+            200,
+            ReplyBody::Sized(LARGE),
+            WebhookAttemptOutcome::Delivered { status_code: 200 },
+        ),
+        (
+            200,
+            ReplyBody::Chunked(LARGE),
+            WebhookAttemptOutcome::Delivered { status_code: 200 },
+        ),
+        (
+            202,
+            ReplyBody::Truncated(LARGE),
+            WebhookAttemptOutcome::Delivered { status_code: 202 },
+        ),
+        (
+            204,
+            ReplyBody::Sized(0),
+            WebhookAttemptOutcome::Delivered { status_code: 204 },
+        ),
+        (
+            503,
+            ReplyBody::Sized(LARGE),
+            WebhookAttemptOutcome::TransientFailure {
+                status_code: Some(503),
+            },
+        ),
+        (
+            400,
+            ReplyBody::Chunked(LARGE),
+            WebhookAttemptOutcome::PermanentFailure {
+                status_code: Some(400),
+            },
+        ),
+    ] {
+        let (url, served) = local_receiver(status, body).await;
+        let (mut transport, _, _) = fixture(vec![vec!["1.1.1.1"]], 0);
+        transport.poster = Arc::new(LocalReceiverPoster { url });
+        assert_eq!(
+            transport
+                .send_prepared(request("https://hooks.example/notify", 1000))
+                .await,
+            expected,
+            "{status} with {body:?}"
+        );
+        let received = served.await.unwrap();
+        assert!(
+            received.contains("browserd-webhook-event-id: 019c0000-0000-7000-8000-000000000001")
+        );
+    }
 }
