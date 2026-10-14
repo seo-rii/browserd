@@ -6321,7 +6321,7 @@ fn terminalize_actions_for_shutdown(session: &mut SessionState) -> Result<(), Wo
             approval.state = ApprovalState::Expired;
         }
     }
-    session.durability_degraded = first_error.is_some();
+    session.durability_degraded |= first_error.is_some();
     first_error.map_or(Ok(()), Err)
 }
 

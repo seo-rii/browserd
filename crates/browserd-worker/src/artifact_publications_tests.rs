@@ -625,6 +625,30 @@ fn uncertain_publication_without_exact_read_or_withdrawal_holds_bytes_and_charge
     assert!(state.durability_degraded);
 }
 #[test]
+fn clean_shutdown_terminalization_keeps_earlier_durability_degradation() {
+    let f = fixture();
+    assert!(f.worker.control_plane_qualified());
+    f.store.mode.store(1, Ordering::SeqCst);
+    f.store.lookup_fails.store(true, Ordering::SeqCst);
+    f.store.withdrawal_fails.store(true, Ordering::SeqCst);
+    assert_eq!(upload(&f), Err(WorkerError::DependencyUnavailable));
+    assert!(!f.worker.control_plane_qualified());
+    // Closing runs shutdown terminalization, which has no actions to settle and succeeds.
+    let closed = f
+        .worker
+        .close_session(
+            &f.peer,
+            &f.created.session_id,
+            &f.created.fence,
+            SessionTime::new(1002),
+        )
+        .unwrap();
+    assert_eq!(closed.lifecycle, SessionLifecycle::Closed);
+    let executor = f.worker.session(&f.created.session_id).unwrap();
+    assert!(executor.state.lock().unwrap().durability_degraded);
+    assert!(!f.worker.control_plane_qualified());
+}
+#[test]
 fn known_withdrawal_precedes_generation_discard_after_failed_publication() {
     let f = fixture();
     f.store.mode.store(2, Ordering::SeqCst);
