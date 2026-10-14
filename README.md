@@ -532,7 +532,12 @@ are present in this release.
 `scripts/package_release.py` produces a deterministic gzip/tar archive containing
 the five binaries, built TypeScript SDK, Python wheel, viewer assets, deployment
 templates, verified Chromium files, source identity and SHA-256 inventory. It
-refuses secret and runtime-state paths. A deployment-qualified package requires
+refuses secret and runtime-state paths. The deployment templates are the systemd
+units, `deploy/.env.example` and the helpers that the units and runbook run. The
+kernel probe lab, asset preparer, seccomp generator, validation-host setup, their
+examples and the deploy tests need a repository checkout, so they stay out of the
+archive, as do Python bytecode caches. Packaging refuses any other `deploy/` file
+until it is classified. A deployment-qualified package requires
 clean committed source, a build performed by the packager and passed reports for
 all five tiers. Kernel and soak reports must match the bundled Chromium artifact
 and the same target kernel and machine.
