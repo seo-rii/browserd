@@ -36,6 +36,15 @@ TIERS = validation.TIERS
 BINARIES = ("browser-egressd", "browser-sandboxd", "browser-worker", "browser-gateway", "browserd-launch-gate")
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_ROOTS = {"bin", "chromium", "sdk", "viewer", "deploy", "qualification"}
+# deploy/ files the single-host runbook and systemd units use from an extracted release.
+DEPLOY_RUNTIME = frozenset({".env.example", "next_epochs.py", "run-sandbox.sh", "wait_ready.py"})
+# Repository-only qualification tooling and its tests. It needs scripts/, locally built probe
+# binaries or a Docker build context, none of which a release contains.
+DEPLOY_REPOSITORY_ONLY = frozenset({
+    "Dockerfile.kernel-probe-lab", "kernel-probe-approval.example.json", "kernel-probe-lab-entry.py",
+    "kernel-probe-lab.py", "kernel-probe-runtime-manifest.example.json", "kernel-probe-seccomp.py",
+    "prepare-kernel-probe-assets.py", "setup-validation-host.py", "tests",
+})
 
 
 class PackageError(Exception):
@@ -243,10 +252,13 @@ def collect_payload(binary_dir: Path, wheel: Path, chromium: Path, epoch: int) -
     for path in [ROOT / "viewer-web/index.html", ROOT / "viewer-web/styles.css", *sorted((ROOT / "viewer-web/src").glob("*.mjs"))]:
         entries["viewer/" + path.relative_to(ROOT / "viewer-web").as_posix()] = (read_input(path), 0o444)
     for path in sorted((ROOT / "deploy").rglob("*")):
-        if path.is_file():
+        parts = path.relative_to(ROOT / "deploy").parts
+        # Ignored bytecode caches and repository-only tooling stay out of the release.
+        if (path.is_file() and "__pycache__" not in parts and path.suffix != ".pyc"
+                and parts[0] not in DEPLOY_REPOSITORY_ONLY):
             relative = path.relative_to(ROOT).as_posix()
             safe_name(relative)
-            if path.name != ".env.example" and path.suffix not in {".service", ".sh", ".py"}:
+            if "/".join(parts) not in DEPLOY_RUNTIME and not (parts[:-1] == ("systemd",) and path.suffix == ".service"):
                 raise PackageError(f"unexpected deployment input: {relative}")
             value = read_input(path)
             if path.name == ".env.example":

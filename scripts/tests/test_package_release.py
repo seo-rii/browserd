@@ -5,6 +5,8 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -215,7 +217,7 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(release.PackageError):
             release.normalized_wheel(wheel, 1700000000)
 
-    def test_payload_staging_includes_only_declared_assets(self):
+    def payload_inputs(self):
         repo = self.root / "repo"
         binaries = self.root / "binaries"
         for path in [binaries, repo / "sdk/typescript/dist", repo / "sdk/python/browserd", repo / "viewer-web/src", repo / "deploy"]:
@@ -235,6 +237,10 @@ class PackageTests(unittest.TestCase):
             archive.writestr("browserd_client-0.1.0.dist-info/METADATA", "Name: browserd-client\nVersion: 0.1.0\n")
             archive.writestr("browserd_client-0.1.0.dist-info/WHEEL", "Wheel-Version: 1.0\n")
             archive.writestr("browserd_client-0.1.0.dist-info/RECORD", "")
+        return repo, binaries, wheel, artifact
+
+    def test_payload_staging_includes_only_declared_assets(self):
+        repo, binaries, wheel, artifact = self.payload_inputs()
         with patch.object(release, "ROOT", repo):
             entries, _ = release.collect_payload(binaries, wheel, artifact, 1700000000)
         self.assertIn("bin/browser-sandboxd", entries)
@@ -252,6 +258,40 @@ class PackageTests(unittest.TestCase):
             manifest = json.load(archive.extractfile("manifest.json"))
         self.assertFalse(manifest["deployment"]["qualified"])
         self.assertEqual(manifest["candidate"], "development-unqualified")
+
+    def test_payload_packages_the_current_deploy_tree_for_the_runbook(self):
+        repo, binaries, wheel, artifact = self.payload_inputs()
+        shutil.rmtree(repo / "deploy")
+        shutil.copytree(SCRIPT.parents[1] / "deploy", repo / "deploy",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        # Running the deploy and lab tests leaves ignored bytecode caches in a clean checkout.
+        for cache in ("deploy/__pycache__/next_epochs.cpython-311.pyc",
+                      "deploy/tests/__pycache__/test_wait_ready.cpython-311.pyc"):
+            (repo / cache).parent.mkdir(exist_ok=True)
+            (repo / cache).write_bytes(b"bytecode")
+        with patch.object(release, "ROOT", repo):
+            entries, _ = release.collect_payload(binaries, wheel, artifact, 1700000000)
+        units = sorted((repo / "deploy/systemd").glob("*.service"))
+        self.assertEqual({name for name in entries if name.startswith("deploy/")},
+                         {"deploy/" + name for name in release.DEPLOY_RUNTIME}
+                         | {"deploy/systemd/" + unit.name for unit in units})
+        runbook = (SCRIPT.parents[1] / "README.md").read_text()
+        runbook = runbook.split("## Single-host operating procedure", 1)[1].split("\n## ", 1)[0]
+        required = set(re.findall(r"\bdeploy/[\w.-]+(?:/[\w.-]+)*", runbook))
+        # Release paths that units, the sandbox launcher and the environment example execute.
+        release_path = r"(?:\$\{BROWSERD_RELEASE_ROOT\}|\$BROWSERD_RELEASE_ROOT|/opt/browserd/releases/REPLACE_RELEASE_ID)/((?:bin|deploy)/[\w./-]+)"
+        for name, (data, _mode) in entries.items():
+            if name.startswith("deploy/"):
+                required |= set(re.findall(release_path, data.decode()))
+        self.assertLessEqual({"deploy/wait_ready.py", "deploy/run-sandbox.sh", "bin/browser-sandboxd",
+                              "bin/browserd-launch-gate"}, required)
+        for name in sorted(required):
+            with self.subTest(path=name):
+                self.assertIn(name, entries)
+        self.assertEqual(entries["deploy/run-sandbox.sh"][1], 0o555)
+        (repo / "deploy/unclassified.conf").write_text("setting")
+        with patch.object(release, "ROOT", repo), self.assertRaises(release.PackageError):
+            release.collect_payload(binaries, wheel, artifact, 1700000000)
 
     def test_epoch_helper_reads_both_actual_formats_without_mutating_state(self):
         helper_spec = importlib.util.spec_from_file_location("next_epochs", SCRIPT.parent.parent / "deploy/next_epochs.py")
