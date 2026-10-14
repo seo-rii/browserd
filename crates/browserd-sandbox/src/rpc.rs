@@ -36,6 +36,7 @@ const CLIENT_FINAL_RECEIPT: u8 = 0x55;
 const DESCRIPTOR_HANDOFF_COMPLETE: u8 = 0x56;
 const HANDOFF_FRAME_BYTES: usize = 17;
 const SCM_RIGHTS_MAX_FDS: usize = 253;
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const _: () = assert!(std::mem::align_of::<usize>() >= std::mem::align_of::<nix::libc::cmsghdr>());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1108,15 +1109,36 @@ where
         let terminal = loop {
             tokio::select! {
                 () = shutdown.cancelled() => break Ok(()),
-                Some(joined) = connections.join_next(), if !connections.is_empty() => {
-                    if joined.is_err() {
-                        break Err(SandboxRpcError::ConnectionTaskFailed);
-                    }
-                }
+                // A panicked connection task unwinds through the same drop paths the request
+                // timeout already exercises: supervisor state is behind a non-poisoning async
+                // mutex and backend effects run in detached owner tasks, so only its peer is lost.
+                Some(_joined) = connections.join_next(), if !connections.is_empty() => {}
                 accepted = listener.accept() => {
                     let (stream, _address) = match accepted {
                         Ok(accepted) => accepted,
-                        Err(error) => break Err(SandboxRpcError::Io(error.to_string())),
+                        // These mean the listening socket itself is unusable.
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(
+                                    nix::libc::EBADF
+                                        | nix::libc::EINVAL
+                                        | nix::libc::ENOTSOCK
+                                        | nix::libc::EOPNOTSUPP
+                                )
+                            ) =>
+                        {
+                            break Err(SandboxRpcError::Io(error.to_string()));
+                        }
+                        // Anything else (EMFILE, ENFILE, ENOBUFS, ENOMEM, ECONNABORTED, ...) fails
+                        // only the pending connection. Descriptor exhaustion leaves the listener
+                        // readable, so back off instead of spinning.
+                        Err(_) => {
+                            tokio::select! {
+                                () = shutdown.cancelled() => break Ok(()),
+                                () = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => continue,
+                            }
+                        }
                     };
                     if let Some(allowed_uid) = self.config.allowed_uid {
                         let peer = match stream.peer_cred() {
@@ -1552,8 +1574,6 @@ pub enum SandboxRpcError {
         code: RpcFailureCode,
         message: String,
     },
-    #[error("sandbox RPC connection task failed")]
-    ConnectionTaskFailed,
     #[error("sandbox shutdown left {pending_shards} shard(s) requiring restart reconciliation")]
     ShutdownIncomplete { pending_shards: usize },
 }
