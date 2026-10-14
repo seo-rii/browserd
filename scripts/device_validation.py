@@ -282,7 +282,7 @@ def functional(settings: dict, log_dir: Path) -> int:
                         "--test", "live_chromium_emulation", "--test", "live_chromium_input",
                         "--test", "live_chromium_capture", "--test", "live_chromium_viewer",
                         "--test", "live_chromium_downloads", "--test", "live_chromium_workers",
-                        "--test", "live_chromium_evaluate",
+                        "--test", "live_chromium_evaluate", "--test", "live_chromium_shared_context",
                         "--", "--ignored"), root),
                 Command("real-browser-file-inputs", ("cargo", "test", "--locked", "-p", "browserd-worker",
                         "--lib", "chromium_owner::uploads::live_tests::actual_owner_file_inputs_preserve_names_bytes_and_scope",
@@ -295,6 +295,9 @@ def functional(settings: dict, log_dir: Path) -> int:
                         "--", "--ignored", "--exact"), root),
                 Command("real-browser-frame-input", ("cargo", "test", "--locked", "-p", "browserd-worker",
                         "--lib", "chromium_owner::frames::live_tests::actual_owner_nested_frames_and_oopif_input_are_fenced",
+                        "--", "--ignored", "--exact"), root),
+                Command("real-browser-typed-approvals", ("cargo", "test", "--locked", "-p", "browserd-worker",
+                        "--lib", "chromium_owner::approvals::live_tests::actual_owner_typed_approvals_bind_child_secret_files_and_blank_context",
                         "--", "--ignored", "--exact"), root)]
     run_dir, report = execute("device-functional", commands, log_dir, environment(settings, dict(os.environ)))
     report.update(artifact_status="local_candidate", operator_approval=False,

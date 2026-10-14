@@ -140,9 +140,9 @@ python3 scripts/device_validation.py functional
 python3 scripts/device_validation.py doctor
 ```
 
-The functional command runs the Python browser suites, all seven ignored Rust
-browser suites and the real file-input, secret-injection, checkpoint and frame-input proofs
-against that copy, with private logs
+The functional command runs the Python browser suites, all eight ignored Rust
+browser suites and the real file-input, secret-injection, checkpoint, frame-input
+and typed-approval proofs against that copy, with private logs
 under `~/logs`. Its report
 is a `device-functional` result, not a kernel/soak gate. Installation records the
 manifest digest and rejects later artifact drift; `candidate.env` clears inherited
