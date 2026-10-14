@@ -33,7 +33,11 @@ import validation
 from native_profile_artifact import NativeProfileArtifactError, validate_native_catalog
 
 TIERS = validation.TIERS
-BINARIES = ("browser-egressd", "browser-sandboxd", "browser-worker", "browser-gateway", "browserd-launch-gate")
+# Service binaries plus the offline action migration that the runbook runs against the
+# deployed Redis namespace. Kernel-lab tools (browserd-kernel-probe and the lab-restricted
+# browserd-safety-initialize) are built separately and never released.
+BINARIES = ("browser-egressd", "browser-sandboxd", "browser-worker", "browser-gateway", "browserd-launch-gate",
+            "action_migrate")
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWED_ROOTS = {"bin", "chromium", "sdk", "viewer", "deploy", "qualification"}
 

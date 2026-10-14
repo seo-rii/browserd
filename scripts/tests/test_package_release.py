@@ -177,6 +177,23 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(release.source_policy({"revision": "a" * 40, "dirty": True}, True), "development-unqualified")
         self.assertEqual(release.source_policy({"revision": "a" * 40, "dirty": False}, False), "release-candidate")
 
+    def test_release_binaries_include_runbook_operator_tools(self):
+        # README `cargo run` commands act on deployed state, so a release must ship them.
+        # `cargo build` lines there only stage kernel-lab inputs.
+        readme = (SCRIPT.parents[1] / "README.md").read_text()
+        operator = {line.split(" --bin ", 1)[1].split()[0] for line in readme.splitlines()
+                    if line.startswith("cargo run ") and " --bin " in line}
+        self.assertIn("action_migrate", operator)
+        self.assertLessEqual(operator, set(release.BINARIES))
+        for name in release.BINARIES:
+            with self.subTest(binary=name):
+                sources = SCRIPT.parents[1]
+                self.assertTrue(any(sources.glob(f"*/*/src/bin/{name}.rs"))
+                                or any((manifest.parent / "src/main.rs").is_file()
+                                       for manifest in sources.glob(f"*/{name}/Cargo.toml")))
+        for name in ("browserd-kernel-probe", "browserd-safety-initialize"):
+            self.assertNotIn(name, release.BINARIES)
+
     def test_qualification_requires_all_current_clean_gates_and_matching_kernel_artifact(self):
         source = {"revision": "a" * 40, "dirty": False}
         reports = [{"tier": tier, "status": "passed", "source_revision": source["revision"], "source_dirty": False,

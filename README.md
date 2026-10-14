@@ -530,7 +530,7 @@ future work; the broader architecture in SPEC does not imply those capabilities
 are present in this release.
 
 `scripts/package_release.py` produces a deterministic gzip/tar archive containing
-the five binaries, built TypeScript SDK, Python wheel, viewer assets, deployment
+the release binaries, built TypeScript SDK, Python wheel, viewer assets, deployment
 templates, verified Chromium files, source identity and SHA-256 inventory. It
 refuses secret and runtime-state paths. A deployment-qualified package requires
 clean committed source, a build performed by the packager and passed reports for
@@ -838,6 +838,11 @@ explicitly run the offline tool with the same `BROWSERD_REDIS_URL` and
 cargo run --locked -p browser-gateway --bin action_migrate -- \
   --confirm-gateway-writers-stopped
 ```
+
+A release archive contains the same tool as `bin/action_migrate`, built with its
+gateway. On a deployed host, run that release's
+`bin/action_migrate --confirm-gateway-writers-stopped` with the gateway
+environment instead of building from source.
 
 The tool performs bounded steps with a durable migration cursor. If interrupted,
 resume the same command before starting gateways. It preserves action identities,
