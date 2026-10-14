@@ -7,12 +7,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{
-    EgressFence, LaunchGeneration, LeaseId, OwnerFence, RouteGeneration, SessionId,
-    SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
+    EgressFence, LaunchGeneration, LeaseId, OwnerFence, RouteGeneration, RuntimeSafetyCache,
+    SessionId, SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_egress::{
     AcceptedIngressHandler, AcceptedRouteIngress, AttachmentState, BindingDigest, DaemonEpoch,
-    IngressHandlerError, QuotaLimits,
+    DataPlaneLimits, IngressHandlerError, QuotaLimits,
 };
 use browserd_egress_control::{
     ClientInstallError, EpochProbeRequest, InstallRequest, ServerCommitError, receive_listener,
@@ -893,4 +893,34 @@ fn shared_prepare_is_explicit_and_mode_policy_and_route_identity_remain_immutabl
         daemon.prepare(changed),
         Err(DaemonControlError::PlanConflict)
     ));
+}
+
+#[test]
+fn configured_idle_timeout_is_the_data_plane_relay_idle_timeout() {
+    for idle in [
+        Duration::from_millis(250),
+        quotas().idle_connection_timeout,
+        Duration::from_secs(120),
+    ] {
+        let limits = DaemonLimits::new(
+            Duration::from_secs(30),
+            8,
+            QuotaLimits {
+                idle_connection_timeout: idle,
+                ..quotas()
+            },
+        )
+        .expect("daemon limits are valid");
+
+        assert_eq!(
+            limits.data_plane_limits(),
+            DataPlaneLimits {
+                idle_timeout: idle,
+                ..DataPlaneLimits::default()
+            }
+        );
+        EgressDaemon::new(epoch(), limits.clone()).expect("derived data plane limits are valid");
+        EgressDaemon::with_runtime_safety(epoch(), limits, Arc::new(RuntimeSafetyCache::new()))
+            .expect("derived data plane limits are valid");
+    }
 }
