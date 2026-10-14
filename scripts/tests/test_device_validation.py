@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import struct
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -238,6 +239,36 @@ class DeviceInstallationTests(unittest.TestCase):
             connection.recv.return_value = json.dumps({"pid": 9999}).encode() + b"\n"
             with self.assertRaisesRegex(device.DeviceError, "pid"):
                 device.query_host(self.state / "control.sock", os.getuid())
+
+    def test_functional_runs_every_kernel_live_browser_proof(self):
+        commands = []
+
+        def execute(_name, planned, _log_dir, _env):
+            commands.extend(planned)
+            return self.root, {"status": "passed"}
+
+        settings = {"repo": str(self.repo), "artifact_root": str(self.artifact),
+                    "test_chromium": str(self.artifact / "chrome-headless-shell"), "manifest_sha256": "a" * 64}
+        with patch.object(device, "execute", side_effect=execute), patch.object(device, "write_private"):
+            self.assertEqual(device.functional(settings, self.root / "logs"), 0)
+
+        def live(plan):
+            suites, proofs = set(), set()
+            for command in plan:
+                argv = command.argv
+                if argv[:5] != ("cargo", "test", "--locked", "-p", "browserd-worker") or "--ignored" not in argv:
+                    continue
+                suites |= {argv[index + 1] for index, part in enumerate(argv) if part == "--test"}
+                proofs |= {argv[index + 1] for index, part in enumerate(argv) if part == "--lib"}
+            return suites, proofs
+
+        # device_validation imports the gate runner as the top-level validation module.
+        kernel_suites, kernel_proofs = live(sys.modules["validation"].build_plan("kernel", SCRIPT.parents[1]))
+        functional_suites, functional_proofs = live(commands)
+        self.assertIn("live_chromium_shared_context", kernel_suites)
+        self.assertIn("chromium_owner::approvals::live_tests::actual_owner_typed_approvals_bind_child_secret_files_and_blank_context", kernel_proofs)
+        self.assertEqual(functional_suites, kernel_suites)
+        self.assertEqual(functional_proofs, kernel_proofs)
 
 
 if __name__ == "__main__":
