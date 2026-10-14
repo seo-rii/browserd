@@ -24,7 +24,8 @@ let objectUrl = null;
 let frameDimensions = null;
 
 function sendInputIfControlling(type, payload) {
-  if (viewer?.state.controlling) viewer.sendInput(type, payload);
+  if (viewer?.state.controlling && frameDimensions !== null &&
+      viewer.state.frameTransformId === frameDimensions.frameTransformId) viewer.sendInput(type, payload);
 }
 
 function setStatus(state) {
@@ -54,8 +55,15 @@ function showFrame(frame) {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
     return;
   }
-  frameDimensions = { width, height };
+  // Input remains disabled until this exact frame has decoded, including after a transform
+  // message arrives ahead of its JPEG. Metadata dimensions are CSS viewport pixels, not DPR.
+  frameDimensions = null;
   const nextUrl = URL.createObjectURL(new Blob([frame.jpeg], { type: "image/jpeg" }));
+  elements.frame.onload = () => {
+    if (objectUrl !== nextUrl) return;
+    frameDimensions = { width, height, frameTransformId: Number(frame.transformEpoch) };
+  };
+  elements.frame.onerror = () => { if (objectUrl === nextUrl) frameDimensions = null; };
   elements.frame.src = nextUrl;
   elements.frame.classList.add("visible");
   elements.empty.hidden = true;
@@ -115,7 +123,9 @@ elements.frame.addEventListener("pointerup", (event) => pointerPayload(event, "u
 elements.frame.addEventListener("contextmenu", (event) => event.preventDefault());
 elements.frame.addEventListener("wheel", (event) => {
   event.preventDefault();
-  sendInputIfControlling("wheel", { delta_x: event.deltaX, delta_y: event.deltaY });
+  if (frameDimensions === null) return;
+  const point = mapPointerToFrame(event, elements.frame.getBoundingClientRect(), frameDimensions);
+  sendInputIfControlling("wheel", { ...point, delta_x: event.deltaX, delta_y: event.deltaY });
 }, { passive: false });
 
 elements.viewport.addEventListener("keydown", (event) => {
@@ -156,7 +166,8 @@ elements.ime.addEventListener("compositionend", (event) => {
   elements.ime.value = "";
 });
 elements.ime.addEventListener("beforeinput", (event) => {
-  if (!event.isComposing && event.data) sendInputIfControlling("insert_text", { text: event.data });
+  if (viewer?.state.controlling && frameDimensions !== null &&
+      viewer.state.frameTransformId === frameDimensions.frameTransformId) viewer.beforeInput(event);
 });
 
 window.addEventListener("beforeunload", () => {

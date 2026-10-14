@@ -48,6 +48,8 @@ function newViewer(overrides = {}) {
       trace_id: "trace-viewer-ticket",
     }),
     WebSocketImpl: FakeSocket,
+    setIntervalImpl: () => 1,
+    clearIntervalImpl: () => {},
     onFrame: (frame) => frames.push(frame),
     onState: (state) => states.push(state),
     ...overrides,
@@ -206,4 +208,55 @@ test("requires a fresh ticket for reconnect and prevents parallel connections", 
   assert.equal(issuances, 2);
   assert.deepEqual(first.sent, []);
   assert.deepEqual(second.sent, []);
+});
+
+test("transform updates preserve the active lease input sequence", async () => {
+  const { viewer } = newViewer();
+  await viewer.connect();
+  const socket = FakeSocket.instances[0]; socket.open();
+  const control = { type: "control_changed", controller: "human", lease_epoch: 2, page_id: "pg_a", frame_transform_id: 3 };
+  socket.receive(JSON.stringify(control));
+  viewer.sendInput("insert_text", { text: "a" });
+  socket.receive(JSON.stringify({ ...control, frame_transform_id: 4 }));
+  viewer.sendInput("insert_text", { text: "b" });
+  assert.equal(socket.sent.at(-1).input_sequence, 2);
+  assert.equal(socket.sent.at(-1).frame_transform_id, 4);
+  socket.receive(JSON.stringify({ ...control, controller: "human_other" }));
+  assert.equal(viewer.state.controlling, false);
+});
+
+test("heartbeats run only while the current socket is connected", async () => {
+  let tick; let cleared = 0;
+  const { viewer } = newViewer({
+    setIntervalImpl: (callback, milliseconds) => { assert.equal(milliseconds, 5000); tick = callback; return 17; },
+    clearIntervalImpl: (id) => { assert.equal(id, 17); cleared += 1; },
+  });
+  await viewer.connect(); const socket = FakeSocket.instances[0]; socket.open();
+  tick(); assert.deepEqual(socket.sent.at(-1), { type: "ping" });
+  viewer.disconnect(); assert.equal(cleared, 1);
+  tick(); assert.equal(socket.sent.length, 1);
+});
+
+test("a new connection resets frame generation and ignores a late old close", async () => {
+  const { viewer, frames } = newViewer();
+  await viewer.connect(); const first = FakeSocket.instances[0]; first.open();
+  first.receive(encodeFrameForTest({ frameId: 10n, transformEpoch: 90n, metadata: {}, jpeg: new Uint8Array([1]) }));
+  first.close(); await viewer.connect(); const second = FakeSocket.instances[1]; second.open();
+  first.close(); assert.equal(viewer.state.phase, "connected");
+  second.receive(encodeFrameForTest({ frameId: 1n, transformEpoch: 2n, metadata: {}, jpeg: new Uint8Array([2]) }));
+  assert.equal(frames.length, 2);
+});
+
+test("composition commit is inserted exactly once when beforeinput follows it", async () => {
+  const { viewer } = newViewer(); await viewer.connect();
+  const socket = FakeSocket.instances[0]; socket.open();
+  socket.receive(JSON.stringify({ type: "control_changed", controller: "human", lease_epoch: 4, page_id: "pg_a", frame_transform_id: 1 }));
+  viewer.compositionStart();
+  viewer.beforeInput({ data: "ㅎ", isComposing: true, inputType: "insertCompositionText" });
+  viewer.compositionUpdate("한"); viewer.compositionCommit("한");
+  viewer.beforeInput({ data: "한", isComposing: false, inputType: "insertText" });
+  assert.equal(socket.sent.filter((message) => message.type === "insert_text").length, 0);
+  await Promise.resolve();
+  viewer.beforeInput({ data: "한", isComposing: false, inputType: "insertText" });
+  assert.equal(socket.sent.filter((message) => message.type === "insert_text").length, 1);
 });
