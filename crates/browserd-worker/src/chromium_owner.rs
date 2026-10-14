@@ -2816,12 +2816,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 deadline,
                 response,
             } => {
-                // The caller committed authorization before sending this private request.
+                // The caller committed authorization before sending this private request. Only a
+                // refusal before the credential was submitted is known; it leaves the shard intact.
                 let result = self
                     .fill_secret(&target, secret, deadline)
                     .await
-                    .map_err(|_| OwnerActorError::OutcomeUncertain);
-                let failed = result.is_err();
+                    .map_err(|error| match error {
+                        OwnerActorError::Rejected => OwnerActorError::Rejected,
+                        _ => OwnerActorError::OutcomeUncertain,
+                    });
+                let failed = matches!(result, Err(OwnerActorError::OutcomeUncertain));
                 if response.send(result).is_err() || failed {
                     return Err(());
                 }
