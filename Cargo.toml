@@ -22,7 +22,7 @@ hmac = "0.12"
 http = "1.3"
 http-body-util = "0.1"
 ipnet = { version = "2.11", features = ["serde"] }
-jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 lru = "0.16"
 nix = { version = "0.30", features = ["dir", "fs", "mount", "process", "resource", "sched", "signal", "socket", "user"] }
 parking_lot = "0.12"
