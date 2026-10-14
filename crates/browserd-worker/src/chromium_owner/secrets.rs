@@ -14,8 +14,10 @@ use super::{
 };
 use crate::{ResolvedSecret, SecretFillTarget, TargetManagerDrain};
 
-// The secret is never passed to the inspection call. Cross-frame lookup is unsupported.
-const INSPECT_SECRET_INPUT: &str = "function () { const el=this, doc=el.ownerDocument; if (!el.isConnected || doc!==document || !doc || doc.defaultView!==globalThis || globalThis!==globalThis.top || el.disabled || el.readOnly || el.matches(':disabled')) return null; if (!(el.tagName==='TEXTAREA' || (el.tagName==='INPUT' && ['text','search','tel','url','email','password'].includes(el.type)))) return null; return globalThis.location.origin; }";
+// The secret is never passed to the inspection call, and page script never reports the origin.
+// Cross-frame lookup is unsupported.
+const INSPECT_SECRET_INPUT: &str = "function () { const el=this, doc=el.ownerDocument; if (!el.isConnected || doc!==document || !doc || doc.defaultView!==globalThis || globalThis!==globalThis.top || el.disabled || el.readOnly || el.matches(':disabled')) return false; return el.tagName==='TEXTAREA' || (el.tagName==='INPUT' && ['text','search','tel','url','email','password'].includes(el.type)); }";
+// The in-page origin comparison can only refuse. The origin authority is the browser frame tree.
 const FILL_SECRET_INPUT: &str = "function (expectedOrigin, value) { const el=this, doc=el.ownerDocument; if (!el.isConnected || doc!==document || !doc || doc.defaultView!==globalThis || globalThis!==globalThis.top || globalThis.location.origin!==expectedOrigin || el.disabled || el.readOnly || el.matches(':disabled')) return false; const tag=el.tagName; if (!(tag==='TEXTAREA' || (tag==='INPUT' && ['text','search','tel','url','email','password'].includes(el.type)))) return false; const proto=tag==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype; const setter=Object.getOwnPropertyDescriptor(proto,'value'); if (!setter || typeof setter.set!=='function') return false; setter.set.call(el,value); if (el.value!==value) return false; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); return true; }";
 
 #[cfg(test)]
@@ -242,15 +244,27 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             frame_document_epoch: entry.frame_document_epoch,
             url_revision: entry.url_revision,
         };
-        let observed = self
+        // Only a node of the page's main frame resolves here; a child-frame node is refused
+        // before any CDP command.
+        let (frame, _) = self.node_frame_guard(&target_id, &query.node, true)?;
+        // The origin comes from the browser's frame tree, never from page script: `globalThis`,
+        // `location` and `defaultView` are page-writable, so a script-read origin could name
+        // another origin's grant.
+        let tree = self
+            .command_event_first(
+                "Page.getFrameTree",
+                json!({}),
+                Some(route.session_id().to_owned()),
+                None,
+                None,
+                Some(deadline),
+            )
+            .await?;
+        let eligible = self
             .call_function_on_node(
                 &target_id,
                 route.session_id().to_owned(),
-                Some(GuardedPageExecution {
-                    viewer_transform: None,
-                    target_id: target_id.clone(),
-                    fence,
-                }),
+                None,
                 &query.node,
                 NodeFunctionCall {
                     declaration: INSPECT_SECRET_INPUT,
@@ -259,21 +273,45 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 Some(deadline),
             )
             .await?;
-        let raw_origin = observed.as_str().ok_or(OwnerActorError::Rejected)?;
-        let origin = Origin::parse(raw_origin).map_err(|_| OwnerActorError::Rejected)?;
-        if origin.as_str() != raw_origin {
+        if eligible != Value::Bool(true) {
             return Err(OwnerActorError::Rejected);
         }
+        // Both reads are unguarded, so events that precede each response have been applied and a
+        // document change shows up here. It is a known refusal of a read-only inspection;
+        // OutcomeUncertain would fail the whole shard closed and let any page tear down every
+        // session on it by navigating.
+        self.validate_frame_guard(&frame)?;
         let entry = self
             .routes
             .get(&target_id)
             .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if entry.route.ownership_fence() != &query.fence {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
         if entry.target_incarnation != fence.target_incarnation
             || entry.frame_document_epoch != fence.frame_document_epoch
             || entry.url_revision != fence.url_revision
-            || entry.route.ownership_fence() != &query.fence
         {
-            return Err(OwnerActorError::OutcomeUncertain);
+            return Err(OwnerActorError::Rejected);
+        }
+        let root = tree
+            .pointer("/frameTree/frame")
+            .ok_or(OwnerActorError::Rejected)?;
+        if root.get("id").and_then(Value::as_str) != Some(frame.scope.frame_id.as_str())
+            || root.get("parentId").is_some()
+        {
+            return Err(OwnerActorError::Rejected);
+        }
+        // A secret binds only to a canonical tuple HTTP(S) origin. An opaque document (a fresh
+        // `about:blank`, `data:`, a sandboxed page) reports none and is refused.
+        let raw_origin = root
+            .get("securityOrigin")
+            .and_then(Value::as_str)
+            .filter(|origin| origin.len() <= 8_192)
+            .ok_or(OwnerActorError::Rejected)?;
+        let origin = Origin::parse(raw_origin).map_err(|_| OwnerActorError::Rejected)?;
+        if origin.as_str() != raw_origin {
+            return Err(OwnerActorError::Rejected);
         }
         Ok(SecretFillTarget {
             tenant_id: query.tenant.clone(),
@@ -288,6 +326,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         })
     }
 
+    /// Fills an authorized secret into the inspected target. `Rejected` is returned only before
+    /// the credential is submitted; every failure after that is `OutcomeUncertain`.
     pub(super) async fn fill_secret(
         &mut self,
         target: &SecretFillTarget,
@@ -331,7 +371,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 json!({"backendNodeId":backend}),
                 Some(route.session_id().to_owned()),
                 None,
-                guarded.clone(),
+                None,
                 Some(deadline),
             )
             .await?;
@@ -341,6 +381,18 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .and_then(Value::as_str)
             .filter(|value| valid_identifier(value))
             .ok_or(OwnerActorError::OutcomeUncertain)?;
+        // The credential has not left the actor yet, so a document that changed since the
+        // inspection is a known refusal rather than an uncertain effect.
+        let entry = self
+            .routes
+            .get(&target_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if entry.target_incarnation != target.target_incarnation
+            || entry.frame_document_epoch != target.frame_document_epoch
+            || entry.url_revision != target.url_revision
+        {
+            return Err(OwnerActorError::Rejected);
+        }
 
         #[derive(Serialize)]
         struct Argument<'a> {
@@ -400,10 +452,12 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 biased;
                 () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
                 control = self.control_requests.recv() => {
-                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)
+                        .map_err(|_| OwnerActorError::OutcomeUncertain)?;
                 }
                 completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
-                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)
+                        .map_err(|_| OwnerActorError::OutcomeUncertain)?;
                 }
                 () = tokio::time::sleep_until(deadline.into()) => return Err(OwnerActorError::OutcomeUncertain),
                 () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}

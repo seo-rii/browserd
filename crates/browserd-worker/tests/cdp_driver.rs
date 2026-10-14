@@ -8,6 +8,8 @@ mod review_document_fence;
 mod review_network_activity;
 #[path = "cdp_driver/review_snapshot_contract.rs"]
 mod review_snapshot_contract;
+#[path = "cdp_driver/secret_fill_origin.rs"]
+mod secret_fill_origin;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
