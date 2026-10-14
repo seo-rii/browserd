@@ -20,6 +20,8 @@ pub(super) const JOURNAL_NAME: &str = "publications.journal";
 const HEADER: &[u8] = b"browserd-artifact-publications-v1\n";
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RECORD_BYTES: usize = 32 * 1024;
+/// Withdraw and delete frames reserved for every retained artifact.
+const CLEANUP_FRAMES: usize = 2;
 type IndexKey = (TenantId, SessionId, ArtifactId);
 
 fn index_key(key: &ArtifactKey) -> IndexKey {
@@ -269,6 +271,7 @@ pub(super) struct Publications {
     file: File,
     root: Arc<File>,
     bytes: u64,
+    max_bytes: u64,
     sequence: u64,
     digest: [u8; 32],
     healthy: bool,
@@ -420,6 +423,14 @@ impl Publications {
         )
     }
     pub fn open(root: Arc<File>, maximum_entries: usize) -> Result<Self, DependencyError> {
+        // The fixed budget holds the actual records and unacknowledged notifications. Every
+        // configured artifact also backs its reserved worst-case cleanup frames, so reservations
+        // alone cannot exhaust the journal below the configured maximum.
+        let max_bytes = maximum_entries
+            .checked_mul(CLEANUP_FRAMES)
+            .and_then(|frames| (frames as u64).checked_mul(MAX_RECORD_BYTES as u64 + 1))
+            .and_then(|reserved| reserved.checked_add(MAX_BYTES))
+            .ok_or(DependencyError::Rejected)?;
         let flags = OFlag::O_RDWR
             | OFlag::O_APPEND
             | OFlag::O_CLOEXEC
@@ -451,7 +462,7 @@ impl Publications {
             || metadata.mode() & 0o777 != 0o600
             || metadata.nlink() != 1
             || metadata.uid() != nix::unistd::Uid::effective().as_raw()
-            || metadata.len() > MAX_BYTES
+            || metadata.len() > max_bytes
         {
             return Err(DependencyError::Rejected);
         }
@@ -461,7 +472,7 @@ impl Publications {
         file.seek(SeekFrom::Start(0))
             .and_then(|_| {
                 Read::by_ref(&mut file)
-                    .take(MAX_BYTES + 1)
+                    .take(max_bytes + 1)
                     .read_to_end(&mut bytes)
             })
             .map_err(|_| DependencyError::Unavailable)?;
@@ -475,6 +486,7 @@ impl Publications {
             file,
             root,
             bytes: metadata.len(),
+            max_bytes,
             sequence: 0,
             digest: [0; 32],
             healthy: true,
@@ -482,7 +494,7 @@ impl Publications {
                 .max(bytes.iter().filter(|byte| **byte == b'\n').count()),
             entries: BTreeMap::new(),
             staged: HashMap::new(),
-            notifications: Notifications::default(),
+            notifications: Notifications::with_cleanup_capacity(maximum_entries)?,
             quarantine: BTreeMap::new(),
             quarantine_retired_before: 0,
         };
@@ -778,7 +790,7 @@ impl Publications {
             .ok_or(DependencyError::Rejected)?;
         if next
             .checked_add(reserved_bytes)
-            .is_none_or(|total| total > MAX_BYTES)
+            .is_none_or(|total| total > self.max_bytes)
         {
             self.rewrite(None)?;
             // Physical sequence/digest changed; re-encode this same immutable notification.
@@ -801,7 +813,7 @@ impl Publications {
                 .ok_or(DependencyError::Rejected)?;
             if next
                 .checked_add(reserved_bytes)
-                .is_none_or(|total| total > MAX_BYTES)
+                .is_none_or(|total| total > self.max_bytes)
             {
                 return Err(DependencyError::Rejected);
             }
@@ -1176,7 +1188,7 @@ impl Publications {
             }
             bytes.extend(encoded);
             bytes.push(b'\n');
-            if bytes.len() as u64 > MAX_BYTES {
+            if bytes.len() as u64 > self.max_bytes {
                 return Err(DependencyError::Rejected);
             }
         }
@@ -1206,7 +1218,7 @@ impl Publications {
             serde_json::to_writer(&mut bytes, &Envelope { record, digest })
                 .map_err(|_| DependencyError::Rejected)?;
             bytes.push(b'\n');
-            if bytes.len() as u64 > MAX_BYTES {
+            if bytes.len() as u64 > self.max_bytes {
                 return Err(DependencyError::Rejected);
             }
         }
@@ -1243,11 +1255,17 @@ impl Publications {
             }
             bytes.extend(encoded);
             bytes.push(b'\n');
-            if bytes.len() as u64 > MAX_BYTES {
+            if bytes.len() as u64 > self.max_bytes {
                 return Err(DependencyError::Rejected);
             }
         }
-        match super::retention::replace_file(&self.root, JOURNAL_NAME, "publications.tmp", &bytes) {
+        match super::retention::replace_file(
+            &self.root,
+            JOURNAL_NAME,
+            "publications.tmp",
+            &bytes,
+            self.max_bytes,
+        ) {
             Ok(file) => {
                 self.file = file;
                 self.bytes = bytes.len() as u64;
@@ -1442,6 +1460,78 @@ mod admission_tests {
         )
         .expect("publication");
         (root, runtime, store, publication)
+    }
+
+    #[test]
+    fn journal_holds_its_configured_maximum_of_live_publications_and_no_more() {
+        // Above both former ceilings: about 250 live artifacts from the byte reserve and 2048
+        // from the pending-notification reserve.
+        const CONFIGURED: usize = 2_100;
+        let root = tempfile::tempdir().expect("root");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).expect("private root");
+        let owner = Arc::new(File::open(root.path()).expect("root"));
+        let mut registry = Publications::open(owner.clone(), CONFIGURED).expect("authority");
+        let tenant = TenantId::new();
+        let session = SessionId::new();
+        let fence = OwnershipFence::new(WorkerId::new("capacity-test").expect("worker"), 1, 1, 1);
+        let stage = |registry: &mut Publications| {
+            let key = ArtifactKey::new(tenant.clone(), session.clone(), ArtifactId::new());
+            let metadata = ArtifactContentMetadata::new(
+                1,
+                ArtifactChecksum::new([1; 32]),
+                "text/plain",
+                ArtifactContentSource::Generated,
+                "capture",
+            )
+            .expect("metadata");
+            let generation = ArtifactObjectGeneration::new([1; 32]);
+            let publication = ArtifactPublication::new(
+                key.clone(),
+                fence.clone(),
+                metadata.clone(),
+                generation,
+                None,
+                None,
+                1000,
+                2000,
+            )
+            .expect("publication");
+            registry
+                .stage(
+                    key,
+                    StagedProvenance {
+                        fence: fence.clone(),
+                        metadata,
+                        generation,
+                        scan: None,
+                        scan_attestation: None,
+                    },
+                )
+                .expect("staged");
+            publication
+        };
+        let mut live = Vec::new();
+        for index in 0..CONFIGURED {
+            let publication = stage(&mut registry);
+            assert_eq!(registry.publish(&publication, 1000), Ok(()), "{index}");
+            live.push(publication);
+        }
+        // No notification was acknowledged, yet every artifact's cleanup stays admissible.
+        let first = &live[0];
+        registry.withdraw(first, true, 1001).expect("withdraw");
+        registry
+            .deleted(first.key(), Some(first.object_generation()), 1002)
+            .expect("delete");
+        // The configured maximum remains the bound, counting the deleted record until retirement.
+        let extra = stage(&mut registry);
+        assert_eq!(
+            registry.publish(&extra, 1003),
+            Err(DependencyError::Rejected)
+        );
+        drop(registry);
+        let reopened = Publications::open(owner, CONFIGURED).expect("restart");
+        assert_eq!(reopened.published().count(), CONFIGURED - 1);
+        assert_eq!(reopened.records().len(), CONFIGURED);
     }
 
     #[test]

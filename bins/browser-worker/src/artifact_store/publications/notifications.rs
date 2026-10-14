@@ -30,6 +30,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cleanup_capacity_backs_exactly_the_configured_artifacts_reserves() {
+        let authority = Notifications::with_cleanup_capacity(10).expect("capacity");
+        assert_eq!(authority.check_capacity(MAX_PENDING + 20), Ok(()));
+        assert_eq!(
+            authority.check_capacity(MAX_PENDING + 21),
+            Err(DependencyError::Rejected)
+        );
+        assert_eq!(
+            Notifications::default().check_capacity(MAX_PENDING + 1),
+            Err(DependencyError::Rejected)
+        );
+    }
+
+    #[test]
     fn full_rejection_capacity_replays_exact_pinned_checkpoints_after_pending_commits() {
         let mut authority = Notifications::default();
         authority
@@ -156,6 +170,9 @@ pub(super) struct Notifications {
     source_id: Option<Uuid>,
     sources: BTreeMap<SourceKey, SourceState>,
     rejections: BTreeMap<IndexKey, RejectionCheckpoint>,
+    // Reserved cleanup notifications the configured artifacts may still need, on top of the
+    // fixed pending bound.
+    cleanup_capacity: usize,
     pub clock_floor: u64,
 }
 
@@ -184,6 +201,15 @@ fn rejection_key(commit: &NotificationCommit) -> Result<Option<IndexKey>, Depend
 }
 
 impl Notifications {
+    pub fn with_cleanup_capacity(maximum_entries: usize) -> Result<Self, DependencyError> {
+        Ok(Self {
+            cleanup_capacity: maximum_entries
+                .checked_mul(CLEANUP_FRAMES)
+                .ok_or(DependencyError::Rejected)?,
+            ..Self::default()
+        })
+    }
+
     pub fn initialized(&self) -> bool {
         self.source_id.is_some()
     }
@@ -360,7 +386,7 @@ impl Notifications {
             .sum::<usize>();
         if pending
             .checked_add(cleanup_reserves)
-            .is_none_or(|total| total > MAX_PENDING)
+            .is_none_or(|total| total > MAX_PENDING.saturating_add(self.cleanup_capacity))
             || self.sources.len() > MAX_SOURCES
             || self.rejections.len() > MAX_REJECTIONS
         {
