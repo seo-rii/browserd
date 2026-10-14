@@ -49,7 +49,7 @@ from native_profile_artifact import (
 
 
 TIERS = ("fast", "adapter", "process", "kernel", "soak")
-LIVE_BROWSER_SUITES = frozenset({"live_chromium_input", "live_chromium_capture", "live_chromium_viewer", "live_chromium_emulation", "live_chromium_downloads", "live_chromium_workers", "live_chromium_evaluate"})
+LIVE_BROWSER_SUITES = frozenset({"live_chromium_input", "live_chromium_capture", "live_chromium_viewer", "live_chromium_emulation", "live_chromium_downloads", "live_chromium_workers", "live_chromium_evaluate", "live_chromium_shared_context"})
 ADAPTER_SUITES = frozenset({
     ("browser-gateway", "worker_notifications"),
     ("browserd-coordination", "notification_import"),
@@ -199,7 +199,8 @@ def inventory(root: Path) -> dict[tuple[str, str], str]:
                 tier = "process"
             else:
                 tier = "fast"
-                if re.search(r'env::var\("BROWSERD_[A-Z_]*TEST_[A-Z_]*"', source.read_text()):
+                # Live suites read their browser through shared helpers, so the name marks them.
+                if source.stem.startswith("live_") or re.search(r'env::var\("BROWSERD_[A-Z_]*TEST_[A-Z_]*"', source.read_text()):
                     raise GateError(f"classify new infrastructure-dependent suite: {package}/{source.stem}")
             result[target] = tier
     if not result:
@@ -262,6 +263,9 @@ def build_plan(tier: str, root: Path) -> list[Command]:
             "--", "--ignored", "--exact"), root))
         commands.append(Command("frame-node-input", ("cargo", "test", "--locked", "-p", "browserd-worker",
             "--lib", "chromium_owner::frames::live_tests::actual_owner_nested_frames_and_oopif_input_are_fenced",
+            "--", "--ignored", "--exact"), root))
+        commands.append(Command("typed-approvals", ("cargo", "test", "--locked", "-p", "browserd-worker",
+            "--lib", "chromium_owner::approvals::live_tests::actual_owner_typed_approvals_bind_child_secret_files_and_blank_context",
             "--", "--ignored", "--exact"), root))
     suites = inventory(root)
     if tier == "adapter" and {target for target, gate in suites.items() if gate == tier} != ADAPTER_SUITES:

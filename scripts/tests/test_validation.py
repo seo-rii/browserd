@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -378,6 +379,54 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("chromium_owner::frames::live_tests::actual_owner_nested_frames_and_oopif_input_are_fenced", frames[0].argv)
         self.assertEqual(frames[0].argv[-3:], ("--", "--ignored", "--exact"))
         self.assertFalse(any(command.name == "frame-node-input" for command in validation.build_plan("fast", self.root)))
+
+    def test_every_repository_live_browser_test_runs_ignored_only_in_kernel(self):
+        root = SCRIPT.parent.parent
+        worker = root / "crates/browserd-worker"
+        suites = {path.stem for path in (worker / "tests").glob("live_*.rs")}
+        self.assertIn("live_chromium_shared_context", suites)
+        self.assertEqual(suites, set(validation.LIVE_BROWSER_SUITES))
+        inventory = validation.inventory(root)
+        kernel = validation.build_plan("kernel", root)
+        fast = validation.build_plan("fast", root)
+        live = [command for command in kernel if command.name == "browserd-worker"]
+        self.assertEqual(len(live), 1)
+        self.assertEqual(live[0].argv[-2:], ("--", "--ignored"))
+        for suite in sorted(suites):
+            with self.subTest(suite=suite):
+                self.assertEqual(inventory[("browserd-worker", suite)], "kernel")
+                self.assertIn(suite, live[0].argv)
+                # Only the emulation fixture regressions run in fast, filtered and never ignored.
+                self.assertFalse(any(suite in command.argv and command.name != "native-fixture-tests"
+                                     for command in fast))
+        # Library live_tests modules run by exact name; inline modules start at `mod live_tests {`.
+        ignored = re.compile(r'#\[ignore(?:\s*=\s*"[^"]*")?\]\s*(?:#\[[^\]]*\]\s*)*(?:async\s+)?fn\s+(\w+)')
+        proofs = set()
+        for path in (worker / "src").rglob("*.rs"):
+            module = path.relative_to(worker / "src").with_suffix("").parts
+            text = path.read_text()
+            if module[-1] == "live_tests":
+                proofs |= {"::".join(module) + "::" + name for name in ignored.findall(text)}
+            elif "mod live_tests {" in text:
+                prefix = "::".join(module + ("live_tests",))
+                proofs |= {prefix + "::" + name for name in ignored.findall(text.split("mod live_tests {", 1)[1])}
+        self.assertIn("chromium_owner::approvals::live_tests::actual_owner_typed_approvals_bind_child_secret_files_and_blank_context", proofs)
+        self.assertGreaterEqual(len(proofs), 5)
+        for proof in sorted(proofs):
+            with self.subTest(proof=proof):
+                commands = [command for command in kernel if proof in command.argv]
+                self.assertEqual(len(commands), 1)
+                self.assertEqual(commands[0].argv[:6], ("cargo", "test", "--locked", "-p", "browserd-worker", "--lib"))
+                self.assertEqual(commands[0].argv[-3:], ("--", "--ignored", "--exact"))
+                self.assertFalse(any(proof in command.argv for command in fast))
+
+    def test_unlisted_live_suite_cannot_fall_into_the_fast_tier(self):
+        package = self.root / "crates/browserd-worker"
+        (package / "tests").mkdir(parents=True)
+        (package / "Cargo.toml").write_text('[package]\nname = "browserd-worker"\n')
+        (package / "tests/live_chromium_unlisted.rs").write_text('#[ignore = "real Chromium"]\nfn probe() {}')
+        with self.assertRaisesRegex(validation.GateError, "live_chromium_unlisted"):
+            validation.inventory(self.root)
 
     def test_live_browser_binary_is_the_pinned_executable_not_an_unrelated_system_build(self):
         binary = self.root / "chromium"
