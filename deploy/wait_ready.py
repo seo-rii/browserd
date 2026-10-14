@@ -6,6 +6,11 @@ import socket
 import time
 from urllib.request import build_opener, ProxyHandler
 
+# Transport liveness routes: egress control serves /healthz (bins/browser-egressd) and
+# the gateway serves /health/live (crates/browserd-http). Readiness (/readyz and
+# /health/ready) reports effect admission separately and must not gate startup.
+LIVENESS_PATHS = {"egress": "/healthz", "gateway": "/health/live"}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -24,7 +29,7 @@ def main() -> int:
                 return 0
             base = os.environ["BROWSERD_EGRESS_CONTROL_URL"] if args.daemon == "egress" else "http://" + os.environ["BROWSERD_BIND"]
             # The admin Initialize endpoint must remain reachable before safety admission is ready.
-            with http.open(base.rstrip("/") + "/healthz", timeout=1) as response:
+            with http.open(base.rstrip("/") + LIVENESS_PATHS[args.daemon], timeout=1) as response:
                 if 200 <= response.status < 300:
                     return 0
         except (OSError, ValueError):
