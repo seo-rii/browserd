@@ -8,15 +8,17 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use browserd_egress::DaemonEpoch;
+use nix::fcntl::OFlag;
 
 const RECORD_HEADER: &str = "browserd-egressd-daemon-epoch-v1\n";
 const MAX_RECORD_BYTES: usize = 64;
 const MAX_TEMPORARY_FILE_ATTEMPTS: u64 = 256;
 
-// Linux flags from asm-generic/fcntl.h. browser-egressd is a Linux daemon.
-const O_DIRECTORY: i32 = 0o200_000;
-const O_NONBLOCK: i32 = 0o4_000;
-const O_NOFOLLOW: i32 = 0o400_000;
+// Open flags differ by architecture (the x86_64 O_DIRECTORY/O_NOFOLLOW bits mean
+// O_DIRECT/O_LARGEFILE on aarch64), so take them from the target's libc.
+const O_DIRECTORY: i32 = OFlag::O_DIRECTORY.bits();
+const O_NONBLOCK: i32 = OFlag::O_NONBLOCK.bits();
+const O_NOFOLLOW: i32 = OFlag::O_NOFOLLOW.bits();
 
 static TEMPORARY_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -288,8 +290,8 @@ fn canonical_record(epoch: u64) -> String {
 }
 
 fn map_path_error(error: io::Error) -> DaemonEpochStoreError {
-    // Linux returns ELOOP (40) when O_NOFOLLOW encounters a symbolic link.
-    if error.raw_os_error() == Some(40)
+    // Linux returns ELOOP when O_NOFOLLOW encounters a symbolic link.
+    if error.raw_os_error() == Some(nix::libc::ELOOP)
         || matches!(
             error.kind(),
             io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::IsADirectory
