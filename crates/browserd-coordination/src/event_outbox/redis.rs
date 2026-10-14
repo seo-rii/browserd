@@ -42,11 +42,26 @@ use crate::{EventProjectionSource, GatewayEventProjection, StoreConfig};
 /// string-based u64 math the action store needs for its full-range sequences.
 const MAX_SAFE_REDIS_INTEGER: u64 = 9_007_199_254_740_991;
 
-/// Shared prune preamble: drop every event whose `created_at` is at or before the retention cutoff,
-/// clean its indexes, and advance `pruned_through`. `now`/`retention` come from ARGV as noted per
-/// script.
+/// Most stale events a single append or read script prunes. Redis runs a script atomically on its
+/// one thread, so an unbounded prune after a quiet period, a retention cut or an expiry burst would
+/// stall every tenant and could outlast the command timeout, failing (and so retrying) the very
+/// call doing the work. A bounded batch drains such a backlog over the following calls instead;
+/// every call still prunes more than an append adds, so the drain always gains on the stream.
+const PRUNE_BATCH_LIMIT: usize = 256;
+
+/// Shared prune preamble: drop up to `limit` of the oldest events whose `created_at` is at or
+/// before the retention cutoff, clean their indexes, and advance `pruned_through`.
+/// `now`/`retention`/`limit` come from ARGV as noted per script.
+///
+/// "Oldest" is by `created_at`, which need not follow `seq`: callers' clocks may disagree, and
+/// Redis orders equal scores by member string ("100" before "99"), so a partial prune can leave a
+/// retained event below a pruned one. Gap detection stays exact regardless, because
+/// `pruned_through` is the highest `seq` ever pruned: a reader positioned after `seq` S missed an
+/// event if and only if `pruned_through > S`. Both read anchors are therefore checked against it.
+/// Stale events past the batch stay readable until a later call prunes them, which an
+/// at-least-once consumer tolerates.
 const PRUNE_FRAGMENT: &str = r#"
-local function prune(meta, events, index, bytime, now, retention)
+local function prune(meta, events, index, bytime, now, retention, limit)
   -- Projection metadata survives payload TTL. Preserve a resumable gap when the idle payload
   -- namespace expired, instead of resetting the stream or resurrecting old projections.
   if redis.call('HEXISTS', meta, 'projection_persistent') == 1 and redis.call('EXISTS', index) == 0 then
@@ -57,7 +72,7 @@ local function prune(meta, events, index, bytime, now, retention)
     end
   end
   local cutoff = now - retention
-  local stale = redis.call('ZRANGEBYSCORE', bytime, '-inf', cutoff)
+  local stale = redis.call('ZRANGEBYSCORE', bytime, '-inf', cutoff, 'LIMIT', 0, limit)
   if #stale == 0 then return end
   local max_pruned = 0
   for _, seq in ipairs(stale) do
@@ -84,8 +99,8 @@ end
 
 /// Shared append transaction, called by legacy appends and durable source projections.
 const APPEND_FRAGMENT: &str = r#"
-local function append_event(meta, events, index, bytime, dedup, event_id, json, created_at, retention, now, max_seq)
-  prune(meta, events, index, bytime, now, retention)
+local function append_event(meta, events, index, bytime, dedup, event_id, json, created_at, retention, now, max_seq, prune_limit)
+  prune(meta, events, index, bytime, now, retention, prune_limit)
   local existing = redis.call('HGET', events, '@dedup:' .. dedup)
   if existing then
     local previous = redis.call('HGET', events, existing)
@@ -112,19 +127,21 @@ end
 "#;
 
 /// KEYS: meta, events, index, bytime.
-/// ARGV: dedup_key, event_id, event_json, created_at_millis, retention_millis, now_millis, max_seq.
+/// ARGV: dedup_key, event_id, event_json, created_at_millis, retention_millis, now_millis, max_seq,
+/// prune_limit.
 fn append_script() -> String {
     format!(
         "{PRUNE_FRAGMENT}{APPEND_FRAGMENT}{}",
         r#"
-return append_event(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]))
+return append_event(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[8]))
 "#
     )
 }
 
 /// The source sequence is an exact decimal string (up to i64::MAX), independent of the tenant's
 /// notification cursor. Never convert it through Lua's f64 number type.
-/// KEYS/ARGV match append_script, with ARGV[8] session_id and ARGV[9] source sequence.
+/// KEYS/ARGV match append_script up to max_seq, then ARGV[8] session_id, ARGV[9] source sequence
+/// and ARGV[10] prune_limit.
 fn projection_script() -> String {
     format!(
         "{PRUNE_FRAGMENT}{APPEND_FRAGMENT}{}",
@@ -156,7 +173,7 @@ local highwater = redis.call('HGET', KEYS[1], watermark_key) or '0'
 if not valid_decimal(highwater) or not valid_decimal(ARGV[9]) or ARGV[9] == '0' then return {'6'} end
 if less_equal(ARGV[9], highwater) then return {'2'} end
 if ARGV[9] ~= increment(highwater) then return {'3'} end
-local result = append_event(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]))
+local result = append_event(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]), tonumber(ARGV[10]))
 if result[1] ~= '1' and result[1] ~= '2' then return result end
 redis.call('HSET', KEYS[1], watermark_key, ARGV[9], 'projection_persistent', '1')
 redis.call('PERSIST', KEYS[1])
@@ -168,13 +185,13 @@ return {'1'}
 /// Read a page after an anchor, pruning first.
 ///
 /// KEYS: meta, events, index, bytime.
-/// ARGV: mode ('seq'|'id'), anchor, limit, retention_millis, now_millis.
+/// ARGV: mode ('seq'|'id'), anchor, limit, retention_millis, now_millis, prune_limit.
 /// Returns `{'1', cursor_expired, next_cursor, json1, seq1, …}` or `{'6'}` on corrupt state.
 fn read_script() -> String {
     format!(
         "{PRUNE_FRAGMENT}{}",
         r#"
-prune(KEYS[1], KEYS[2], KEYS[3], KEYS[4], tonumber(ARGV[5]), tonumber(ARGV[4]))
+prune(KEYS[1], KEYS[2], KEYS[3], KEYS[4], tonumber(ARGV[5]), tonumber(ARGV[4]), tonumber(ARGV[6]))
 local pruned_through = tonumber(redis.call('HGET', KEYS[1], 'pruned_through') or '0')
 local after_seq = 0
 local cursor_expired = 0
@@ -186,6 +203,8 @@ elseif ARGV[1] == 'id' then
   local seq = redis.call('HGET', KEYS[2], '@byid:' .. ARGV[2])
   if seq then
     after_seq = tonumber(seq)
+    if not after_seq then return {'6'} end
+    if pruned_through > after_seq then cursor_expired = 1 end
   else
     after_seq = 0
     cursor_expired = 1
@@ -491,6 +510,7 @@ impl RedisEventOutbox {
                     .arg(limit)
                     .arg(retention)
                     .arg(now_millis)
+                    .arg(PRUNE_BATCH_LIMIT)
                     .invoke_async(&mut connection)
                     .await
             })
@@ -531,6 +551,7 @@ impl EventOutbox for RedisEventOutbox {
                     .arg(retention)
                     .arg(now_millis)
                     .arg(MAX_SAFE_REDIS_INTEGER)
+                    .arg(PRUNE_BATCH_LIMIT)
                     .invoke_async(&mut connection)
                     .await
             })
@@ -594,6 +615,7 @@ impl EventOutbox for RedisEventOutbox {
                     .arg(MAX_SAFE_REDIS_INTEGER)
                     .arg(session_id)
                     .arg(sequence)
+                    .arg(PRUNE_BATCH_LIMIT)
                     .invoke_async(&mut connection)
                     .await
             })
