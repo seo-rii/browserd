@@ -21,7 +21,7 @@ use browserd_sandbox::{
     PreparedShardEffect, PreparedShardEffectPermit, PreparedShardJournalError,
     PreparedShardJournalLimits, PreparedShardJournalRecord, PreparedShardRecoveryBackend,
     PreparedShardRecoveryDisposition, PreparedShardRecoveryError, PreparedShardRecoveryLocators,
-    StartupPreparedShardReconciler,
+    PreparedShardRecoveryRoots, StartupPreparedShardReconciler,
 };
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
@@ -107,6 +107,209 @@ fn fence_record_key(fence: &ShardFence) -> String {
     hasher.update(fence.shard_id().as_bytes());
     hasher.update(fence.launch_generation().get().to_be_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn reserved_live_journal() -> (tempfile::TempDir, FilePreparedShardJournal, ShardFence) {
+    let directory = tempfile::tempdir().expect("journal directory must be created");
+    let fence = shard_fence();
+    let journal =
+        FilePreparedShardJournal::open(directory.path()).expect("prepared-shard journal must open");
+    journal
+        .reserve(
+            fence.clone(),
+            PreparedShardRecoveryLocators::new(
+                "backend-token-live-inspection",
+                PathBuf::from("/sys/fs/cgroup/browserd/live-inspection"),
+                PathBuf::from("/run/browserd/shards/live-inspection"),
+            )
+            .expect("recovery locators must be valid"),
+        )
+        .expect("live fence reservation must be durable");
+    (directory, journal, fence)
+}
+
+#[test]
+fn live_record_inspection_preserves_the_active_writer_and_reads_atomic_replacements() {
+    let (directory, journal, fence) = reserved_live_journal();
+    assert!(matches!(
+        FilePreparedShardJournal::open(directory.path()),
+        Err(PreparedShardJournalError::WriterAlreadyActive)
+    ));
+    let entries_before = fs::read_dir(directory.path())
+        .expect("journal directory must be readable")
+        .count();
+    let first = FilePreparedShardJournal::inspect_existing_record(
+        directory.path(),
+        PreparedShardJournalLimits::default(),
+        PreparedShardRecoveryRoots::production(),
+        &fence,
+    )
+    .expect("inspection must succeed while the daemon writer lock remains held");
+    assert_eq!(
+        &first,
+        &journal.records().expect("writer must stay usable")[0]
+    );
+
+    let permit = journal
+        .begin_effect(
+            &fence,
+            first.sequence(),
+            PreparedShardEffect::CreateFilesystemCgroup,
+        )
+        .expect("live writer must retain authority after inspection");
+    let completed = journal
+        .complete_effect(&permit)
+        .expect("writer must durably replace the completed frame");
+    let latest = FilePreparedShardJournal::inspect_existing_record(
+        directory.path(),
+        PreparedShardJournalLimits::default(),
+        PreparedShardRecoveryRoots::production(),
+        &fence,
+    )
+    .expect("inspection must read the current replacement rather than cached state");
+    assert_eq!(latest, completed);
+    assert!(latest.sequence() > first.sequence());
+    assert!(matches!(
+        FilePreparedShardJournal::open(directory.path()),
+        Err(PreparedShardJournalError::WriterAlreadyActive)
+    ));
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("journal directory must stay readable")
+            .count(),
+        entries_before
+    );
+}
+
+#[test]
+fn live_record_inspection_rejects_checksum_corruption_while_the_writer_remains_active() {
+    let (directory, _journal, fence) = reserved_live_journal();
+    let path = directory
+        .path()
+        .join(format!("{}.psj", fence_record_key(&fence)));
+    let mut bytes = fs::read(&path).expect("record frame must be readable");
+    let checksum = bytes
+        .last_mut()
+        .expect("record frame must contain a checksum");
+    *checksum ^= 1;
+    fs::write(&path, bytes).expect("corruption fixture must replace the checksum");
+
+    assert!(matches!(
+        FilePreparedShardJournal::inspect_existing_record(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::production(),
+            &fence,
+        ),
+        Err(PreparedShardJournalError::Corrupt(
+            "record checksum does not match"
+        ))
+    ));
+}
+
+#[test]
+fn live_record_inspection_rejects_a_valid_frame_under_the_wrong_fence_key() {
+    let (directory, _journal, fence) = reserved_live_journal();
+    let wrong_fence = ShardFence::new(
+        fence.owner().clone(),
+        fence.shard_id().clone(),
+        LaunchGeneration::new(fence.launch_generation().get() + 1)
+            .expect("different launch generation must be positive"),
+    );
+    let requested_path = directory
+        .path()
+        .join(format!("{}.psj", fence_record_key(&wrong_fence)));
+    fs::rename(
+        directory
+            .path()
+            .join(format!("{}.psj", fence_record_key(&fence))),
+        &requested_path,
+    )
+    .expect("fixture must move an otherwise valid frame to a mismatched key");
+
+    assert!(matches!(
+        FilePreparedShardJournal::inspect_existing_record(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::production(),
+            &wrong_fence,
+        ),
+        Err(PreparedShardJournalError::Corrupt(
+            "record fence does not match exact requested key"
+        ))
+    ));
+}
+
+#[test]
+fn live_record_inspection_rejects_a_missing_frame_without_creating_journal_files() {
+    let directory = tempfile::tempdir().expect("empty journal directory must be created");
+    assert!(
+        FilePreparedShardJournal::inspect_existing_record(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::production(),
+            &shard_fence(),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("empty directory must remain readable")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn live_record_inspection_rejects_locators_outside_the_selected_recovery_roots() {
+    let (directory, _journal, fence) = reserved_live_journal();
+    let roots = PreparedShardRecoveryRoots::new(
+        PathBuf::from("/sys/fs/cgroup/other-sandbox"),
+        PathBuf::from("/run/other-sandbox/shards"),
+    )
+    .expect("alternative recovery roots must be valid");
+    assert!(matches!(
+        FilePreparedShardJournal::inspect_existing_record(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            roots,
+            &fence,
+        ),
+        Err(PreparedShardJournalError::LocatorOutsideRecoveryRoots)
+    ));
+}
+
+#[test]
+fn live_record_inspection_enforces_the_selected_frame_size_limit() {
+    let (directory, _journal, fence) = reserved_live_journal();
+    let limits = PreparedShardJournalLimits::new(1, 64, 1024, 1)
+        .expect("small inspection limits must be internally consistent");
+    assert!(matches!(
+        FilePreparedShardJournal::inspect_existing_record(
+            directory.path(),
+            limits,
+            PreparedShardRecoveryRoots::production(),
+            &fence,
+        ),
+        Err(PreparedShardJournalError::LimitExceeded)
+    ));
+}
+
+#[test]
+fn live_record_inspection_rejects_a_symbolic_link_in_an_ancestor_component() {
+    let (directory, _journal, fence) = reserved_live_journal();
+    let parent = tempfile::tempdir().expect("symlink fixture directory must be created");
+    let link = parent.path().join("linked-journal");
+    symlink(directory.path(), &link).expect("journal directory link must be created");
+    assert!(matches!(
+        FilePreparedShardJournal::inspect_existing_record(
+            &link,
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::production(),
+            &fence,
+        ),
+        Err(PreparedShardJournalError::UnsafeDirectory)
+    ));
 }
 
 fn advance_to_release_intent(

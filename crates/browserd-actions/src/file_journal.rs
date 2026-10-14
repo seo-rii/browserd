@@ -4,9 +4,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use browserd_core::ActionId;
+use browserd_core::{ActionId, ApprovalId, NotificationSourceFamily, NotificationSourceScope};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat, openat2};
 use nix::sys::stat::{Mode, fstat};
@@ -70,10 +71,19 @@ struct FileJournalState {
     last_action_sequence: u64,
     dispatch_intents: HashSet<ActionId>,
     approval_decisions: HashMap<ActionId, ApprovalDecision>,
+    approval_ids: HashMap<ActionId, ApprovalId>,
+    last_notification_sequence: u64,
     terminal_records: HashSet<ActionId>,
     terminal_reserves: HashMap<ActionId, u64>,
     reserved_terminal_bytes: u64,
     poisoned: bool,
+    #[cfg(test)]
+    fail_after_write: bool,
+}
+
+pub(crate) trait JournalBudget: std::fmt::Debug + Send + Sync {
+    fn reserve(&self, entry: &JournalEntry, total_bytes: u64) -> Result<(), JournalError>;
+    fn committed(&self, total_bytes: u64);
 }
 
 #[derive(Debug)]
@@ -81,12 +91,15 @@ pub struct FileActionJournal {
     path: PathBuf,
     limits: ActionJournalLimits,
     state: Mutex<FileJournalState>,
+    budget: Option<Arc<dyn JournalBudget>>,
+    notification_source: Option<NotificationSourceScope>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileOpenMode {
     OpenOrCreate,
     CreateNew,
+    Existing,
 }
 
 impl FileActionJournal {
@@ -208,6 +221,40 @@ impl FileActionJournal {
         after_parent_validation();
         validate_directory(&parent_fd, true)?;
 
+        Self::open_pinned(path, parent_fd, limits, mode)
+    }
+
+    pub(crate) fn create_at(
+        path: &Path,
+        parent: &File,
+        limits: ActionJournalLimits,
+    ) -> Result<Self, JournalError> {
+        let fd: OwnedFd = parent
+            .try_clone()
+            .map_err(|_| JournalError::new("journal directory clone failed"))?
+            .into();
+        Self::open_pinned(path, fd, limits, FileOpenMode::CreateNew)
+    }
+
+    pub(crate) fn open_at(
+        path: &Path,
+        parent: &File,
+        limits: ActionJournalLimits,
+    ) -> Result<Self, JournalError> {
+        let fd: OwnedFd = parent
+            .try_clone()
+            .map_err(|_| JournalError::new("journal directory clone failed"))?
+            .into();
+        Self::open_pinned(path, fd, limits, FileOpenMode::Existing)
+    }
+
+    fn open_pinned(
+        path: &Path,
+        parent_fd: OwnedFd,
+        limits: ActionJournalLimits,
+        mode: FileOpenMode,
+    ) -> Result<Self, JournalError> {
+        let effective_uid = Uid::effective().as_raw();
         let file_name = path
             .file_name()
             .ok_or_else(|| JournalError::new("action journal path has no file name"))?;
@@ -229,8 +276,8 @@ impl FileActionJournal {
                 Mode::from_bits_truncate(0o600),
             )
         };
-        let (file_fd, created) = match open_file(true) {
-            Ok(file) => (file, true),
+        let (file_fd, created) = match open_file(mode != FileOpenMode::Existing) {
+            Ok(file) => (file, mode != FileOpenMode::Existing),
             Err(Errno::EEXIST) => {
                 if mode == FileOpenMode::CreateNew {
                     return Err(JournalError::new(format!(
@@ -292,10 +339,41 @@ impl FileActionJournal {
         let mut last_action_sequence = 0_u64;
         let mut dispatch_intents = HashSet::new();
         let mut approval_decisions = HashMap::new();
+        let mut approval_ids = HashMap::new();
+        let notification_source = entries
+            .iter()
+            .find_map(|e| e.notifications().map(|c| c.scope().clone()));
+        let mut last_notification_sequence = 0_u64;
         let mut terminal_records = HashSet::new();
         let mut terminal_reserves = HashMap::new();
         let mut reserved_terminal_bytes = 0_u64;
         for entry in &entries {
+            if matches!(entry.kind(), JournalEntryKind::ApprovalRequired)
+                && let Some(id) = entry.approval_id()
+                && (approval_ids.values().any(|known| known == id)
+                    || approval_ids
+                        .insert(entry.action_id().clone(), id.clone())
+                        .is_some())
+            {
+                return Err(JournalError::new(
+                    "action journal approval identity is duplicated",
+                ));
+            }
+            if let Some(source) = &notification_source {
+                let sequence = last_notification_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| JournalError::new("action notification sequence overflow"))?;
+                crate::notifications::validate_entry_notification(
+                    entry,
+                    source,
+                    sequence,
+                    approval_ids.get(entry.action_id()),
+                    approval_decisions.contains_key(entry.action_id()),
+                )?;
+                if entry.notifications().is_some() {
+                    last_notification_sequence = sequence;
+                }
+            }
             if matches!(entry.kind(), JournalEntryKind::Accepted { .. }) {
                 let expected = last_action_sequence.checked_add(1).ok_or_else(|| {
                     JournalError::new("action journal accepted sequence overflow")
@@ -366,6 +444,8 @@ impl FileActionJournal {
         Ok(Self {
             path: path.to_path_buf(),
             limits,
+            budget: None,
+            notification_source,
             state: Mutex::new(FileJournalState {
                 file,
                 records: entries.len(),
@@ -373,12 +453,90 @@ impl FileActionJournal {
                 last_action_sequence,
                 dispatch_intents,
                 approval_decisions,
+                approval_ids,
+                last_notification_sequence,
                 terminal_records,
                 terminal_reserves,
                 reserved_terminal_bytes,
                 poisoned: false,
+                #[cfg(test)]
+                fail_after_write: false,
             }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_post_write_failure(&self) -> Result<(), JournalError> {
+        self.lock_state()?.fail_after_write = true;
+        Ok(())
+    }
+
+    pub(crate) fn with_budget(mut self, budget: Arc<dyn JournalBudget>) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    pub fn with_notification_source(
+        mut self,
+        source: NotificationSourceScope,
+    ) -> Result<Self, JournalError> {
+        source
+            .validate()
+            .map_err(|_| JournalError::new("action notification source is invalid"))?;
+        if source.family() != NotificationSourceFamily::ActionJournal {
+            return Err(JournalError::new(
+                "action journal notification family is invalid",
+            ));
+        }
+        let state = self.lock_state()?;
+        if self
+            .notification_source
+            .as_ref()
+            .is_some_and(|known| known != &source)
+            || (self.notification_source.is_none() && state.records != 0)
+        {
+            return Err(JournalError::new(
+                "legacy action journal cannot acquire notification authority",
+            ));
+        }
+        drop(state);
+        self.notification_source = Some(source);
+        Ok(self)
+    }
+
+    pub(crate) fn charged_bytes(&self) -> Result<u64, JournalError> {
+        let state = self.lock_state()?;
+        state
+            .file_bytes
+            .checked_add(state.reserved_terminal_bytes)
+            .ok_or_else(|| JournalError::new("journal charge overflow"))
+    }
+
+    pub(crate) fn identity(&self) -> Result<(u64, u64), JournalError> {
+        use std::os::unix::fs::MetadataExt;
+        let state = self.lock_state()?;
+        let metadata = state
+            .file
+            .metadata()
+            .map_err(|_| JournalError::new("journal identity unavailable"))?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+
+    pub(crate) fn with_replay<T>(
+        &self,
+        consume: impl FnOnce(&[JournalEntry]) -> Result<T, JournalError>,
+    ) -> Result<T, JournalError> {
+        let mut state = self.lock_state()?;
+        if state.poisoned {
+            return Err(JournalError::new("action journal is poisoned"));
+        }
+        let (entries, file_bytes) = scan(&mut state.file, self.limits)?;
+        if entries.len() != state.records || file_bytes != state.file_bytes {
+            return Err(JournalError::new(
+                "action journal changed outside its writer",
+            ));
+        }
+        consume(&entries)
     }
 
     #[must_use]
@@ -400,6 +558,73 @@ impl FileActionJournal {
 
 impl DurableActionJournal for FileActionJournal {
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError> {
+        if entry.notifications().is_some() {
+            return Err(JournalError::new(
+                "action notification metadata must be minted by the original append",
+            ));
+        }
+        let mut state = self.lock_state()?;
+        if state.poisoned {
+            return Err(JournalError::new(
+                "action journal is poisoned after a prior write failure",
+            ));
+        }
+        let mut entry = entry.clone();
+        let approval_identity = if matches!(entry.kind(), JournalEntryKind::ApprovalRequired) {
+            if let Some(id) = entry.approval_id() {
+                if state.approval_ids.contains_key(entry.action_id())
+                    || state.approval_ids.values().any(|known| known == id)
+                {
+                    return Err(JournalError::new(
+                        "action journal approval identity is duplicated",
+                    ));
+                }
+                Some(id.clone())
+            } else {
+                None
+            }
+        } else {
+            let known = state.approval_ids.get(entry.action_id()).cloned();
+            if entry
+                .approval_id()
+                .is_some_and(|id| Some(id) != known.as_ref())
+            {
+                return Err(JournalError::new(
+                    "action journal approval identity contradicts original requirement",
+                ));
+            }
+            known
+        };
+        if let Some(source) = &self.notification_source {
+            let next_sequence = state
+                .last_notification_sequence
+                .checked_add(1)
+                .ok_or_else(|| JournalError::new("action notification sequence overflow"))?;
+            let occurred = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| JournalError::new("action notification clock unavailable"))?;
+            let occurred_ms = u64::try_from(occurred.as_millis())
+                .map_err(|_| JournalError::new("action notification clock overflow"))?;
+            entry.notifications = crate::notifications::commit_for_entry(
+                source,
+                next_sequence,
+                occurred_ms,
+                &entry,
+                approval_identity.as_ref(),
+                state.approval_decisions.contains_key(entry.action_id()),
+            )?;
+        }
+        if self.notification_source.is_some()
+            && matches!(
+                entry.kind(),
+                JournalEntryKind::ApprovalGranted
+                    | JournalEntryKind::Terminal { .. }
+                    | JournalEntryKind::Resolved { .. }
+            )
+        {
+            entry.approval_id = approval_identity.clone();
+        }
+        let entry = &entry;
         let payload = serde_json::to_vec(entry).map_err(|error| {
             JournalError::new(format!("action journal record encoding failed: {error}"))
         })?;
@@ -416,12 +641,6 @@ impl DurableActionJournal for FileActionJournal {
             .ok_or_else(|| JournalError::new("action journal frame length overflow"))?;
         let checksum = Sha256::digest(&payload);
 
-        let mut state = self.lock_state()?;
-        if state.poisoned {
-            return Err(JournalError::new(
-                "action journal is poisoned after a prior write failure",
-            ));
-        }
         let accepted_terminal_reserve = matches!(entry.kind(), JournalEntryKind::Accepted { .. })
             .then(|| terminal_reserve_frame_bytes(entry, self.limits))
             .transpose()?;
@@ -528,10 +747,21 @@ impl DurableActionJournal for FileActionJournal {
             ));
         }
 
+        let charged_after = next_file_bytes
+            .checked_add(reserved_terminal_bytes_after)
+            .ok_or_else(|| JournalError::new("journal charge overflow"))?;
+        if let Some(budget) = &self.budget {
+            budget.reserve(entry, charged_after)?;
+        }
+
         let write_result = (|| -> std::io::Result<()> {
             state.file.write_all(&payload_length.to_be_bytes())?;
             state.file.write_all(&payload)?;
             state.file.write_all(&checksum)?;
+            #[cfg(test)]
+            if std::mem::take(&mut state.fail_after_write) {
+                return Err(std::io::Error::other("injected post-write failure"));
+            }
             state.file.flush()?;
             state.file.sync_data()
         })();
@@ -542,6 +772,14 @@ impl DurableActionJournal for FileActionJournal {
             )));
         }
         state.records += 1;
+        if let Some(commit) = entry.notifications() {
+            state.last_notification_sequence = commit.source_sequence();
+        }
+        if matches!(entry.kind(), JournalEntryKind::ApprovalRequired)
+            && let Some(id) = approval_identity
+        {
+            state.approval_ids.insert(entry.action_id().clone(), id);
+        }
         state.file_bytes = next_file_bytes;
         if let Some(sequence) = accepted_sequence {
             state.last_action_sequence = sequence;
@@ -564,7 +802,14 @@ impl DurableActionJournal for FileActionJournal {
             state.terminal_reserves.remove(entry.action_id());
         }
         state.reserved_terminal_bytes = reserved_terminal_bytes_after;
+        if let Some(budget) = &self.budget {
+            budget.committed(charged_after);
+        }
         Ok(())
+    }
+
+    fn notification_source(&self) -> Option<NotificationSourceScope> {
+        self.notification_source.clone()
     }
 }
 
@@ -580,6 +825,8 @@ fn terminal_reserve_frame_bytes(
         TerminalDetail::FailedKnown(KnownFailureReason::ApprovalDenied),
         TerminalDetail::FailedKnown(KnownFailureReason::ApprovalTimedOut),
         TerminalDetail::FailedKnown(KnownFailureReason::ExecutionTimedOut),
+        TerminalDetail::FailedKnown(KnownFailureReason::SnapshotTooLarge),
+        TerminalDetail::FailedKnown(KnownFailureReason::DocumentChanged),
         TerminalDetail::CancelledBeforeDispatch,
         TerminalDetail::CancelledConfirmed,
         TerminalDetail::OutcomeUnknown(OutcomeUnknownReason::AmbiguousTransportLoss),
@@ -590,7 +837,27 @@ fn terminal_reserve_frame_bytes(
     for detail in candidates {
         let mut terminal = entry.clone();
         terminal.kind = JournalEntryKind::Terminal { detail };
-        let payload = serde_json::to_vec(&terminal).map_err(|error| {
+        if let Some(commit) = entry.notifications() {
+            let approval_id = ApprovalId::from_uuid(*entry.action_id().as_uuid())
+                .map_err(|_| JournalError::new("action reserve identity is invalid"))?;
+            terminal.approval_id = Some(approval_id.clone());
+            terminal.notifications = crate::notifications::commit_for_entry(
+                commit.scope(),
+                i64::MAX as u64,
+                i64::MAX as u64,
+                &terminal,
+                Some(&approval_id),
+                false,
+            )?;
+        }
+        let mut wire = serde_json::to_value(&terminal)
+            .map_err(|_| JournalError::new("action reserve encoding failed"))?;
+        if let Some(commit) = wire.get_mut("notifications") {
+            // SHA bytes occupy one to three decimal digits; reserve the largest exact wire shape.
+            commit["digest"] = serde_json::to_value([u8::MAX; 32])
+                .map_err(|_| JournalError::new("action reserve digest encoding failed"))?;
+        }
+        let payload = serde_json::to_vec(&wire).map_err(|error| {
             JournalError::new(format!(
                 "action journal terminal reserve encoding failed: {error}"
             ))

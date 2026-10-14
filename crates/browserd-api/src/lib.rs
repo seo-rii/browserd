@@ -2,6 +2,20 @@
 
 #![forbid(unsafe_code)]
 
+mod safety;
+pub use safety::{SafetyApi, SafetyInitializeBody, SafetyMutationBody, SafetyRequest};
+
+mod webhooks;
+pub use webhooks::{
+    WebhookApi, WebhookDeleteBody, WebhookEndpointResponse, WebhookKeyError, WebhookPutBody,
+    WebhookRequest, WebhookResumeBody, WebhookResumeMode, WebhookSigningKeyProvider,
+    WebhookSigningSecret,
+};
+
+pub use browserd_features::{
+    CaptureDelivery, PdfOptions, ScrapeOptions, ScreenshotClip, ScreenshotFormat, ScreenshotOptions,
+};
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browserd_actions::{
     AcceptDecision, ActionKind, ActionLedger, ActionLedgerError, ActionRequest, ActionSnapshot,
     CanonicalRequestHash as ActionCanonicalRequestHash, DurableActionJournal,
@@ -20,8 +35,7 @@ use browserd_coordination::{
     CanonicalRequestHash as DurableRequestHash, ClaimCreateOperation, ClaimOutcome,
     CoordinationBlockingClient, CoordinationError, CreateOperationError, CreateOperationResult,
     CreateOperationSnapshot as DurableOperationSnapshot, DispatchLeaseToken, DownstreamDedupeKey,
-    EventOutboxBlockingClient, OperationMutation, OutboxAggregate, OutboxEvent, OutboxEventKind,
-    RecoverableCreateIntent,
+    EventOutboxBlockingClient, OperationMutation, OutboxEvent, RecoverableCreateIntent,
 };
 use browserd_core::{
     ActionId, ApprovalId, ArtifactId, CreateOperationState, ErrorCode, IsolationProfile,
@@ -31,7 +45,10 @@ use browserd_operations::{
     CanonicalRequestHash, CreateSessionOperation, IdempotencyClaim, IdempotencyKey,
     IdempotencyRegistry,
 };
-use browserd_policy::{ApprovalDecision, ApprovalState, CanonicalActionProposal};
+use browserd_policy::{
+    ActionType, ApprovalContextScope, ApprovalDecision, ApprovalState, CanonicalActionProposal,
+    Origin, TypedActionPayload,
+};
 use browserd_session::{ClientBinding, OwnershipFence, ReconnectToken, SessionTime};
 use browserd_viewer::{ViewerScopes, ViewerTicket};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -60,8 +77,19 @@ pub const PUBLIC_ROUTES: &[&str] = &[
     "DELETE /v1/sessions/{session_id}/actions/{action_id}",
     "POST /v1/sessions/{session_id}/actions/{action_id}/resolve",
     "GET /v1/events",
+    "GET /v1/webhook-endpoint",
+    "PUT /v1/webhook-endpoint",
+    "DELETE /v1/webhook-endpoint",
+    "POST /v1/webhook-endpoint/resume",
+    "GET /v1/admin/safety-switches",
+    "POST /v1/admin/safety-switches/initialize",
+    "PATCH /v1/admin/safety-switches",
+    "GET /v1/admin/safety-switches/audits",
+    "POST /v1/admin/safety-switches/audit-ack",
     "POST /v1/sessions/{session_id}/viewer-ticket",
     "POST /v1/sessions/{session_id}/artifacts/uploads",
+    "GET /v1/sessions/{session_id}/artifacts",
+    "GET /v1/sessions/{session_id}/artifacts/{artifact_id}/content",
     "GET /v1/sessions/{session_id}/artifacts/{artifact_id}",
     "POST /v1/sessions/{session_id}/artifacts/{artifact_id}/download",
     "GET /v1/approvals",
@@ -77,6 +105,8 @@ pub const MAX_SESSION_METADATA_BYTES: usize = 4_096;
 pub const MAX_SESSION_VIEWPORT_PIXELS: u64 = 16_777_216;
 pub const MAX_ACTION_BODY_BYTES: usize = 131_072;
 pub const MAX_ACTION_SELECTOR_BYTES: usize = 8_192;
+pub const MAX_ACTION_FRAME_PATH_DEPTH: usize = 8;
+pub const MAX_ACTION_FRAME_PATH_BYTES: usize = 32_768;
 pub const MAX_EVALUATE_SOURCE_BYTES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,9 +202,14 @@ pub struct SessionCreateDispatch {
     admission_deadline: DateTime<Utc>,
     dispatch_generation: u64,
     runtime_timeout: StdDuration,
+    dispatch_token: Option<DispatchLeaseToken>,
 }
 
 impl SessionCreateDispatch {
+    #[must_use]
+    pub const fn dispatch_token(&self) -> Option<&DispatchLeaseToken> {
+        self.dispatch_token.as_ref()
+    }
     #[must_use]
     pub const fn operation_id(&self) -> &OperationId {
         &self.operation_id
@@ -385,6 +420,8 @@ pub enum ActionPayload {
     },
     QueryAll {
         selector: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frame_path: Vec<String>,
     },
     ExtractTable {
         node_ref: String,
@@ -400,10 +437,22 @@ pub enum ActionPayload {
     Evaluate {
         expression: String,
     },
-    Screenshot,
-    Pdf,
-    Scrape,
-    Checkpoint,
+    Screenshot {
+        #[serde(default)]
+        options: ScreenshotOptions,
+    },
+    Pdf {
+        #[serde(default)]
+        options: PdfOptions,
+    },
+    Scrape {
+        #[serde(default)]
+        options: ScrapeOptions,
+    },
+    Checkpoint {
+        #[serde(default)]
+        origins: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -507,7 +556,15 @@ impl ActionSubmitRequest {
             ActionPayload::SetFiles {
                 node_ref,
                 artifact_ids,
-            } => !valid_node_ref(node_ref) || artifact_ids.is_empty() || artifact_ids.len() > 128,
+            } => {
+                !valid_node_ref(node_ref)
+                    || artifact_ids.is_empty()
+                    || artifact_ids.len() > 128
+                    || artifact_ids
+                        .iter()
+                        .enumerate()
+                        .any(|(index, id)| artifact_ids[..index].contains(id))
+            }
             ActionPayload::HandleDialog { prompt_text, .. } => prompt_text
                 .as_ref()
                 .is_some_and(|prompt| prompt.len() > 65_536),
@@ -520,7 +577,16 @@ impl ActionSubmitRequest {
                     || name.len() > 256
                     || name.chars().any(char::is_control)
             }
-            ActionPayload::QueryAll { selector } => !valid_selector(selector),
+            ActionPayload::QueryAll {
+                selector,
+                frame_path,
+            } => {
+                !valid_selector(selector)
+                    || frame_path.len() > MAX_ACTION_FRAME_PATH_DEPTH
+                    || frame_path.iter().any(|selector| !valid_selector(selector))
+                    || frame_path.iter().map(String::len).sum::<usize>()
+                        > MAX_ACTION_FRAME_PATH_BYTES
+            }
             ActionPayload::NewPage { url } => url.as_ref().is_some_and(|url| !valid_url(url)),
             ActionPayload::WaitFor { condition } => match condition {
                 WaitCondition::SelectorAttached { selector }
@@ -542,11 +608,11 @@ impl ActionSubmitRequest {
             | ActionPayload::GetUrl
             | ActionPayload::GetTitle
             | ActionPayload::ClosePage
-            | ActionPayload::ActivatePage
-            | ActionPayload::Screenshot
-            | ActionPayload::Pdf
-            | ActionPayload::Scrape
-            | ActionPayload::Checkpoint => false,
+            | ActionPayload::ActivatePage => false,
+            ActionPayload::Checkpoint { origins } => !valid_checkpoint_origins(origins),
+            ActionPayload::Screenshot { options } => !options.validate(),
+            ActionPayload::Pdf { options } => !options.validate(),
+            ActionPayload::Scrape { options } => !options.validate(),
         };
         if invalid {
             return Err(ApiError::invalid_request(
@@ -555,6 +621,15 @@ impl ActionSubmitRequest {
         }
         Ok(())
     }
+}
+
+fn valid_checkpoint_origins(origins: &[String]) -> bool {
+    origins.len() <= 16
+        && origins.iter().enumerate().all(|(index, value)| {
+            value.len() <= 2048
+                && Origin::parse(value).is_ok_and(|origin| origin.as_str() == value)
+                && !origins[..index].contains(value)
+        })
 }
 
 pub fn decode_action_submit(json: &str) -> Result<ActionSubmitRequest, ApiError> {
@@ -872,26 +947,7 @@ impl OperationEnvelope {
             CreateOperationState::Cancelled => "cancelled",
             CreateOperationState::Failed => "failed",
         };
-        let session = self.session.as_ref().map(|session| {
-            serde_json::json!({
-                "id": session.id,
-                "lifecycle": format!("{:?}", session.lifecycle).to_ascii_lowercase(),
-                "incarnation": session.incarnation,
-                "requested_isolation": match session.requested_isolation {
-                    IsolationProfile::SharedContext => "shared_context",
-                    IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
-                    IsolationProfile::DedicatedProcess => "dedicated_process",
-                    IsolationProfile::DedicatedWorker => "dedicated_worker",
-                },
-                "effective_isolation": match session.effective_isolation {
-                    IsolationProfile::SharedContext => "shared_context",
-                    IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
-                    IsolationProfile::DedicatedProcess => "dedicated_process",
-                    IsolationProfile::DedicatedWorker => "dedicated_worker",
-                },
-                "metadata": session.metadata,
-            })
-        });
+        let session = self.session.as_ref().map(SessionResource::public_value);
         serde_json::json!({ "id": self.id, "state": state, "poll_url": self.poll_url, "session": session, "failure": self.failure })
     }
 }
@@ -916,6 +972,36 @@ pub struct SessionResource {
     pub requested_isolation: IsolationProfile,
     pub effective_isolation: IsolationProfile,
     pub metadata: BTreeMap<String, String>,
+}
+
+impl SessionResource {
+    /// The public resource keeps both historical state field names equal. Durable storage
+    /// continues to use `lifecycle`; single-session HTTP readers retain `state`.
+    #[must_use]
+    pub fn public_value(&self) -> serde_json::Value {
+        let lifecycle = match self.lifecycle {
+            SessionLifecycle::Creating => "creating",
+            SessionLifecycle::Ready => "ready",
+            SessionLifecycle::Closing => "closing",
+            SessionLifecycle::Closed => "closed",
+            SessionLifecycle::Failed => "failed",
+        };
+        let isolation_name = |profile| match profile {
+            IsolationProfile::SharedContext => "shared_context",
+            IsolationProfile::TenantDedicatedShard => "tenant_dedicated_shard",
+            IsolationProfile::DedicatedProcess => "dedicated_process",
+            IsolationProfile::DedicatedWorker => "dedicated_worker",
+        };
+        serde_json::json!({
+            "id": self.id,
+            "state": lifecycle,
+            "lifecycle": lifecycle,
+            "incarnation": self.incarnation,
+            "requested_isolation": isolation_name(self.requested_isolation),
+            "effective_isolation": isolation_name(self.effective_isolation),
+            "metadata": self.metadata,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -965,84 +1051,27 @@ pub struct SessionListPage {
     next_page_token: Option<String>,
 }
 
-impl SessionListPage {
-    #[must_use]
-    pub fn items(&self) -> &[SessionResource] {
-        &self.items
+/// Tenant/filter-bound pagination position shared by local and durable directory projections.
+pub struct SessionListCursor {
+    after: Option<SessionId>,
+    ceiling: Option<SessionId>,
+    filter_hash: [u8; 32],
+}
+impl SessionListCursor {
+    pub const fn after(&self) -> Option<&SessionId> {
+        self.after.as_ref()
     }
-
-    #[must_use]
-    pub fn next_page_token(&self) -> Option<&str> {
-        self.next_page_token.as_deref()
+    pub const fn ceiling(&self) -> Option<&SessionId> {
+        self.ceiling.as_ref()
     }
 }
-
-struct CatalogEntry {
-    session: SessionResource,
-    /// Last time this entry was written; drives terminal-session reclamation (BRD-018).
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Default)]
-pub struct SessionCatalog {
-    sessions: Mutex<HashMap<(TenantId, SessionId), CatalogEntry>>,
-}
-
-impl SessionCatalog {
-    pub fn upsert(
-        &self,
-        tenant_id: TenantId,
-        session: SessionResource,
-        now: DateTime<Utc>,
-    ) -> Result<(), ApiError> {
-        self.sessions
-            .lock()
-            .map_err(|_| {
-                ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
-            })?
-            .insert(
-                (tenant_id, session.id.clone()),
-                CatalogEntry {
-                    session,
-                    updated_at: now,
-                },
-            );
-        Ok(())
-    }
-
-    /// Drop terminal (`Closed`/`Failed`) catalog entries whose last write is older than `retention`,
-    /// so the listing store stays bounded under session churn while a recently-closed session stays
-    /// listable for the retention window (BRD-018). Active sessions are never dropped, regardless of
-    /// age. Returns the number of entries reclaimed.
-    pub fn reclaim(
-        &self,
-        now: DateTime<Utc>,
-        retention: ChronoDuration,
-    ) -> Result<usize, ApiError> {
-        let mut sessions = self.sessions.lock().map_err(|_| {
-            ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
-        })?;
-        let before = sessions.len();
-        sessions.retain(|_, entry| {
-            let terminal = matches!(
-                entry.session.lifecycle,
-                SessionLifecycle::Closed | SessionLifecycle::Failed
-            );
-            !(terminal && now.signed_duration_since(entry.updated_at) >= retention)
-        });
-        Ok(before - sessions.len())
-    }
-
-    pub fn list(
-        &self,
-        tenant_id: &TenantId,
-        query: &SessionListQuery,
-    ) -> Result<SessionListPage, ApiError> {
-        query.validate()?;
+impl SessionListQuery {
+    pub fn cursor_for(&self, tenant: &TenantId) -> Result<SessionListCursor, ApiError> {
+        self.validate()?;
         let mut hash = Sha256::new();
         hash.update(b"browserd-session-list-v1\0");
-        hash.update(tenant_id.as_bytes());
-        hash.update([match query.lifecycle {
+        hash.update(tenant.as_bytes());
+        hash.update([match self.lifecycle {
             None => 0,
             Some(SessionLifecycle::Creating) => 1,
             Some(SessionLifecycle::Ready) => 2,
@@ -1050,20 +1079,19 @@ impl SessionCatalog {
             Some(SessionLifecycle::Closed) => 4,
             Some(SessionLifecycle::Failed) => 5,
         }]);
-        hash.update([match query.isolation {
+        hash.update([match self.isolation {
             None => 0,
             Some(IsolationProfile::SharedContext) => 1,
             Some(IsolationProfile::TenantDedicatedShard) => 2,
             Some(IsolationProfile::DedicatedProcess) => 3,
             Some(IsolationProfile::DedicatedWorker) => 4,
         }]);
-        if let Some(metadata_key) = &query.metadata_key {
-            hash.update((metadata_key.len() as u64).to_be_bytes());
-            hash.update(metadata_key.as_bytes());
+        if let Some(key) = &self.metadata_key {
+            hash.update((key.len() as u64).to_be_bytes());
+            hash.update(key.as_bytes());
         }
-        let filter_hash: [u8; 32] = hash.finalize().into();
-
-        let (after, ceiling) = if let Some(token) = &query.page_token {
+        let filter_hash = hash.finalize().into();
+        let (after, ceiling) = if let Some(token) = &self.page_token {
             let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(token)
                 .map_err(|_| ApiError::invalid_request("invalid session page token"))?;
@@ -1086,58 +1114,279 @@ impl SessionCatalog {
         } else {
             (None, None)
         };
+        Ok(SessionListCursor {
+            after,
+            ceiling,
+            filter_hash,
+        })
+    }
+}
 
-        let sessions = self.sessions.lock().map_err(|_| {
-            ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
-        })?;
-        let mut matching = sessions
-            .iter()
-            .filter(|((stored_tenant, _), entry)| {
-                stored_tenant == tenant_id
-                    && query
-                        .lifecycle
-                        .is_none_or(|state| entry.session.lifecycle == state)
-                    && query
-                        .isolation
-                        .is_none_or(|isolation| entry.session.effective_isolation == isolation)
-                    && query
-                        .metadata_key
-                        .as_ref()
-                        .is_none_or(|key| entry.session.metadata.contains_key(key))
+impl SessionListPage {
+    /// Build one filtered page from at most 256 already tenant-scoped, ordered directory rows.
+    /// Lifecycle is the directory's last confirmed observation, not a fresh worker liveness claim.
+    pub fn from_bounded_resources(
+        tenant: &TenantId,
+        query: &SessionListQuery,
+        rows: Vec<SessionResource>,
+        ceiling: Option<SessionId>,
+        source_has_more: bool,
+    ) -> Result<Self, ApiError> {
+        let cursor = query.cursor_for(tenant)?;
+        if rows.len() > 256
+            || rows.windows(2).any(|pair| pair[0].id >= pair[1].id)
+            || cursor
+                .ceiling
+                .as_ref()
+                .zip(ceiling.as_ref())
+                .is_some_and(|(expected, actual)| expected != actual)
+            || rows.iter().any(|row| {
+                cursor.after.as_ref().is_some_and(|after| row.id <= *after)
+                    || ceiling.as_ref().is_none_or(|end| row.id > *end)
             })
-            .map(|(_, entry)| entry.session.clone())
-            .collect::<Vec<_>>();
-        matching.sort_by(|left, right| left.id.cmp(&right.id));
-        let ceiling = ceiling.or_else(|| matching.last().map(|session| session.id.clone()));
-        let mut eligible = matching
-            .into_iter()
-            .filter(|session| {
-                after.as_ref().is_none_or(|cursor| session.id > *cursor)
-                    && ceiling.as_ref().is_none_or(|last| session.id <= *last)
-            })
-            .collect::<Vec<_>>();
-        let has_more = eligible.len() > query.limit;
-        eligible.truncate(query.limit);
+        {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                "invalid session directory page",
+            ));
+        }
+        let mut eligible = Vec::with_capacity(query.limit);
+        let mut last_examined = None;
+        let mut has_more = source_has_more;
+        for row in rows {
+            let matches = query.lifecycle.is_none_or(|phase| row.lifecycle == phase)
+                && query
+                    .isolation
+                    .is_none_or(|isolation| row.effective_isolation == isolation)
+                && query
+                    .metadata_key
+                    .as_ref()
+                    .is_none_or(|key| row.metadata.contains_key(key));
+            if matches && eligible.len() == query.limit {
+                has_more = true;
+                break;
+            }
+            last_examined = Some(row.id.clone());
+            if matches {
+                eligible.push(row);
+            }
+        }
         let next_page_token = if has_more {
-            let last = eligible
-                .last()
+            let after = last_examined
+                .as_ref()
                 .ok_or_else(|| ApiError::new(ErrorCode::Internal, "pagination invariant failed"))?;
             let ceiling = ceiling
                 .as_ref()
                 .ok_or_else(|| ApiError::new(ErrorCode::Internal, "pagination invariant failed"))?;
             let mut raw = Vec::with_capacity(65);
             raw.push(1);
-            raw.extend_from_slice(last.id.as_bytes());
+            raw.extend_from_slice(after.as_bytes());
             raw.extend_from_slice(ceiling.as_bytes());
-            raw.extend_from_slice(&filter_hash);
+            raw.extend_from_slice(&cursor.filter_hash);
             Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw))
         } else {
             None
         };
-        Ok(SessionListPage {
+        Ok(Self {
             items: eligible,
             next_page_token,
         })
+    }
+    #[must_use]
+    pub fn items(&self) -> &[SessionResource] {
+        &self.items
+    }
+
+    #[must_use]
+    pub fn next_page_token(&self) -> Option<&str> {
+        self.next_page_token.as_deref()
+    }
+}
+
+struct CatalogEntry {
+    session: SessionResource,
+    /// Last time this entry was written; drives terminal-session reclamation (BRD-018).
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Default)]
+pub struct SessionCatalog {
+    state: Mutex<SessionCatalogState>,
+}
+
+#[derive(Default)]
+struct SessionCatalogState {
+    tenants: BTreeMap<TenantId, BTreeMap<SessionId, CatalogEntry>>,
+    entries: usize,
+    gc_after: Option<(TenantId, SessionId)>,
+}
+impl SessionCatalogState {
+    fn gc_scan(
+        &self,
+        after: Option<&(TenantId, SessionId)>,
+        now: DateTime<Utc>,
+        retention: ChronoDuration,
+    ) -> Vec<(TenantId, SessionId, bool)> {
+        let mut selected = Vec::with_capacity(32);
+        for (tenant, rows) in self.tenants.range((
+            after.map_or(std::ops::Bound::Unbounded, |(tenant, _)| {
+                std::ops::Bound::Included(tenant)
+            }),
+            std::ops::Bound::Unbounded,
+        )) {
+            let lower = after
+                .filter(|(previous, _)| previous == tenant)
+                .map_or(std::ops::Bound::Unbounded, |(_, session)| {
+                    std::ops::Bound::Excluded(session)
+                });
+            for (session, row) in rows.range((lower, std::ops::Bound::Unbounded)) {
+                let eligible = matches!(
+                    row.session.lifecycle,
+                    SessionLifecycle::Closed | SessionLifecycle::Failed
+                ) && now.signed_duration_since(row.updated_at) >= retention;
+                selected.push((tenant.clone(), session.clone(), eligible));
+                if selected.len() == 32 {
+                    break;
+                }
+            }
+            if selected.len() == 32 {
+                break;
+            }
+        }
+        selected
+    }
+}
+
+impl SessionCatalog {
+    pub fn upsert(
+        &self,
+        tenant_id: TenantId,
+        session: SessionResource,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApiError> {
+        let mut state = self.state.lock().map_err(|_| {
+            ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
+        })?;
+        let previous = state
+            .tenants
+            .get(&tenant_id)
+            .and_then(|rows| rows.get(&session.id));
+        if previous.is_none() && state.entries >= 16_384 {
+            return Err(ApiError::new(
+                ErrorCode::GlobalCapacityExceeded,
+                "session catalog is full",
+            ));
+        }
+        // Polling the same terminal resource does not extend its retention horizon.
+        let updated_at = previous
+            .filter(|row| {
+                matches!(
+                    row.session.lifecycle,
+                    SessionLifecycle::Closed | SessionLifecycle::Failed
+                ) && row.session.lifecycle == session.lifecycle
+            })
+            .map_or(now, |row| row.updated_at);
+        let inserted = state
+            .tenants
+            .entry(tenant_id)
+            .or_default()
+            .insert(
+                session.id.clone(),
+                CatalogEntry {
+                    session,
+                    updated_at,
+                },
+            )
+            .is_none();
+        state.entries += usize::from(inserted);
+        Ok(())
+    }
+
+    /// Drop terminal (`Closed`/`Failed`) catalog entries whose last write is older than `retention`,
+    /// so the listing store stays bounded under session churn while a recently-closed session stays
+    /// listable for the retention window (BRD-018). Active sessions are never dropped, regardless of
+    /// age. Returns the number of entries reclaimed.
+    pub fn reclaim(
+        &self,
+        now: DateTime<Utc>,
+        retention: ChronoDuration,
+    ) -> Result<usize, ApiError> {
+        let mut state = self.state.lock().map_err(|_| {
+            ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
+        })?;
+        let after = state.gc_after.clone();
+        let mut selected = state.gc_scan(after.as_ref(), now, retention);
+        if selected.is_empty() && after.is_some() {
+            selected = state.gc_scan(None, now, retention);
+        }
+        state.gc_after = selected
+            .last()
+            .map(|(tenant, session, _)| (tenant.clone(), session.clone()));
+        let mut removed = 0;
+        for (tenant, session, eligible) in selected {
+            if eligible {
+                if let Some(rows) = state.tenants.get_mut(&tenant) {
+                    removed += usize::from(rows.remove(&session).is_some());
+                }
+                if state.tenants.get(&tenant).is_some_and(BTreeMap::is_empty) {
+                    state.tenants.remove(&tenant);
+                }
+            }
+        }
+        state.entries -= removed;
+        Ok(removed)
+    }
+
+    pub fn list(
+        &self,
+        tenant_id: &TenantId,
+        query: &SessionListQuery,
+    ) -> Result<SessionListPage, ApiError> {
+        let cursor = query.cursor_for(tenant_id)?;
+        let after = cursor.after;
+        let ceiling = cursor.ceiling;
+
+        let state = self.state.lock().map_err(|_| {
+            ApiError::new(ErrorCode::WorkerUnavailable, "session catalog unavailable")
+        })?;
+        let Some(rows) = state.tenants.get(tenant_id) else {
+            return Ok(SessionListPage {
+                items: Vec::new(),
+                next_page_token: None,
+            });
+        };
+        let ceiling = ceiling.or_else(|| rows.last_key_value().map(|(session, _)| session.clone()));
+        if after
+            .as_ref()
+            .zip(ceiling.as_ref())
+            .is_some_and(|(after, ceiling)| after >= ceiling)
+        {
+            return Ok(SessionListPage {
+                items: Vec::new(),
+                next_page_token: None,
+            });
+        }
+        let lower = after
+            .as_ref()
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        let upper = ceiling
+            .as_ref()
+            .map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
+        let mut candidates = rows.range((lower, upper)).peekable();
+        let mut resources = Vec::with_capacity(256);
+        for _ in 0..256 {
+            let Some((_, entry)) = candidates.next() else {
+                break;
+            };
+            resources.push(entry.session.clone());
+        }
+        SessionListPage::from_bounded_resources(
+            tenant_id,
+            query,
+            resources,
+            ceiling,
+            candidates.peek().is_some(),
+        )
     }
 }
 
@@ -1200,6 +1449,20 @@ pub struct PageResource {
     pub target_incarnation: u64,
     pub document_epoch: u64,
     pub url_revision: u64,
+}
+
+impl PageResource {
+    #[must_use]
+    pub fn public_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.page_id,
+            "session_id": self.session_id,
+            "active": self.active,
+            "target_incarnation": self.target_incarnation,
+            "document_epoch": self.document_epoch,
+            "url_revision": self.url_revision,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1277,10 +1540,10 @@ where
                 | ActionPayload::GetComputedStyle { .. }
                 | ActionPayload::QueryAll { .. }
                 | ActionPayload::ExtractTable { .. }
-                | ActionPayload::Screenshot
-                | ActionPayload::Pdf
-                | ActionPayload::Scrape
-                | ActionPayload::Checkpoint
+                | ActionPayload::Screenshot { .. }
+                | ActionPayload::Pdf { .. }
+                | ActionPayload::Scrape { .. }
+                | ActionPayload::Checkpoint { .. }
         ) {
             ActionKind::ReadOnly
         } else {
@@ -1293,6 +1556,13 @@ where
                     ActionIdempotencyKey::new(command.idempotency_key.to_string()),
                     ActionCanonicalRequestHash::new(*canonical.as_bytes()),
                     kind,
+                )
+                .with_result_budget(
+                    if matches!(command.body.action, ActionPayload::Snapshot) {
+                        browserd_actions::ActionResultBudget::Snapshot
+                    } else {
+                        browserd_actions::ActionResultBudget::Standard
+                    },
                 ),
             )
             .map_err(|error| match error {
@@ -1385,6 +1655,31 @@ pub struct ArtifactMetadata {
     pub size_bytes: Option<u64>,
     pub content_type: Option<String>,
     pub source_origin: Option<String>,
+    /// Original upload basename for display; never a filesystem path or download header.
+    pub display_filename: Option<String>,
+}
+
+impl ArtifactMetadata {
+    pub fn validate_display_filename(&self) -> Result<(), ApiError> {
+        if self
+            .display_filename
+            .as_deref()
+            .is_some_and(|name| !valid_artifact_display_filename(name))
+        {
+            return Err(ApiError::invalid_request(
+                "invalid artifact display filename",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn valid_artifact_display_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !matches!(value, "." | "..")
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_control)
 }
 
 #[derive(Clone, Debug)]
@@ -1393,25 +1688,71 @@ pub struct ArtifactRequest {
     pub artifact_id: ArtifactId,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArtifactListRequest {
+    pub session_id: SessionId,
+    pub after: Option<ArtifactId>,
+    pub limit: usize,
+}
+
+impl ArtifactListRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if !(1..=100).contains(&self.limit) {
+            return Err(ApiError::invalid_request("artifact limit must be 1..=100"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ArtifactListPage {
+    pub items: Vec<ArtifactMetadata>,
+    pub next_cursor: Option<ArtifactId>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactUploadBody {
     pub display_filename: String,
     pub declared_content_type: Option<String>,
     pub expected_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
 }
 
 impl ArtifactUploadBody {
+    /// The JSON ingress is deliberately bounded; larger generated files use streaming reads.
+    pub fn decode_bytes(&self) -> Result<Vec<u8>, ApiError> {
+        let data = self
+            .data_base64
+            .as_deref()
+            .ok_or_else(|| ApiError::invalid_request("artifact data_base64 is required"))?;
+        if data.len() > 699_052 || self.expected_size_bytes > 524_288 {
+            return Err(ApiError::invalid_request(
+                "artifact upload exceeds byte limit",
+            ));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(data)
+            .map_err(|_| ApiError::invalid_request("invalid artifact base64"))?;
+        if bytes.len() as u64 != self.expected_size_bytes || bytes.is_empty() {
+            return Err(ApiError::invalid_request("artifact size mismatch"));
+        }
+        Ok(bytes)
+    }
+
     pub fn validate(&self) -> Result<(), ApiError> {
-        if self.display_filename.is_empty()
-            || self.display_filename.len() > 255
-            || self.display_filename.chars().any(char::is_control)
+        if !valid_artifact_display_filename(&self.display_filename)
             || self.expected_size_bytes == 0
+            || self.expected_size_bytes > 524_288
             || self.declared_content_type.as_ref().is_some_and(|value| {
                 value.is_empty() || value.len() > 255 || value.chars().any(char::is_control)
             })
         {
             return Err(ApiError::invalid_request("invalid artifact upload body"));
+        }
+        if self.data_base64.is_some() {
+            self.decode_bytes()?;
         }
         Ok(())
     }
@@ -1539,6 +1880,128 @@ pub struct ApprovalResource {
     pub proposal: CanonicalActionProposal,
 }
 
+/// A deliberate allowlist for human approval review. Browser arguments, script source,
+/// plain fill values, credential values, and artifact bytes never enter this response.
+#[derive(Debug, Serialize)]
+pub struct ApprovalSummary<'a> {
+    pub schema_version: u8,
+    pub requester_principal_id: &'a browserd_core::PrincipalId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<&'a PageId>,
+    pub context: ApprovalContextScope,
+    pub action_kind: &'static str,
+    pub expires_at_unix_millis: u64,
+    pub proposal_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_role: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub navigation_destination: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ApprovalFileSummary<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_origins: Option<&'a [String]>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApprovalFileSummary<'a> {
+    pub artifact_id: &'a ArtifactId,
+    pub object_generation: String,
+    pub size_bytes: u64,
+    pub checksum_sha256: String,
+    pub display_filename: &'a str,
+}
+
+fn approval_digest_hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+impl ApprovalResource {
+    #[must_use]
+    pub fn summary(&self) -> ApprovalSummary<'_> {
+        let binding = self.proposal.typed_binding();
+        let mut summary = ApprovalSummary {
+            schema_version: self.proposal.schema_version(),
+            requester_principal_id: self.proposal.requester_principal_id(),
+            page_id: (!binding.is_some_and(|binding| {
+                matches!(binding.context_scope, ApprovalContextScope::BrowserContext)
+            }))
+            .then_some(self.proposal.page_id()),
+            context: binding.map_or_else(
+                || ApprovalContextScope::HttpOrigin {
+                    origin: self.proposal.current_origin().as_str().to_owned(),
+                },
+                |binding| binding.context_scope.clone(),
+            ),
+            action_kind: binding.map_or_else(
+                || match self.proposal.action_type() {
+                    ActionType::Click => "click",
+                    ActionType::Fill => "fill",
+                    ActionType::Navigate => "navigate",
+                    ActionType::Evaluate => "evaluate",
+                    ActionType::Upload => "upload",
+                    ActionType::Download => "download",
+                    ActionType::Custom(_) => "custom",
+                },
+                |binding| binding.payload.action_kind().as_str(),
+            ),
+            expires_at_unix_millis: self.proposal.expires_at_unix_ms(),
+            proposal_hash: approval_digest_hex(self.proposal.hash().as_bytes()),
+            policy_digest: binding.map(|binding| approval_digest_hex(&binding.policy_digest)),
+            node_ref: self
+                .proposal
+                .node_ref()
+                .map(browserd_policy::NodeReference::as_str),
+            node_role: binding
+                .and_then(|binding| binding.payload.node())
+                .and_then(|node| node.role.as_deref()),
+            node_name: binding
+                .and_then(|binding| binding.payload.node())
+                .and_then(|node| node.name.as_deref()),
+            navigation_destination: None,
+            secret_ref: None,
+            files: Vec::new(),
+            checkpoint_origins: None,
+        };
+        if let Some(binding) = binding {
+            match &binding.payload {
+                TypedActionPayload::Browser {
+                    navigation_destination,
+                    ..
+                } => {
+                    summary.navigation_destination = navigation_destination.as_deref();
+                }
+                TypedActionPayload::FillSecret { secret_ref, .. } => {
+                    summary.secret_ref = Some(secret_ref);
+                }
+                TypedActionPayload::SetFiles { files, .. } => {
+                    summary.files = files
+                        .iter()
+                        .map(|file| ApprovalFileSummary {
+                            artifact_id: &file.artifact_id,
+                            object_generation: approval_digest_hex(&file.object_generation),
+                            size_bytes: file.size_bytes,
+                            checksum_sha256: approval_digest_hex(&file.checksum_sha256),
+                            display_filename: &file.effective_filename,
+                        })
+                        .collect();
+                }
+                TypedActionPayload::Checkpoint { origins, .. } => {
+                    summary.checkpoint_origins = Some(origins);
+                }
+            }
+        }
+        summary
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ApprovalListPage {
     items: Vec<ApprovalResource>,
@@ -1567,6 +2030,10 @@ impl ApprovalCatalog {
         if public_approval_id(approval.approval_id).is_err()
             || approval.proposal.tenant_id() != &approval.tenant_id
             || approval.proposal.session_id() != &approval.session_id
+            || approval.proposal.typed_binding().is_some_and(|binding| {
+                binding.action_id != approval.action_id
+                    || binding.validate_for(&approval.proposal).is_err()
+            })
         {
             return Err(ApiError::invalid_request(
                 "approval identity does not match its proposal",
@@ -1710,6 +2177,8 @@ impl ApprovalCatalog {
 
 #[derive(Debug)]
 pub enum ApiRequest {
+    Safety(SafetyRequest),
+    Webhook(WebhookRequest),
     CreateSession {
         body: SessionCreateRequest,
         idempotency_key: String,
@@ -1737,6 +2206,7 @@ pub enum ApiRequest {
     },
     IssueViewerTicket(ViewerTicketRequest),
     UploadArtifact(ArtifactUploadRequest),
+    ListArtifacts(ArtifactListRequest),
     GetArtifact(ArtifactRequest),
     DownloadArtifact(ArtifactRequest),
     ListApprovals(ApprovalListQuery),
@@ -1750,6 +2220,8 @@ pub enum ApiRequest {
 impl ApiRequest {
     pub fn authorize(&self, principal: &AuthenticatedPrincipal) -> Result<(), ApiError> {
         let required_scope = match self {
+            Self::Safety(request) => request.scope(),
+            Self::Webhook(request) => request.scope(),
             Self::CreateSession { .. } | Self::CancelOperation(_) => "session:create",
             Self::GetOperation(_)
             | Self::ListSessions(_)
@@ -1768,7 +2240,9 @@ impl ApiRequest {
             Self::ResumeEvents { .. } => "events:read",
             Self::IssueViewerTicket(_) => "viewer:read",
             Self::UploadArtifact(_) => "artifact:upload",
-            Self::GetArtifact(_) | Self::DownloadArtifact(_) => "artifact:read",
+            Self::ListArtifacts(_) | Self::GetArtifact(_) | Self::DownloadArtifact(_) => {
+                "artifact:read"
+            }
             Self::ListApprovals(_) | Self::GetApproval(_) => "approval:read",
             Self::DecideApproval { .. } => "approval:decide",
         };
@@ -1778,11 +2252,31 @@ impl ApiRequest {
                 "request scope is not granted to this principal",
             )
         })?;
+        if let Self::CreateSession { body, .. } = self
+            && body.checkpoint_ref.is_some()
+        {
+            principal.require_scope("checkpoint:read").map_err(|_| {
+                ApiError::new(
+                    ErrorCode::PermissionDenied,
+                    "request scope is not granted to this principal",
+                )
+            })?;
+        }
+        if let Self::CreateSession { body, .. } = self
+            && body.feature_profile == "privileged"
+        {
+            principal.require_scope("browser:evaluate").map_err(|_| {
+                ApiError::new(
+                    ErrorCode::PermissionDenied,
+                    "request scope is not granted to this principal",
+                )
+            })?;
+        }
         if let Self::SubmitAction(command) = self {
             let conditional_scope = match &command.body.action {
                 ActionPayload::Evaluate { .. } => Some("browser:evaluate"),
                 ActionPayload::FillSecret { .. } => Some("secret:use"),
-                ActionPayload::Checkpoint => Some("checkpoint:create"),
+                ActionPayload::Checkpoint { .. } => Some("checkpoint:create"),
                 ActionPayload::SetFiles { .. } => Some("artifact:read"),
                 _ => None,
             };
@@ -1820,6 +2314,8 @@ impl ApiRequest {
 
     pub fn validate(&self) -> Result<(), ApiError> {
         match self {
+            Self::Safety(request) => request.validate()?,
+            Self::Webhook(request) => request.validate()?,
             Self::CreateSession {
                 body,
                 idempotency_key,
@@ -1839,6 +2335,7 @@ impl ApiRequest {
             Self::ListSessions(query) => query.validate()?,
             Self::CreatePage(command) => command.body.validate()?,
             Self::UploadArtifact(command) => command.body.validate()?,
+            Self::ListArtifacts(command) => command.validate()?,
             Self::ListApprovals(query) => query.validate()?,
             Self::GetApproval(approval_id) if public_approval_id(*approval_id).is_err() => {
                 return Err(ApiError::invalid_request("approval ID must be a UUIDv7"));
@@ -1903,6 +2400,8 @@ impl ApiRequest {
 
 #[derive(Debug)]
 pub enum ApiResponse {
+    Safety(ApiEnvelope<serde_json::Value>),
+    WebhookEndpoint(ApiEnvelope<WebhookEndpointResponse>),
     SessionCreate(ApiEnvelope<SessionCreateResponse>),
     Operation(ApiEnvelope<OperationEnvelope>),
     Sessions(ApiEnvelope<SessionListPage>),
@@ -1917,6 +2416,7 @@ pub enum ApiResponse {
     Events(ApiEnvelope<EventPage>),
     ViewerTicket(ApiEnvelope<ViewerTicket>),
     ArtifactUpload(ApiEnvelope<ArtifactMetadata>),
+    Artifacts(ApiEnvelope<ArtifactListPage>),
     Artifact(ApiEnvelope<ArtifactMetadata>),
     ArtifactDownload(ApiEnvelope<DownloadToken>),
     Approvals(ApiEnvelope<ApprovalListPage>),
@@ -1929,11 +2429,39 @@ pub trait ApiService: Send + Sync {
         principal: &AuthenticatedPrincipal,
         request: ApiRequest,
     ) -> Result<ApiResponse, ApiError>;
+
+    /// Optionally reports a durably accepted action before waiting for worker completion.
+    /// The observer must be non-blocking and must not re-enter this service; implementations
+    /// may invoke it while holding session admission. It cannot reject or cancel dispatch.
+    /// Existing backends may return their ordinary response without emitting an observation.
+    fn execute_with_action_acceptance(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+        _accepted: &mut (dyn FnMut(ApiEnvelope<ActionSnapshot>) + Send),
+    ) -> Result<ApiResponse, ApiError> {
+        self.execute(principal, request)
+    }
 }
 
 /// Runtime-dependent endpoint adapter. A gateway binary can connect its
 /// session/action/viewer/artifact implementation without coupling it to HTTP.
 pub trait RuntimeApiBackend: Send + Sync {
+    /// Managed admission classifies deadlines using durable exposure evidence.
+    fn manages_create_admission(&self) -> bool {
+        false
+    }
+
+    /// Invoked only after the exact durable create operation positively records success.
+    fn create_projection_committed(
+        &self,
+        _authority: &CreateAuthority,
+        _dispatch: &SessionCreateDispatch,
+        _session: &SessionResource,
+    ) -> Result<(), ApiError> {
+        Ok(())
+    }
+
     fn create_session(
         &self,
         authority: &CreateAuthority,
@@ -1946,11 +2474,25 @@ pub trait RuntimeApiBackend: Send + Sync {
         principal: &AuthenticatedPrincipal,
         request: ApiRequest,
     ) -> Result<ApiResponse, ApiError>;
+
+    /// Reports durable action acceptance at most once, before a newly armed action is
+    /// enqueued to a worker. The observer must be non-blocking and non-reentrant. Immediate
+    /// results, including idempotent replay, may return without emitting an observation.
+    fn execute_runtime_with_action_acceptance(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+        _accepted: &mut (dyn FnMut(ApiEnvelope<ActionSnapshot>) + Send),
+    ) -> Result<ApiResponse, ApiError> {
+        self.execute_runtime(principal, request)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum RuntimeCreateResult {
     Succeeded(SessionResource),
+    /// The provider positively confirms no worker creation has been armed or exposed.
+    Deferred,
     ConfirmedFailure(ApiError),
     OutcomeUnknown(ApiError),
 }
@@ -1958,6 +2500,8 @@ pub enum RuntimeCreateResult {
 pub struct ApiRouter<B> {
     coordination: InMemoryApiService,
     runtime: Arc<B>,
+    webhooks: Option<WebhookApi>,
+    safety: Option<SafetyApi>,
 }
 
 impl<B> ApiRouter<B> {
@@ -1971,7 +2515,21 @@ impl<B> ApiRouter<B> {
         Self {
             coordination,
             runtime,
+            webhooks: None,
+            safety: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: WebhookApi) -> Self {
+        self.webhooks = Some(webhooks);
+        self
+    }
+
+    #[must_use]
+    pub fn with_safety(mut self, safety: SafetyApi) -> Self {
+        self.safety = Some(safety);
+        self
     }
 
     #[must_use]
@@ -1984,6 +2542,22 @@ impl<B> ApiService for ApiRouter<B>
 where
     B: RuntimeApiBackend,
 {
+    fn execute_with_action_acceptance(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+        accepted: &mut (dyn FnMut(ApiEnvelope<ActionSnapshot>) + Send),
+    ) -> Result<ApiResponse, ApiError> {
+        if matches!(&request, ApiRequest::SubmitAction(_)) {
+            request.authorize(principal)?;
+            request.validate()?;
+            self.runtime
+                .execute_runtime_with_action_acceptance(principal, request, accepted)
+        } else {
+            self.execute(principal, request)
+        }
+    }
+
     fn execute(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -1992,6 +2566,16 @@ where
         request.authorize(principal)?;
         request.validate()?;
         match request {
+            ApiRequest::Safety(request) => self
+                .safety
+                .as_ref()
+                .ok_or_else(safety::unavailable)?
+                .execute(principal, request),
+            ApiRequest::Webhook(request) => self
+                .webhooks
+                .as_ref()
+                .ok_or_else(webhooks::unavailable)?
+                .execute(principal, request),
             ApiRequest::CreateSession {
                 body,
                 idempotency_key,
@@ -2012,6 +2596,10 @@ where
                         request,
                     ) {
                         RuntimeCreateResult::Succeeded(session) => Ok(session),
+                        RuntimeCreateResult::Deferred => Err(ApiError::new(
+                            ErrorCode::WorkerUnavailable,
+                            "managed admission requires durable create coordination",
+                        )),
                         RuntimeCreateResult::ConfirmedFailure(error)
                         | RuntimeCreateResult::OutcomeUnknown(error) => Err(error),
                     },
@@ -2034,6 +2622,8 @@ pub struct DurableApiRouter<B> {
     /// Durable event outbox (BRD-017). When present, `ResumeEvents` is served from it — the source
     /// connected to durable terminal transitions — instead of the in-memory auxiliary store.
     event_outbox: Option<EventOutboxBlockingClient>,
+    webhooks: Option<WebhookApi>,
+    safety: Option<SafetyApi>,
     dispatch_lease_duration: StdDuration,
     runtime_create_timeout: StdDuration,
     dispatch_slots: Arc<AtomicUsize>,
@@ -2058,6 +2648,8 @@ where
             runtime,
             auxiliary: InMemoryApiService::default(),
             event_outbox: None,
+            webhooks: None,
+            safety: None,
             dispatch_lease_duration: StdDuration::from_secs(30),
             runtime_create_timeout: StdDuration::from_secs(25),
             dispatch_slots: Arc::new(AtomicUsize::new(0)),
@@ -2070,6 +2662,18 @@ where
     #[must_use]
     pub fn with_event_outbox(mut self, outbox: EventOutboxBlockingClient) -> Self {
         self.event_outbox = Some(outbox);
+        self
+    }
+
+    #[must_use]
+    pub fn with_webhooks(mut self, webhooks: WebhookApi) -> Self {
+        self.webhooks = Some(webhooks);
+        self
+    }
+
+    #[must_use]
+    pub fn with_safety(mut self, safety: SafetyApi) -> Self {
+        self.safety = Some(safety);
         self
     }
 
@@ -2093,6 +2697,8 @@ where
             runtime,
             auxiliary: InMemoryApiService::default(),
             event_outbox: None,
+            webhooks: None,
+            safety: None,
             dispatch_lease_duration: duration,
             runtime_create_timeout,
             dispatch_slots: Arc::new(AtomicUsize::new(0)),
@@ -2164,7 +2770,8 @@ where
     ) -> Result<DurableOperationSnapshot, ApiError> {
         loop {
             let transition_now = Utc::now();
-            if transition_now >= snapshot.intent().admission_deadline()
+            if !self.runtime.manages_create_admission()
+                && transition_now >= snapshot.intent().admission_deadline()
                 && matches!(
                     snapshot.state(),
                     CreateOperationState::Accepted
@@ -2281,7 +2888,9 @@ where
                 )
             })?;
         let _slot = DispatchSlotGuard(dispatch_slots);
-        if Utc::now() >= snapshot.intent().admission_deadline() {
+        if !self.runtime.manages_create_admission()
+            && Utc::now() >= snapshot.intent().admission_deadline()
+        {
             return self
                 .coordination
                 .compare_and_set(
@@ -2318,6 +2927,7 @@ where
             admission_deadline: snapshot.intent().admission_deadline(),
             dispatch_generation: snapshot.dispatch_generation(),
             runtime_timeout: self.runtime_create_timeout,
+            dispatch_token: Some(dispatch_token.clone()),
         };
         let coordination = self.coordination.clone();
         let tenant_id = snapshot.tenant_id().clone();
@@ -2389,6 +2999,17 @@ where
             ));
         }
         match runtime_result {
+            RuntimeCreateResult::Deferred => self
+                .coordination
+                .compare_and_set(
+                    snapshot.tenant_id(),
+                    snapshot.operation_id(),
+                    snapshot.revision(),
+                    CreateOperationState::Creating,
+                    OperationMutation::defer_with_lease(dispatch_token),
+                    Utc::now(),
+                )
+                .map_err(Self::map_coordination_error),
             RuntimeCreateResult::Succeeded(session) => {
                 let lifecycle = match session.lifecycle {
                     SessionLifecycle::Creating => "creating",
@@ -2417,7 +3038,8 @@ where
                     "effective_isolation": effective_isolation,
                     "metadata": session.metadata,
                 });
-                self.coordination
+                let completed = self
+                    .coordination
                     .compare_and_set(
                         snapshot.tenant_id(),
                         snapshot.operation_id(),
@@ -2425,7 +3047,7 @@ where
                         CreateOperationState::Creating,
                         OperationMutation::succeed_with_lease(
                             dispatch_token,
-                            CreateOperationResult::new(session.id, value),
+                            CreateOperationResult::new(session.id.clone(), value),
                         ),
                         Utc::now(),
                     )
@@ -2436,7 +3058,25 @@ where
                             error,
                         )
                     })
-                    .map_err(Self::map_coordination_error)
+                    .map_err(Self::map_coordination_error)?;
+                if completed.state() == CreateOperationState::Succeeded
+                    && completed
+                        .result()
+                        .is_some_and(|result| result.session_id() == &session.id)
+                {
+                    // Failure preserves the Redis projection obligation; it cannot undo the
+                    // already committed PG result or cause another browser creation.
+                    let _ = self
+                        .runtime
+                        .create_projection_committed(&authority, &dispatch, &session);
+                }
+                Ok(completed)
+            }
+            RuntimeCreateResult::OutcomeUnknown(_) if self.runtime.manages_create_admission() => {
+                // Acceptance is already durable. A managed backend retains its exact reservation
+                // and can inspect it after this dispatch lease expires; no unknown result may
+                // release the lease or be reclassified as a fresh creation.
+                Ok(snapshot)
             }
             RuntimeCreateResult::OutcomeUnknown(error) => Err(error),
             RuntimeCreateResult::ConfirmedFailure(error) => self
@@ -2713,20 +3353,16 @@ where
 /// transition surfaces as an action state change; a session-lost fence as a session lifecycle
 /// change. The stable event id is carried through as the public resume cursor.
 fn map_outbox_event(event: &OutboxEvent) -> EventRecord {
-    let kind = match event.kind() {
-        OutboxEventKind::ActionTerminal => EventKind::ActionStateChanged,
-        OutboxEventKind::SessionLost => EventKind::SessionLifecycleChanged,
-    };
-    let resource = match event.aggregate() {
-        OutboxAggregate::Action { action_id, .. } => EventResource::Action(action_id.clone()),
-        OutboxAggregate::Session { session_id } => EventResource::Session(session_id.clone()),
-    };
+    let wire = event.public_wire();
     EventRecord {
-        event_id: event.event_id(),
+        event_id: wire.event_id,
         tenant_id: event.tenant_id().clone(),
-        kind,
-        resource,
-        created_at: event.created_at(),
+        kind: wire.kind,
+        resource: wire.resource,
+        created_at: wire.created_at,
+        aggregate_revision: wire.aggregate_revision,
+        summary: wire.summary,
+        session_id: wire.session_id,
     }
 }
 
@@ -2734,6 +3370,22 @@ impl<B> ApiService for DurableApiRouter<B>
 where
     B: RuntimeApiBackend + 'static,
 {
+    fn execute_with_action_acceptance(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+        accepted: &mut (dyn FnMut(ApiEnvelope<ActionSnapshot>) + Send),
+    ) -> Result<ApiResponse, ApiError> {
+        if matches!(&request, ApiRequest::SubmitAction(_)) {
+            request.authorize(principal)?;
+            request.validate()?;
+            self.runtime
+                .execute_runtime_with_action_acceptance(principal, request, accepted)
+        } else {
+            self.execute(principal, request)
+        }
+    }
+
     fn execute(
         &self,
         principal: &AuthenticatedPrincipal,
@@ -2742,6 +3394,16 @@ where
         request.authorize(principal)?;
         request.validate()?;
         match request {
+            ApiRequest::Safety(request) => self
+                .safety
+                .as_ref()
+                .ok_or_else(safety::unavailable)?
+                .execute(principal, request),
+            ApiRequest::Webhook(request) => self
+                .webhooks
+                .as_ref()
+                .ok_or_else(webhooks::unavailable)?
+                .execute(principal, request),
             ApiRequest::CreateSession {
                 body,
                 idempotency_key,
@@ -2765,26 +3427,9 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EventKind {
-    OperationStateChanged,
-    SessionLifecycleChanged,
-    SessionExecutionChanged,
-    ActionStateChanged,
-    ActionApprovalRequired,
-    ApprovalDecided,
-    BrowserControlChanged,
-    DownloadCompleted,
-    ArtifactStateChanged,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum EventResource {
-    Operation(OperationId),
-    Session(SessionId),
-    Action(ActionId),
-    Artifact(ArtifactId),
-}
+pub use browserd_coordination::{
+    EventNotificationKind as EventKind, EventNotificationResource as EventResource,
+};
 
 #[derive(Clone, Debug)]
 pub struct EventRecord {
@@ -2793,9 +3438,25 @@ pub struct EventRecord {
     kind: EventKind,
     resource: EventResource,
     created_at: DateTime<Utc>,
+    aggregate_revision: u64,
+    summary: Option<browserd_coordination::EventStateSummary>,
+    session_id: Option<SessionId>,
 }
 
 impl EventRecord {
+    #[must_use]
+    pub fn public_wire(&self) -> browserd_coordination::OutboxEventWire {
+        browserd_coordination::OutboxEventWire {
+            event_id: self.event_id,
+            kind: self.kind,
+            created_at: self.created_at,
+            resource: self.resource.clone(),
+            aggregate_revision: self.aggregate_revision,
+            summary: self.summary.clone(),
+            session_id: self.session_id.clone(),
+        }
+    }
+
     #[must_use]
     pub const fn event_id(&self) -> Uuid {
         self.event_id
@@ -2895,6 +3556,9 @@ impl EventStore {
             kind,
             resource,
             created_at: now,
+            aggregate_revision: 0,
+            summary: None,
+            session_id: None,
         };
         events.push_back(record.clone());
         Ok(record)
@@ -3122,6 +3786,7 @@ impl InMemoryApiService {
                 admission_deadline: Utc::now() + ChronoDuration::seconds(30),
                 dispatch_generation: 1,
                 runtime_timeout: StdDuration::from_secs(25),
+                dispatch_token: None,
             },
             created,
         ))
@@ -3234,6 +3899,8 @@ impl ApiService for InMemoryApiService {
         request.authorize(principal)?;
         request.validate()?;
         match request {
+            ApiRequest::Safety(_) => Err(safety::unavailable()),
+            ApiRequest::Webhook(_) => Err(webhooks::unavailable()),
             ApiRequest::CreateSession {
                 body,
                 idempotency_key,
@@ -3276,6 +3943,7 @@ impl ApiService for InMemoryApiService {
             | ApiRequest::ResolveAction(_)
             | ApiRequest::IssueViewerTicket(_)
             | ApiRequest::UploadArtifact(_)
+            | ApiRequest::ListArtifacts(_)
             | ApiRequest::GetArtifact(_)
             | ApiRequest::DownloadArtifact(_)
             | ApiRequest::ListApprovals(_)

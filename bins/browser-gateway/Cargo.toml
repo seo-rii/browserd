@@ -12,12 +12,14 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 axum.workspace = true
 browserd-actions = { path = "../../crates/browserd-actions" }
 browserd-api = { path = "../../crates/browserd-api" }
 browserd-artifacts = { path = "../../crates/browserd-artifacts" }
 browserd-auth = { path = "../../crates/browserd-auth" }
 browserd-core = { path = "../../crates/browserd-core" }
+browserd-egress = { path = "../../crates/browserd-egress" }
 browserd-coordination = { path = "../../crates/browserd-coordination" }
 browserd-http = { path = "../../crates/browserd-http" }
 browserd-operations = { path = "../../crates/browserd-operations" }
@@ -26,11 +28,22 @@ browserd-viewer = { path = "../../crates/browserd-viewer" }
 browserd-worker = { path = "../../crates/browserd-worker" }
 chrono.workspace = true
 hex.workspace = true
+hmac.workspace = true
 jsonwebtoken.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+nix.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+url.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
-sha2.workspace = true
+browser-worker = { path = "../browser-worker" }
+browserd-observability = { path = "../../crates/browserd-observability" }
+browserd-sandbox = { path = "../../crates/browserd-sandbox" }
+browserd-session = { path = "../../crates/browserd-session" }
+tempfile.workspace = true

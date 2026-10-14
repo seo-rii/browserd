@@ -1,37 +1,52 @@
 //! Shard sandbox supervisor contract, ownership leases, and cleanup ordering.
 
+mod context_routes;
 mod journal;
 mod linux;
+mod native_netns_listener;
 mod netns_listener;
+mod process_profile;
 mod rpc;
+mod scratch;
 
 #[cfg(test)]
 mod netns_listener_tests;
 
+pub use context_routes::{
+    ContextEgressBinding, ContextEgressReleaseReceipt, ContextEgressRequest, ContextRoutePolicy,
+};
 pub use journal::{
-    FilePreparedShardJournal, JournalSequence, PreparedShardCleanupFailure,
-    PreparedShardCleanupPermit, PreparedShardCleanupProgress, PreparedShardCleanupStage,
-    PreparedShardCleanupStageStatus, PreparedShardEffect, PreparedShardEffectPermit,
-    PreparedShardJournalError, PreparedShardJournalLimits, PreparedShardJournalRecord,
-    PreparedShardRecoveryBackend, PreparedShardRecoveryDisposition, PreparedShardRecoveryError,
-    PreparedShardRecoveryLocators, PreparedShardRecoveryRoots, StartupPreparedShardReconciler,
-    StartupReconciliationHandle, StartupReconciliationReport,
+    ContextRouteJournalEntry, ContextRoutePhase, FilePreparedShardJournal, JournalSequence,
+    PreparedShardCleanupFailure, PreparedShardCleanupPermit, PreparedShardCleanupProgress,
+    PreparedShardCleanupStage, PreparedShardCleanupStageStatus, PreparedShardEffect,
+    PreparedShardEffectPermit, PreparedShardJournalError, PreparedShardJournalLimits,
+    PreparedShardJournalRecord, PreparedShardRecoveryBackend, PreparedShardRecoveryDisposition,
+    PreparedShardRecoveryError, PreparedShardRecoveryLocators, PreparedShardRecoveryRoots,
+    StartupPreparedShardReconciler, StartupReconciliationHandle, StartupReconciliationReport,
 };
 pub use linux::{
     CHROMIUM_CDP_READ_FD, CHROMIUM_CDP_WRITE_FD, CgroupLimits, ChildIdentity, ChromiumCdpPipes,
-    ChromiumRuntime, EgressRouteBackend, LaunchGateRuntime, LinuxProcessBackend,
-    LinuxSandboxBackend, LinuxSandboxConfig, NetworkNamespaceIdentity, PinnedNetworkNamespace,
-    PreparedLinuxChild, ProcessSignal, ReadOnlyMount, SandboxFilesystem, ShardEgressFence,
-    ShardEgressReservation, ShardIngressLease, ShardIngressReceipt, SpawnRequest,
-    StdLinuxProcessBackend, StdSandboxFilesystem,
+    ChromiumRuntime, DedicatedEgressProxyBinding, EgressRouteBackend, LaunchGateRuntime,
+    LinuxProcessBackend, LinuxSandboxBackend, LinuxSandboxConfig, NativeProcessResources,
+    NetworkNamespaceIdentity, PinnedNetworkNamespace, PreparedLinuxChild, ProcessSignal,
+    ReadOnlyMount, SandboxFilesystem, ShardEgressFence, ShardEgressReservation, ShardIngressLease,
+    ShardIngressReceipt, SpawnRequest, StdLinuxProcessBackend, StdSandboxFilesystem,
+};
+pub use native_netns_listener::{
+    create_native_dedicated_egress_listener, dispatch_native_egress_listener_helper,
 };
 pub use netns_listener::{
     DedicatedEgressListener, DedicatedEgressListenerError, DedicatedEgressListenerReceipt,
     create_dedicated_egress_listener,
 };
+pub use process_profile::ChromiumProcessProfile;
 pub use rpc::{
     RpcFailureCode, SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcPeerBinding,
     SandboxRpcServer,
+};
+pub use scratch::{
+    SANDBOX_SCRATCH_MAX_BYTES, SANDBOX_SCRATCH_PATH, SandboxScratch, ScratchMetadata,
+    validate_scratch_directory,
 };
 
 use std::collections::HashMap;
@@ -345,7 +360,10 @@ pub struct LaunchSpec {
     worker_id: WorkerId,
     worker_epoch: u64,
     chromium_binary_digest: ChromiumBinaryDigest,
+    process_profile: ChromiumProcessProfile,
     dedicated_egress: DedicatedEgressSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_route_policy: Option<ContextRoutePolicy>,
 }
 
 impl LaunchSpec {
@@ -361,7 +379,9 @@ impl LaunchSpec {
             worker_id: shard_fence.owner().worker_id().clone(),
             worker_epoch: shard_fence.owner().worker_epoch().get(),
             chromium_binary_digest,
+            process_profile: ChromiumProcessProfile::BaselineV1,
             dedicated_egress,
+            context_route_policy: None,
         }
     }
 
@@ -371,6 +391,7 @@ impl LaunchSpec {
         worker_id: WorkerId,
         worker_epoch: u64,
         chromium_binary_digest: ChromiumBinaryDigest,
+        process_profile: ChromiumProcessProfile,
         dedicated_egress: DedicatedEgressSpec,
     ) -> Result<Self, SandboxError> {
         let spec = Self {
@@ -379,13 +400,33 @@ impl LaunchSpec {
             worker_id,
             worker_epoch,
             chromium_binary_digest,
+            process_profile,
             dedicated_egress,
+            context_route_policy: None,
         };
         spec.validate()?;
         Ok(spec)
     }
 
+    pub fn with_context_route_policy(
+        mut self,
+        policy: ContextRoutePolicy,
+    ) -> Result<Self, SandboxError> {
+        self.context_route_policy = Some(policy);
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub const fn context_route_policy(&self) -> Option<&ContextRoutePolicy> {
+        self.context_route_policy.as_ref()
+    }
+
     fn validate(&self) -> Result<(), SandboxError> {
+        self.process_profile.validate()?;
+        if let Some(policy) = &self.context_route_policy {
+            policy.validate()?;
+            ContextEgressRequest::initial(self)?.validate_for(self)?;
+        }
         self.dedicated_egress.validate()?;
         let shard_fence = self.dedicated_egress.egress_fence().shard();
         if &self.shard_id != shard_fence.shard_id()
@@ -422,6 +463,19 @@ impl LaunchSpec {
 
     pub const fn chromium_binary_digest(&self) -> ChromiumBinaryDigest {
         self.chromium_binary_digest
+    }
+
+    pub fn with_process_profile(
+        mut self,
+        process_profile: ChromiumProcessProfile,
+    ) -> Result<Self, SandboxError> {
+        self.process_profile = process_profile;
+        self.validate()?;
+        Ok(self)
+    }
+
+    pub const fn process_profile(&self) -> &ChromiumProcessProfile {
+        &self.process_profile
     }
 
     pub const fn dedicated_egress(&self) -> &DedicatedEgressSpec {
@@ -580,6 +634,32 @@ pub trait SandboxBackend: Send + Sync + 'static {
         ))
     }
 
+    async fn attach_context_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _request: &ContextEgressRequest,
+        _sandboxd_epoch: u64,
+        _max_ttl: Duration,
+    ) -> Result<ContextEgressBinding, SandboxError> {
+        Err(SandboxError::Backend("context egress unsupported".into()))
+    }
+    async fn renew_context_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _binding: &ContextEgressBinding,
+        _ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        Err(SandboxError::Backend("context egress unsupported".into()))
+    }
+    async fn release_context_egress(
+        &self,
+        _handle: &SandboxHandle,
+        _request: &ContextEgressRequest,
+        _sandboxd_epoch: u64,
+    ) -> Result<ContextEgressReleaseReceipt, SandboxError> {
+        Err(SandboxError::Backend("context egress unsupported".into()))
+    }
+
     async fn revoke_egress(
         &self,
         handle: &SandboxHandle,
@@ -679,6 +759,7 @@ pub struct SandboxSupervisor<B> {
     config: SupervisorConfig,
     backend: Arc<B>,
     state: Arc<Mutex<SupervisorState>>,
+    context_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl<B> Clone for SandboxSupervisor<B> {
@@ -687,6 +768,7 @@ impl<B> Clone for SandboxSupervisor<B> {
             config: self.config,
             backend: Arc::clone(&self.backend),
             state: Arc::clone(&self.state),
+            context_slots: Arc::clone(&self.context_slots),
         }
     }
 }
@@ -884,6 +966,7 @@ where
             config,
             backend: Arc::new(backend),
             state: Arc::new(Mutex::new(SupervisorState::default())),
+            context_slots: Arc::new(tokio::sync::Semaphore::new(64)),
         }
     }
 
@@ -1184,6 +1267,125 @@ where
                 let _ = result;
             }
         }
+    }
+
+    async fn context_handle(
+        &self,
+        request: &ContextEgressRequest,
+        require_live: bool,
+    ) -> Result<(SandboxHandle, Duration, Arc<Mutex<()>>), SandboxError> {
+        request.validate()?;
+        let state = self.state.lock().await;
+        let active = state
+            .active
+            .get(request.egress().egress_fence().shard().shard_id())
+            .ok_or(SandboxError::ShardNotFound)?;
+        request.validate_for(&active.launch_spec)?;
+        let remaining = active
+            .ownership
+            .expires_at
+            .saturating_duration_since(Instant::now());
+        if require_live && (remaining.is_zero() || state.admission_closed) {
+            return Err(SandboxError::ShardNotFound);
+        }
+        Ok((
+            active.handle.clone(),
+            remaining,
+            Arc::clone(&active.renewal_operation),
+        ))
+    }
+
+    pub async fn attach_context_egress(
+        &self,
+        request: ContextEgressRequest,
+        sandboxd_epoch: u64,
+    ) -> Result<ContextEgressBinding, SandboxError> {
+        let (_, _, operation) = self.context_handle(&request, true).await?;
+        let permit = Arc::clone(&self.context_slots)
+            .try_acquire_owned()
+            .map_err(|_| SandboxError::Backend("context route operations saturated".into()))?;
+        let owner = self.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _guard = operation.lock().await;
+            let result = async {
+                if sender.is_closed() {
+                    return Err(SandboxError::ShardNotFound);
+                }
+                let (handle, remaining, _) = owner.context_handle(&request, true).await?;
+                let binding = owner
+                    .backend
+                    .attach_context_egress(&handle, &request, sandboxd_epoch, remaining)
+                    .await?;
+                if sender.is_closed() || owner.context_handle(&request, true).await.is_err() {
+                    let _ = owner
+                        .backend
+                        .release_context_egress(&handle, &request, sandboxd_epoch)
+                        .await;
+                    return Err(SandboxError::ShardNotFound);
+                }
+                Ok(binding)
+            }
+            .await;
+            if let Err(Ok(_binding)) = sender.send(result)
+                && let Ok((handle, _, _)) = owner.context_handle(&request, false).await
+            {
+                let _ = owner
+                    .backend
+                    .release_context_egress(&handle, &request, sandboxd_epoch)
+                    .await;
+            }
+        });
+        receiver
+            .await
+            .map_err(|_| SandboxError::Backend("context attach owner stopped".into()))?
+    }
+
+    pub async fn renew_context_egress(
+        &self,
+        binding: ContextEgressBinding,
+        ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        binding.validate()?;
+        let (_, _, operation) = self.context_handle(binding.request(), true).await?;
+        let _guard = operation.lock().await;
+        let (handle, remaining, _) = self.context_handle(binding.request(), true).await?;
+        if ttl.is_zero() || ttl > remaining {
+            return Err(SandboxError::InvalidEgressLease);
+        }
+        self.backend
+            .renew_context_egress(&handle, &binding, ttl)
+            .await
+    }
+
+    pub async fn release_context_egress(
+        &self,
+        request: ContextEgressRequest,
+        sandboxd_epoch: u64,
+    ) -> Result<ContextEgressReleaseReceipt, SandboxError> {
+        let (_, _, operation) = self.context_handle(&request, false).await?;
+        let permit = Arc::clone(&self.context_slots)
+            .try_acquire_owned()
+            .map_err(|_| SandboxError::Backend("context route operations saturated".into()))?;
+        let owner = self.clone();
+        let (sender, receiver) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _guard = operation.lock().await;
+            let result = async {
+                let (handle, _, _) = owner.context_handle(&request, false).await?;
+                owner
+                    .backend
+                    .release_context_egress(&handle, &request, sandboxd_epoch)
+                    .await
+            }
+            .await;
+            let _ = sender.send(result);
+        });
+        receiver
+            .await
+            .map_err(|_| SandboxError::Backend("context release owner stopped".into()))?
     }
 
     pub async fn renew_owner_lease(
@@ -2358,6 +2560,8 @@ pub enum SandboxError {
     LaunchBindingMismatch,
     #[error("launch spec Chromium binary digest does not match the pinned executable")]
     ChromiumBinaryDigestMismatch,
+    #[error("Chromium process profile syntax or resource identity is invalid")]
+    InvalidChromiumProcessProfile,
     #[error("production sandbox capability is missing: {name}")]
     MissingCapability { name: &'static str },
     #[error("launch spec and owner lease do not identify the same worker epoch")]

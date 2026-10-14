@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, SyncSender};
 
 use browserd_actions::{
-    ActionSequence, BrowserResult, DispatchId, ResolutionAnnotation, TerminalDetail, TransportLoss,
+    ActionSequence, BrowserResult, DispatchId, ResolutionAnnotation, TerminalCustodyReceipt,
+    TerminalCustodyRequirement, TerminalDetail, TransportLoss,
 };
 use browserd_core::{ActionId, SessionId, TenantId};
 use chrono::{DateTime, Utc};
@@ -10,10 +11,95 @@ use chrono::{DateTime, Utc};
 use crate::{
     ClaimGatewayAction, CoordinationActorConfig, GatewayActionClaimOutcome,
     GatewayActionCoordination, GatewayActionCoordinationError, GatewayActionPlacement,
-    GatewayActionSnapshot, SessionLossClaim, SessionLossOutcome,
+    GatewayActionRecoveryCursor, GatewayActionRecoveryPage, GatewayActionRetentionCursor,
+    GatewayActionRetentionPage, GatewayActionSnapshot, GatewayActionSubmissionLease,
+    GatewayCustodyCursor, GatewayCustodyPage, GatewayEventProjection, GatewayEventScanCursor,
+    GatewayEventScanPage, GatewayPendingCustody, GatewayTerminalCustodyCatchupPage,
+    SessionLossClaim, SessionLossOutcome, SessionLossReceipt,
 };
 
+mod fleet;
+mod session_directory;
+
 enum Command {
+    Fleet(Box<fleet::FleetCommand>),
+    SessionDirectory(Box<session_directory::DirectoryCommand>),
+    ScanTerminalCustodyCatchup {
+        cursor: GatewayActionRecoveryCursor,
+        limit: usize,
+        response:
+            SyncSender<Result<GatewayTerminalCustodyCatchupPage, GatewayActionCoordinationError>>,
+    },
+    AttachTerminalCustody {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        action_id: ActionId,
+        expected_revision: u64,
+        placement: GatewayActionPlacement,
+        receipt: TerminalCustodyReceipt,
+        response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
+    },
+    MaintainActionRetention {
+        cursor: GatewayActionRetentionCursor,
+        limit: usize,
+        response: SyncSender<Result<GatewayActionRetentionPage, GatewayActionCoordinationError>>,
+    },
+    ScanPendingCustody {
+        cursor: GatewayCustodyCursor,
+        limit: usize,
+        response: SyncSender<Result<GatewayCustodyPage, GatewayActionCoordinationError>>,
+    },
+    AckPendingCustody {
+        entry: GatewayPendingCustody,
+        now: DateTime<Utc>,
+        response: SyncSender<Result<(), GatewayActionCoordinationError>>,
+    },
+    CompleteCustodyRelease {
+        entry: GatewayPendingCustody,
+        now: DateTime<Utc>,
+        response: SyncSender<Result<(), GatewayActionCoordinationError>>,
+    },
+    ScanPendingActions {
+        cursor: GatewayActionRecoveryCursor,
+        limit: usize,
+        response: SyncSender<Result<GatewayActionRecoveryPage, GatewayActionCoordinationError>>,
+    },
+    ArmDispatchOwned {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        action_id: ActionId,
+        expected_revision: u64,
+        placement: GatewayActionPlacement,
+        dispatch_id: DispatchId,
+        lease: GatewayActionSubmissionLease,
+        now: DateTime<Utc>,
+        response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
+    },
+    ExpireUnattemptedAction {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        action_id: ActionId,
+        expected_revision: u64,
+        placement: GatewayActionPlacement,
+        lease: GatewayActionSubmissionLease,
+        now: DateTime<Utc>,
+        response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
+    },
+    ScanEventSessions {
+        cursor: GatewayEventScanCursor,
+        limit: usize,
+        response: SyncSender<Result<GatewayEventScanPage, GatewayActionCoordinationError>>,
+    },
+    PeekEventProjection {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        response:
+            SyncSender<Result<Option<GatewayEventProjection>, GatewayActionCoordinationError>>,
+    },
+    AckEventProjection {
+        projection: GatewayEventProjection,
+        response: SyncSender<Result<(), GatewayActionCoordinationError>>,
+    },
     Claim {
         claim: ClaimGatewayAction,
         now: DateTime<Utc>,
@@ -55,6 +141,8 @@ enum Command {
         action_sequence: ActionSequence,
         result: BrowserResult,
         result_body: Option<Vec<u8>>,
+        custody: Option<TerminalCustodyReceipt>,
+        requirement: Option<TerminalCustodyRequirement>,
         now: DateTime<Utc>,
         response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
     },
@@ -67,6 +155,8 @@ enum Command {
         dispatch_id: DispatchId,
         action_sequence: ActionSequence,
         detail: TerminalDetail,
+        custody: Option<TerminalCustodyReceipt>,
+        requirement: Option<TerminalCustodyRequirement>,
         now: DateTime<Utc>,
         response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
     },
@@ -97,6 +187,8 @@ enum Command {
         expected_revision: u64,
         placement: GatewayActionPlacement,
         annotation: ResolutionAnnotation,
+        custody: Option<TerminalCustodyReceipt>,
+        requirement: Option<TerminalCustodyRequirement>,
         now: DateTime<Utc>,
         response: SyncSender<Result<GatewayActionSnapshot, GatewayActionCoordinationError>>,
     },
@@ -104,6 +196,11 @@ enum Command {
         claim: SessionLossClaim,
         now: DateTime<Utc>,
         response: SyncSender<Result<SessionLossOutcome, GatewayActionCoordinationError>>,
+    },
+    EnsureSessionLost {
+        proposed: SessionLossClaim,
+        now: DateTime<Utc>,
+        response: SyncSender<Result<SessionLossReceipt, GatewayActionCoordinationError>>,
     },
     MaterializeSessionLoss {
         claim: SessionLossClaim,
@@ -146,6 +243,151 @@ impl GatewayActionBlockingClient {
                     let store = Arc::clone(&store);
                     runtime.spawn(async move {
                         match command {
+                            Command::Fleet(command) => command.run(store.as_ref()).await,
+                            Command::SessionDirectory(command) => command.run(store.as_ref()).await,
+                            Command::ScanTerminalCustodyCatchup {
+                                cursor,
+                                limit,
+                                response,
+                            } => {
+                                let _ = response
+                                    .send(store.scan_terminal_custody_catchup(cursor, limit).await);
+                            }
+                            Command::AttachTerminalCustody {
+                                tenant_id,
+                                session_id,
+                                action_id,
+                                expected_revision,
+                                placement,
+                                receipt,
+                                response,
+                            } => {
+                                let _ = response.send(
+                                    store
+                                        .attach_terminal_custody(
+                                            &tenant_id,
+                                            &session_id,
+                                            &action_id,
+                                            expected_revision,
+                                            &placement,
+                                            receipt,
+                                        )
+                                        .await,
+                                );
+                            }
+                            Command::MaintainActionRetention {
+                                cursor,
+                                limit,
+                                response,
+                            } => {
+                                let _ = response
+                                    .send(store.maintain_action_retention(cursor, limit).await);
+                            }
+                            Command::ScanPendingCustody {
+                                cursor,
+                                limit,
+                                response,
+                            } => {
+                                let _ =
+                                    response.send(store.scan_pending_custody(cursor, limit).await);
+                            }
+                            Command::AckPendingCustody {
+                                entry,
+                                now,
+                                response,
+                            } => {
+                                let _ = response.send(store.ack_pending_custody(&entry, now).await);
+                            }
+                            Command::CompleteCustodyRelease {
+                                entry,
+                                now,
+                                response,
+                            } => {
+                                let _ = response
+                                    .send(store.complete_custody_release(&entry, now).await);
+                            }
+                            Command::ScanPendingActions {
+                                cursor,
+                                limit,
+                                response,
+                            } => {
+                                let _ =
+                                    response.send(store.scan_pending_actions(cursor, limit).await);
+                            }
+                            Command::ArmDispatchOwned {
+                                tenant_id,
+                                session_id,
+                                action_id,
+                                expected_revision,
+                                placement,
+                                dispatch_id,
+                                lease,
+                                now,
+                                response,
+                            } => {
+                                let _ = response.send(
+                                    store
+                                        .arm_dispatch_owned(
+                                            &tenant_id,
+                                            &session_id,
+                                            &action_id,
+                                            expected_revision,
+                                            &placement,
+                                            dispatch_id,
+                                            &lease,
+                                            now,
+                                        )
+                                        .await,
+                                );
+                            }
+                            Command::ExpireUnattemptedAction {
+                                tenant_id,
+                                session_id,
+                                action_id,
+                                expected_revision,
+                                placement,
+                                lease,
+                                now,
+                                response,
+                            } => {
+                                let _ = response.send(
+                                    store
+                                        .expire_unattempted_action(
+                                            &tenant_id,
+                                            &session_id,
+                                            &action_id,
+                                            expected_revision,
+                                            &placement,
+                                            &lease,
+                                            now,
+                                        )
+                                        .await,
+                                );
+                            }
+                            Command::ScanEventSessions {
+                                cursor,
+                                limit,
+                                response,
+                            } => {
+                                let _ =
+                                    response.send(store.scan_event_sessions(cursor, limit).await);
+                            }
+                            Command::PeekEventProjection {
+                                tenant_id,
+                                session_id,
+                                response,
+                            } => {
+                                let _ = response.send(
+                                    store.peek_event_projection(&tenant_id, &session_id).await,
+                                );
+                            }
+                            Command::AckEventProjection {
+                                projection,
+                                response,
+                            } => {
+                                let _ =
+                                    response.send(store.ack_event_projection(&projection).await);
+                            }
                             Command::Claim {
                                 claim,
                                 now,
@@ -223,12 +465,14 @@ impl GatewayActionBlockingClient {
                                 action_sequence,
                                 result,
                                 result_body,
+                                custody,
+                                requirement,
                                 now,
                                 response,
                             } => {
                                 let _ = response.send(
                                     store
-                                        .record_worker_result(
+                                        .record_worker_result_with_custody(
                                             &tenant_id,
                                             &session_id,
                                             &action_id,
@@ -238,6 +482,8 @@ impl GatewayActionBlockingClient {
                                             action_sequence,
                                             result,
                                             result_body,
+                                            custody,
+                                            requirement,
                                             now,
                                         )
                                         .await,
@@ -252,12 +498,14 @@ impl GatewayActionBlockingClient {
                                 dispatch_id,
                                 action_sequence,
                                 detail,
+                                custody,
+                                requirement,
                                 now,
                                 response,
                             } => {
                                 let _ = response.send(
                                     store
-                                        .record_worker_terminal(
+                                        .record_worker_terminal_with_custody(
                                             &tenant_id,
                                             &session_id,
                                             &action_id,
@@ -266,6 +514,8 @@ impl GatewayActionBlockingClient {
                                             &dispatch_id,
                                             action_sequence,
                                             detail,
+                                            custody,
+                                            requirement,
                                             now,
                                         )
                                         .await,
@@ -326,18 +576,22 @@ impl GatewayActionBlockingClient {
                                 expected_revision,
                                 placement,
                                 annotation,
+                                custody,
+                                requirement,
                                 now,
                                 response,
                             } => {
                                 let _ = response.send(
                                     store
-                                        .resolve_unknown(
+                                        .resolve_unknown_with_custody(
                                             &tenant_id,
                                             &session_id,
                                             &action_id,
                                             expected_revision,
                                             &placement,
                                             annotation,
+                                            custody,
+                                            requirement,
                                             now,
                                         )
                                         .await,
@@ -349,6 +603,14 @@ impl GatewayActionBlockingClient {
                                 response,
                             } => {
                                 let _ = response.send(store.mark_session_lost(&claim, now).await);
+                            }
+                            Command::EnsureSessionLost {
+                                proposed,
+                                now,
+                                response,
+                            } => {
+                                let _ =
+                                    response.send(store.ensure_session_lost(&proposed, now).await);
                             }
                             Command::MaterializeSessionLoss {
                                 claim,
@@ -375,6 +637,171 @@ impl GatewayActionBlockingClient {
             query_timeout: config.query_timeout(),
             mutation_timeout: config.mutation_timeout(),
         })
+    }
+
+    pub fn scan_terminal_custody_catchup(
+        &self,
+        cursor: GatewayActionRecoveryCursor,
+        limit: usize,
+    ) -> Result<GatewayTerminalCustodyCatchupPage, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ScanTerminalCustodyCatchup {
+                cursor,
+                limit,
+                response,
+            },
+            ResponsePolicy::Query,
+        )
+    }
+    pub fn attach_terminal_custody(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        receipt: TerminalCustodyReceipt,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::AttachTerminalCustody {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                action_id: action_id.clone(),
+                expected_revision,
+                placement: placement.clone(),
+                receipt,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    pub fn maintain_action_retention(
+        &self,
+        cursor: GatewayActionRetentionCursor,
+        limit: usize,
+    ) -> Result<GatewayActionRetentionPage, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::MaintainActionRetention {
+                cursor,
+                limit,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    pub fn scan_pending_custody(
+        &self,
+        cursor: GatewayCustodyCursor,
+        limit: usize,
+    ) -> Result<GatewayCustodyPage, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ScanPendingCustody {
+                cursor,
+                limit,
+                response,
+            },
+            ResponsePolicy::Query,
+        )
+    }
+    pub fn ack_pending_custody(
+        &self,
+        entry: &GatewayPendingCustody,
+        now: DateTime<Utc>,
+    ) -> Result<(), GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::AckPendingCustody {
+                entry: entry.clone(),
+                now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    pub fn complete_custody_release(
+        &self,
+        entry: &GatewayPendingCustody,
+        now: DateTime<Utc>,
+    ) -> Result<(), GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::CompleteCustodyRelease {
+                entry: entry.clone(),
+                now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    pub fn scan_pending_actions(
+        &self,
+        cursor: GatewayActionRecoveryCursor,
+        limit: usize,
+    ) -> Result<GatewayActionRecoveryPage, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ScanPendingActions {
+                cursor,
+                limit,
+                response,
+            },
+            ResponsePolicy::Query,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn arm_dispatch_owned(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        dispatch_id: DispatchId,
+        lease: &GatewayActionSubmissionLease,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ArmDispatchOwned {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                action_id: action_id.clone(),
+                expected_revision,
+                placement: placement.clone(),
+                dispatch_id,
+                lease: lease.clone(),
+                now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn expire_unattempted_action(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        lease: &GatewayActionSubmissionLease,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ExpireUnattemptedAction {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                action_id: action_id.clone(),
+                expected_revision,
+                placement: placement.clone(),
+                lease: lease.clone(),
+                now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
     }
 
     pub fn claim_action(
@@ -475,6 +902,38 @@ impl GatewayActionBlockingClient {
         result_body: Option<Vec<u8>>,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.record_worker_result_with_custody(
+            tenant_id,
+            session_id,
+            action_id,
+            expected_revision,
+            placement,
+            dispatch_id,
+            action_sequence,
+            result,
+            result_body,
+            None,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_worker_result_with_custody(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        dispatch_id: &DispatchId,
+        action_sequence: ActionSequence,
+        result: BrowserResult,
+        result_body: Option<Vec<u8>>,
+        custody: Option<TerminalCustodyReceipt>,
+        requirement: Option<TerminalCustodyRequirement>,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
         self.submit(
             |response| Command::RecordWorkerResult {
                 tenant_id: tenant_id.clone(),
@@ -486,6 +945,8 @@ impl GatewayActionBlockingClient {
                 action_sequence,
                 result,
                 result_body,
+                custody,
+                requirement,
                 now,
                 response,
             },
@@ -506,6 +967,36 @@ impl GatewayActionBlockingClient {
         detail: TerminalDetail,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.record_worker_terminal_with_custody(
+            tenant_id,
+            session_id,
+            action_id,
+            expected_revision,
+            placement,
+            dispatch_id,
+            action_sequence,
+            detail,
+            None,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_worker_terminal_with_custody(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        dispatch_id: &DispatchId,
+        action_sequence: ActionSequence,
+        detail: TerminalDetail,
+        custody: Option<TerminalCustodyReceipt>,
+        requirement: Option<TerminalCustodyRequirement>,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
         self.submit(
             |response| Command::RecordWorkerTerminal {
                 tenant_id: tenant_id.clone(),
@@ -516,6 +1007,8 @@ impl GatewayActionBlockingClient {
                 dispatch_id: dispatch_id.clone(),
                 action_sequence,
                 detail,
+                custody,
+                requirement,
                 now,
                 response,
             },
@@ -586,6 +1079,32 @@ impl GatewayActionBlockingClient {
         annotation: ResolutionAnnotation,
         now: DateTime<Utc>,
     ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
+        self.resolve_unknown_with_custody(
+            tenant_id,
+            session_id,
+            action_id,
+            expected_revision,
+            placement,
+            annotation,
+            None,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_unknown_with_custody(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        action_id: &ActionId,
+        expected_revision: u64,
+        placement: &GatewayActionPlacement,
+        annotation: ResolutionAnnotation,
+        custody: Option<TerminalCustodyReceipt>,
+        requirement: Option<TerminalCustodyRequirement>,
+        now: DateTime<Utc>,
+    ) -> Result<GatewayActionSnapshot, GatewayActionCoordinationError> {
         self.submit(
             |response| Command::ResolveUnknown {
                 tenant_id: tenant_id.clone(),
@@ -594,6 +1113,8 @@ impl GatewayActionBlockingClient {
                 expected_revision,
                 placement: placement.clone(),
                 annotation,
+                custody,
+                requirement,
                 now,
                 response,
             },
@@ -616,6 +1137,21 @@ impl GatewayActionBlockingClient {
         )
     }
 
+    pub fn ensure_session_lost(
+        &self,
+        proposed: &SessionLossClaim,
+        now: DateTime<Utc>,
+    ) -> Result<SessionLossReceipt, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::EnsureSessionLost {
+                proposed: proposed.clone(),
+                now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
     pub fn materialize_session_loss(
         &self,
         claim: &SessionLossClaim,
@@ -627,6 +1163,49 @@ impl GatewayActionBlockingClient {
                 claim: claim.clone(),
                 limit,
                 now,
+                response,
+            },
+            ResponsePolicy::Mutation,
+        )
+    }
+
+    pub fn scan_event_sessions(
+        &self,
+        cursor: GatewayEventScanCursor,
+        limit: usize,
+    ) -> Result<GatewayEventScanPage, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::ScanEventSessions {
+                cursor,
+                limit,
+                response,
+            },
+            ResponsePolicy::Query,
+        )
+    }
+
+    pub fn peek_event_projection(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+    ) -> Result<Option<GatewayEventProjection>, GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::PeekEventProjection {
+                tenant_id: tenant_id.clone(),
+                session_id: session_id.clone(),
+                response,
+            },
+            ResponsePolicy::Query,
+        )
+    }
+
+    pub fn ack_event_projection(
+        &self,
+        projection: &GatewayEventProjection,
+    ) -> Result<(), GatewayActionCoordinationError> {
+        self.submit(
+            |response| Command::AckEventProjection {
+                projection: projection.clone(),
                 response,
             },
             ResponsePolicy::Mutation,

@@ -369,6 +369,450 @@ fn data_limits() -> DataPlaneLimits {
     }
 }
 
+fn safety_cache(
+    snapshot: browserd_core::SafetySwitchSnapshot,
+    ttl: Duration,
+) -> Arc<browserd_core::RuntimeSafetyCache> {
+    let cache = Arc::new(browserd_core::RuntimeSafetyCache::new());
+    cache
+        .install(*TenantId::new().as_uuid(), snapshot, ttl)
+        .expect("initial authority");
+    cache
+}
+
+fn update_safety(
+    cache: &browserd_core::RuntimeSafetyCache,
+    mutation: browserd_core::SafetySwitchMutation,
+) {
+    let namespace = cache.generation().expect("fresh namespace").namespace_id();
+    let snapshot = cache
+        .with_fresh_snapshot(|snapshot| snapshot.apply(&mutation))
+        .expect("fresh")
+        .expect("mutation");
+    cache
+        .install(namespace, snapshot, Duration::from_secs(5))
+        .expect("new authority revision");
+}
+
+#[test]
+fn runtime_denied_unselected_dns_candidate_rejects_the_entire_actual_route_plan() {
+    let snapshot = browserd_core::SafetySwitchSnapshot::default()
+        .apply(&browserd_core::SafetySwitchMutation::SetDeniedIp {
+            ip: "::ffff:1.1.1.1".parse().expect("mapped public IP"),
+            denied: true,
+        })
+        .expect("canonical IP deny");
+    let cache = safety_cache(snapshot, Duration::from_secs(5));
+    let (registry, claim) = setup();
+    let registry = registry.with_runtime_safety(cache);
+    let url = crate::CanonicalUrl::parse("https://example.com/").expect("URL");
+    let pre_dns = registry
+        .authorize_dns(&claim, &url, MonotonicMillis::new(1001))
+        .expect("host admitted");
+    assert!(matches!(
+        pre_dns.finish(
+            DnsResolution::new(
+                "example.com",
+                [
+                    "93.184.216.34".parse().expect("selected IP"),
+                    "1.1.1.1".parse().expect("later denied IP"),
+                ]
+            ),
+            MonotonicMillis::new(1002)
+        ),
+        Err(RouteError::Plan(crate::PlanError::EmergencyIpDenied))
+    ));
+    let usage = registry.usage(&claim).expect("usage");
+    assert_eq!(usage.active_connections, 0);
+    assert_eq!(usage.connection_starts_in_window, 0);
+}
+
+#[tokio::test]
+async fn runtime_domain_and_subdomain_denial_prevents_autonomous_dns() {
+    for host in ["example.com", "assets.example.com"] {
+        let snapshot = browserd_core::SafetySwitchSnapshot::default()
+            .apply(&browserd_core::SafetySwitchMutation::SetDeniedDomain {
+                domain: "EXAMPLE.COM.".into(),
+                denied: true,
+            })
+            .expect("domain deny");
+        let cache = safety_cache(snapshot, Duration::from_secs(5));
+        let (registry, claim) = setup();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let service = DataPlane::new(
+            registry.with_runtime_safety(cache),
+            FakeResolver {
+                calls: calls.clone(),
+                gate: None,
+            },
+            FakeConnector {
+                targets: targets.clone(),
+                upstream: Arc::new(Mutex::new(None)),
+            },
+            data_limits(),
+        )
+        .expect("service");
+        let (mut client, server) = tokio::io::duplex(2048);
+        client
+            .write_all(
+                format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n").as_bytes(),
+            )
+            .await
+            .expect("request");
+        assert!(matches!(
+            service
+                .serve_verified_connection(
+                    VerifiedRouteSource::new(claim),
+                    server,
+                    MonotonicMillis::new(1001)
+                )
+                .await,
+            Err(DataPlaneError::Route(RouteError::Plan(
+                crate::PlanError::EmergencyDomainDenied
+            )))
+        ));
+        assert!(calls.lock().expect("calls").is_empty());
+        assert!(targets.lock().expect("targets").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn runtime_revision_cancels_blocked_dns_and_connect_before_more_effects() {
+    for block_dns in [true, false] {
+        let cache = safety_cache(
+            browserd_core::SafetySwitchSnapshot::default(),
+            Duration::from_secs(5),
+        );
+        let (registry, claim) = setup();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let connect_started = Arc::new(Notify::new());
+        let service = DataPlane::new(
+            registry.with_runtime_safety(cache.clone()),
+            FakeResolver {
+                calls: calls.clone(),
+                gate: block_dns.then(|| Arc::new(Notify::new())),
+            },
+            GatedConnector {
+                started: connect_started.clone(),
+                gate: Arc::new(Notify::new()),
+            },
+            data_limits(),
+        )
+        .expect("service");
+        let (mut client, server) = tokio::io::duplex(2048);
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+            .await
+            .expect("request");
+        let serve = tokio::spawn(async move {
+            service
+                .serve_verified_connection(
+                    VerifiedRouteSource::new(claim),
+                    server,
+                    MonotonicMillis::new(1001),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            if block_dns {
+                while calls.lock().expect("calls").is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                connect_started.notified().await;
+            }
+        })
+        .await
+        .expect("entered gated effect");
+        update_safety(
+            &cache,
+            browserd_core::SafetySwitchMutation::SetDeniedIp {
+                ip: "93.184.216.34".parse().expect("ip"),
+                denied: true,
+            },
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), serve)
+                .await
+                .expect("cancels promptly")
+                .expect("join"),
+            Err(DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable))
+        ));
+        if block_dns {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), connect_started.notified())
+                    .await
+                    .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn runtime_freshness_deadline_closes_header_stall_without_observer_polls() {
+    let cache = safety_cache(
+        browserd_core::SafetySwitchSnapshot::default(),
+        Duration::from_millis(100),
+    );
+    let (registry, claim) = setup();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let service = DataPlane::new(
+        registry.with_runtime_safety(cache),
+        FakeResolver {
+            calls: calls.clone(),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(None)),
+        },
+        data_limits(),
+    )
+    .expect("service");
+    let (_client, server) = tokio::io::duplex(2048);
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.serve_verified_connection(
+                VerifiedRouteSource::new(claim),
+                server,
+                MonotonicMillis::new(1001)
+            )
+        )
+        .await
+        .expect("freshness timer"),
+        Err(DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable))
+    ));
+    assert!(calls.lock().expect("calls").is_empty());
+}
+
+#[tokio::test]
+async fn runtime_same_version_refresh_preserves_long_connect_then_new_deny_closes_it() {
+    let cache = safety_cache(
+        browserd_core::SafetySwitchSnapshot::default(),
+        Duration::from_millis(500),
+    );
+    let (registry, claim) = setup();
+    let (proxy, mut origin) = tokio::io::duplex(4096);
+    let service = DataPlane::new(
+        registry.with_runtime_safety(cache.clone()),
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(Some(proxy))),
+        },
+        data_limits(),
+    )
+    .expect("service");
+    let (mut client, server) = tokio::io::duplex(4096);
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .expect("request");
+    let serve = tokio::spawn(async move {
+        service
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
+                server,
+                MonotonicMillis::new(1001),
+            )
+            .await
+    });
+    let mut response = [0; 39];
+    client.read_exact(&mut response).await.expect("established");
+    let generation = cache.generation().expect("initial generation");
+    let snapshot = cache
+        .with_fresh_snapshot(Clone::clone)
+        .expect("exact snapshot");
+    cache
+        .install(generation.namespace_id(), snapshot, Duration::from_secs(2))
+        .expect("exact polling refresh");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !serve.is_finished(),
+        "old captured expiry must rearm from exact refresh"
+    );
+    client.write_all(b"alive").await.expect("healthy flow");
+    let mut bytes = [0; 5];
+    tokio::time::timeout(Duration::from_secs(1), origin.read_exact(&mut bytes))
+        .await
+        .expect("still routed")
+        .expect("origin read");
+    assert_eq!(&bytes, b"alive");
+    update_safety(
+        &cache,
+        browserd_core::SafetySwitchMutation::SetDeniedDomain {
+            domain: "example.com".into(),
+            denied: true,
+        },
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("existing tunnel closes")
+            .expect("join"),
+        Err(DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable))
+    ));
+    assert_eq!(origin.read(&mut bytes).await.expect("origin closed"), 0);
+}
+
+#[tokio::test]
+async fn delayed_accepted_handler_uses_current_shared_registry_time() {
+    use crate::{
+        AcceptedIngressHandler, AcceptedRouteIngress, AttachmentManager, BindingDigest,
+        DaemonEpoch, IngressHandlerError,
+    };
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct QueueConnector(Arc<Mutex<VecDeque<DuplexStream>>>);
+    #[async_trait]
+    impl Connector for QueueConnector {
+        async fn connect(
+            &self,
+            _target: InspectedSocketAddr,
+        ) -> Result<BoxedEgressIo, DataPlaneError> {
+            self.0
+                .lock()
+                .expect("queue lock")
+                .pop_front()
+                .map(|stream| Box::new(stream) as BoxedEgressIo)
+                .ok_or_else(|| DataPlaneError::Connect("missing test origin".into()))
+        }
+    }
+    struct DelayedHandler {
+        service: DataPlane<FakeResolver, QueueConnector>,
+        accepted: AtomicUsize,
+        first_accepted: Notify,
+        release_first: Notify,
+        completed: Notify,
+        results: Mutex<Vec<Result<(), DataPlaneError>>>,
+    }
+    #[async_trait]
+    impl AcceptedIngressHandler for DelayedHandler {
+        async fn handle(&self, ingress: AcceptedRouteIngress) -> Result<(), IngressHandlerError> {
+            if self.accepted.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_accepted.notify_one();
+                self.release_first.notified().await;
+            }
+            let result = self.service.serve_accepted_connection(ingress).await;
+            self.results.lock().expect("results lock").push(result);
+            self.completed.notify_one();
+            Ok(())
+        }
+    }
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let (first_upstream, mut first_origin) = tokio::io::duplex(4_096);
+    let (second_upstream, mut second_origin) = tokio::io::duplex(4_096);
+    let handler = Arc::new(DelayedHandler {
+        service: DataPlane::new(
+            registry.clone(),
+            FakeResolver {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                gate: None,
+            },
+            QueueConnector(Arc::new(Mutex::new(VecDeque::from([
+                first_upstream,
+                second_upstream,
+            ])))),
+            data_limits(),
+        )
+        .expect("limits"),
+        accepted: AtomicUsize::new(0),
+        first_accepted: Notify::new(),
+        release_first: Notify::new(),
+        completed: Notify::new(),
+        results: Mutex::new(Vec::new()),
+    });
+    let manager = AttachmentManager::with_registry(
+        DaemonEpoch::new(7).expect("epoch"),
+        registry,
+        handler.clone(),
+    );
+    let (_, fixture_claim) = setup();
+    let route_fence = fixture_claim.fence().clone();
+    let prepared = manager
+        .prepare(route_fence.clone(), BindingDigest::new([7; 32]))
+        .expect("prepare");
+    let raw = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
+    let address = raw.local_addr().expect("address");
+    let active = manager
+        .install(
+            &prepared,
+            RouteBinding::new(
+                TenantId::new(),
+                route_fence.session_id().clone(),
+                route_fence.shard().shard_id().clone(),
+                route_fence.shard().owner().worker_epoch().get(),
+                EgressPolicy::public_web_default(),
+                limits(),
+                MonotonicMillis::new(manager.now().value() + 10_000),
+            ),
+            raw.into(),
+        )
+        .await
+        .expect("install");
+    let origin_task = tokio::spawn(async move {
+        for origin in [&mut first_origin, &mut second_origin] {
+            let mut request = Vec::new();
+            origin
+                .read_to_end(&mut request)
+                .await
+                .expect("forwarded request EOF");
+            assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+            origin
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                .await
+                .expect("response");
+            origin.shutdown().await.expect("origin EOF");
+        }
+    });
+    let mut first = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("first");
+    first
+        .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .expect("first request");
+    handler.first_accepted.notified().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut second = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("second");
+    second
+        .write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .expect("second request");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), second.read_to_end(&mut response))
+        .await
+        .expect("second completes")
+        .expect("second response");
+    handler.completed.notified().await;
+    assert!(handler.results.lock().expect("results")[0].is_ok());
+    handler.release_first.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), handler.completed.notified())
+        .await
+        .expect("delayed first completes");
+    assert!(
+        handler.results.lock().expect("results")[1].is_ok(),
+        "older acceptance must not move shared quota time backwards"
+    );
+    response.clear();
+    first
+        .read_to_end(&mut response)
+        .await
+        .expect("first response");
+    assert!(response.ends_with(b"OK"));
+    origin_task.await.expect("origin task joins");
+    manager.revoke(&active).await.expect("exact cleanup");
+}
+
 #[tokio::test]
 async fn accepted_listener_capability_is_the_public_data_plane_entrypoint() {
     let (registry, claim) = setup();
@@ -904,6 +1348,132 @@ async fn shard_revoke_cancels_a_blocked_relay_write_before_more_bytes_flush() {
 }
 
 #[tokio::test]
+async fn tunnel_duplex_backpressure_keeps_both_directions_progressing() {
+    let (registry, claim) = setup();
+    let (proxy_upstream, mut origin) = tokio::io::duplex(64);
+    let service = DataPlane::new(
+        registry,
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(Some(proxy_upstream))),
+        },
+        data_limits(),
+    )
+    .expect("limits");
+    let (mut client, server) = tokio::io::duplex(64);
+    let serve = tokio::spawn(async move {
+        service
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
+                server,
+                MonotonicMillis::new(1_001),
+            )
+            .await
+    });
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .expect("request");
+    let mut established = [0_u8; 39];
+    client
+        .read_exact(&mut established)
+        .await
+        .expect("CONNECT reply");
+    let peers = async {
+        let client_side = async {
+            client
+                .write_all(&[b'c'; 512])
+                .await
+                .expect("client sends before reading");
+            client.shutdown().await.expect("client write EOF");
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .await
+                .expect("client reads origin EOF");
+            assert_eq!(response, vec![b'o'; 512]);
+        };
+        let origin_side = async {
+            origin
+                .write_all(&[b'o'; 512])
+                .await
+                .expect("origin sends before reading");
+            origin.shutdown().await.expect("origin write EOF");
+            let mut request = Vec::new();
+            origin
+                .read_to_end(&mut request)
+                .await
+                .expect("origin reads client EOF");
+            assert_eq!(request, vec![b'c'; 512]);
+        };
+        tokio::join!(client_side, origin_side);
+    };
+    tokio::time::timeout(Duration::from_millis(250), peers)
+        .await
+        .expect("both bounded buffers must make progress");
+    assert!(serve.await.expect("serve joins").is_ok());
+}
+
+#[tokio::test]
+async fn tunnel_client_write_eof_preserves_the_origin_response() {
+    let (registry, claim) = setup();
+    let (proxy_upstream, mut origin) = tokio::io::duplex(4_096);
+    let service = DataPlane::new(
+        registry,
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(Some(proxy_upstream))),
+        },
+        data_limits(),
+    )
+    .expect("limits");
+    let (mut client, server) = tokio::io::duplex(4_096);
+    let serve = tokio::spawn(async move {
+        service
+            .serve_verified_connection(
+                VerifiedRouteSource::new(claim),
+                server,
+                MonotonicMillis::new(1_001),
+            )
+            .await
+    });
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .expect("request");
+    let mut established = [0_u8; 39];
+    client
+        .read_exact(&mut established)
+        .await
+        .expect("CONNECT reply");
+    client.write_all(b"request").await.expect("request payload");
+    client.shutdown().await.expect("client write EOF");
+    let mut received = Vec::new();
+    origin
+        .read_to_end(&mut received)
+        .await
+        .expect("origin sees client EOF");
+    assert_eq!(received, b"request");
+    origin
+        .write_all(b"response after request EOF")
+        .await
+        .expect("origin response remains writable");
+    origin.shutdown().await.expect("origin EOF");
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).await.expect("response");
+    assert_eq!(response, b"response after request EOF");
+    assert!(serve.await.expect("serve joins").is_ok());
+}
+
+#[tokio::test]
 async fn tunnel_half_close_is_bounded_by_the_write_timeout() {
     let (registry, claim) = setup();
     let shutdown_started = Arc::new(Notify::new());
@@ -1307,6 +1877,10 @@ async fn websocket_upgrade_uses_the_same_bidirectional_bounded_tunnel() {
         .write_all(b"C")
         .await
         .expect("client frame should write");
+    client
+        .shutdown()
+        .await
+        .expect("client tunnel direction completes");
     origin_task.await.expect("origin task should join");
     assert!(serve.await.expect("serve task should join").is_ok());
 }
@@ -1513,6 +2087,10 @@ async fn tunnel_idle_timeout_resets_on_traffic_in_either_direction() {
         .await
         .expect("one-way traffic should keep the tunnel alive");
     assert_eq!(&streamed, b"ABCD");
+    client
+        .shutdown()
+        .await
+        .expect("client tunnel direction completes");
     origin_task.await.expect("origin task should join");
     assert!(serve.await.expect("serve task should join").is_ok());
 }

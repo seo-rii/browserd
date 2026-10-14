@@ -10,7 +10,7 @@ use crate::{
     InputStateSnapshot, ViewerConnection,
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ActiveInputState {
     mouse_buttons: BTreeSet<u8>,
     keys: BTreeSet<String>,
@@ -18,12 +18,13 @@ struct ActiveInputState {
     composition_preedit: Option<String>,
 }
 
+#[derive(Clone)]
 struct ActiveControl {
     lease: ControlLease,
     input: ActiveInputState,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ManagerState {
     epoch: u64,
     connections: HashMap<ConnectionId, ViewerConnection>,
@@ -106,7 +107,22 @@ impl ControlManager {
         page_id: PageId,
         now_millis: u64,
     ) -> Result<AcquireOutcome, ControlError> {
-        let mut state = self.lock_state()?;
+        self.acquire_with_commit(connection_id, page_id, now_millis, |_| Ok(()))
+    }
+
+    /// Publish a new lease only after the caller durably commits its transition.
+    pub fn acquire_with_commit<F>(
+        &self,
+        connection_id: &ConnectionId,
+        page_id: PageId,
+        now_millis: u64,
+        commit: F,
+    ) -> Result<AcquireOutcome, ControlError>
+    where
+        F: FnOnce(&AcquireOutcome) -> Result<(), ControlError>,
+    {
+        let mut current = self.lock_state()?;
+        let mut state = current.clone();
         let connection = state
             .connections
             .get(connection_id)
@@ -131,7 +147,11 @@ impl ControlManager {
             }
         }
 
-        self.grant_control(&mut state, connection_id.clone(), page_id, now_millis, None)
+        let outcome =
+            self.grant_control(&mut state, connection_id.clone(), page_id, now_millis, None)?;
+        commit(&outcome)?;
+        *current = state;
+        Ok(outcome)
     }
 
     pub fn force_acquire(
@@ -280,6 +300,21 @@ impl ControlManager {
             .ok_or(ControlError::EpochExhausted)?;
         state.transform_epochs.insert(page_id, next);
         Ok(next)
+    }
+
+    /// Bind input to the latest epoch assigned by the trusted Chromium owner.
+    pub fn observe_transform(&self, page_id: PageId, epoch: u64) -> Result<(), ControlError> {
+        let mut state = self.lock_state()?;
+        if epoch == 0
+            || state
+                .transform_epochs
+                .get(&page_id)
+                .is_some_and(|old| epoch < *old)
+        {
+            return Err(ControlError::StateUnavailable);
+        }
+        state.transform_epochs.insert(page_id, epoch);
+        Ok(())
     }
 
     pub fn process_input(

@@ -998,3 +998,161 @@ fn confirmed_failure_details_survive_restart_and_are_http_serializable()
     assert_eq!(json["failure"]["details"]["policy"], "blocked");
     Ok(())
 }
+
+type CreateDispatchObservation = (OperationId, u64, DateTime<Utc>, DateTime<Utc>);
+
+struct DeferredManagedRuntime {
+    unknown_first: bool,
+    coordination: CoordinationBlockingClient,
+    calls: AtomicUsize,
+    projected: AtomicUsize,
+    session: SessionId,
+    dispatches: Mutex<Vec<CreateDispatchObservation>>,
+}
+impl RuntimeApiBackend for DeferredManagedRuntime {
+    fn manages_create_admission(&self) -> bool {
+        true
+    }
+    fn create_session(
+        &self,
+        _: &CreateAuthority,
+        dispatch: &SessionCreateDispatch,
+        body: &SessionCreateRequest,
+    ) -> RuntimeCreateResult {
+        assert!(dispatch.dispatch_token().is_some());
+        self.dispatches.lock().expect("dispatch lock").push((
+            dispatch.operation_id().clone(),
+            dispatch.dispatch_generation(),
+            dispatch.accepted_at(),
+            dispatch.admission_deadline(),
+        ));
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return if self.unknown_first {
+                RuntimeCreateResult::OutcomeUnknown(ApiError::new(
+                    ErrorCode::WorkerUnavailable,
+                    "reserved worker response unavailable",
+                ))
+            } else {
+                RuntimeCreateResult::Deferred
+            };
+        }
+        RuntimeCreateResult::Succeeded(SessionResource {
+            id: self.session.clone(),
+            lifecycle: SessionLifecycle::Ready,
+            incarnation: 1,
+            requested_isolation: body.isolation.into(),
+            effective_isolation: body.isolation.into(),
+            metadata: body.metadata.clone(),
+        })
+    }
+    fn create_projection_committed(
+        &self,
+        authority: &CreateAuthority,
+        dispatch: &SessionCreateDispatch,
+        session: &SessionResource,
+    ) -> Result<(), ApiError> {
+        let persisted = self
+            .coordination
+            .get(authority.tenant_id(), dispatch.operation_id())
+            .expect("PG projection read")
+            .expect("operation");
+        assert_eq!(persisted.state(), CreateOperationState::Succeeded);
+        assert_eq!(
+            persisted.result().expect("result").session_id(),
+            &session.id
+        );
+        self.projected.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn execute_runtime(
+        &self,
+        _: &AuthenticatedPrincipal,
+        _: ApiRequest,
+    ) -> Result<ApiResponse, ApiError> {
+        Err(ApiError::new(ErrorCode::WorkerUnavailable, "unused"))
+    }
+}
+
+#[test]
+fn managed_defer_releases_only_dispatch_lease_and_projects_ready_before_ack()
+-> Result<(), Box<dyn Error>> {
+    let coordination = actor(MemoryCoordinationDatabase::default());
+    let runtime = Arc::new(DeferredManagedRuntime {
+        unknown_first: false,
+        coordination: coordination.clone(),
+        calls: AtomicUsize::new(0),
+        projected: AtomicUsize::new(0),
+        session: SessionId::new(),
+        dispatches: Mutex::new(Vec::new()),
+    });
+    let router = DurableApiRouter::new(Arc::clone(&runtime), coordination.clone());
+    let principal = principal(TenantId::new(), &["session:create", "session:read"])?;
+    let request = decode_session_create(CREATE_JSON)?;
+    let key = Uuid::new_v4().to_string();
+    let first =
+        create_response(router.execute(&principal, create_request(request.clone(), key.clone()))?);
+    assert_eq!(first.state(), CreateOperationState::Queued);
+    let queued = coordination
+        .get(principal.tenant_id(), first.id())?
+        .expect("queued operation");
+    assert!(queued.dispatch_lease().is_none());
+    let second =
+        create_response(router.execute(&principal, create_request(request.clone(), key.clone()))?);
+    assert_eq!(second.state(), CreateOperationState::Succeeded);
+    assert_eq!(first.id(), second.id());
+    let third = create_response(router.execute(&principal, create_request(request, key))?);
+    assert_eq!(third.id(), second.id());
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.projected.load(Ordering::SeqCst), 1);
+    let dispatches = runtime.dispatches.lock().expect("dispatch records");
+    assert_eq!(dispatches[0].0, dispatches[1].0);
+    assert!(dispatches[1].1 > dispatches[0].1);
+    assert_eq!(dispatches[0].2, dispatches[1].2);
+    assert_eq!(dispatches[0].3, dispatches[1].3);
+    Ok(())
+}
+
+#[test]
+fn managed_uncertain_reply_returns_accepted_operation_without_releasing_dispatch_lease()
+-> Result<(), Box<dyn Error>> {
+    let coordination = actor(MemoryCoordinationDatabase::default());
+    let runtime = Arc::new(DeferredManagedRuntime {
+        unknown_first: true,
+        coordination: coordination.clone(),
+        calls: AtomicUsize::new(0),
+        projected: AtomicUsize::new(0),
+        session: SessionId::new(),
+        dispatches: Mutex::new(Vec::new()),
+    });
+    let router = DurableApiRouter::with_dispatch_lease_duration(
+        Arc::clone(&runtime),
+        coordination.clone(),
+        Duration::from_millis(100),
+    )?;
+    let principal = principal(TenantId::new(), &["session:create", "session:read"])?;
+    let body = decode_session_create(CREATE_JSON)?;
+    let key = Uuid::new_v4().to_string();
+    let first =
+        create_response(router.execute(&principal, create_request(body.clone(), key.clone()))?);
+    assert_eq!(first.state(), CreateOperationState::Creating);
+    let owned = coordination
+        .get(principal.tenant_id(), first.id())?
+        .expect("accepted intent");
+    assert!(owned.dispatch_lease().is_some());
+    let retry =
+        create_response(router.execute(&principal, create_request(body.clone(), key.clone()))?);
+    assert_eq!(retry.id(), first.id());
+    assert_eq!(retry.state(), CreateOperationState::Creating);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
+    thread::sleep(Duration::from_millis(150));
+    let recovered = create_response(router.execute(&principal, create_request(body, key))?);
+    assert_eq!(recovered.id(), first.id());
+    assert_eq!(recovered.state(), CreateOperationState::Succeeded);
+    assert_eq!(runtime.calls.load(Ordering::SeqCst), 2);
+    let records = runtime.dispatches.lock().expect("exact intent records");
+    assert_eq!(records[0].0, records[1].0);
+    assert_eq!(records[0].2, records[1].2);
+    assert_eq!(records[0].3, records[1].3);
+    assert!(records[1].1 > records[0].1);
+    Ok(())
+}

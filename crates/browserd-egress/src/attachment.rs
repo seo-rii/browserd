@@ -78,9 +78,14 @@ pub struct PreparedAttachmentReceipt {
     binding_digest: BindingDigest,
     daemon_epoch: DaemonEpoch,
     prepare_revision: u64,
+    shared_context: bool,
 }
 
 impl PreparedAttachmentReceipt {
+    pub(crate) const fn is_shared_context(&self) -> bool {
+        self.shared_context
+    }
+
     #[must_use]
     pub const fn fence(&self) -> &EgressFence {
         &self.fence
@@ -485,9 +490,31 @@ impl AttachmentRegistry {
         fence: EgressFence,
         binding_digest: BindingDigest,
     ) -> Result<PreparedAttachmentReceipt, AttachmentError> {
+        self.prepare_route(daemon_epoch, fence, binding_digest, false)
+    }
+
+    /// Opt-in shared-context admission. Dedicated preparation keeps its single-route contract.
+    pub fn prepare_context_route(
+        &mut self,
+        daemon_epoch: DaemonEpoch,
+        fence: EgressFence,
+        binding_digest: BindingDigest,
+    ) -> Result<PreparedAttachmentReceipt, AttachmentError> {
+        self.prepare_route(daemon_epoch, fence, binding_digest, true)
+    }
+
+    fn prepare_route(
+        &mut self,
+        daemon_epoch: DaemonEpoch,
+        fence: EgressFence,
+        binding_digest: BindingDigest,
+        shared_context: bool,
+    ) -> Result<PreparedAttachmentReceipt, AttachmentError> {
         self.ensure_daemon_epoch(daemon_epoch)?;
         if let Some(record) = self.records.get(&fence) {
-            if record.prepared.binding_digest() != binding_digest {
+            if record.prepared.binding_digest() != binding_digest
+                || record.prepared.shared_context != shared_context
+            {
                 return Err(AttachmentError::BindingConflict);
             }
             return match record.state {
@@ -497,10 +524,25 @@ impl AttachmentRegistry {
                 state => Err(AttachmentError::Terminal(state)),
             };
         }
-        if self
+        let siblings = self
             .records
             .values()
-            .any(|record| record.prepared.fence().shard() == fence.shard())
+            .filter(|record| record.prepared.fence().shard() == fence.shard())
+            .collect::<Vec<_>>();
+        if !siblings.is_empty()
+            && (!shared_context
+                || siblings.iter().any(|record| {
+                    !record.prepared.shared_context
+                        || record.prepared.binding_digest() != binding_digest
+                        || record.prepared.fence().session_id() == fence.session_id()
+                        || record.prepared.fence().route_generation() == fence.route_generation()
+                })
+                || siblings.len() >= 500
+                || siblings
+                    .iter()
+                    .filter(|record| record.state != AttachmentState::Released)
+                    .count()
+                    >= 8)
         {
             return Err(AttachmentError::ShardAttachmentConflict);
         }
@@ -511,6 +553,7 @@ impl AttachmentRegistry {
             binding_digest,
             daemon_epoch,
             prepare_revision,
+            shared_context,
         };
         self.records.insert(
             fence,

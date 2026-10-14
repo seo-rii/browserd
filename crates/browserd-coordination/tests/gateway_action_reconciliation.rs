@@ -65,6 +65,74 @@ fn resolution() -> ResolutionAnnotation {
     )
 }
 
+#[tokio::test]
+async fn resolution_preserves_the_initial_terminal_projection_until_acknowledged() {
+    let fixture = unknown_mutation().await;
+    let initial = fixture
+        .store
+        .peek_event_projection(&fixture.tenant_id, &fixture.session_id)
+        .await
+        .expect("peek initial")
+        .expect("initial intent");
+    assert_eq!(initial.sequence(), 1);
+    assert_eq!(
+        initial.append(),
+        &fixture.snapshot.terminal_outbox_append().expect("terminal")
+    );
+    let resolved = fixture
+        .store
+        .resolve_unknown(
+            &fixture.tenant_id,
+            &fixture.session_id,
+            &fixture.action_id,
+            fixture.snapshot.revision(),
+            &fixture.placement,
+            resolution(),
+            at(5),
+        )
+        .await
+        .expect("resolve");
+    assert_eq!(
+        fixture
+            .store
+            .peek_event_projection(&fixture.tenant_id, &fixture.session_id)
+            .await
+            .expect("peek still oldest"),
+        Some(initial.clone())
+    );
+    fixture
+        .store
+        .ack_event_projection(&initial)
+        .await
+        .expect("ack initial");
+    let resolution_event = fixture
+        .store
+        .peek_event_projection(&fixture.tenant_id, &fixture.session_id)
+        .await
+        .expect("peek resolution")
+        .expect("resolution intent");
+    assert_eq!(resolution_event.sequence(), 2);
+    assert_eq!(
+        resolution_event.append(),
+        &resolved
+            .terminal_outbox_append()
+            .expect("terminal resolution")
+    );
+    fixture
+        .store
+        .ack_event_projection(&initial)
+        .await
+        .expect("stale ack safe");
+    assert_eq!(
+        fixture
+            .store
+            .peek_event_projection(&fixture.tenant_id, &fixture.session_id)
+            .await
+            .expect("peek"),
+        Some(resolution_event)
+    );
+}
+
 struct UnknownMutation {
     store: MemoryGatewayActionStore,
     tenant_id: TenantId,

@@ -1833,3 +1833,54 @@ fn stale_pre_restart_claim_cannot_control_a_rebound_generation() {
         Ok(rebound_identity)
     );
 }
+
+#[test]
+fn per_route_release_waits_for_accepted_guard_without_revoking_siblings() {
+    let registry = RouteRegistry::new(Duration::from_secs(30));
+    let shard = ShardId::new();
+    let first = RouteClaim::new(
+        RouteEndpoint::new(91).expect("endpoint"),
+        exact_fence(shard.clone(), SessionId::new(), 1, 1, 1),
+    );
+    let second = RouteClaim::new(
+        RouteEndpoint::new(92).expect("endpoint"),
+        exact_fence(shard, SessionId::new(), 1, 2, 1),
+    );
+    registry
+        .prepare_shard(first.fence().shard())
+        .expect("shard");
+    for claim in [&first, &second] {
+        registry
+            .bind(
+                claim,
+                RouteBinding::new(
+                    TenantId::new(),
+                    claim.fence().session_id().clone(),
+                    claim.fence().shard().shard_id().clone(),
+                    7,
+                    EgressPolicy::public_web_default(),
+                    limits(),
+                    MonotonicMillis::new(10_000),
+                ),
+                MonotonicMillis::new(0),
+            )
+            .expect("bind");
+    }
+    let guard = registry
+        .begin_ingress(&first, MonotonicMillis::new(1))
+        .expect("accepted guard");
+    registry.revoke(&first).expect("revoke first");
+    assert_eq!(
+        registry.release_route(&first),
+        Err(RouteError::ShardNotDrained)
+    );
+    assert!(registry.binding(&second, MonotonicMillis::new(2)).is_ok());
+    drop(guard);
+    registry.release_route(&first).expect("first drained");
+    registry.release_route(&first).expect("idempotent release");
+    assert!(
+        registry
+            .begin_ingress(&second, MonotonicMillis::new(3))
+            .is_ok()
+    );
+}

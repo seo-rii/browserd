@@ -1,20 +1,22 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{CreateOperationState, OperationId, PrincipalId, TenantId};
 use chrono::{DateTime, Utc};
+use sqlx::Row;
 use sqlx::SqlSafeStr;
 use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
-use sqlx::{Executor, Row};
 use uuid::Uuid;
 
 use crate::{
     CanonicalRequestHash, ClaimCreateOperation, ClaimOutcome, CoordinationError,
     CreateOperationError, CreateOperationResult, CreateOperationSnapshot,
     CreateSessionCoordination, DispatchLease, DispatchLeaseToken, DownstreamDedupeKey,
-    MINIMUM_DISPATCH_LEASE_TTL, OperationMutation, RecoverableCreateIntent, StoreConfig,
+    EventStateSummary, MINIMUM_DISPATCH_LEASE_TTL, OperationMutation, OutboxAggregate,
+    OutboxAppend, OutboxEventKind, PostgresEventOutbox, RecoverableCreateIntent, StoreConfig,
     is_terminal, parse_state, state_name, validate_mutation,
 };
 
@@ -22,12 +24,17 @@ use crate::{
 pub struct PostgresCreateSessionStore {
     pool: PgPool,
     config: StoreConfig,
+    janitor: Arc<tokio::sync::Semaphore>,
 }
 
 impl PostgresCreateSessionStore {
     #[must_use]
-    pub const fn new(pool: PgPool, config: StoreConfig) -> Self {
-        Self { pool, config }
+    pub fn new(pool: PgPool, config: StoreConfig) -> Self {
+        Self {
+            pool,
+            config,
+            janitor: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
     }
 
     pub async fn connect(
@@ -68,6 +75,31 @@ impl PostgresCreateSessionStore {
             Migrator::with_migrations(vec![migration, dispatch_lease_migration, intent_migration]);
         migrator.dangerous_set_table_name("_browserd_coordination_migrations");
         migrator.run(&self.pool).await?;
+        PostgresEventOutbox::new(self.pool.clone(), self.config)
+            .migrate()
+            .await?;
+        Ok(())
+    }
+
+    async fn append_operation_event(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        snapshot: &CreateOperationSnapshot,
+    ) -> Result<(), CoordinationError> {
+        let append = OutboxAppend::state_changed(
+            snapshot.tenant_id().clone(),
+            OutboxAggregate::Operation {
+                operation_id: snapshot.operation_id().clone(),
+            },
+            snapshot.revision(),
+            OutboxEventKind::OperationStateChanged,
+            EventStateSummary::Operation {
+                state: snapshot.state().into(),
+            },
+        )?;
+        PostgresEventOutbox::new(self.pool.clone(), self.config)
+            .append_transactional(transaction, append, snapshot.updated_at())
+            .await?;
         Ok(())
     }
 
@@ -129,6 +161,10 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
             return Err(CoordinationError::IdempotencyConflict {
                 existing_operation_id: snapshot.operation_id,
             });
+        }
+        if inserted {
+            self.append_operation_event(&mut transaction, &snapshot)
+                .await?;
         }
         transaction.commit().await?;
         Ok(if inserted {
@@ -235,6 +271,10 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
         .fetch_one(&mut *transaction)
         .await?;
         let snapshot = snapshot_from_row(&updated)?;
+        if snapshot.state() != current.state() {
+            self.append_operation_event(&mut transaction, &snapshot)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(snapshot)
     }
@@ -305,6 +345,10 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
         ).bind(*token.as_uuid()).bind(ttl_ms).bind(*tenant_id.as_uuid()).bind(*operation_id.as_uuid())
          .bind(expected_revision).fetch_one(&mut *transaction).await?;
         let snapshot = snapshot_from_row(&updated)?;
+        if snapshot.state() != current.state() {
+            self.append_operation_event(&mut transaction, &snapshot)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(snapshot)
     }
@@ -368,14 +412,36 @@ impl CreateSessionCoordination for PostgresCreateSessionStore {
     }
 
     async fn purge_expired(&self, _now: DateTime<Utc>) -> Result<u64, CoordinationError> {
-        let result = self
-            .pool
-            .execute(sqlx::query(
-                "DELETE FROM browserd_create_session_operations \
-                     WHERE state IN ('succeeded', 'timed_out', 'cancelled', 'failed') \
-                       AND retain_until <= clock_timestamp()",
-            ))
-            .await?;
+        // The actor owns an in-flight query even after its caller times out. Store clones share
+        // this permit so a later maintenance tick cannot overlap that still-owned query.
+        let Ok(_permit) = self.janitor.try_acquire() else {
+            return Ok(0);
+        };
+        // Terminal state and its outbox event commit atomically above; pruning the source after
+        // its idempotency horizon must not depend on the retained lifetime of the outbox payload.
+        // The existing partial retain_until index bounds candidates before any row locks. A
+        // locked candidate is skipped, not replaced by an unbounded scan for additional rows.
+        let result = sqlx::query(
+            "WITH candidates AS MATERIALIZED ( \
+                SELECT tenant_id, idempotency_key FROM browserd_create_session_operations \
+                WHERE state IN ('succeeded', 'timed_out', 'cancelled', 'failed') \
+                  AND retain_until <= statement_timestamp() \
+                ORDER BY retain_until LIMIT 32 \
+             ), locked AS MATERIALIZED ( \
+                SELECT operation.tenant_id, operation.idempotency_key \
+                FROM browserd_create_session_operations operation \
+                INNER JOIN candidates candidate USING (tenant_id, idempotency_key) \
+                WHERE operation.state IN ('succeeded', 'timed_out', 'cancelled', 'failed') \
+                  AND operation.retain_until <= statement_timestamp() \
+                FOR UPDATE OF operation SKIP LOCKED \
+             ) DELETE FROM browserd_create_session_operations operation USING locked \
+               WHERE operation.tenant_id=locked.tenant_id \
+                 AND operation.idempotency_key=locked.idempotency_key \
+                 AND operation.state IN ('succeeded', 'timed_out', 'cancelled', 'failed') \
+                 AND operation.retain_until <= statement_timestamp()",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 }

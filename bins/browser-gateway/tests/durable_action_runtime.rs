@@ -1,5 +1,10 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
+#[path = "support/action_acceptance.rs"]
+mod action_acceptance;
+#[path = "support/action_exposure_recovery.rs"]
+mod action_exposure_recovery;
+
 use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,6 +165,8 @@ impl GatewayWorkerPending for ControlledPending {
                 terminal_detail: Some(TerminalDetail::Succeeded(digest)),
                 result: Some(SUCCEEDED_RESULT_BODY.to_vec()),
                 resolution: None,
+                custody: None,
+                custody_requirement: None,
             }));
         }
         Ok(WorkerRpcResponse::Action(WorkerActionReceipt {
@@ -175,6 +182,8 @@ impl GatewayWorkerPending for ControlledPending {
             terminal_detail: None,
             result: None,
             resolution: None,
+            custody: None,
+            custody_requirement: None,
         }))
     }
 }
@@ -211,6 +220,7 @@ impl GatewayWorkerClient for ActionWorker {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
@@ -255,6 +265,8 @@ impl GatewayWorkerClient for ActionWorker {
                 now_unix_millis,
                 basis,
             )),
+            custody: None,
+            custody_requirement: None,
         }))
     }
 
@@ -1104,5 +1116,88 @@ fn succeeded_action_records_a_single_terminal_event_in_the_outbox() -> Result<()
         "resubmission must not double-record"
     );
     assert_eq!(after.events()[0].event_id(), event.event_id());
+    Ok(())
+}
+
+#[test]
+fn restarted_gateway_recovers_terminal_notifications_without_a_live_session()
+-> Result<(), Box<dyn Error>> {
+    // Model a crash after the source commit but before any outbox append.
+    let fixture = Fixture::new(EnqueueMode::Succeed)?;
+    let completed = submit_after_releasing_pending(&fixture, fixture.command(Uuid::new_v4()))?;
+    let outbox = EventOutboxBlockingClient::spawn(Arc::new(MemoryEventOutbox::default()), 2)?;
+    let restarted = GatewayWorkerRuntime::with_action_coordination(
+        Arc::clone(&fixture.worker),
+        GatewayWorkerPlacement::new(WorkerId::new("durable-action-worker")?, 41, 7, 29)?,
+        Arc::clone(&fixture.store),
+        CoordinationActorConfig::default(),
+    )?
+    .with_terminal_event_outbox(outbox.clone());
+
+    assert!(
+        outbox
+            .read_from(
+                fixture.principal.tenant_id(),
+                EventCursor::start(),
+                16,
+                Utc::now()
+            )?
+            .events()
+            .is_empty()
+    );
+    assert_eq!(restarted.reconcile_terminal_events(16)?, 1);
+    assert_eq!(restarted.reconcile_terminal_events(16)?, 0);
+    let page = outbox.read_from(
+        fixture.principal.tenant_id(),
+        EventCursor::start(),
+        16,
+        Utc::now(),
+    )?;
+    assert_eq!(page.events().len(), 1);
+    assert!(
+        matches!(page.events()[0].aggregate(), OutboxAggregate::Action { action_id, .. }
+        if action_id == completed.action_id())
+    );
+    assert_eq!(
+        fixture.worker.enqueue_count.load(Ordering::Acquire),
+        1,
+        "notification recovery must never replay browser effects"
+    );
+    Ok(())
+}
+
+#[test]
+fn event_recovery_is_bounded_and_keeps_the_unprocessed_session_tail() -> Result<(), Box<dyn Error>>
+{
+    let fixture = Fixture::new(EnqueueMode::Succeed)?;
+    for _ in 0..3 {
+        submit_after_releasing_pending(&fixture, fixture.command(Uuid::new_v4()))?;
+    }
+    let outbox = EventOutboxBlockingClient::spawn(Arc::new(MemoryEventOutbox::default()), 2)?;
+    let restarted = GatewayWorkerRuntime::with_action_coordination(
+        Arc::clone(&fixture.worker),
+        GatewayWorkerPlacement::new(WorkerId::new("durable-action-worker")?, 41, 7, 29)?,
+        Arc::clone(&fixture.store),
+        CoordinationActorConfig::default(),
+    )?
+    .with_terminal_event_outbox(outbox.clone());
+    assert!(restarted.reconcile_terminal_events(0).is_err());
+    for expected in 1..=3 {
+        assert_eq!(restarted.reconcile_terminal_events(1)?, 1);
+        assert_eq!(
+            outbox
+                .read_from(
+                    fixture.principal.tenant_id(),
+                    EventCursor::start(),
+                    16,
+                    Utc::now()
+                )?
+                .events()
+                .len(),
+            expected
+        );
+    }
+    assert_eq!(restarted.reconcile_terminal_events(1)?, 0);
+    assert_eq!(fixture.worker.enqueue_count.load(Ordering::Acquire), 3);
     Ok(())
 }

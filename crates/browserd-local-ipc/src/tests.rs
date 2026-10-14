@@ -646,3 +646,24 @@ fn malformed_control_failure_drops_descriptors_already_installed_by_the_kernel()
     drop(received);
     assert_writer_closed(&reader);
 }
+
+#[test]
+fn socket_namespace_cookie_is_kernel_bound_and_rejects_non_sockets() {
+    use std::os::fd::AsFd;
+    let first = std::net::TcpListener::bind("127.0.0.1:0").expect("first listener");
+    let second = std::net::TcpListener::bind("127.0.0.1:0").expect("second listener");
+    let first_cookie =
+        crate::socket_network_namespace_cookie(first.as_fd()).expect("kernel namespace cookie");
+    assert_ne!(first_cookie, 0);
+    assert_eq!(
+        crate::socket_network_namespace_cookie(second.as_fd()).expect("same namespace"),
+        first_cookie
+    );
+    let duplicate = first.try_clone().expect("duplicate");
+    assert_eq!(
+        crate::socket_network_namespace_cookie(duplicate.as_fd()).expect("same socket"),
+        first_cookie
+    );
+    let file = std::fs::File::open("/dev/null").expect("non socket");
+    assert!(crate::socket_network_namespace_cookie(file.as_fd()).is_err());
+}

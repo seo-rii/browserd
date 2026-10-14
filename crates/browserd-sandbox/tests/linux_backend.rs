@@ -8,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -78,6 +78,7 @@ struct FakeFilesystem {
     directories: Arc<Mutex<HashSet<PathBuf>>>,
     symlinks: Arc<Mutex<HashSet<PathBuf>>>,
     unwritable: Arc<Mutex<HashSet<PathBuf>>>,
+    directory_entries_override: Arc<Mutex<Option<Vec<PathBuf>>>>,
     failing_writes: Arc<Mutex<HashSet<String>>>,
     failing_directories: Arc<Mutex<HashSet<String>>>,
     failing_removes: Arc<Mutex<HashSet<String>>>,
@@ -178,6 +179,44 @@ impl SandboxFilesystem for FakeFilesystem {
             .expect("symlink lock should work")
             .iter()
             .any(|symlink| path.starts_with(symlink)))
+    }
+
+    fn read_directory(&self, path: &Path) -> Result<Vec<PathBuf>, SandboxError> {
+        if let Some(entries) = self
+            .directory_entries_override
+            .lock()
+            .expect("directory entries override")
+            .clone()
+        {
+            return Ok(entries);
+        }
+        let mut children = self
+            .directories
+            .lock()
+            .expect("directory entries")
+            .iter()
+            .filter(|child| child.parent() == Some(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        children.extend(
+            self.files
+                .lock()
+                .expect("file entries")
+                .keys()
+                .filter(|child| child.parent() == Some(path))
+                .cloned(),
+        );
+        children.extend(
+            self.symlinks
+                .lock()
+                .expect("symlink entries")
+                .iter()
+                .filter(|child| child.parent() == Some(path))
+                .cloned(),
+        );
+        children.sort();
+        children.dedup();
+        Ok(children)
     }
 
     fn create_directory(&self, path: &Path) -> Result<(), SandboxError> {
@@ -348,6 +387,10 @@ impl LinuxProcessBackend for FakeProcess {
         _backend_token: &str,
         _identity: ChildIdentity,
     ) -> Result<browserd_sandbox::ChromiumCdpPipes, SandboxError> {
+        self.events
+            .lock()
+            .expect("process event lock should work")
+            .push("cdp:claim".into());
         let (command_reader, command_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .map_err(|error| SandboxError::Backend(error.to_string()))?;
         let (event_reader, event_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
@@ -452,6 +495,85 @@ struct BlockingReleaseProcess {
     release_calls: Arc<AtomicUsize>,
     entered: Arc<Barrier>,
     proceed: Arc<Barrier>,
+}
+
+#[derive(Clone)]
+struct ClaimNamespaceProcess {
+    inner: FakeProcess,
+    namespace_matches: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl LinuxProcessBackend for ClaimNamespaceProcess {
+    async fn spawn_prepared(
+        &self,
+        token: &str,
+        request: &SpawnRequest,
+    ) -> Result<PreparedLinuxChild, SandboxError> {
+        self.inner.spawn_prepared(token, request).await
+    }
+    async fn claim_cdp_pipes(
+        &self,
+        token: &str,
+        identity: ChildIdentity,
+    ) -> Result<browserd_sandbox::ChromiumCdpPipes, SandboxError> {
+        self.inner.claim_cdp_pipes(token, identity).await
+    }
+    async fn network_namespace_matches(
+        &self,
+        token: &str,
+        identity: ChildIdentity,
+        namespace: &PinnedNetworkNamespace,
+    ) -> Result<bool, SandboxError> {
+        if !self.namespace_matches.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.inner
+            .network_namespace_matches(token, identity, namespace)
+            .await
+    }
+    async fn release_prepared(
+        &self,
+        token: &str,
+        identity: ChildIdentity,
+    ) -> Result<(), SandboxError> {
+        self.inner.release_prepared(token, identity).await
+    }
+    async fn abort_spawned(
+        &self,
+        token: &str,
+        identity: Option<ChildIdentity>,
+    ) -> Result<(), SandboxError> {
+        self.inner.abort_spawned(token, identity).await
+    }
+    async fn release_spawned(
+        &self,
+        token: &str,
+        identity: ChildIdentity,
+    ) -> Result<(), SandboxError> {
+        self.inner.release_spawned(token, identity).await
+    }
+    async fn identity_matches(
+        &self,
+        token: &str,
+        identity: ChildIdentity,
+    ) -> Result<bool, SandboxError> {
+        self.inner.identity_matches(token, identity).await
+    }
+    async fn signal(
+        &self,
+        token: &str,
+        identity: ChildIdentity,
+        signal: ProcessSignal,
+    ) -> Result<(), SandboxError> {
+        self.inner.signal(token, identity, signal).await
+    }
+    async fn is_alive(&self, token: &str, identity: ChildIdentity) -> Result<bool, SandboxError> {
+        self.inner.is_alive(token, identity).await
+    }
+    async fn wait(&self, duration: Duration) {
+        self.inner.wait(duration).await;
+    }
 }
 
 #[derive(Clone)]
@@ -1083,6 +1205,7 @@ struct FakeEgress {
     revoke_commit_pause: Option<AsyncPause>,
     release_commit_pause: Option<AsyncPause>,
     force_inactive: bool,
+    omit_proxy_address: bool,
 }
 
 #[derive(Default)]
@@ -1128,10 +1251,31 @@ enum EgressCall {
     Revoke(ShardIngressLease),
     Release(ShardIngressLease),
     IsActive(ShardIngressLease),
+    RetireShard(browserd_core::ShardFence),
 }
 
 #[async_trait]
 impl EgressRouteBackend for FakeEgress {
+    async fn retire_shard(&self, fence: &browserd_core::ShardFence) -> Result<(), SandboxError> {
+        let state = self.state.lock().expect("route state");
+        if state.routes.iter().any(|(reservation, state)| {
+            reservation
+                .egress_fence()
+                .is_some_and(|route| route.shard() == fence)
+                && !matches!(
+                    state,
+                    FakeRouteLifecycle::ReservationReleased | FakeRouteLifecycle::LeaseReleased(_)
+                )
+        }) {
+            return Err(SandboxError::InvalidEgressLease);
+        }
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(EgressCall::RetireShard(fence.clone()));
+        Ok(())
+    }
+
     async fn prepare(&self, reservation: &ShardEgressReservation) -> Result<(), SandboxError> {
         self.events
             .lock()
@@ -1187,7 +1331,15 @@ impl EgressRouteBackend for FakeEgress {
                 .ok_or_else(|| SandboxError::Backend("route reservation missing".into()))?;
             match route {
                 FakeRouteLifecycle::Prepared(attachment @ None) => {
-                    let receipt = ShardIngressReceipt::new();
+                    let receipt = if self.omit_proxy_address {
+                        ShardIngressReceipt::new()
+                    } else {
+                        ShardIngressReceipt::with_proxy_address(
+                            "127.0.0.1:43117"
+                                .parse()
+                                .expect("fixed test listener endpoint"),
+                        )?
+                    };
                     *attachment = Some(FakeIngressAttachment {
                         network_namespace: namespace_identity,
                         receipt: receipt.clone(),
@@ -1484,15 +1636,20 @@ impl EgressRouteBackend for FakeEgress {
 }
 
 fn config() -> LinuxSandboxConfig {
+    config_for_executable("/opt/browser/chrome")
+}
+
+fn config_for_executable(executable: &str) -> LinuxSandboxConfig {
+    config_for_runtime_paths(executable, "/opt/browser/browserd-launch-gate")
+}
+
+fn config_for_runtime_paths(executable: &str, gate: &str) -> LinuxSandboxConfig {
     LinuxSandboxConfig::new(
         "/sys/fs/cgroup/browserd",
         "/var/lib/browserd/shards",
         "/usr/bin/bwrap",
-        chromium_runtime("/opt/browser/chrome"),
-        LaunchGateRuntime::new(
-            "/usr/libexec/browserd-launch-gate",
-            "/opt/browser/browserd-launch-gate",
-        ),
+        chromium_runtime(executable),
+        LaunchGateRuntime::new("/usr/libexec/browserd-launch-gate", gate),
         [
             ReadOnlyMount::new("/opt/runtime", "/opt/runtime"),
             ReadOnlyMount::new("/usr/share/fonts", "/usr/share/fonts"),
@@ -1504,6 +1661,665 @@ fn config() -> LinuxSandboxConfig {
         Duration::from_millis(10),
     )
     .expect("configuration should be valid")
+}
+
+fn config_with_resource_mounts(
+    executable: &str,
+    mounts: impl IntoIterator<Item = ReadOnlyMount>,
+) -> Result<LinuxSandboxConfig, SandboxError> {
+    LinuxSandboxConfig::new(
+        "/sys/fs/cgroup/browserd",
+        "/var/lib/browserd/shards",
+        "/usr/bin/bwrap",
+        chromium_runtime(executable),
+        LaunchGateRuntime::new("/usr/libexec/browserd-launch-gate", "/browserd/launch-gate"),
+        mounts,
+        CgroupLimits::new(512 << 20, 384 << 20, 256, 100_000, 100_000).expect("resource limits"),
+        9,
+        Duration::from_millis(100),
+        Duration::from_millis(10),
+    )
+}
+
+#[test]
+fn chromium_parent_resources_precede_pinned_executable_gate_and_native_overlays() {
+    use browserd_sandbox::{ChromiumProcessProfile, NativeProcessResources};
+
+    let directory = tempfile::tempdir().expect("native resource fixture directory");
+    let icu = directory.path().join("icudtl.dat");
+    let pak = directory.path().join("ko.pak");
+    std::fs::write(&icu, b"approved ICU").expect("ICU fixture");
+    std::fs::write(&pak, b"approved locale").expect("locale fixture");
+    let catalog_digest = chromium_digest(b"approved catalog");
+    let resources = NativeProcessResources::new(
+        chromium_digest(TEST_CHROMIUM_BYTES),
+        catalog_digest,
+        &icu,
+        chromium_digest(b"approved ICU"),
+        vec![(
+            "ko-KR".to_owned(),
+            pak.clone(),
+            chromium_digest(b"approved locale"),
+        )],
+        vec!["Asia/Seoul".to_owned()],
+    )
+    .expect("pin native resources");
+    let config = config_with_resource_mounts(
+        "/browserd-chromium/chromium",
+        [
+            ReadOnlyMount::new("/opt/chromium", "/browserd-chromium"),
+            ReadOnlyMount::new("/opt/runtime", "/opt/runtime"),
+        ],
+    )
+    .expect("exact parent runtime directory")
+    .with_native_profiles(resources.clone())
+    .expect("parent resources can be overlaid by pinned native data");
+    std::fs::write(&icu, b"changed source ICU").expect("change original ICU");
+    std::fs::write(&pak, b"changed source locale").expect("change original locale");
+    let filesystem = FakeFilesystem::production_tree();
+    filesystem
+        .unwritable
+        .lock()
+        .expect("immutable parent fixture")
+        .insert("/opt/chromium".into());
+    filesystem
+        .directories
+        .lock()
+        .expect("resource directories")
+        .insert("/opt/chromium/locales".into());
+    for resource in [
+        "chromium",
+        "icudtl.dat",
+        "headless_lib_data.pak",
+        "v8_context_snapshot.bin",
+    ] {
+        filesystem.files.lock().expect("resource files").insert(
+            Path::new("/opt/chromium").join(resource),
+            "baseline resource".into(),
+        );
+    }
+    let backend = LinuxSandboxBackend::new(
+        config,
+        filesystem,
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    for native in [false, true] {
+        let base = launch_spec(ShardId::new());
+        let spec = if native {
+            base.with_process_profile(
+                ChromiumProcessProfile::native_locale(
+                    "ko-KR",
+                    "Asia/Seoul",
+                    catalog_digest,
+                    chromium_digest(b"approved locale"),
+                    chromium_digest(b"approved ICU"),
+                )
+                .expect("native profile"),
+            )
+            .expect("bind native profile")
+        } else {
+            base
+        };
+        let request = backend
+            .planned_spawn_request(&spec)
+            .expect("ordered resource launch");
+        let args = request.arguments();
+        assert!(
+            !args
+                .windows(3)
+                .any(|window| window == ["--ro-bind", "/opt/chromium", "/browserd-chromium"])
+        );
+        assert!(!args.windows(3).any(|window| window
+            == [
+                "--ro-bind",
+                "/opt/chromium/chromium",
+                "/browserd-chromium/chromium"
+            ]));
+        let mount = args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind",
+                        "/opt/chromium/icudtl.dat",
+                        "/browserd-chromium/icudtl.dat",
+                    ]
+            })
+            .expect("baseline ICU projection");
+        let locale_mount = args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind",
+                        "/opt/chromium/locales",
+                        "/browserd-chromium/locales",
+                    ]
+            })
+            .expect("baseline locales projection");
+        let other_mount = args
+            .windows(3)
+            .position(|window| window == ["--ro-bind", "/opt/runtime", "/opt/runtime"])
+            .expect("other runtime mount");
+        let executable = args
+            .windows(3)
+            .position(|window| window[0] == "--file" && window[2] == "/browserd-chromium/chromium")
+            .expect("named executable copy from sealed capability");
+        let gate = args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind",
+                        "/usr/libexec/browserd-launch-gate",
+                        "/browserd/launch-gate",
+                    ]
+            })
+            .expect("trusted gate overlay");
+        assert!(
+            mount < executable
+                && locale_mount < executable
+                && other_mount < executable
+                && executable < gate
+        );
+        let root_read_only = args
+            .windows(2)
+            .position(|window| window == ["--remount-ro", "/"])
+            .expect("private guest root becomes immutable");
+        let seccomp = args
+            .iter()
+            .position(|arg| arg == "--seccomp")
+            .expect("seccomp admission");
+        assert!(gate < root_read_only && root_read_only < seccomp);
+        assert_eq!(
+            args.windows(2)
+                .filter(|window| *window == ["--remount-ro", "/"])
+                .count(),
+            1
+        );
+        let executable_fd = args[executable + 1]
+            .to_str()
+            .expect("executable FD")
+            .parse::<i32>()
+            .expect("numeric executable FD");
+        assert_eq!(executable_fd, request.chromium_executable_fd().as_raw_fd());
+        assert!(request.inherited_fds().contains(&executable_fd));
+        assert_eq!(
+            std::fs::read(format!("/proc/self/fd/{executable_fd}")).expect("pinned Chromium bytes"),
+            TEST_CHROMIUM_BYTES
+        );
+        let seals = nix::fcntl::fcntl(
+            request.chromium_executable_fd(),
+            nix::fcntl::FcntlArg::F_GET_SEALS,
+        )
+        .expect("executable seals");
+        assert!(nix::fcntl::SealFlag::from_bits_truncate(seals).contains(
+            nix::fcntl::SealFlag::F_SEAL_WRITE
+                | nix::fcntl::SealFlag::F_SEAL_GROW
+                | nix::fcntl::SealFlag::F_SEAL_SHRINK
+                | nix::fcntl::SealFlag::F_SEAL_SEAL
+        ));
+        for (destination, expected) in [
+            ("/browserd-chromium/icudtl.dat", b"approved ICU".as_slice()),
+            (
+                "/browserd-chromium/locales/ko-KR.pak",
+                b"approved locale".as_slice(),
+            ),
+        ] {
+            let overlay = args
+                .windows(3)
+                .position(|window| window[0] == "--ro-bind-data" && window[2] == destination);
+            if native {
+                let overlay = overlay.expect("native resource overlay");
+                assert!(
+                    gate < overlay && overlay < root_read_only,
+                    "native data must follow every runtime/executable/gate bind"
+                );
+                let descriptor = args[overlay + 1]
+                    .to_str()
+                    .expect("resource FD")
+                    .parse::<i32>()
+                    .expect("numeric resource FD");
+                assert!(request.inherited_fds().contains(&descriptor));
+                assert_eq!(
+                    std::fs::read(format!("/proc/self/fd/{descriptor}"))
+                        .expect("pinned native bytes"),
+                    expected
+                );
+            } else {
+                assert!(
+                    overlay.is_none(),
+                    "baseline uses the approved parent directory resources"
+                );
+            }
+        }
+    }
+    for destination in [
+        "/browserd-chromium/icudtl.dat",
+        "/browserd-chromium/locales",
+        "/browserd-chromium/locales/ko-KR.pak",
+    ] {
+        assert!(
+            config_with_resource_mounts(
+                "/browserd-chromium/chromium",
+                [ReadOnlyMount::new("/opt/runtime", destination)]
+            )
+            .expect("sibling mount has no executable overlap")
+            .with_native_profiles(resources.clone())
+            .is_err(),
+            "individual native resource overlaps remain forbidden: {destination}"
+        );
+    }
+}
+
+#[test]
+fn chromium_resource_mount_accepts_only_the_exact_private_executable_parent() {
+    for destination in [
+        "/",
+        "/browserd-chromium",
+        "/browserd-chromium/nested/chromium",
+        "/browserd-chromium/nested/chromium/child",
+        "/browserd",
+        "/browserd/launch-gate",
+    ] {
+        assert!(
+            config_with_resource_mounts(
+                "/browserd-chromium/nested/chromium",
+                [ReadOnlyMount::new("/opt/chromium", destination)]
+            )
+            .is_err(),
+            "broader ancestors and executable/gate overlaps stay forbidden: {destination}"
+        );
+    }
+    assert!(
+        config_with_resource_mounts(
+            "/browserd-chromium/nested/chromium",
+            [ReadOnlyMount::new(
+                "/opt/chromium",
+                "/browserd-chromium/nested"
+            )]
+        )
+        .is_ok()
+    );
+    for source in [
+        "/tmp/resources",
+        "/dev/shm/resources",
+        "/var/lib/browserd/shards/resources",
+        "/sys/fs/cgroup/browserd/resources",
+    ] {
+        assert!(
+            config_with_resource_mounts(
+                "/browserd-chromium/chromium",
+                [ReadOnlyMount::new(source, "/browserd-chromium")]
+            )
+            .is_err(),
+            "mutable launch state cannot supply executable-parent resources: {source}"
+        );
+    }
+}
+
+#[test]
+fn named_chromium_executable_cannot_be_materialized_in_a_writable_or_virtual_mount() {
+    for executable in [
+        "/proc/chromium",
+        "/dev/chromium",
+        "/dev/shm/chromium",
+        "/sys/chromium",
+        "/tmp/chromium",
+        "/profile/chromium",
+        "/profile/browserd-files/chromium",
+    ] {
+        assert!(
+            config_with_resource_mounts(executable, []).is_err(),
+            "named executable must be protected by the guest root remount: {executable}"
+        );
+    }
+}
+
+#[test]
+fn production_directory_projection_requires_root_owned_immutable_non_symlink_source() {
+    let directory = tempfile::tempdir().expect("directory projection fixture");
+    let source = directory.path().join("resources");
+    std::fs::create_dir(&source).expect("runtime source fixture");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+        .expect("writable source mode");
+    let filesystem =
+        StdSandboxFilesystem::new("/sys/fs/cgroup/browserd", "/var/lib/browserd/shards")
+            .expect("filesystem configuration");
+    assert!(
+        filesystem.read_directory(&source).is_err(),
+        "writable directories cannot supply the projection"
+    );
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&source, &alias).expect("source symlink fixture");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o555))
+        .expect("immutable source mode");
+    assert!(
+        filesystem.read_directory(&alias).is_err(),
+        "symlinked sources cannot supply the projection"
+    );
+    if !nix::unistd::geteuid().is_root() {
+        assert!(
+            filesystem.read_directory(&source).is_err(),
+            "a non-root owner can change permissions and must be rejected"
+        );
+    }
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+        .expect("restore fixture for cleanup");
+}
+
+#[tokio::test]
+async fn chromium_parent_runtime_requires_an_immutable_directory_before_any_effect() {
+    for kind in ["writable", "file", "symlink"] {
+        let filesystem = FakeFilesystem::production_tree();
+        if kind == "file" {
+            filesystem
+                .directories
+                .lock()
+                .expect("directory fixtures")
+                .remove(Path::new("/opt/chromium"));
+            filesystem
+                .files
+                .lock()
+                .expect("file fixtures")
+                .insert(PathBuf::from("/opt/chromium"), String::new());
+        } else if kind == "symlink" {
+            filesystem
+                .symlinks
+                .lock()
+                .expect("symlink fixtures")
+                .insert(PathBuf::from("/opt/chromium"));
+        }
+        let process_events = Arc::new(Mutex::new(Vec::new()));
+        let egress = FakeEgress::default();
+        let backend = LinuxSandboxBackend::new(
+            config_with_resource_mounts(
+                "/browserd-chromium/chromium",
+                [ReadOnlyMount::new("/opt/chromium", "/browserd-chromium")],
+            )
+            .expect("parent mount configuration"),
+            filesystem.clone(),
+            FakeProcess {
+                events: process_events.clone(),
+                alive: Arc::new(Mutex::new(false)),
+                identity_matches: true,
+            },
+            egress.clone(),
+        );
+        assert!(
+            backend
+                .provision_gated(&launch_spec(ShardId::new()))
+                .await
+                .is_err(),
+            "unsafe source kind: {kind}"
+        );
+        assert!(filesystem.events().is_empty());
+        assert!(process_events.lock().expect("process events").is_empty());
+        assert!(egress.events.lock().expect("egress events").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn chromium_parent_projection_rejects_symlink_special_and_escaped_entries_before_any_effect()
+{
+    for kind in ["symlink", "special", "escaped", "too_many"] {
+        let filesystem = FakeFilesystem::production_tree();
+        filesystem
+            .unwritable
+            .lock()
+            .expect("immutable source")
+            .insert("/opt/chromium".into());
+        let child = PathBuf::from("/opt/chromium/resource");
+        let entries = match kind {
+            "escaped" => vec![PathBuf::from("/opt/foreign-resource")],
+            "too_many" => (0..4097)
+                .map(|index| Path::new("/opt/chromium").join(format!("resource-{index}")))
+                .collect(),
+            _ => vec![child.clone()],
+        };
+        if kind == "symlink" {
+            filesystem
+                .symlinks
+                .lock()
+                .expect("symlink entry")
+                .insert(child);
+        }
+        *filesystem
+            .directory_entries_override
+            .lock()
+            .expect("directory fixture") = Some(entries);
+        let process_events = Arc::new(Mutex::new(Vec::new()));
+        let egress = FakeEgress::default();
+        let backend = LinuxSandboxBackend::new(
+            config_with_resource_mounts(
+                "/browserd-chromium/chromium",
+                [ReadOnlyMount::new("/opt/chromium", "/browserd-chromium")],
+            )
+            .expect("exact parent configuration"),
+            filesystem.clone(),
+            FakeProcess {
+                events: process_events.clone(),
+                alive: Arc::new(Mutex::new(false)),
+                identity_matches: true,
+            },
+            egress.clone(),
+        );
+        assert!(
+            backend
+                .provision_gated(&launch_spec(ShardId::new()))
+                .await
+                .is_err(),
+            "unsafe child kind: {kind}"
+        );
+        assert!(filesystem.events().is_empty());
+        assert!(process_events.lock().expect("process effects").is_empty());
+        assert!(egress.events.lock().expect("egress effects").is_empty());
+    }
+}
+
+#[test]
+fn native_profile_launch_seals_resources_and_clears_ambient_environment() {
+    use browserd_sandbox::{ChromiumProcessProfile, NativeProcessResources};
+    let directory = tempfile::tempdir().expect("resource directory");
+    let pak_path = directory.path().join("ko.pak");
+    let icu_path = directory.path().join("icudtl.dat");
+    std::fs::write(&pak_path, b"approved locale data").expect("pak fixture");
+    std::fs::write(&icu_path, b"approved ICU data").expect("ICU fixture");
+    let pak_digest = chromium_digest(b"approved locale data");
+    let icu_digest = chromium_digest(b"approved ICU data");
+    let catalog_digest = chromium_digest(b"approved catalog");
+    let resources = NativeProcessResources::new(
+        chromium_digest(TEST_CHROMIUM_BYTES),
+        catalog_digest,
+        &icu_path,
+        icu_digest,
+        vec![("ko-KR".to_owned(), pak_path.clone(), pak_digest)],
+        vec!["Asia/Seoul".to_owned()],
+    )
+    .expect("approved resources");
+    for executable in ["/opt/browser/locales", "/opt/browser/icudtl.dat"] {
+        assert!(
+            config_for_executable(executable)
+                .with_native_profiles(resources.clone())
+                .is_err(),
+            "resource overlays must not replace the executable"
+        );
+    }
+    assert!(
+        config_for_runtime_paths("/opt/browser/chrome", "/opt/browser/icudtl.dat/gate")
+            .with_native_profiles(resources.clone())
+            .is_err(),
+        "resource overlays must not collide with the launch gate"
+    );
+    // Launch must use the sealed snapshot even if the source changes later.
+    std::fs::write(&pak_path, b"replaced locale data").expect("replace source");
+    std::fs::write(&icu_path, b"replaced ICU data").expect("replace source");
+    let config = config()
+        .with_native_profiles(resources)
+        .expect("native configuration");
+    let backend = LinuxSandboxBackend::new(
+        config,
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let profile = ChromiumProcessProfile::native_locale(
+        "ko-KR",
+        "Asia/Seoul",
+        catalog_digest,
+        pak_digest,
+        icu_digest,
+    )
+    .expect("profile")
+    .with_user_agent(Some("browserd-native-workers/1.0".to_owned()))
+    .expect("immutable UA");
+    let spec = launch_spec(ShardId::new())
+        .with_process_profile(profile)
+        .expect("native launch");
+    let request = backend
+        .planned_spawn_request(&spec)
+        .expect("native launch plan");
+    let args = request.arguments();
+    assert!(args.iter().any(|arg| arg == "--clearenv"));
+    for (key, value) in [
+        ("LANG", "C.UTF-8"),
+        ("LC_ALL", "C.UTF-8"),
+        ("LANGUAGE", "ko-KR"),
+        ("TZ", "Asia/Seoul"),
+    ] {
+        assert!(
+            args.windows(3)
+                .any(|window| window == ["--setenv", key, value])
+        );
+    }
+    assert!(
+        args.windows(2)
+            .any(|window| window == ["--remount-ro", "/opt/browser/locales"])
+    );
+    for (destination, expected) in [
+        (
+            "/opt/browser/locales/ko-KR.pak",
+            b"approved locale data".as_slice(),
+        ),
+        ("/opt/browser/icudtl.dat", b"approved ICU data".as_slice()),
+    ] {
+        let window = args
+            .windows(3)
+            .find(|window| window[0] == "--ro-bind-data" && window[2] == destination)
+            .expect("sealed resource overlay");
+        let fd: i32 = window[1]
+            .to_str()
+            .expect("FD string")
+            .parse()
+            .expect("FD number");
+        assert!(request.inherited_fds().contains(&fd));
+        let bytes = std::fs::read(format!("/proc/self/fd/{fd}")).expect("sealed resource read");
+        assert_eq!(bytes, expected);
+    }
+    assert!(args.iter().any(|arg| arg == "--lang=ko-KR"));
+    assert!(args.iter().any(|arg| arg == "--accept-lang=ko-KR"));
+    assert!(
+        args.iter()
+            .any(|arg| arg == "--user-agent=browserd-native-workers/1.0")
+    );
+}
+
+#[tokio::test]
+async fn native_profile_without_approved_resources_has_no_provisioning_effects() {
+    use browserd_sandbox::ChromiumProcessProfile;
+    let filesystem = FakeFilesystem::production_tree();
+    let backend = backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let digest = chromium_digest(b"unavailable resource");
+    let profile =
+        ChromiumProcessProfile::native_locale("ko-KR", "Asia/Seoul", digest, digest, digest)
+            .expect("valid profile");
+    let spec = launch_spec(ShardId::new())
+        .with_process_profile(profile)
+        .expect("native launch");
+    let before = filesystem.events();
+    assert!(backend.provision_gated(&spec).await.is_err());
+    assert_eq!(filesystem.events(), before);
+}
+
+#[test]
+fn native_resources_reject_changed_digest_and_symlink_sources() {
+    use browserd_sandbox::NativeProcessResources;
+    let directory = tempfile::tempdir().expect("resource directory");
+    let icu = directory.path().join("icudtl.dat");
+    let pak = directory.path().join("ko.pak");
+    let alias = directory.path().join("alias.pak");
+    std::fs::write(&icu, b"ICU").expect("ICU fixture");
+    std::fs::write(&pak, b"pak").expect("pak fixture");
+    std::os::unix::fs::symlink(&pak, &alias).expect("symlink fixture");
+    let build = |source: PathBuf, digest| {
+        NativeProcessResources::new(
+            chromium_digest(TEST_CHROMIUM_BYTES),
+            chromium_digest(b"catalog"),
+            &icu,
+            chromium_digest(b"ICU"),
+            vec![("ko-KR".to_owned(), source, digest)],
+            vec!["Asia/Seoul".to_owned()],
+        )
+    };
+    assert!(build(pak, chromium_digest(b"wrong bytes")).is_err());
+    assert!(build(alias, chromium_digest(b"pak")).is_err());
+}
+
+#[test]
+fn browser_file_launch_has_private_bounded_tmpfs_and_requires_gate_export() {
+    let backend = LinuxSandboxBackend::new(
+        config().with_browser_files(),
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let request = backend
+        .planned_spawn_request(&launch_spec(ShardId::new()))
+        .expect("browser-file launch should be valid");
+    let arguments = request.arguments();
+    for key in ["LANG", "LC_ALL"] {
+        assert!(
+            arguments
+                .windows(3)
+                .any(|window| window == ["--setenv", key, "C.UTF-8"])
+        );
+    }
+    assert!(arguments.windows(6).any(|window| window
+        == [
+            "--perms",
+            "0700",
+            "--size",
+            "33554432",
+            "--tmpfs",
+            "/profile/browserd-files"
+        ]));
+    assert!(arguments.windows(3).any(|window| window
+        == [
+            "/opt/browser/browserd-launch-gate",
+            "--export-scratch",
+            "--"
+        ]));
 }
 
 #[test]
@@ -1538,7 +2354,7 @@ fn planned_launch_wraps_chromium_with_a_read_only_trusted_gate() {
     assert!(arguments.windows(5).any(|window| {
         window[0] == "--perms"
             && window[1] == "0555"
-            && window[2] == "--ro-bind-data"
+            && window[2] == "--file"
             && window[3]
                 .to_str()
                 .and_then(|descriptor| descriptor.parse::<i32>().ok())
@@ -2049,12 +2865,22 @@ fn run_network_process_helper(test_name: &str) {
 }
 
 fn install_required_launch_descriptors() -> OwnedFd {
-    let null = File::options()
-        .read(true)
-        .write(true)
-        .open("/dev/null")
-        .expect("null device should open");
-    let source = null.as_raw_fd();
+    let mut policy = tempfile::tempfile().expect("regular seccomp fixture should open");
+    let code = u16::try_from(nix::libc::BPF_RET | nix::libc::BPF_K)
+        .expect("BPF return opcode")
+        .to_ne_bytes();
+    let denied = (nix::libc::SECCOMP_RET_ERRNO
+        | u32::try_from(nix::libc::EPERM).expect("EPERM operand"))
+    .to_ne_bytes();
+    policy
+        .write_all(&[
+            code[0], code[1], 0, 0, denied[0], denied[1], denied[2], denied[3],
+        ])
+        .expect("deny-only cBPF fixture");
+    policy
+        .seek(SeekFrom::Start(0))
+        .expect("initial seccomp fixture offset");
+    let source = policy.as_raw_fd();
     // SAFETY: the helper runs in an isolated subprocess and duplicates one live descriptor only
     // onto the fixed seccomp descriptor used by its SpawnRequest.
     let duplicated = unsafe { nix::libc::dup2(source, 9) };
@@ -2063,9 +2889,9 @@ fn install_required_launch_descriptors() -> OwnedFd {
     let result = unsafe { nix::libc::fcntl(9, nix::libc::F_SETFD, 0) };
     assert_eq!(result, 0, "seccomp descriptor should be inheritable");
     if source == 9 {
-        OwnedFd::from(null)
+        OwnedFd::from(policy)
     } else {
-        drop(null);
+        drop(policy);
         // SAFETY: dup2 created descriptor 9 above and ownership has not been transferred elsewhere.
         unsafe { OwnedFd::from_raw_fd(9) }
     }
@@ -2202,7 +3028,7 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
         "/tmp",
         "/dev/shm",
         "--ro-bind",
-        "--ro-bind-data",
+        "--file",
         "--seccomp",
     ] {
         assert!(process_events.contains(argument), "missing {argument}");
@@ -2210,6 +3036,13 @@ async fn cgroup_and_bwrap_are_configured_before_shell_free_launch() {
     assert!(
         !process_events.contains("--preserve-fds"),
         "the pinned bubblewrap CLI has no preserve-fds option"
+    );
+    assert!(
+        !planned
+            .arguments()
+            .iter()
+            .any(|argument| argument == "--rlimit"),
+        "resource limits must be installed before exec rather than passed to bubblewrap"
     );
     assert!(!process_events.contains("--no-sandbox"));
     assert!(!process_events.contains("/home"));
@@ -3168,6 +4001,261 @@ async fn a_hung_runtime_route_revoke_cannot_delay_bounded_child_termination() {
     assert!(
         kill_completed_while_revoke_was_blocked,
         "network cleanup serialization must never put child termination behind a hung revoke"
+    );
+}
+
+fn journaled_cleanup_backend(
+    filesystem: FakeFilesystem,
+    process: FakeProcess,
+    egress: FakeEgress,
+) -> (
+    tempfile::TempDir,
+    Arc<FilePreparedShardJournal>,
+    Arc<LinuxSandboxBackend<FakeFilesystem, FakeProcess, FakeEgress>>,
+) {
+    let directory = tempfile::tempdir().expect("journal directory");
+    let journal = Arc::new(
+        FilePreparedShardJournal::open_with_limits_and_roots(
+            directory.path(),
+            PreparedShardJournalLimits::default(),
+            PreparedShardRecoveryRoots::new(
+                "/sys/fs/cgroup/browserd".into(),
+                "/var/lib/browserd/shards".into(),
+            )
+            .expect("exact test roots"),
+        )
+        .expect("real private journal"),
+    );
+    let backend = Arc::new(
+        backend(filesystem, process, egress)
+            .with_prepared_journal(Arc::clone(&journal), 41)
+            .expect("journal binding"),
+    );
+    (directory, journal, backend)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn journaled_runtime_kill_waits_for_actual_revoke_intent_before_effects() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut filesystem = FakeFilesystem::production_tree();
+    filesystem.events = Arc::clone(&trace);
+    let (_directory, journal, backend) = journaled_cleanup_backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::clone(&trace),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let shard = ShardId::new();
+    let handle = backend
+        .provision_gated(&launch_spec(shard.clone()))
+        .await
+        .expect("gated runtime");
+    filesystem.files.lock().expect("files").insert(
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{shard}-launch-1/cgroup.events")),
+        "populated 0\n".into(),
+    );
+    let kill = tokio::spawn({
+        let backend = Arc::clone(&backend);
+        let handle = handle.clone();
+        async move {
+            backend
+                .kill_cgroup(&handle, CleanupReason::Administrative)
+                .await
+        }
+    });
+    // The revoke branch deliberately does not start: scheduling delay must remain pending,
+    // rather than exhaust a finite number of CPU yields and report a spurious failure.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !kill.is_finished(),
+        "kill must wait for the exact durable revoke intent"
+    );
+    assert!(
+        !trace
+            .lock()
+            .expect("trace")
+            .iter()
+            .any(|event| event.starts_with("signal:") || event.contains("cgroup.kill"))
+    );
+    let record = journal
+        .records()
+        .expect("journal")
+        .pop()
+        .expect("exact record");
+    assert_eq!(
+        record
+            .cleanup_progress(PreparedShardCleanupStage::AbortGate)
+            .expect("progress")
+            .attempts(),
+        0
+    );
+
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("durable revoke");
+    tokio::time::timeout(Duration::from_secs(1), kill)
+        .await
+        .expect("bounded kill completion")
+        .expect("kill task")
+        .expect("positive kill");
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("exact namespace cleanup");
+    let record = journal
+        .records()
+        .expect("journal")
+        .pop()
+        .expect("exact record");
+    assert_eq!(
+        record.recovery_disposition(),
+        PreparedShardRecoveryDisposition::ReleasedTombstone
+    );
+    for stage in PreparedShardCleanupStage::ALL {
+        let progress = record.cleanup_progress(stage).expect("progress");
+        assert_eq!(
+            progress.status(),
+            PreparedShardCleanupStageStatus::Completed
+        );
+        assert_eq!(progress.attempts(), 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn journaled_runtime_kill_proceeds_while_the_post_intent_revoke_effect_is_blocked() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut filesystem = FakeFilesystem::production_tree();
+    filesystem.events = Arc::clone(&trace);
+    let pause = AsyncPause::new();
+    let (_directory, journal, backend) = journaled_cleanup_backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::clone(&trace),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress {
+            revoke_pause: Some(pause.clone()),
+            ..FakeEgress::default()
+        },
+    );
+    let shard = ShardId::new();
+    let handle = backend
+        .provision_gated(&launch_spec(shard.clone()))
+        .await
+        .expect("gated runtime");
+    filesystem.files.lock().expect("files").insert(
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{shard}-launch-1/cgroup.events")),
+        "populated 0\n".into(),
+    );
+    let revoke = tokio::spawn({
+        let backend = Arc::clone(&backend);
+        let handle = handle.clone();
+        async move {
+            backend
+                .revoke_egress(&handle, CleanupReason::Administrative)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.entered.notified())
+        .await
+        .expect("revoke effect started");
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.kill_cgroup(&handle, CleanupReason::Administrative),
+    )
+    .await;
+    let still_blocked = !revoke.is_finished();
+    pause.proceed.notify_one();
+    revoke.await.expect("revoke task").expect("exact revoke");
+    result
+        .expect("kill must not wait for the egress effect")
+        .expect("positive kill");
+    assert!(still_blocked);
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("exact cleanup");
+    let record = journal
+        .records()
+        .expect("journal")
+        .pop()
+        .expect("exact record");
+    assert_eq!(
+        record.recovery_disposition(),
+        PreparedShardRecoveryDisposition::ReleasedTombstone
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn cancelled_revoke_intent_wait_stays_bounded_and_preserves_later_exact_cleanup() {
+    let filesystem = FakeFilesystem::production_tree();
+    let (_directory, journal, backend) = journaled_cleanup_backend(
+        filesystem.clone(),
+        FakeProcess {
+            events: Arc::new(Mutex::new(Vec::new())),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let shard = ShardId::new();
+    let handle = backend
+        .provision_gated(&launch_spec(shard.clone()))
+        .await
+        .expect("gated runtime");
+    filesystem.files.lock().expect("files").insert(
+        PathBuf::from("/sys/fs/cgroup/browserd").join(format!("{shard}-launch-1/cgroup.events")),
+        "populated 0\n".into(),
+    );
+    let pending = tokio::time::timeout(
+        Duration::from_millis(30),
+        backend.kill_cgroup(&handle, CleanupReason::Administrative),
+    )
+    .await;
+    assert!(
+        pending.is_err(),
+        "existing caller bounds must cancel an absent-intent wait"
+    );
+    let record = journal
+        .records()
+        .expect("journal")
+        .pop()
+        .expect("exact record");
+    assert_eq!(
+        record
+            .cleanup_progress(PreparedShardCleanupStage::AbortGate)
+            .expect("progress")
+            .attempts(),
+        0
+    );
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("durable revoke");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        backend.kill_cgroup(&handle, CleanupReason::Administrative),
+    )
+    .await
+    .expect("cancelled wait did not retain process lock")
+    .expect("positive kill");
+    backend
+        .cleanup_namespaces(&handle)
+        .await
+        .expect("exact cleanup");
+    let record = journal
+        .records()
+        .expect("journal")
+        .pop()
+        .expect("exact record");
+    assert_eq!(
+        record.recovery_disposition(),
+        PreparedShardRecoveryDisposition::ReleasedTombstone
     );
 }
 
@@ -4818,6 +5906,8 @@ fn launch_gate_path_cannot_be_shadowed_by_a_later_runtime_mount() {
 #[test]
 fn chromium_executable_path_cannot_be_shadowed_by_a_runtime_mount() {
     for destination in [
+        "/",
+        "/opt",
         "/opt/chromium/chrome",
         "/opt/chromium",
         "/opt/chromium/chrome/resources",
@@ -4827,10 +5917,7 @@ fn chromium_executable_path_cannot_be_shadowed_by_a_runtime_mount() {
             "/var/lib/browserd/shards",
             "/usr/bin/bwrap",
             chromium_runtime("/opt/chromium/chrome"),
-            LaunchGateRuntime::new(
-                "/usr/libexec/browserd-launch-gate",
-                "/opt/browser/browserd-launch-gate",
-            ),
+            LaunchGateRuntime::new("/usr/libexec/browserd-launch-gate", "/browserd/launch-gate"),
             [ReadOnlyMount::new("/opt/runtime", destination)],
             CgroupLimits::new(10, 5, 2, 1000, 1000).expect("limits should work"),
             9,
@@ -4838,9 +5925,10 @@ fn chromium_executable_path_cannot_be_shadowed_by_a_runtime_mount() {
             Duration::from_millis(1),
         );
 
-        assert!(
-            configuration.is_err(),
-            "runtime mount at {destination} could shadow Chromium",
+        assert_eq!(
+            configuration.is_ok(),
+            destination == "/opt/chromium",
+            "only Chromium's exact parent may provide runtime resources: {destination}",
         );
     }
 }
@@ -5542,6 +6630,268 @@ fn production_process_rejects_a_child_left_in_the_host_network_namespace() {
 }
 
 #[test]
+fn production_process_applies_child_resource_limits_and_rejects_a_hard_limit_increase() {
+    run_process_helper("std_process_resource_limits_helper");
+}
+
+#[test]
+fn production_seccomp_readers_keep_identity_and_independent_offsets_across_concurrent_launches() {
+    run_process_helper("std_process_seccomp_offsets_helper");
+}
+
+#[test]
+#[ignore = "uses the configured seccomp FD only in an isolated descriptor-owning subprocess"]
+fn std_process_seccomp_offsets_helper() {
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    let source = install_required_launch_descriptors();
+    let expected = std::fs::read("/proc/self/fd/9").expect("original cBPF bytes");
+    let identity = nix::sys::stat::fstat(&source).expect("original filter identity");
+    nix::unistd::lseek(&source, 0, nix::unistd::Whence::SeekEnd)
+        .expect("simulate previously consumed filter");
+    let marker_directory = tempfile::tempdir().expect("seccomp observations directory");
+    let markers = [
+        marker_directory.path().join("first.json"),
+        marker_directory.path().join("second.json"),
+    ];
+    let script = r#"#!/usr/bin/python3
+import hashlib
+import json
+import os
+import sys
+import time
+
+info_fd = None
+arguments = iter(sys.argv[1:])
+for argument in arguments:
+    if argument == "--info-fd":
+        info_fd = int(next(arguments))
+    elif argument == "--seccomp":
+        policy_fd = int(next(arguments))
+
+before = os.lseek(policy_fd, 0, os.SEEK_CUR)
+raw = os.read(policy_fd, 32769)
+metadata = os.fstat(policy_fd)
+with open("__SECCOMP_MARKER__", "w") as marker:
+    json.dump({"initial_offset": before, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest(),
+               "device": metadata.st_dev, "inode": metadata.st_ino}, marker)
+    marker.flush()
+    os.fsync(marker.fileno())
+sandbox_pid = os.fork()
+if sandbox_pid == 0:
+    os.setsid()
+    os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
+    os.close(info_fd)
+    sys.stdin.buffer.read()
+    os._exit(0)
+os.close(info_fd)
+time.sleep(30)
+"#;
+    let (first_directory, first_executable) = executable_script(&script.replace(
+        "__SECCOMP_MARKER__",
+        markers[0].to_str().expect("first marker path"),
+    ));
+    let (second_directory, second_executable) = executable_script(&script.replace(
+        "__SECCOMP_MARKER__",
+        markers[1].to_str().expect("second marker path"),
+    ));
+    let (_first_cgroup, first_request) = process_request_for(&first_executable);
+    let (_second_cgroup, second_request) = process_request_for(&second_executable);
+    let tokens = [LeaseId::new().to_string(), LeaseId::new().to_string()];
+    let process = StdLinuxProcessBackend::default();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("seccomp helper runtime");
+    runtime.block_on(async {
+        let (first, second) = tokio::join!(
+            process.spawn_prepared(&tokens[0], &first_request),
+            process.spawn_prepared(&tokens[1], &second_request),
+        );
+        for result in [first, second] {
+            let error = result.expect_err("fixture leaves the host network namespace unchanged");
+            assert!(
+                error.to_string().contains("distinct network namespace"),
+                "unexpected fixture rejection: {error}"
+            );
+        }
+        for token in &tokens {
+            process
+                .abort_spawned(token, None)
+                .await
+                .expect("exact fixture processes are reaped");
+        }
+    });
+    for marker in markers {
+        let observed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(marker).expect("child seccomp observation"))
+                .expect("seccomp observation JSON");
+        assert_eq!(observed["initial_offset"], serde_json::json!(0));
+        assert_eq!(observed["bytes"], serde_json::json!(expected.len()));
+        assert_eq!(
+            observed["sha256"],
+            serde_json::json!(hex::encode(Sha256::digest(&expected)))
+        );
+        assert_eq!(observed["device"], serde_json::json!(identity.st_dev));
+        assert_eq!(observed["inode"], serde_json::json!(identity.st_ino));
+    }
+    assert_eq!(
+        nix::unistd::lseek(&source, 0, nix::unistd::Whence::SeekCur)
+            .expect("supervisor filter offset"),
+        i64::try_from(expected.len()).expect("filter length fits offset"),
+        "launches must not rewind or consume the supervisor's shared reader"
+    );
+    // Invalid inputs are rejected before exec, rather than becoming an empty/permissive filter.
+    for size in [
+        0,
+        7,
+        (usize::try_from(nix::libc::BPF_MAXINSNS).expect("filter instruction limit") + 1) * 8,
+    ] {
+        let invalid = tempfile::tempfile().expect("invalid seccomp fixture");
+        invalid
+            .set_len(u64::try_from(size).expect("fixture length fits"))
+            .expect("invalid policy size");
+        // SAFETY: descriptor 9 belongs only to this isolated helper. Its OwnedFd retains ownership
+        // of that slot after dup2 atomically replaces the underlying file capability.
+        assert_eq!(unsafe { nix::libc::dup2(invalid.as_raw_fd(), 9) }, 9);
+        let error = runtime
+            .block_on(process.spawn_prepared(&LeaseId::new().to_string(), &first_request))
+            .expect_err("invalid seccomp input must reject before exec");
+        assert!(error.to_string().contains("bounded regular cBPF file"));
+    }
+    let nonregular = File::open("/dev/null").expect("nonregular seccomp fixture");
+    // SAFETY: the configured slot is confined to this helper, as above.
+    assert_eq!(unsafe { nix::libc::dup2(nonregular.as_raw_fd(), 9) }, 9);
+    let error = runtime
+        .block_on(process.spawn_prepared(&LeaseId::new().to_string(), &first_request))
+        .expect_err("nonregular seccomp input must reject before exec");
+    assert!(error.to_string().contains("bounded regular cBPF file"));
+    drop((first_directory, second_directory));
+}
+
+#[test]
+#[ignore = "changes hard resource limits only in an isolated descriptor-owning subprocess"]
+fn std_process_resource_limits_helper() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    let _descriptors = install_required_launch_descriptors();
+    let marker_directory = tempfile::tempdir().expect("resource limit marker directory");
+    let marker = marker_directory.path().join("limits.json");
+    let supervisor_core = getrlimit(Resource::RLIMIT_CORE).expect("supervisor core limit");
+    let supervisor_nofile = getrlimit(Resource::RLIMIT_NOFILE).expect("supervisor nofile limit");
+    assert!(
+        supervisor_nofile.1 >= 65_536,
+        "test host must supply the fixed launch limit"
+    );
+    let script = r#"#!/usr/bin/python3
+import json
+import os
+import resource
+import sys
+import time
+
+info_fd = None
+arguments = iter(sys.argv[1:])
+for argument in arguments:
+    if argument == "--rlimit":
+        raise RuntimeError("bubblewrap does not accept --rlimit")
+    elif argument == "--info-fd":
+        info_fd = int(next(arguments))
+
+bootstrap = {"core": resource.getrlimit(resource.RLIMIT_CORE),
+             "nofile": resource.getrlimit(resource.RLIMIT_NOFILE)}
+sandbox_pid = os.fork()
+if sandbox_pid == 0:
+    os.setsid()
+    with open("__LIMITS_MARKER__", "w") as output:
+        json.dump({"bootstrap": bootstrap,
+                   "sandbox": {"core": resource.getrlimit(resource.RLIMIT_CORE),
+                               "nofile": resource.getrlimit(resource.RLIMIT_NOFILE)}}, output)
+        output.flush()
+        os.fsync(output.fileno())
+    os.write(info_fd, json.dumps({"child-pid": os.getpid()}).encode() + b"\n")
+    os.close(info_fd)
+    sys.stdin.buffer.read()
+    os._exit(0)
+os.close(info_fd)
+time.sleep(30)
+"#
+    .replace(
+        "__LIMITS_MARKER__",
+        marker.to_str().expect("resource limit marker path"),
+    );
+    let (_directory, executable) = executable_script(&script);
+    let (_cgroup_directory, request) = process_request_for(&executable);
+    let process = StdLinuxProcessBackend::default();
+    let token = LeaseId::new().to_string();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("resource limit helper runtime");
+    runtime.block_on(async {
+        // Namespace rejection is expected for this small executable fixture. The actual resource
+        // limits are measured after exec and fork, before the production PID/namespace checks.
+        let error = process
+            .spawn_prepared(&token, &request)
+            .await
+            .expect_err("fixture shares the host network namespace");
+        assert!(
+            error.to_string().contains("distinct network namespace"),
+            "unexpected rejection: {error}"
+        );
+        process
+            .abort_spawned(&token, None)
+            .await
+            .expect("exact fixture processes are reaped");
+    });
+    let observed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&marker).expect("actual child limit observation"))
+            .expect("resource limit JSON");
+    for process in ["bootstrap", "sandbox"] {
+        assert_eq!(observed[process]["core"], serde_json::json!([0, 0]));
+        assert_eq!(
+            observed[process]["nofile"],
+            serde_json::json!([65_536, 65_536])
+        );
+    }
+    assert_eq!(
+        getrlimit(Resource::RLIMIT_CORE).expect("unchanged supervisor core"),
+        supervisor_core
+    );
+    assert_eq!(
+        getrlimit(Resource::RLIMIT_NOFILE).expect("unchanged supervisor nofile"),
+        supervisor_nofile
+    );
+
+    // Only this isolated helper loses its hard limit. The production spawn must refuse to increase
+    // it even when launched from a namespace or service with otherwise sufficient privileges.
+    setrlimit(Resource::RLIMIT_NOFILE, 65_535, 65_535).expect("reduce isolated helper hard limit");
+    std::fs::remove_file(&marker).expect("remove earlier child observation");
+    let rejected_token = LeaseId::new().to_string();
+    let error = runtime
+        .block_on(process.spawn_prepared(&rejected_token, &request))
+        .expect_err("fixed child limit must not raise the inherited hard limit");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("os error {}", nix::libc::EPERM)),
+        "unexpected limit rejection: {error}"
+    );
+    assert!(!marker.exists(), "rejected bootstrap must not execute");
+    assert_eq!(
+        getrlimit(Resource::RLIMIT_NOFILE).expect("rejected spawn preserves hard limit"),
+        (65_535, 65_535)
+    );
+    runtime
+        .block_on(process.abort_spawned(&rejected_token, None))
+        .expect("failed pre-exec leaves no child ownership");
+}
+
+#[test]
 #[ignore = "runs only in an isolated descriptor-owning subprocess"]
 fn std_process_host_network_namespace_helper() {
     if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
@@ -6017,6 +7367,7 @@ time.sleep(30)
     runtime.block_on(async {
         let spawn = tokio::spawn({
             let backend_token = backend_token.clone();
+            let process = process.clone();
             async move { process.spawn_prepared(&backend_token, &request).await }
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -6067,31 +7418,116 @@ fn pinned_bubblewrap_preserves_inheritable_chromium_descriptors() {
 
 #[test]
 fn pinned_bubblewrap_materializes_the_sealed_chromium_executable() {
-    let script = br##"#!/bin/sh
-for descriptor in /proc/self/fd/*; do
-  case "$(readlink "$descriptor")" in
-    *memfd:browserd-chromium*) exit 17 ;;
-  esac
-done
-exit 0
-"##;
+    run_process_helper("real_bwrap_named_chromium_materialization_helper");
+}
+
+#[test]
+#[ignore = "runs only in an isolated descriptor-owning subprocess"]
+fn real_bwrap_named_chromium_materialization_helper() {
+    const EXECUTABLE: &str = "/browserd-chromium/chromium";
+    const STAGE: &str = "BROWSERD_NAMED_MATERIALIZATION_STAGE";
+    if let Some(stage) = std::env::var_os(STAGE) {
+        assert_eq!(
+            std::env::current_exe().expect("named ELF executable"),
+            Path::new(EXECUTABLE)
+        );
+        assert_eq!(
+            std::fs::read_link("/proc/self/exe").expect("canonical self executable link"),
+            Path::new(EXECUTABLE)
+        );
+        let metadata = std::fs::metadata(EXECUTABLE).expect("named executable metadata");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o555);
+        assert_eq!(
+            &std::fs::read(EXECUTABLE).expect("named ELF bytes")[..4],
+            b"\x7fELF"
+        );
+        for descriptor in std::fs::read_dir("/proc/self/fd").expect("inherited descriptors") {
+            if let Ok(target) = std::fs::read_link(descriptor.expect("descriptor entry").path()) {
+                assert!(!target.to_string_lossy().contains("memfd:browserd-chromium"));
+            }
+        }
+        if stage == "reexec" {
+            return;
+        }
+        assert_eq!(stage, "initial");
+        for result in [
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(EXECUTABLE)
+                .map(|_| ()),
+            std::fs::set_permissions(EXECUTABLE, std::fs::Permissions::from_mode(0o755)),
+            std::fs::remove_file(EXECUTABLE),
+            std::fs::write("/browserd-chromium/replacement", b"denied"),
+        ] {
+            let error = result.expect_err("executable and parent must remain immutable");
+            assert!(
+                matches!(
+                    error.raw_os_error(),
+                    Some(nix::libc::EROFS | nix::libc::EPERM | nix::libc::EACCES)
+                ),
+                "unexpected immutable boundary error: {error}"
+            );
+        }
+        for directory in [
+            "/tmp",
+            "/dev/shm",
+            "/profile",
+            browserd_sandbox::SANDBOX_SCRATCH_PATH,
+        ] {
+            std::fs::write(
+                Path::new(directory).join("named-executable-write-proof"),
+                b"allowed",
+            )
+            .expect("nested private writable mount");
+        }
+        let reexec = Command::new(EXECUTABLE)
+            .args([
+                "--ignored",
+                "--exact",
+                "real_bwrap_named_chromium_materialization_helper",
+                "--nocapture",
+            ])
+            .env(STAGE, "reexec")
+            .output()
+            .expect("ELF self-reexec should start");
+        assert!(
+            reexec.status.success(),
+            "named ELF self-reexec failed: {}",
+            String::from_utf8_lossy(&reexec.stderr)
+        );
+        return;
+    }
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    let bytes = std::fs::read(std::env::current_exe().expect("ELF fixture source"))
+        .expect("read genuine test ELF");
+    assert_eq!(&bytes[..4], b"\x7fELF");
+    let directory = tempfile::tempdir().expect("private materialization fixture");
+    let source = directory.path().join("source-elf");
+    let profile = directory.path().join("profile");
+    std::fs::write(&source, &bytes).expect("ELF source");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755))
+        .expect("ELF source mode");
+    std::fs::create_dir(&profile).expect("private profile directory");
+    let runtime = ChromiumRuntime::from_path(&source, EXECUTABLE, chromium_digest(&bytes))
+        .expect("ELF bytes should be sealed before the host alias changes");
+    std::fs::write(&source, b"replaced unapproved host executable")
+        .expect("replace original host alias");
     let base_spec = launch_spec(ShardId::new());
-    let script_spec = LaunchSpec::production(
+    let elf_spec = LaunchSpec::production(
         base_spec.tenant_id().clone(),
         base_spec.dedicated_egress().clone(),
-        chromium_digest(script),
+        chromium_digest(&bytes),
     );
-    let request = LinuxSandboxBackend::new(
+    let backend = LinuxSandboxBackend::new(
         LinuxSandboxConfig::new(
             "/sys/fs/cgroup/browserd",
             "/var/lib/browserd/shards",
             "/usr/bin/bwrap",
-            ChromiumRuntime::from_bytes(script, "/opt/browser/chrome", chromium_digest(script))
-                .expect("test Chromium script should be pinned"),
-            LaunchGateRuntime::new(
-                "/usr/libexec/browserd-launch-gate",
-                "/opt/browser/browserd-launch-gate",
-            ),
+            runtime,
+            LaunchGateRuntime::new("/usr/libexec/browserd-launch-gate", "/browserd/launch-gate"),
             [],
             CgroupLimits::new(512, 256, 4, 10, 100).expect("limits should be valid"),
             9,
@@ -6106,39 +7542,102 @@ exit 0
             identity_matches: true,
         },
         FakeEgress::default(),
-    )
-    .planned_spawn_request(&script_spec)
-    .expect("sealed Chromium launch capability should be available");
-    let executable_fd = request.chromium_executable_fd().as_raw_fd();
-    let mut command = Command::new("/usr/bin/bwrap");
-    // SAFETY: the callback runs after fork and performs only async-signal-safe fcntl calls on the
-    // request-owned descriptor. The parent remains CLOEXEC, so concurrent unrelated spawns cannot
-    // inherit the Chromium capability.
-    unsafe {
-        command.pre_exec(move || {
-            let flags = nix::libc::fcntl(executable_fd, nix::libc::F_GETFD);
-            if flags < 0
-                || nix::libc::fcntl(
-                    executable_fd,
-                    nix::libc::F_SETFD,
-                    flags & !nix::libc::FD_CLOEXEC,
-                ) < 0
-            {
-                return Err(std::io::Error::last_os_error());
+    );
+    for _ in 0..2 {
+        let request = backend
+            .planned_spawn_request(&elf_spec)
+            .expect("independent sealed ELF reader");
+        let args = request.arguments();
+        let copy_start = args
+            .windows(2)
+            .position(|window| window == ["--dir", "/browserd-chromium"])
+            .expect("named executable parent");
+        let copy_end = args
+            .windows(3)
+            .position(|window| {
+                window
+                    == [
+                        "--ro-bind",
+                        "/usr/libexec/browserd-launch-gate",
+                        "/browserd/launch-gate",
+                    ]
+            })
+            .expect("trusted gate follows named copy");
+        let immutable = args
+            .windows(2)
+            .position(|window| window == ["--remount-ro", "/"])
+            .expect("production root remount");
+        let executable_fd = request.chromium_executable_fd().as_raw_fd();
+        let mut command = Command::new("/usr/bin/bwrap");
+        command
+            .args([
+                "--unshare-user",
+                "--unshare-pid",
+                "--unshare-net",
+                "--unshare-ipc",
+                "--unshare-uts",
+                "--clearenv",
+                "--cap-drop",
+                "ALL",
+                "--proc",
+                "/proc",
+                "--dev",
+                "/dev",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/dev/shm",
+                "--bind",
+            ])
+            .arg(&profile)
+            .arg("/profile");
+        command.args(["--tmpfs", browserd_sandbox::SANDBOX_SCRATCH_PATH]);
+        for path in ["/usr", "/lib", "/lib64"] {
+            if Path::new(path).is_dir() {
+                command.args(["--ro-bind", path, path]);
             }
-            Ok(())
-        });
+        }
+        command
+            .args(&args[copy_start..copy_end])
+            .args(&args[immutable..immutable + 2])
+            .args([
+                "--setenv",
+                STAGE,
+                "initial",
+                "--",
+                EXECUTABLE,
+                "--ignored",
+                "--exact",
+                "real_bwrap_named_chromium_materialization_helper",
+                "--nocapture",
+            ])
+            .env_clear();
+        // SAFETY: the callback runs after fork and uses only async-signal-safe fcntl calls on
+        // the request-owned descriptor. The parent capability remains CLOEXEC.
+        unsafe {
+            command.pre_exec(move || {
+                let flags = nix::libc::fcntl(executable_fd, nix::libc::F_GETFD);
+                if flags < 0
+                    || nix::libc::fcntl(
+                        executable_fd,
+                        nix::libc::F_SETFD,
+                        flags & !nix::libc::FD_CLOEXEC,
+                    ) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command
+            .output()
+            .expect("bubblewrap should copy the sealed ELF to a named guest inode");
+        assert!(
+            output.status.success(),
+            "named ELF materialization failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let status = command
-        .args(["--ro-bind", "/", "/", "--tmpfs", "/tmp", "--perms", "0555"])
-        .arg("--ro-bind-data")
-        .arg(executable_fd.to_string())
-        .args(["/tmp/browserd-chromium", "--", "/tmp/browserd-chromium"])
-        .env_clear()
-        .status()
-        .expect("bubblewrap should materialize the sealed Chromium capability");
-
-    assert!(status.success());
 }
 
 #[test]
@@ -6366,6 +7865,7 @@ os._exit(0)
         let first_claim = {
             let claim_barrier = Arc::clone(&claim_barrier);
             let backend_token = backend_token.clone();
+            let process = process.clone();
             tokio::spawn(async move {
                 claim_barrier.wait().await;
                 process.claim_cdp_pipes(&backend_token, identity).await
@@ -6374,6 +7874,7 @@ os._exit(0)
         let second_claim = {
             let claim_barrier = Arc::clone(&claim_barrier);
             let backend_token = backend_token.clone();
+            let process = process.clone();
             tokio::spawn(async move {
                 claim_barrier.wait().await;
                 process.claim_cdp_pipes(&backend_token, identity).await
@@ -7237,12 +8738,272 @@ async fn runtime_handle_fences_the_cdp_capability_claim() {
     };
     let backend = backend(filesystem, process, FakeEgress::default());
     let shard_id = ShardId::new();
+    let spec = launch_spec(shard_id.clone());
     let handle = backend
-        .provision(&launch_spec(shard_id.clone()))
+        .provision(&spec)
         .await
         .expect("runtime should provision");
     let forged = browserd_sandbox::SandboxHandle::new(shard_id, LeaseId::new().to_string());
 
     assert!(backend.claim_cdp_pipes(&forged).await.is_err());
-    assert!(backend.claim_cdp_pipes(&handle).await.is_ok());
+    let pipes = backend
+        .claim_cdp_pipes(&handle)
+        .await
+        .expect("exact active claim succeeds");
+    let binding = pipes
+        .egress_proxy_binding()
+        .expect("production claim carries exact route binding");
+    assert!(binding.matches_launch(&spec));
+    assert_eq!(
+        binding.proxy_address(),
+        "127.0.0.1:43117"
+            .parse()
+            .expect("fixed test listener endpoint")
+    );
+}
+
+#[tokio::test]
+async fn revoked_ingress_refuses_cdp_claim_before_consuming_process_capabilities() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let backend = backend(
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: trace.clone(),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress::default(),
+    );
+    let handle = backend
+        .provision_gated(&launch_spec(ShardId::new()))
+        .await
+        .expect("gated provision");
+    backend
+        .revoke_egress(&handle, CleanupReason::Administrative)
+        .await
+        .expect("exact route revokes");
+    assert!(backend.claim_cdp_pipes(&handle).await.is_err());
+    assert!(
+        !trace
+            .lock()
+            .expect("trace lock")
+            .iter()
+            .any(|event| event == "cdp:claim"),
+        "inactive route must reject before consuming the one-shot raw pipe pair"
+    );
+}
+
+#[tokio::test]
+async fn addressless_ingress_refuses_cdp_claim_before_consuming_process_capabilities() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let backend = backend(
+        FakeFilesystem::production_tree(),
+        FakeProcess {
+            events: trace.clone(),
+            alive: Arc::new(Mutex::new(false)),
+            identity_matches: true,
+        },
+        FakeEgress {
+            omit_proxy_address: true,
+            ..FakeEgress::default()
+        },
+    );
+    let handle = backend
+        .provision_gated(&launch_spec(ShardId::new()))
+        .await
+        .expect("legacy gated provision");
+    assert!(backend.claim_cdp_pipes(&handle).await.is_err());
+    assert!(
+        !trace
+            .lock()
+            .expect("trace lock")
+            .iter()
+            .any(|event| event == "cdp:claim"),
+        "missing production endpoint must reject before consuming raw pipe capabilities"
+    );
+}
+
+#[tokio::test]
+async fn changed_namespace_refuses_cdp_claim_before_consuming_process_capabilities() {
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let namespace_matches = Arc::new(AtomicBool::new(true));
+    let backend = LinuxSandboxBackend::new(
+        config(),
+        FakeFilesystem::production_tree(),
+        ClaimNamespaceProcess {
+            inner: FakeProcess {
+                events: trace.clone(),
+                alive: Arc::new(Mutex::new(false)),
+                identity_matches: true,
+            },
+            namespace_matches: namespace_matches.clone(),
+        },
+        FakeEgress::default(),
+    );
+    let handle = backend
+        .provision_gated(&launch_spec(ShardId::new()))
+        .await
+        .expect("gated provision");
+    namespace_matches.store(false, Ordering::SeqCst);
+    assert!(backend.claim_cdp_pipes(&handle).await.is_err());
+    assert!(
+        !trace
+            .lock()
+            .expect("trace lock")
+            .iter()
+            .any(|event| event == "cdp:claim"),
+        "changed namespace must reject before consuming raw pipe capabilities"
+    );
+}
+
+#[path = "support/shared_context_routes.rs"]
+mod shared_context_routes;
+
+#[path = "support/spawn_diagnostics.rs"]
+mod spawn_diagnostics;
+
+#[test]
+fn private_child_stderr_rejects_public_nonempty_append_and_readable_sinks() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = tempfile::tempdir().expect("private sink directory");
+    for (name, mode, nonempty, append, readable) in [
+        ("public", 0o644, false, false, false),
+        ("nonempty", 0o600, true, false, false),
+        ("append", 0o600, false, true, false),
+        ("readable", 0o600, false, false, true),
+    ] {
+        let path = directory.path().join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .read(readable)
+            .append(append)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+            .expect("sink fixture should open");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("sink mode fixture must not depend on the invoking umask");
+        if nonempty {
+            file.write_all(b"private-existing")
+                .expect("existing sink contents");
+        }
+        let error = StdLinuxProcessBackend::default()
+            .with_private_child_stderr(file)
+            .expect_err("unsafe diagnostic sink must reject");
+        assert!(
+            error
+                .to_string()
+                .contains("empty owned mode-0600 write-only file")
+        );
+        let contents = std::fs::read(&path).expect("sink fixture contents should remain available");
+        assert_eq!(
+            contents,
+            if nonempty {
+                b"private-existing".as_slice()
+            } else {
+                b"".as_slice()
+            }
+        );
+    }
+}
+
+#[test]
+fn production_private_stderr_capture_is_bounded_and_keeps_draining_after_the_limit() {
+    run_process_helper("std_process_private_stderr_helper");
+}
+
+#[test]
+#[ignore = "uses configured launch descriptors only in an isolated subprocess"]
+fn std_process_private_stderr_helper() {
+    use std::os::unix::fs::OpenOptionsExt;
+    if std::env::var_os("BROWSERD_PROCESS_HELPER").is_none() {
+        return;
+    }
+    let _descriptors = install_required_launch_descriptors();
+    let directory = tempfile::tempdir().expect("private stderr test directory");
+    let marker = directory.path().join("drained");
+    let capture = directory.path().join("private.stderr");
+    let mut sink = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&capture)
+        .expect("exclusive private sink should open");
+    // The implementation must use bounded positioned writes, even if an owned OFD starts beyond
+    // the limit. No read position or stream position is trusted for the file size bound.
+    sink.seek(SeekFrom::Start(128 * 1024))
+        .expect("fixture changes only its owned sink offset");
+    let configured = StdLinuxProcessBackend::default()
+        .with_private_child_stderr(sink)
+        .expect("empty owned write-only capability should admit");
+    let script = r#"#!/usr/bin/python3
+import json,os,sys,time
+info_fd=None
+arguments=iter(sys.argv[1:])
+for argument in arguments:
+ if argument=='--info-fd': info_fd=int(next(arguments))
+data=b'native-private-stderr-fixture\n'+b'x'*(512*1024)
+while data:
+ count=os.write(2,data)
+ data=data[count:]
+with open('__DRAINED_MARKER__','wb') as marker: marker.write(b'all-stderr-written')
+pid=os.fork()
+if pid==0:
+ os.setsid()
+ os.write(info_fd,json.dumps({'child-pid':os.getpid()}).encode()+b'\n')
+ os.close(info_fd)
+ sys.stdin.buffer.read()
+ os._exit(0)
+os.close(info_fd)
+time.sleep(30)
+"#
+    .replace(
+        "__DRAINED_MARKER__",
+        marker.to_str().expect("private marker path"),
+    );
+    let (_executable_directory, executable) = executable_script(&script);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("isolated stderr test runtime");
+    // A clone shares the same 16KiB run budget. The default backend still sends stderr to null.
+    for process in [
+        configured.clone(),
+        configured,
+        StdLinuxProcessBackend::default(),
+    ] {
+        let (_cgroup_directory, request) = process_request_for(&executable);
+        let token = LeaseId::new().to_string();
+        runtime.block_on(async {
+            let error = process
+                .spawn_prepared(&token, &request)
+                .await
+                .expect_err("fixture intentionally leaves the host NET namespace unchanged");
+            assert!(
+                error.to_string().contains("distinct network namespace"),
+                "unexpected spawn failure: {error}"
+            );
+            assert_eq!(
+                std::fs::read(&marker).expect("child proves complete stderr write"),
+                b"all-stderr-written"
+            );
+            process
+                .abort_spawned(&token, None)
+                .await
+                .expect("exact fixture cleanup should succeed");
+        });
+    }
+    let contents = std::fs::read(&capture).expect("bounded private capture should read");
+    assert_eq!(contents.len(), 16 * 1024);
+    let prefix = b"native-private-stderr-fixture\n";
+    assert_eq!(&contents[..prefix.len()], prefix);
+    assert!(contents[prefix.len()..].iter().all(|byte| *byte == b'x'));
+    assert_eq!(
+        std::fs::metadata(&capture)
+            .expect("private sink metadata")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o600
+    );
 }

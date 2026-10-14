@@ -42,6 +42,15 @@ pub enum BootstrapStageFailure {
     StateOverflow,
 }
 
+/// Only an exact owner may prove that a paused target is already closing or retired.
+/// These dispositions grant no script execution or readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootstrapDisposition {
+    Completed,
+    OwnedClosing,
+    OwnedRetired,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShardTaintReason {
     UnknownTargetOwnership,
@@ -102,6 +111,15 @@ pub trait BootstrapBackend {
         stage: BootstrapStage,
     ) -> Result<(), BootstrapStageFailure>;
 
+    fn run_stage_with_disposition(
+        &mut self,
+        target: &PausedTarget,
+        stage: BootstrapStage,
+    ) -> Result<BootstrapDisposition, BootstrapStageFailure> {
+        self.run_stage(target, stage)
+            .map(|()| BootstrapDisposition::Completed)
+    }
+
     fn close_paused_target(&mut self, target: &PausedTarget);
 
     fn taint_shard(&mut self, reason: ShardTaintReason);
@@ -121,17 +139,35 @@ impl TargetBootstrapBarrier {
         target: &PausedTarget,
         backend: &mut B,
     ) -> Result<ReadyTarget, BootstrapError> {
-        for stage in ORDERED_STAGES {
-            if let Err(cause) = backend.run_stage(target, stage) {
-                backend.close_paused_target(target);
-                if cause == BootstrapStageFailure::UnknownOwnership {
-                    backend.taint_shard(ShardTaintReason::UnknownTargetOwnership);
-                }
-                return Err(BootstrapError::StageFailed { stage, cause });
-            }
+        if self.bootstrap_with_disposition(target, backend)? != BootstrapDisposition::Completed {
+            return Err(BootstrapError::StageFailed {
+                stage: BootstrapStage::AttributeOwnership,
+                cause: BootstrapStageFailure::Rejected,
+            });
         }
         Ok(ReadyTarget {
             target_id: target.target_id.clone(),
         })
+    }
+
+    pub fn bootstrap_with_disposition<B: BootstrapBackend>(
+        &self,
+        target: &PausedTarget,
+        backend: &mut B,
+    ) -> Result<BootstrapDisposition, BootstrapError> {
+        for stage in ORDERED_STAGES {
+            match backend.run_stage_with_disposition(target, stage) {
+                Ok(BootstrapDisposition::Completed) => {}
+                Ok(disposition) => return Ok(disposition),
+                Err(cause) => {
+                    backend.close_paused_target(target);
+                    if cause == BootstrapStageFailure::UnknownOwnership {
+                        backend.taint_shard(ShardTaintReason::UnknownTargetOwnership);
+                    }
+                    return Err(BootstrapError::StageFailed { stage, cause });
+                }
+            }
+        }
+        Ok(BootstrapDisposition::Completed)
     }
 }
