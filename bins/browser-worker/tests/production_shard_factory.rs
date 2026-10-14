@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::collections::VecDeque;
+use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex, mpsc};
@@ -14,11 +15,16 @@ use browser_worker::{
     SessionShardFactory, SessionShardRouter,
 };
 use browserd_cdp::CdpTransportConfig;
-use browserd_chromium::{ChromiumArtifactIdentity, ChromiumConnectionConfig, Sha256Digest};
+use browserd_chromium::{
+    ArtifactFile, ChromiumArtifactIdentity, ChromiumConnectionConfig, CompatibilityArtifact,
+    Sha256Digest, VerifiedNativeProfileCatalog,
+};
 use browserd_core::{LaunchGeneration, SessionId, ShardId, TenantId, WorkerId};
 use browserd_sandbox::{
-    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CleanupResult, CreateShardOutcome,
-    EgressPolicyBinding, KillShardOutcome, LaunchSpec,
+    ChromiumBinaryDigest, ChromiumCdpPipes, ChromiumProcessProfile, CleanupReason, CleanupResult,
+    CreateShardOutcome, DedicatedEgressProxyBinding, EgressPolicyBinding, KillShardOutcome,
+    LaunchSpec, PinnedNetworkNamespace, ShardEgressReservation, ShardIngressLease,
+    ShardIngressReceipt,
 };
 use browserd_session::OwnershipFence;
 use browserd_worker::{
@@ -26,10 +32,15 @@ use browserd_worker::{
     SandboxShardRpc, ShardRuntimeError, WorkerSessionOptionsV1, WorkerViewport,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tempfile::{TempDir, tempdir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::pipe::{Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+
+#[path = "support/privileged_evaluate.rs"]
+mod privileged_evaluate;
 
 struct FailingSandbox {
     daemon_epoch: u64,
@@ -223,6 +234,9 @@ struct ScriptedSandbox {
     cancel_delay: Mutex<Duration>,
     peer_termination: Option<PeerTermination>,
     panic_next_cancel: AtomicBool,
+    missing_binding: bool,
+    created_specs: Mutex<Vec<LaunchSpec>>,
+    pinned_namespaces: Mutex<Vec<PinnedNetworkNamespace>>,
     peers: Mutex<VecDeque<oneshot::Sender<(Receiver, Sender)>>>,
     launches: AtomicUsize,
     claims: AtomicUsize,
@@ -241,9 +255,13 @@ struct PeerTermination {
 impl SandboxShardRpc for ScriptedSandbox {
     async fn create_shard(
         &self,
-        _spec: LaunchSpec,
+        spec: LaunchSpec,
         _lease_ttl: Duration,
     ) -> Result<CreateShardOutcome, ShardRuntimeError> {
+        self.created_specs
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?
+            .push(spec);
         self.launches.fetch_add(1, Ordering::SeqCst);
         Ok(CreateShardOutcome::Created)
     }
@@ -281,10 +299,10 @@ impl SandboxShardRpc for ScriptedSandbox {
 
     async fn claim_cdp_pipes(
         &self,
-        _shard_id: &ShardId,
-        _worker_id: &WorkerId,
-        _worker_epoch: u64,
-        _launch_generation: LaunchGeneration,
+        shard_id: &ShardId,
+        worker_id: &WorkerId,
+        worker_epoch: u64,
+        launch_generation: LaunchGeneration,
     ) -> Result<ChromiumCdpPipes, ShardRuntimeError> {
         self.claims.fetch_add(1, Ordering::SeqCst);
         let (command_reader, command_writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
@@ -293,6 +311,48 @@ impl SandboxShardRpc for ScriptedSandbox {
             .map_err(|_| ShardRuntimeError::Unavailable)?;
         let pipes = ChromiumCdpPipes::from_owned_fds(command_writer, event_reader)
             .map_err(|_| ShardRuntimeError::Unavailable)?;
+        let pipes = if self.missing_binding {
+            pipes
+        } else {
+            let spec = self
+                .created_specs
+                .lock()
+                .map_err(|_| ShardRuntimeError::Unavailable)?
+                .iter()
+                .find(|spec| {
+                    spec.shard_id() == shard_id
+                        && spec.worker_id() == worker_id
+                        && spec.worker_epoch() == worker_epoch
+                        && spec.launch_generation() == launch_generation
+                })
+                .cloned()
+                .ok_or(ShardRuntimeError::Rejected)?;
+            let namespace = PinnedNetworkNamespace::from_owned_fd(
+                fs::File::open("/proc/thread-self/ns/net")
+                    .map_err(|_| ShardRuntimeError::Unavailable)?
+                    .into(),
+            )
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+            let lease = ShardIngressLease::from_attachment(
+                ShardEgressReservation::from_launch_spec(&spec),
+                namespace.identity(),
+                ShardIngressReceipt::with_proxy_address(
+                    "127.0.0.1:32100"
+                        .parse()
+                        .expect("test proxy endpoint should be valid"),
+                )
+                .map_err(|_| ShardRuntimeError::Rejected)?,
+            );
+            let binding = DedicatedEgressProxyBinding::from_lease(&lease)
+                .map_err(|_| ShardRuntimeError::Rejected)?;
+            self.pinned_namespaces
+                .lock()
+                .map_err(|_| ShardRuntimeError::Unavailable)?
+                .push(namespace);
+            pipes
+                .with_egress_proxy_binding(binding)
+                .map_err(|_| ShardRuntimeError::Rejected)?
+        };
         let reader =
             Receiver::from_owned_fd(command_reader).map_err(|_| ShardRuntimeError::Unavailable)?;
         let writer =
@@ -383,21 +443,23 @@ impl SandboxShardRpc for GatedRenewSandbox {
 
     async fn renew_owner_lease(
         &self,
-        _shard_id: &ShardId,
-        _worker_epoch: u64,
-        _launch_generation: LaunchGeneration,
-        _lease_ttl: Duration,
+        shard_id: &ShardId,
+        worker_epoch: u64,
+        launch_generation: LaunchGeneration,
+        lease_ttl: Duration,
     ) -> Result<(), ShardRuntimeError> {
-        self.renewal_entered
+        let entered = self
+            .renewal_entered
             .lock()
             .map_err(|_| ShardRuntimeError::Unavailable)?
-            .take()
-            .ok_or(ShardRuntimeError::Rejected)?
-            .send(())
-            .map_err(|_| ShardRuntimeError::Cancelled)?;
-        self.renewal_release.cancelled().await;
-        self.inner.renewals.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+            .take();
+        if let Some(entered) = entered {
+            entered.send(()).map_err(|_| ShardRuntimeError::Cancelled)?;
+            self.renewal_release.cancelled().await;
+        }
+        self.inner
+            .renew_owner_lease(shard_id, worker_epoch, launch_generation, lease_ttl)
+            .await
     }
 
     async fn kill_shard(
@@ -502,9 +564,13 @@ async fn qualify_protocol(reader: &mut Receiver, writer: &mut Sender) {
     assert_eq!(version["method"], "Browser.getVersion");
     assert_eq!(version["params"], json!({}));
     assert!(version.get("sessionId").is_none());
+    respond_healthy_version(writer, &version).await;
+}
+
+async fn respond_healthy_version(writer: &mut Sender, version: &Value) {
     respond(
         writer,
-        &version,
+        version,
         json!({
             "protocolVersion": "1.3",
             "product": "HeadlessChrome/149.0.7827.55",
@@ -532,7 +598,7 @@ async fn run_scripted_protocol(
     cleanup_probe: CleanupProbe,
 ) {
     let (reader, writer) = peer_rx.await.expect("CDP peer should be transferred");
-    run_scripted_protocol_with_pipes(reader, writer, cleanup_probe).await;
+    run_scripted_protocol_with_pipes(reader, writer, cleanup_probe, None).await;
 }
 
 async fn run_killable_scripted_protocol(
@@ -542,7 +608,7 @@ async fn run_killable_scripted_protocol(
 ) {
     let (reader, writer) = peer_rx.await.expect("CDP peer should be transferred");
     {
-        let protocol = run_scripted_protocol_with_pipes(reader, writer, cleanup_probe);
+        let protocol = run_scripted_protocol_with_pipes(reader, writer, cleanup_probe, None);
         tokio::pin!(protocol);
         tokio::select! {
             biased;
@@ -557,6 +623,7 @@ async fn run_scripted_protocol_with_pipes(
     mut reader: Receiver,
     mut writer: Sender,
     cleanup_probe: CleanupProbe,
+    health_gate: Option<(mpsc::SyncSender<()>, CancellationToken)>,
 ) {
     qualify_protocol(&mut reader, &mut writer).await;
     qualify_protocol(&mut reader, &mut writer).await;
@@ -578,12 +645,33 @@ async fn run_scripted_protocol_with_pipes(
 
     let context = read_command(&mut reader).await;
     assert_eq!(context["method"], "Target.createBrowserContext");
+    assert_eq!(
+        context["params"],
+        json!({
+            "disposeOnDetach": true,
+            "proxyServer": "http://127.0.0.1:32100",
+            "proxyBypassList": "<-loopback>",
+        })
+    );
+    assert!(context.get("sessionId").is_none());
     respond(
         &mut writer,
         &context,
         json!({"browserContextId": "context-production"}),
     )
     .await;
+    let downloads = read_command(&mut reader).await;
+    assert_eq!(downloads["method"], "Browser.setDownloadBehavior");
+    assert_eq!(
+        downloads["params"],
+        json!({
+            "behavior": "deny",
+            "browserContextId": "context-production",
+            "eventsEnabled": true,
+        })
+    );
+    assert!(downloads.get("sessionId").is_none());
+    respond(&mut writer, &downloads, json!({})).await;
     let target = read_command(&mut reader).await;
     assert_eq!(target["method"], "Target.createTarget");
     let attached = serde_json::to_vec(&json!({
@@ -618,16 +706,60 @@ async fn run_scripted_protocol_with_pipes(
         "Network.enable",
         "Runtime.enable",
         "Page.enable",
+        "Page.getFrameTree",
         "Page.setInterceptFileChooserDialog",
         "Runtime.runIfWaitingForDebugger",
     ] {
         let command = read_command(&mut reader).await;
         assert_eq!(command["method"], method);
-        respond(&mut writer, &command, json!({})).await;
+        assert_eq!(command["sessionId"], "flat-production");
+        if method == "Runtime.enable" {
+            let context_created = serde_json::to_vec(&json!({
+                "method": "Runtime.executionContextCreated",
+                "sessionId": "flat-production",
+                "params": {
+                    "context": {
+                        "id": 1,
+                        "uniqueId": "realm-production",
+                        "origin": "about:blank",
+                        "name": "",
+                        "auxData": {
+                            "isDefault": true,
+                            "type": "default",
+                            "frameId": "frame-production",
+                        },
+                    },
+                },
+            }))
+            .expect("CDP default-context event should encode");
+            writer
+                .write_all(&context_created)
+                .await
+                .expect("CDP default-context event should be writable");
+            writer
+                .write_all(&[0])
+                .await
+                .expect("CDP default-context terminator should be writable");
+        }
+        let result = if method == "Page.getFrameTree" {
+            // Frame ownership comes from the protocol tree, not target ID equality.
+            json!({"frameTree": {"frame": {"id": "frame-production", "url": "about:blank"}}})
+        } else {
+            json!({})
+        };
+        respond(&mut writer, &command, result).await;
     }
 
     if matches!(cleanup_probe, CleanupProbe::HealthyThenDriftedHealth) {
-        qualify_protocol(&mut reader, &mut writer).await;
+        let healthy = read_command(&mut reader).await;
+        assert_eq!(healthy["method"], "Browser.getVersion");
+        if let Some((entered, release)) = health_gate {
+            entered
+                .send(())
+                .expect("explicit renderer qualifier started");
+            release.cancelled().await;
+        }
+        respond_healthy_version(&mut writer, &healthy).await;
         let drift = read_command(&mut reader).await;
         assert_eq!(drift["method"], "Browser.getVersion");
         respond(
@@ -705,6 +837,48 @@ async fn run_scripted_protocol_with_pipes(
             }
         };
         respond(&mut writer, &targets, json!({"targetInfos": target_infos})).await;
+        if matches!(cleanup_probe, CleanupProbe::OrphanTarget) {
+            // A pinned, owned target may be observed during bounded asynchronous disposal.
+            // Keep it present on every retry; cleanup must still become uncertain and close
+            // the transport instead of treating the successful dispose response as proof.
+            let probes = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut probes = 1;
+                loop {
+                    let mut bytes = Vec::new();
+                    loop {
+                        let mut byte = [0_u8; 1];
+                        let read = reader
+                            .read(&mut byte)
+                            .await
+                            .expect("orphan cleanup command should be readable");
+                        if read == 0 {
+                            assert!(bytes.is_empty(), "cleanup must close at a frame boundary");
+                            return probes;
+                        }
+                        if byte[0] == 0 {
+                            break;
+                        }
+                        assert!(bytes.len() < 64 * 1024, "bounded cleanup command");
+                        bytes.push(byte[0]);
+                    }
+                    let command: Value =
+                        serde_json::from_slice(&bytes).expect("valid cleanup command");
+                    assert_eq!(command["method"], "Target.getTargets");
+                    assert_eq!(command["params"], json!({}));
+                    assert!(command.get("sessionId").is_none());
+                    probes += 1;
+                    assert!(probes <= 256, "bounded orphan cleanup probes");
+                    respond(&mut writer, &command, json!({"targetInfos": target_infos})).await;
+                }
+            })
+            .await
+            .expect("orphan cleanup must stop within its absolute deadline");
+            assert!(
+                probes > 1,
+                "owned orphan must remain present across retries"
+            );
+            return;
+        }
         if matches!(
             cleanup_probe,
             CleanupProbe::Clean | CleanupProbe::DelayedDispose(_) | CleanupProbe::DelayedVerify(_)
@@ -949,6 +1123,9 @@ fn readiness_deadline_also_bounds_context_disposal() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1011,6 +1188,9 @@ fn readiness_deadline_also_bounds_orphan_verification() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1176,6 +1356,84 @@ fn production_admission_stays_closed_until_real_readiness_qualification_succeeds
 }
 
 #[test]
+fn production_readiness_rejects_missing_routed_binding_and_cleans_exact_created_launch() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    let worker_id = WorkerId::new("production-missing-routed-binding")
+        .expect("worker identity should be valid");
+    let worker_epoch = 31;
+    let daemon_epoch = 17;
+    let (peer_tx, peer_rx) = oneshot::channel();
+    let sandbox = Arc::new(ScriptedSandbox {
+        daemon_epoch,
+        cancel_delay: Mutex::new(Duration::ZERO),
+        peer_termination: None,
+        panic_next_cancel: AtomicBool::new(false),
+        missing_binding: true,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
+        peers: Mutex::new(VecDeque::from([peer_tx])),
+        launches: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
+        renewals: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+        cancelled_specs: Mutex::new(Vec::new()),
+    });
+    let config = ProductionSessionShardConfig::new(
+        worker_id,
+        worker_epoch,
+        daemon_epoch,
+        identity(),
+        ChromiumConnectionConfig::default(),
+        EgressPolicyBinding::new("strict", [31; 32]).expect("egress policy should be valid"),
+        Duration::from_secs(30),
+    )
+    .expect("production shard configuration should be valid");
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone())
+            .expect("multi-thread runtime should be supported");
+    let protocol = runtime.spawn(async move {
+        let (mut reader, _writer) = peer_rx.await.expect("CDP peer should be transferred");
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut byte))
+            .await
+            .expect("unbound CDP pipes should close within the readiness bound")
+            .expect("CDP EOF read should succeed");
+        assert_eq!(
+            closed, 0,
+            "missing binding must reject before any CDP command"
+        );
+    });
+
+    assert!(
+        sandbox.missing_binding,
+        "this fixture supplies unbound CDP pipes"
+    );
+    let qualification = factory.qualify_daemon();
+    wait_protocol(&runtime, protocol).expect("unbound CDP pipes should close without a command");
+    assert_eq!(qualification, Err(DependencyError::Rejected));
+    assert_eq!(sandbox.launches.load(Ordering::SeqCst), 1);
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 1);
+    let created = sandbox
+        .created_specs
+        .lock()
+        .expect("created launch log should remain available");
+    assert_eq!(created.len(), 1);
+    let cancelled = sandbox
+        .cancelled_specs
+        .lock()
+        .expect("exact cancellation log should remain available");
+    assert!(
+        !cancelled.is_empty(),
+        "unbound pipes must clean their created launch"
+    );
+    assert!(cancelled.iter().all(|spec| spec == &created[0]));
+}
+
+#[test]
 fn unsupported_session_options_are_rejected_before_sandbox_effect() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1192,6 +1450,9 @@ fn unsupported_session_options_are_rejected_before_sandbox_effect() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([readiness_peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1223,25 +1484,7 @@ fn unsupported_session_options_are_rejected_before_sandbox_effect() {
         sandbox.claims.load(Ordering::SeqCst),
         sandbox.kills.load(Ordering::SeqCst),
     );
-    let options = WorkerSessionOptionsV1 {
-        workload_class_hint: "interactive".to_owned(),
-        viewport: WorkerViewport {
-            width: 1_280,
-            height: 720,
-            device_scale_factor: 1,
-        },
-        locale: "ko-KR".to_owned(),
-        timezone: "Asia/Seoul".to_owned(),
-        user_agent: None,
-        network_policy_id: "strict".to_owned(),
-        network_class: "public".to_owned(),
-        checkpoint_ref: None,
-        dialog_policy: "auto_dismiss".to_owned(),
-        feature_profile: "standard".to_owned(),
-        ttl_seconds: 1_800,
-        idle_timeout_seconds: 600,
-        metadata: Default::default(),
-    };
+    let options = native_session_options();
     let mut policy_mismatch = options.clone();
     policy_mismatch.network_policy_id = "different-policy".to_owned();
     let mut unsupported_network_class = options.clone();
@@ -1252,11 +1495,13 @@ fn unsupported_session_options_are_rejected_before_sandbox_effect() {
     unsupported_dialog.dialog_policy = "hold".to_owned();
     let mut unsupported_feature = options.clone();
     unsupported_feature.feature_profile = "privileged".to_owned();
+    let native_catalog_missing = options.clone();
     let mut invalid = options;
     invalid.locale.clear();
     let fence = OwnershipFence::new(worker_id, worker_epoch, 3, 1);
 
     for (case, options) in [
+        ("native profile catalog missing", native_catalog_missing),
         ("network policy mismatch", policy_mismatch),
         ("unsupported network class", unsupported_network_class),
         ("unsupported checkpoint", unsupported_checkpoint),
@@ -1385,6 +1630,9 @@ fn concurrent_readiness_callers_share_one_probe_and_one_cleanup() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1453,6 +1701,9 @@ fn readiness_rejects_and_caches_an_orphaned_context_target() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1510,6 +1761,9 @@ fn cleanup_deadline_caches_uncertainty_without_aborting_owned_cleanup() {
         cancel_delay: Mutex::new(Duration::from_millis(250)),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1592,6 +1846,9 @@ fn readiness_cleanup_accepts_eof_after_exact_kill_closes_the_cdp_peer() {
         cancel_delay: Mutex::new(Duration::from_millis(100)),
         peer_termination: Some(peer_termination.clone()),
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1634,6 +1891,94 @@ fn readiness_cleanup_accepts_eof_after_exact_kill_closes_the_cdp_peer() {
 
 #[test]
 fn owned_exact_cleanup_panic_releases_waiters_with_one_terminal_result() {
+    struct ObservedSessionTermination {
+        inner: Arc<ScriptedSandbox>,
+        session_id: SessionId,
+        peer: PeerTermination,
+        terminal_replies: AtomicUsize,
+    }
+    #[async_trait]
+    impl SandboxShardRpc for ObservedSessionTermination {
+        async fn create_shard(
+            &self,
+            spec: LaunchSpec,
+            ttl: Duration,
+        ) -> Result<CreateShardOutcome, ShardRuntimeError> {
+            self.inner.create_shard(spec, ttl).await
+        }
+        async fn cancel_or_kill_shard(
+            &self,
+            spec: &LaunchSpec,
+            reason: CleanupReason,
+        ) -> Result<KillShardOutcome, ShardRuntimeError> {
+            // The one-shot scripted panic remains observable to the production exact owner.
+            let outcome = self.inner.cancel_or_kill_shard(spec, reason).await?;
+            let exact_session = spec.dedicated_egress().egress_fence().session_id()
+                == &self.session_id
+                && self
+                    .inner
+                    .created_specs
+                    .lock()
+                    .map_err(|_| ShardRuntimeError::Unavailable)?
+                    .iter()
+                    .any(|expected| expected == spec);
+            if exact_session
+                && matches!(
+                    outcome,
+                    KillShardOutcome::Terminated(_) | KillShardOutcome::AlreadyTerminated
+                )
+            {
+                // Only this session's successful exact kill authorizes a forced peer close.
+                // Its terminal reply cannot escape before that actual close is observed.
+                self.peer.kill.cancel();
+                self.peer.closed.cancelled().await;
+                self.terminal_replies.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(outcome)
+        }
+        async fn claim_cdp_pipes(
+            &self,
+            id: &ShardId,
+            worker: &WorkerId,
+            epoch: u64,
+            generation: LaunchGeneration,
+        ) -> Result<ChromiumCdpPipes, ShardRuntimeError> {
+            self.inner
+                .claim_cdp_pipes(id, worker, epoch, generation)
+                .await
+        }
+        async fn renew_owner_lease(
+            &self,
+            id: &ShardId,
+            epoch: u64,
+            generation: LaunchGeneration,
+            ttl: Duration,
+        ) -> Result<(), ShardRuntimeError> {
+            self.inner
+                .renew_owner_lease(id, epoch, generation, ttl)
+                .await
+        }
+        async fn kill_shard(
+            &self,
+            id: &ShardId,
+            epoch: u64,
+            generation: LaunchGeneration,
+            reason: CleanupReason,
+        ) -> Result<KillShardOutcome, ShardRuntimeError> {
+            self.inner.kill_shard(id, epoch, generation, reason).await
+        }
+    }
+    #[async_trait]
+    impl ProductionSandboxControl for ObservedSessionTermination {
+        async fn probe_daemon_epoch(
+            &self,
+            worker: &WorkerId,
+            epoch: u64,
+        ) -> Result<u64, ShardRuntimeError> {
+            self.inner.probe_daemon_epoch(worker, epoch).await
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -1650,12 +1995,26 @@ fn owned_exact_cleanup_panic_releases_waiters_with_one_terminal_result() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([readiness_peer_tx, session_peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
         renewals: AtomicUsize::new(0),
         kills: AtomicUsize::new(0),
         cancelled_specs: Mutex::new(Vec::new()),
+    });
+    let session_id = SessionId::new();
+    let session_termination = PeerTermination {
+        kill: CancellationToken::new(),
+        closed: CancellationToken::new(),
+    };
+    let observed_sandbox = Arc::new(ObservedSessionTermination {
+        inner: Arc::clone(&sandbox),
+        session_id: session_id.clone(),
+        peer: session_termination.clone(),
+        terminal_replies: AtomicUsize::new(0),
     });
     let config = ProductionSessionShardConfig::new(
         worker_id.clone(),
@@ -1668,8 +2027,12 @@ fn owned_exact_cleanup_panic_releases_waiters_with_one_terminal_result() {
     )
     .expect("production shard configuration should be valid");
     let production_factory = Arc::new(
-        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone())
-            .expect("multi-thread runtime should be supported"),
+        ProductionSessionShardFactory::new(
+            config,
+            Arc::clone(&observed_sandbox),
+            runtime.handle().clone(),
+        )
+        .expect("multi-thread runtime should be supported"),
     );
     let readiness_protocol = runtime.spawn(run_scripted_protocol(
         readiness_peer_rx,
@@ -1679,11 +2042,11 @@ fn owned_exact_cleanup_panic_releases_waiters_with_one_terminal_result() {
     wait_protocol(&runtime, readiness_protocol).expect("readiness CDP peer should not panic");
 
     let tenant_id = TenantId::new();
-    let session_id = SessionId::new();
     let fence = OwnershipFence::new(worker_id.clone(), worker_epoch, 5, 7);
-    let session_protocol = runtime.spawn(run_scripted_protocol(
+    let session_protocol = runtime.spawn(run_killable_scripted_protocol(
         session_peer_rx,
         CleanupProbe::DisposeOnly,
+        session_termination.clone(),
     ));
     let shard = production_factory
         .create(&tenant_id, &session_id, &fence)
@@ -1745,6 +2108,23 @@ fn owned_exact_cleanup_panic_releases_waiters_with_one_terminal_result() {
         Ok(first_result),
         "a cleanup panic must publish one shared terminal result"
     );
+    assert!(
+        session_termination.closed.is_cancelled(),
+        "the exact session peer must be joined"
+    );
+    let terminal_replies = observed_sandbox.terminal_replies.load(Ordering::SeqCst);
+    if terminal_replies > 0 {
+        assert!(
+            session_termination.kill.is_cancelled(),
+            "terminal replies require an observed exact peer kill"
+        );
+    }
+    if first_result.is_ok() {
+        assert!(
+            terminal_replies > 0,
+            "successful forced cleanup requires an observed terminal reply"
+        );
+    }
 }
 
 #[test]
@@ -1765,6 +2145,9 @@ fn session_cleanup_deadline_publishes_before_an_owned_exact_rpc_finishes() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([readiness_peer_tx, session_peer_tx])),
         launches: AtomicUsize::new(0),
         claims: AtomicUsize::new(0),
@@ -1861,6 +2244,9 @@ fn runtime_owned_concurrent_closes_do_not_starve_cleanup() {
         cancel_delay: Mutex::new(Duration::ZERO),
         peer_termination: None,
         panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
         peers: Mutex::new(VecDeque::from([
             readiness_peer_tx,
             first_peer_tx,
@@ -1978,7 +2364,7 @@ fn runtime_owned_concurrent_closes_do_not_starve_cleanup() {
 }
 
 #[test]
-fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
+fn lease_renewal_is_renderer_independent_and_explicit_qualification_still_fences_drift() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -1992,12 +2378,17 @@ fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
     let (session_peer_tx, session_peer_rx) = oneshot::channel();
     let (renewal_entered, renewal_observed) = mpsc::sync_channel(1);
     let renewal_release = CancellationToken::new();
+    let (health_entered, health_observed) = mpsc::sync_channel(1);
+    let health_release = CancellationToken::new();
     let sandbox = Arc::new(GatedRenewSandbox {
         inner: ScriptedSandbox {
             daemon_epoch,
             cancel_delay: Mutex::new(Duration::ZERO),
             peer_termination: None,
             panic_next_cancel: AtomicBool::new(false),
+            missing_binding: false,
+            created_specs: Mutex::new(Vec::new()),
+            pinned_namespaces: Mutex::new(Vec::new()),
             peers: Mutex::new(VecDeque::from([readiness_peer_tx, session_peer_tx])),
             launches: AtomicUsize::new(0),
             claims: AtomicUsize::new(0),
@@ -2058,10 +2449,19 @@ fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
         )
         .expect("session shard router should be valid"),
     );
-    let protocol = runtime.spawn(run_scripted_protocol(
-        session_peer_rx,
-        CleanupProbe::HealthyThenDriftedHealth,
-    ));
+    let protocol = runtime.spawn({
+        let health_release = health_release.clone();
+        async move {
+            let (reader, writer) = session_peer_rx.await.expect("session CDP peer");
+            run_scripted_protocol_with_pipes(
+                reader,
+                writer,
+                CleanupProbe::HealthyThenDriftedHealth,
+                Some((health_entered, health_release)),
+            )
+            .await;
+        }
+    });
 
     let tenant_id = TenantId::new();
     let session_id = SessionId::new();
@@ -2078,7 +2478,7 @@ fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
     assert_eq!(
         renewal_observed.recv_timeout(Duration::from_millis(500)),
         Ok(()),
-        "the first healthy heartbeat must reach lease renewal",
+        "heartbeat reaches native renewal without a renderer probe",
     );
     let (second_result_sender, second_result) = mpsc::sync_channel(1);
     let second_heartbeat = std::thread::spawn({
@@ -2096,17 +2496,57 @@ fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
         Ok(result) => result,
         Err(_) => second_result
             .recv_timeout(Duration::from_millis(500))
-            .expect("the drifted heartbeat should finish after renewal is released"),
+            .expect("the second heartbeat finishes after renewal is released"),
     };
     let second_join = second_heartbeat.join();
 
     assert!(matches!(first_result, Ok(Ok(()))));
     assert!(second_join.is_ok());
-    assert_eq!(second_after_release, Err(DependencyError::OutcomeUncertain));
+    assert_eq!(second_after_release, Ok(()));
     assert_eq!(
         sandbox.inner.renewals.load(Ordering::SeqCst),
-        1,
-        "an unproven Chromium liveness result must not renew the sandbox lease",
+        2,
+        "both exact native lease renewals complete without renderer round trips",
+    );
+    let qualification = std::thread::spawn({
+        let router = router.clone();
+        move || ChromiumDriver::qualify(router.as_ref())
+    });
+    let entered = health_observed.recv_timeout(Duration::from_millis(500));
+    let (completed, observed) = mpsc::channel();
+    let renewal = std::thread::spawn({
+        let router = router.clone();
+        let worker_id = worker_id.clone();
+        move || {
+            let result = router.heartbeat(&worker_id, worker_epoch);
+            let _ = completed.send(result);
+            result
+        }
+    });
+    let while_renderer_waits = observed.recv_timeout(Duration::from_millis(100));
+    health_release.cancel();
+    let qualification_result = qualification.join();
+    let renewal_result = renewal.join();
+    assert!(entered.is_ok());
+    assert_eq!(
+        while_renderer_waits,
+        Ok(Ok(())),
+        "a pending explicit renderer probe cannot block native renewal"
+    );
+    assert!(matches!(renewal_result, Ok(Ok(()))));
+    assert!(matches!(qualification_result, Ok(Ok(()))));
+    assert_eq!(
+        ChromiumDriver::qualify(router.as_ref()),
+        Err(DependencyError::OutcomeUncertain)
+    );
+    assert_eq!(
+        router.heartbeat(&worker_id, worker_epoch),
+        Err(DependencyError::OutcomeUncertain)
+    );
+    assert_eq!(
+        sandbox.inner.renewals.load(Ordering::SeqCst),
+        3,
+        "observed renderer/owner drain still prevents any subsequent native renewal"
     );
     assert_eq!(router.close_context_fenced(&session_id, &fence), Ok(()));
     assert_eq!(router.close_context_fenced(&session_id, &fence), Ok(()));
@@ -2123,3 +2563,354 @@ fn active_chromium_liveness_gates_lease_renewal_and_bounded_shutdown() {
         "readiness and session shards must each use one exact cleanup flight"
     );
 }
+
+fn native_session_options() -> WorkerSessionOptionsV1 {
+    WorkerSessionOptionsV1 {
+        workload_class_hint: "interactive".to_owned(),
+        viewport: WorkerViewport {
+            width: 1_280,
+            height: 720,
+            device_scale_factor: 1,
+        },
+        locale: "ko-KR".to_owned(),
+        timezone: "Asia/Seoul".to_owned(),
+        user_agent: None,
+        network_policy_id: "strict".to_owned(),
+        network_class: "public".to_owned(),
+        checkpoint_ref: None,
+        dialog_policy: "auto_dismiss".to_owned(),
+        feature_profile: "standard".to_owned(),
+        ttl_seconds: 1_800,
+        idle_timeout_seconds: 600,
+        metadata: Default::default(),
+    }
+}
+
+struct NativeCatalogFixture {
+    root: TempDir,
+    artifact: CompatibilityArtifact,
+}
+
+impl NativeCatalogFixture {
+    fn new() -> Self {
+        let root = tempdir().expect("native catalog artifact directory");
+        let digest = |bytes: &[u8]| {
+            Sha256Digest::from_hex(&hex::encode(Sha256::digest(bytes)))
+                .expect("native resource digest")
+        };
+        let catalog = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "icu_data": "icudtl.dat",
+            "locales": [{"locale": "ko-KR", "pak": "ko.pak"}],
+            "time_zones": ["Asia/Seoul"]
+        }))
+        .expect("encode native catalog");
+        let mut files = Vec::new();
+        for (relative, bytes) in [
+            ("chrome", b"approved test Chromium".as_slice()),
+            ("icudtl.dat", b"approved test ICU".as_slice()),
+            ("ko.pak", b"approved Korean locale pack".as_slice()),
+            ("native-process-profiles.json", catalog.as_slice()),
+        ] {
+            fs::write(root.path().join(relative), bytes).expect("write native artifact resource");
+            files.push(ArtifactFile::new(relative, digest(bytes)));
+        }
+        let mut chromium_identity = identity();
+        chromium_identity.binary_digest = digest(b"approved test Chromium");
+        chromium_identity.launch_profile_digest = digest(&catalog);
+        Self {
+            root,
+            artifact: CompatibilityArtifact {
+                identity: chromium_identity,
+                files,
+            },
+        }
+    }
+
+    fn catalog(&self) -> VerifiedNativeProfileCatalog {
+        VerifiedNativeProfileCatalog::load(self.root.path(), &self.artifact)
+            .expect("verify native profile catalog")
+    }
+
+    fn config(&self, identity: ChromiumArtifactIdentity) -> ProductionSessionShardConfig {
+        ProductionSessionShardConfig::new(
+            WorkerId::new("native-profile-factory").expect("native factory worker"),
+            31,
+            17,
+            identity,
+            ChromiumConnectionConfig::default(),
+            EgressPolicyBinding::new("strict", [25; 32]).expect("native factory egress policy"),
+            Duration::from_secs(30),
+        )
+        .expect("native factory config")
+    }
+}
+
+#[test]
+fn native_profile_config_requires_the_verified_binary_and_launch_catalog_identity() {
+    let fixture = NativeCatalogFixture::new();
+    for change_binary in [true, false] {
+        let mut identity = fixture.artifact.identity.clone();
+        let other_digest = Sha256Digest::from_hex(&"22".repeat(32)).expect("other digest");
+        if change_binary {
+            identity.binary_digest = other_digest;
+        } else {
+            identity.launch_profile_digest = other_digest;
+        }
+        assert!(
+            matches!(
+                fixture
+                    .config(identity)
+                    .with_native_profiles(fixture.catalog()),
+                Err(DependencyError::Rejected)
+            ),
+            "catalog must match both artifact identity bindings"
+        );
+    }
+    assert!(
+        fixture
+            .config(fixture.artifact.identity.clone())
+            .with_native_profiles(fixture.catalog())
+            .is_ok()
+    );
+}
+
+#[test]
+fn unqualified_native_profile_factory_rejects_options_without_sandbox_effects() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("native factory test runtime");
+    let fixture = NativeCatalogFixture::new();
+    let config = fixture
+        .config(fixture.artifact.identity.clone())
+        .with_native_profiles(fixture.catalog())
+        .expect("bound native catalog");
+    let sandbox = Arc::new(FailingSandbox {
+        daemon_epoch: 17,
+        launches: Mutex::new(Vec::new()),
+        cancelled_specs: Mutex::new(Vec::new()),
+        claims: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+    });
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone())
+            .expect("native factory");
+    let fence = OwnershipFence::new(
+        WorkerId::new("native-profile-factory").expect("worker"),
+        31,
+        3,
+        1,
+    );
+    let options = native_session_options();
+    let mut unsupported_locale = options.clone();
+    unsupported_locale.locale = "ko".to_owned();
+    let mut unsupported_timezone = options.clone();
+    unsupported_timezone.timezone = "Asia/Tokyo".to_owned();
+    for options in [options, unsupported_locale, unsupported_timezone] {
+        assert!(matches!(
+            factory.create_with_options(&TenantId::new(), &SessionId::new(), &fence, &options),
+            Err(DependencyError::Rejected)
+        ));
+    }
+    assert!(sandbox.launches.lock().expect("launch log").is_empty());
+    assert!(
+        sandbox
+            .cancelled_specs
+            .lock()
+            .expect("cancel log")
+            .is_empty()
+    );
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), 0);
+    assert_eq!(sandbox.kills.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn qualified_native_profile_factory_rejects_unlisted_exact_profiles_before_launch() {
+    native_profile_admission_case(false);
+}
+
+#[test]
+fn operator_enabled_privileged_profile_preserves_native_launch_identity() {
+    native_profile_admission_case(true);
+}
+
+fn native_profile_admission_case(privileged_enabled: bool) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("native factory test runtime");
+    let fixture = NativeCatalogFixture::new();
+    let expected_profile = fixture
+        .catalog()
+        .process_profile("ko-KR", "Asia/Seoul")
+        .expect("listed native profile");
+    let config = fixture
+        .config(fixture.artifact.identity.clone())
+        .with_native_profiles(fixture.catalog())
+        .expect("bound native catalog")
+        .with_privileged_evaluate(privileged_enabled);
+    let (peer_tx, peer_rx) = oneshot::channel();
+    let sandbox = Arc::new(ScriptedSandbox {
+        daemon_epoch: 17,
+        cancel_delay: Mutex::new(Duration::ZERO),
+        peer_termination: None,
+        panic_next_cancel: AtomicBool::new(false),
+        missing_binding: false,
+        created_specs: Mutex::new(Vec::new()),
+        pinned_namespaces: Mutex::new(Vec::new()),
+        peers: Mutex::new(VecDeque::from([peer_tx])),
+        launches: AtomicUsize::new(0),
+        claims: AtomicUsize::new(0),
+        renewals: AtomicUsize::new(0),
+        kills: AtomicUsize::new(0),
+        cancelled_specs: Mutex::new(Vec::new()),
+    });
+    let factory =
+        ProductionSessionShardFactory::new(config, Arc::clone(&sandbox), runtime.handle().clone())
+            .expect("native factory");
+    let readiness = runtime.spawn(run_scripted_protocol(peer_rx, CleanupProbe::Clean));
+    assert_eq!(factory.qualify_daemon(), Ok(()));
+    wait_protocol(&runtime, readiness).expect("native catalog baseline qualification");
+    let effects_before = (
+        sandbox.launches.load(Ordering::SeqCst),
+        sandbox.claims.load(Ordering::SeqCst),
+        sandbox.kills.load(Ordering::SeqCst),
+    );
+    assert_eq!(effects_before, (1, 1, 1));
+    assert_eq!(
+        sandbox
+            .cancelled_specs
+            .lock()
+            .expect("qualification launch cleanup")[0]
+            .process_profile(),
+        &ChromiumProcessProfile::BaselineV1
+    );
+    let fence = OwnershipFence::new(
+        WorkerId::new("native-profile-factory").expect("worker"),
+        31,
+        3,
+        1,
+    );
+    let mut privileged_options = native_session_options();
+    privileged_options.feature_profile = "privileged".to_owned();
+    if !privileged_enabled {
+        assert!(matches!(
+            factory.create_with_options(
+                &TenantId::new(),
+                &SessionId::new(),
+                &fence,
+                &privileged_options
+            ),
+            Err(DependencyError::Rejected)
+        ));
+        assert_eq!(sandbox.launches.load(Ordering::SeqCst), effects_before.0);
+        assert_eq!(sandbox.claims.load(Ordering::SeqCst), effects_before.1);
+        assert_eq!(sandbox.kills.load(Ordering::SeqCst), effects_before.2);
+    }
+    for (locale, timezone) in [
+        ("ko", "Asia/Seoul"),
+        ("ko-kr", "Asia/Seoul"),
+        ("ko-KR", "Asia/Tokyo"),
+    ] {
+        let mut options = native_session_options();
+        options.locale = locale.to_owned();
+        options.timezone = timezone.to_owned();
+        assert!(matches!(
+            factory.create_with_options(&TenantId::new(), &SessionId::new(), &fence, &options),
+            Err(DependencyError::Rejected)
+        ));
+        assert_eq!(
+            (
+                sandbox.launches.load(Ordering::SeqCst),
+                sandbox.claims.load(Ordering::SeqCst),
+                sandbox.kills.load(Ordering::SeqCst)
+            ),
+            effects_before
+        );
+    }
+    // The listed profile reaches shard admission. The empty peer queue makes
+    // CDP handoff fail, so its exact cleanup spec reveals the bound launch profile.
+    assert!(matches!(
+        factory.create_with_options(
+            &TenantId::new(),
+            &SessionId::new(),
+            &fence,
+            &native_session_options()
+        ),
+        Err(DependencyError::Rejected)
+    ));
+    assert_eq!(
+        sandbox.launches.load(Ordering::SeqCst),
+        effects_before.0 + 1
+    );
+    assert_eq!(sandbox.claims.load(Ordering::SeqCst), effects_before.1 + 1);
+    let cancelled = sandbox
+        .cancelled_specs
+        .lock()
+        .expect("native launch cleanup");
+    let launch = cancelled.last().expect("native launch must be cleaned");
+    assert_eq!(launch.process_profile(), &expected_profile);
+    assert_eq!(
+        launch.chromium_binary_digest(),
+        fixture.artifact.identity.binary_digest.into()
+    );
+    drop(cancelled);
+    let mut custom_options = native_session_options();
+    custom_options.user_agent = Some("browserd-native-factory/1.0".to_owned());
+    assert!(matches!(
+        factory.create_with_options(&TenantId::new(), &SessionId::new(), &fence, &custom_options),
+        Err(DependencyError::Rejected)
+    ));
+    let cancelled = sandbox.cancelled_specs.lock().expect("custom UA cleanup");
+    assert_eq!(
+        cancelled
+            .last()
+            .expect("custom launch cleanup")
+            .process_profile(),
+        &expected_profile
+            .with_user_agent(custom_options.user_agent)
+            .expect("custom immutable UA")
+    );
+    drop(cancelled);
+    if privileged_enabled {
+        let before = sandbox.launches.load(Ordering::SeqCst);
+        assert!(matches!(
+            factory.create_with_options(
+                &TenantId::new(),
+                &SessionId::new(),
+                &fence,
+                &privileged_options
+            ),
+            Err(DependencyError::Rejected)
+        ));
+        assert_eq!(
+            sandbox.launches.load(Ordering::SeqCst),
+            before + 1,
+            "operator-enabled privileged profile must reach native launch admission"
+        );
+        let cancelled = sandbox.cancelled_specs.lock().expect("privileged cleanup");
+        let launch = cancelled.last().expect("privileged launch proof");
+        assert_eq!(
+            launch.dedicated_egress().policy_binding(),
+            &EgressPolicyBinding::new("strict", [25; 32]).expect("fixture egress policy"),
+            "JavaScript privilege preserves the exact configured egress policy"
+        );
+        assert_eq!(
+            launch.process_profile(),
+            &fixture
+                .catalog()
+                .process_profile("ko-KR", "Asia/Seoul")
+                .expect("native process profile")
+        );
+        assert_eq!(
+            launch.chromium_binary_digest(),
+            fixture.artifact.identity.binary_digest.into()
+        );
+    }
+}
+
+#[path = "support/shared_context_pool.rs"]
+mod shared_context_pool;

@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use browserd_core::{OperationId, TenantId};
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceVector {
     pub memory_bytes: u64,
     pub cpu_millis: u64,
@@ -46,7 +47,7 @@ impl ResourceVector {
             && self.targets <= capacity.targets
     }
 
-    fn checked_add(self, other: Self) -> Option<Self> {
+    pub fn checked_add(self, other: Self) -> Option<Self> {
         Some(Self {
             memory_bytes: self.memory_bytes.checked_add(other.memory_bytes)?,
             cpu_millis: self.cpu_millis.checked_add(other.cpu_millis)?,
@@ -57,7 +58,7 @@ impl ResourceVector {
         })
     }
 
-    fn checked_sub(self, other: Self) -> Option<Self> {
+    pub fn checked_sub(self, other: Self) -> Option<Self> {
         Some(Self {
             memory_bytes: self.memory_bytes.checked_sub(other.memory_bytes)?,
             cpu_millis: self.cpu_millis.checked_sub(other.cpu_millis)?,

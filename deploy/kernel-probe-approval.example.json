@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "operator_approval": false,
+  "isolated_validation": true,
+  "validation_uid": 1000,
+  "manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "artifact_root": "/opt/browserd/probe-runtime/chromium",
+  "probe_executable": {
+    "path": "/opt/browserd/probe/bin/browserd-kernel-probe",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "approved_assets": [
+    {"role": "chromium_binary", "path": "/opt/browserd/probe-runtime/chromium/bin/chromium", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    {"role": "launch_gate", "path": "/opt/browserd/probe/bin/browserd-launch-gate", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    {"role": "bwrap", "path": "/usr/bin/bwrap", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    {"role": "seccomp", "path": "/etc/browserd/probe.seccomp", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    {"role": "sandbox_daemon", "path": "/opt/browserd/probe/bin/browser-sandboxd", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    {"role": "egress_daemon", "path": "/opt/browserd/probe/bin/browser-egressd", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    {"role": "runtime_manifest", "path": "/etc/browserd/kernel-probe-runtime-manifest.json", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+  ],
+  "deployment": {
+    "sandbox": {
+      "socket_path": "/run/browserd-probe/sandbox.sock",
+      "expected_server_uid": 1000,
+      "daemon_epoch": 1,
+      "worker_id": "browserd-kernel-probe",
+      "worker_epoch": 1,
+      "cgroup_root": "/sys/fs/cgroup/browserd-probe/workloads",
+      "runtime_root": "/var/lib/browserd-probe/sandbox",
+      "journal_directory": "/var/lib/browserd-probe/sandbox-journal"
+    },
+    "egress": {
+      "control_url": "http://127.0.0.1:18083",
+      "install_socket": "/run/browserd-probe/egress.sock",
+      "expected_server_uid": 1000,
+      "daemon_epoch": 1,
+      "worker_token": "REPLACE_WITH_ISOLATED_WORKER_TOKEN_AT_LEAST_32_BYTES",
+      "supervisor_token": "REPLACE_WITH_ISOLATED_SUPERVISOR_TOKEN_AT_LEAST_32_BYTES",
+      "policy_profile": "kernel-probe",
+      "policy_digest": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "runtime": {
+      "redis_url": "redis://127.0.0.1:6379/15",
+      "redis_prefix": "browserd-isolated-kernel-probe",
+      "safety_pin_path": "/var/lib/browserd-probe/safety/pin.json"
+    },
+    "worker": {
+      "state_root": "/var/lib/browserd-probe/worker",
+      "max_session_count": 8,
+      "privileged_evaluate": false,
+      "scanner": {
+        "socket_path": "/run/browserd-probe/scanner.sock",
+        "expected_uid": 1000,
+        "max_database_age_millis": 86400000,
+        "max_future_skew_millis": 60000
+      }
+    },
+    "fixtures": {
+      "bind_address": "0.0.0.0:31338",
+      "origin": "http://probe.example.com:31338",
+      "host_direct_address": "127.0.0.1:31339",
+      "private_direct_address": "10.0.0.1:31340"
+    },
+    "assets": {
+      "chromium_host_executable": "/opt/browserd/probe-runtime/chromium/bin/chromium",
+      "chromium_sandbox_executable": "/browserd/chromium",
+      "launch_gate_host_executable": "/opt/browserd/probe/bin/browserd-launch-gate",
+      "launch_gate_sandbox_executable": "/browserd/launch-gate",
+      "bwrap_executable": "/usr/bin/bwrap",
+      "seccomp_filter": "/etc/browserd/probe.seccomp",
+      "sandbox_daemon_executable": "/opt/browserd/probe/bin/browser-sandboxd",
+      "egress_daemon_executable": "/opt/browserd/probe/bin/browser-egressd",
+      "runtime_manifest": "/etc/browserd/kernel-probe-runtime-manifest.json",
+      "read_only_mounts": [
+        {"source": "/opt/browserd/probe-runtime", "destination": "/opt/browserd/probe-runtime"},
+        {"source": "/opt/browserd/probe/bin", "destination": "/opt/browserd/probe/bin"}
+      ]
+    }
+  }
+}

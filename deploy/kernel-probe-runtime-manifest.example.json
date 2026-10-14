@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "mounts": [
+    {
+      "source": "/opt/browserd/probe-runtime",
+      "destination": "/opt/browserd/probe-runtime",
+      "files": [
+        {"relative_path": "chromium/bin/chromium", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+      ]
+    },
+    {
+      "source": "/opt/browserd/probe/bin",
+      "destination": "/opt/browserd/probe/bin",
+      "files": [
+        {"relative_path": "browserd-launch-gate", "sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
+      ]
+    }
+  ]
+}

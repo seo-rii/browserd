@@ -64,7 +64,7 @@ fn gateway_main_composes_durable_dependencies_and_probes_them_before_serving() {
     for required in [
         "GatewayAuthenticator::from_hmac_parts",
         "WorkerRpcClient::new",
-        ".probe(",
+        ".exchange(browserd_worker::WorkerRpcRequest::Probe",
         "PostgresCreateSessionStore::connect",
         ".migrate()",
         "CoordinationBlockingClient::spawn",
@@ -73,7 +73,7 @@ fn gateway_main_composes_durable_dependencies_and_probes_them_before_serving() {
         "DurableApiRouter::with_dispatch_lease_duration",
         "GatewayViewer::new",
         "GatewayReadiness::new",
-        "set_worker_ready(true)",
+        "set_worker_ready(initially_worker_ready)",
         "set_coordination_ready(true)",
     ] {
         let Some(composed) = source.find(required) else {
@@ -106,4 +106,50 @@ fn gateway_main_never_installs_in_memory_or_reject_all_placeholders() {
             "production gateway main must not contain placeholder {forbidden}"
         );
     }
+}
+
+#[test]
+fn fleet_readiness_starts_closed_and_uses_its_independent_authenticated_observer() {
+    let source = include_str!("../src/main.rs");
+    let initial = source
+        .find("set_worker_ready(initially_worker_ready)")
+        .expect("mode-aware initial readiness");
+    let probe = source
+        .find(".exchange(browserd_worker::WorkerRpcRequest::Probe")
+        .expect("authenticated metadata startup probe");
+    assert!(
+        probe < initial,
+        "unmanaged readiness follows its startup probe"
+    );
+    assert!(
+        !source.contains("set_worker_ready(true)"),
+        "fleet readiness cannot be unconditionally opened"
+    );
+    assert!(source.contains("(peer.worker_id().clone(), false)"));
+    let begin = source
+        .find("let fleet_observer =")
+        .expect("independent fleet observer");
+    let end = source[begin..]
+        .find("let custody_catchup_monitor =")
+        .map(|offset| begin + offset)
+        .expect("bounded observer block");
+    let observer: String = source[begin..end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    assert!(observer.contains("letenabled=fleet_config.is_some()"));
+    assert!(observer.contains("if!enabled{return;}"));
+    assert!(
+        observer.contains("runtime.refresh_fleet_workers(32)"),
+        "authenticated inventory observations remain bounded"
+    );
+    assert!(
+        observer.contains("set_worker_ready(matches!(result,Ok(Ok(count))ifcount>0))"),
+        "errors and zero ready workers must not open readiness"
+    );
+    assert!(observer.contains("MissedTickBehavior::Skip"));
+    assert!(
+        !observer.contains("maintain_fleet_leases"),
+        "worker discovery must remain independent of lease maintenance"
+    );
 }

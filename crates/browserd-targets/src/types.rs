@@ -97,4 +97,25 @@ impl FrameId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The internal CDP session route, distinct from both a public SessionId and a FrameId.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FlattenedSessionId(String);
+
+impl FlattenedSessionId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }

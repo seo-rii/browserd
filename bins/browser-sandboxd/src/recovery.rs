@@ -70,6 +70,53 @@ where
             .map_err(|_| PreparedShardRecoveryError::new())
     }
 
+    async fn all_context_routes_terminal(
+        &self,
+        record: &PreparedShardJournalRecord,
+        revoke: bool,
+    ) -> Result<(), PreparedShardRecoveryError> {
+        if self.old_epoch_is_superseded(record).await? {
+            return Ok(());
+        }
+        let epoch = record
+            .locators()
+            .egress_daemon_epoch()
+            .ok_or_else(PreparedShardRecoveryError::new)?;
+        for route in record.context_routes() {
+            if route.egress_daemon_epoch() != epoch
+                || route.request().egress().egress_fence().shard() != record.fence()
+            {
+                return Err(PreparedShardRecoveryError::new());
+            }
+            let fence = route.request().egress().egress_fence();
+            if revoke {
+                crate::egress::release_context_route_positive(
+                    self.egress.as_ref(),
+                    epoch,
+                    route.request().tenant_id(),
+                    route.request().egress(),
+                    route.binding().is_some(),
+                )
+                .await
+                .map_err(|_| PreparedShardRecoveryError::new())?;
+            } else {
+                let status = self
+                    .egress
+                    .status(epoch, fence)
+                    .await
+                    .map_err(|_| PreparedShardRecoveryError::new())?;
+                if !status.as_ref().is_some_and(|status| {
+                    status.daemon_epoch() == epoch
+                        && status.egress_fence() == fence
+                        && status.state() == crate::egress::RouteStatusState::Released
+                }) {
+                    return Err(PreparedShardRecoveryError::new());
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn terminal_status(
         record: &PreparedShardJournalRecord,
         status: Option<RouteStatusReceipt>,
@@ -123,7 +170,8 @@ where
                     .revoke(epoch, fence)
                     .await
                     .map_err(|_| PreparedShardRecoveryError::new())?;
-                Self::terminal_status(record, status)
+                Self::terminal_status(record, status)?;
+                self.all_context_routes_terminal(record, true).await
             }
             PreparedShardCleanupStage::AbortGate => {
                 // A startup reconciler runs in a fresh process. Every parent-side launch-gate
@@ -182,7 +230,23 @@ where
             PreparedShardCleanupStage::ConfirmEgressDrained
             | PreparedShardCleanupStage::ReleaseEgressGeneration => {
                 let status = self.egress_status(record).await?;
-                Self::terminal_status(record, status)
+                Self::terminal_status(record, status)?;
+                self.all_context_routes_terminal(record, false).await?;
+                if stage == PreparedShardCleanupStage::ReleaseEgressGeneration
+                    && !self.old_epoch_is_superseded(record).await?
+                {
+                    self.egress
+                        .retire_shard(
+                            record
+                                .locators()
+                                .egress_daemon_epoch()
+                                .ok_or_else(PreparedShardRecoveryError::new)?,
+                            record.fence(),
+                        )
+                        .await
+                        .map_err(|_| PreparedShardRecoveryError::new())?;
+                }
+                Ok(())
             }
             PreparedShardCleanupStage::CloseCapabilities
             | PreparedShardCleanupStage::CleanupNetworkNamespace => {
@@ -285,6 +349,14 @@ mod tests {
             Err(EgressControlError::Protocol("unused status".into()))
         }
 
+        async fn retire_shard(
+            &self,
+            _daemon_epoch: u64,
+            _fence: &browserd_core::ShardFence,
+        ) -> Result<(), EgressControlError> {
+            Ok(())
+        }
+
         async fn revoke(
             &self,
             _daemon_epoch: u64,
@@ -328,6 +400,14 @@ mod tests {
             Err(EgressControlError::Protocol(
                 "old epoch status must not be queried".into(),
             ))
+        }
+
+        async fn retire_shard(
+            &self,
+            _daemon_epoch: u64,
+            _fence: &browserd_core::ShardFence,
+        ) -> Result<(), EgressControlError> {
+            Ok(())
         }
 
         async fn revoke(
@@ -535,5 +615,239 @@ mod tests {
             .await
             .expect("a nonce-bound newer epoch proves the old listener owner exited");
         assert_eq!(revoke_calls.load(Ordering::SeqCst), 0);
+    }
+    struct ContextRecoveryControl {
+        released: std::sync::Mutex<std::collections::HashSet<EgressFence>>,
+        prepared: std::sync::Mutex<Vec<EgressFence>>,
+        revoked: std::sync::Mutex<Vec<EgressFence>>,
+        retired: AtomicUsize,
+        missing: bool,
+    }
+    #[async_trait]
+    impl EgressControlPlane for ContextRecoveryControl {
+        async fn current_daemon_epoch(&self) -> Result<u64, EgressControlError> {
+            Ok(41)
+        }
+        async fn prepare(
+            &self,
+            request: PrepareRouteRequest,
+        ) -> Result<PreparedRouteReceipt, EgressControlError> {
+            self.prepared
+                .lock()
+                .expect("prepared")
+                .push(request.egress_fence.clone());
+            Ok(PreparedRouteReceipt::fixture(request))
+        }
+        #[allow(clippy::panic)]
+        async fn install(
+            &self,
+            _request: InstallRequest,
+            _listener: OwnedFd,
+        ) -> Result<ActiveInstallResponse, EgressControlError> {
+            panic!("recovery must not reinstall routes")
+        }
+        async fn status(
+            &self,
+            epoch: u64,
+            fence: &EgressFence,
+        ) -> Result<Option<RouteStatusReceipt>, EgressControlError> {
+            Ok(self
+                .released
+                .lock()
+                .expect("released")
+                .contains(fence)
+                .then(|| RouteStatusReceipt::released_fixture(epoch, fence.clone())))
+        }
+        async fn revoke(
+            &self,
+            epoch: u64,
+            fence: &EgressFence,
+        ) -> Result<Option<RouteStatusReceipt>, EgressControlError> {
+            self.revoked.lock().expect("revoked").push(fence.clone());
+            if !self.missing {
+                self.released
+                    .lock()
+                    .expect("released")
+                    .insert(fence.clone());
+            }
+            self.status(epoch, fence).await
+        }
+        async fn retire_shard(
+            &self,
+            epoch: u64,
+            fence: &ShardFence,
+        ) -> Result<(), EgressControlError> {
+            assert_eq!(epoch, 41);
+            assert!(
+                self.revoked
+                    .lock()
+                    .expect("revoked")
+                    .iter()
+                    .all(|route| route.shard() == fence
+                        && self.released.lock().expect("released").contains(route))
+            );
+            self.retired.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn restart_recovery_releases_every_durable_context_before_final_shard_retirement() {
+        use browserd_core::{PlacementFence, TenantId};
+        use browserd_sandbox::{
+            ChromiumBinaryDigest, ContextEgressRequest, ContextRoutePhase, ContextRoutePolicy,
+            DedicatedEgressProxyBinding, DedicatedEgressSpec, EgressPolicyBinding, LaunchSpec,
+            PinnedNetworkNamespace, ShardEgressReservation, ShardIngressLease, ShardIngressReceipt,
+        };
+        let directory = tempdir().expect("directory");
+        let cgroups = directory.path().join("cgroups");
+        let runtime = directory.path().join("runtime");
+        std::fs::create_dir_all(&cgroups).expect("cgroups");
+        std::fs::create_dir_all(&runtime).expect("runtime");
+        let roots =
+            PreparedShardRecoveryRoots::new(cgroups.clone(), runtime.clone()).expect("roots");
+        let journal_path = directory.path().join("journal");
+        std::fs::create_dir(&journal_path).expect("journal directory");
+        let journal = FilePreparedShardJournal::open_with_limits_and_roots(
+            &journal_path,
+            PreparedShardJournalLimits::default(),
+            roots.clone(),
+        )
+        .expect("journal");
+        let spec = LaunchSpec::production(
+            TenantId::new(),
+            DedicatedEgressSpec::new(
+                fence(),
+                EgressPolicyBinding::new("public", [7; 32]).expect("policy"),
+                Duration::from_secs(30),
+            )
+            .expect("egress"),
+            ChromiumBinaryDigest::new([3; 32]),
+        )
+        .with_context_route_policy(
+            ContextRoutePolicy::new(PlacementFence::new(7, 1, 2), false, 8, 500).expect("contexts"),
+        )
+        .expect("launch");
+        let shard = spec.dedicated_egress().egress_fence().shard();
+        journal
+            .reserve(
+                shard.clone(),
+                PreparedShardRecoveryLocators::new(
+                    "context-recovery",
+                    cgroups.join("context-recovery"),
+                    runtime.join("context-recovery"),
+                )
+                .expect("locators")
+                .with_egress_binding(41, spec.dedicated_egress().egress_fence().clone())
+                .expect("epoch"),
+            )
+            .expect("reserve");
+        journal
+            .configure_context_routes(shard, spec.context_route_policy().expect("shared").clone())
+            .expect("policy");
+        let initial = ContextEgressRequest::initial(&spec).expect("initial");
+        let reservation = ShardEgressReservation::from_launch_spec(&spec);
+        journal
+            .reserve_context_route(initial.clone(), reservation.generation().clone(), 41, false)
+            .expect("primary intent");
+        let namespace = PinnedNetworkNamespace::from_owned_fd(
+            std::fs::File::open("/proc/self/ns/net")
+                .expect("namespace")
+                .into(),
+        )
+        .expect("pin");
+        let binding = DedicatedEgressProxyBinding::from_lease(&ShardIngressLease::from_attachment(
+            reservation,
+            namespace.identity(),
+            ShardIngressReceipt::with_proxy_address("127.0.0.1:43117".parse().expect("address"))
+                .expect("receipt"),
+        ))
+        .expect("binding");
+        journal
+            .set_context_route_phase(&initial, ContextRoutePhase::Active, Some(binding))
+            .expect("active");
+        let mut expected = vec![initial.egress().egress_fence().clone()];
+        for generation in [6, 7] {
+            let request = ContextEgressRequest::new(
+                TenantId::new(),
+                PlacementFence::new(7, generation, 1),
+                DedicatedEgressSpec::new(
+                    EgressFence::new(
+                        shard.clone(),
+                        RouteGeneration::new(generation).expect("route"),
+                        SessionId::new(),
+                        SessionIncarnation::new(1).expect("incarnation"),
+                    ),
+                    spec.dedicated_egress().policy_binding().clone(),
+                    Duration::from_secs(30),
+                )
+                .expect("egress"),
+            )
+            .expect("request");
+            journal
+                .reserve_context_route(
+                    request.clone(),
+                    browserd_core::LeaseId::new(),
+                    41,
+                    generation == 7,
+                )
+                .expect("intent or cancelled-before-effect");
+            expected.push(request.egress().egress_fence().clone());
+        }
+        drop(journal);
+        let record = FilePreparedShardJournal::open_with_limits_and_roots(
+            &journal_path,
+            PreparedShardJournalLimits::default(),
+            roots,
+        )
+        .expect("restart")
+        .records()
+        .expect("inventory")
+        .remove(0);
+        let control = Arc::new(ContextRecoveryControl {
+            released: Default::default(),
+            prepared: Default::default(),
+            revoked: Default::default(),
+            retired: AtomicUsize::new(0),
+            missing: false,
+        });
+        let recovery =
+            LinuxPreparedShardRecovery::new(control.clone(), cgroups.clone(), runtime.clone())
+                .expect("recovery");
+        for stage in [
+            PreparedShardCleanupStage::RevokeEgress,
+            PreparedShardCleanupStage::ConfirmEgressDrained,
+            PreparedShardCleanupStage::ReleaseEgressGeneration,
+        ] {
+            recovery
+                .run_stage(&record, stage)
+                .await
+                .expect("recovery proof");
+        }
+        {
+            let released = control.released.lock().expect("released");
+            assert_eq!(released.len(), expected.len());
+            assert!(expected.iter().all(|fence| released.contains(fence)));
+        }
+        assert_eq!(control.retired.load(Ordering::SeqCst), 1);
+        let missing = Arc::new(ContextRecoveryControl {
+            released: Default::default(),
+            prepared: Default::default(),
+            revoked: Default::default(),
+            retired: AtomicUsize::new(0),
+            missing: true,
+        });
+        let recovery = LinuxPreparedShardRecovery::new(missing.clone(), cgroups, runtime)
+            .expect("missing control");
+        assert!(
+            recovery
+                .all_context_routes_terminal(&record, true)
+                .await
+                .is_err(),
+            "active journal binding must not be cleared by missing status"
+        );
+        assert!(
+            missing.prepared.lock().expect("prepared").is_empty(),
+            "known-active route cannot be replaced by a synthetic fresh reservation"
+        );
     }
 }

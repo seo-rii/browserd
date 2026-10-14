@@ -1,0 +1,21 @@
+[Unit]
+Description=browserd API gateway (single worker route)
+Requires=browser-worker.service
+BindsTo=browser-worker.service
+After=browser-worker.service
+
+[Service]
+Type=exec
+User=browserd
+Group=browserd
+EnvironmentFile=/etc/browserd/browserd.env
+ExecStart=/usr/bin/env ${BROWSERD_RELEASE_ROOT}/bin/browser-gateway
+ExecStartPost=/usr/bin/python3 ${BROWSERD_RELEASE_ROOT}/deploy/wait_ready.py gateway
+UMask=0077
+Restart=no
+TimeoutStartSec=90
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

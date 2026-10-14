@@ -7,14 +7,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use browserd_core::{ArtifactId, SessionId, TenantId};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
 use sha2::{Digest, Sha256};
+use std::io::Read as _;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 use uuid::Uuid;
@@ -27,6 +30,8 @@ use crate::{
     ArtifactWriteReceipt, AuthorizedCleanupCandidate, CleanupCandidate, CleanupKind,
     CleanupOutcome, JanitorBackend, JanitorError, MultipartUploadId,
 };
+
+mod quarantine;
 
 const COMMIT_MAGIC: &[u8; 8] = b"BRDART01";
 const COMMIT_METADATA_BYTES: usize = 64;
@@ -44,6 +49,8 @@ tokio::task_local! {
 #[derive(Clone, Debug)]
 pub struct FilesystemArtifactStore {
     root: Arc<PathBuf>,
+    quarantine_root: Arc<std::fs::File>,
+    deleted_root_identity: (u64, u64),
     #[cfg(test)]
     test_hooks: Arc<FilesystemTestHooks>,
 }
@@ -89,6 +96,7 @@ struct FilesystemTestHooks {
     after_begin_stage_created: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_delete_live_read: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_complete_stage_exists: std::sync::Mutex<Option<Arc<OneShotPause>>>,
+    after_complete_artifact_lock: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_complete_data_inspection: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_complete_receipt_created: std::sync::Mutex<Option<Arc<OneShotPause>>>,
     after_complete_rename: std::sync::Mutex<Option<Arc<OneShotPause>>>,
@@ -123,6 +131,21 @@ pub struct FilesystemArtifactReader {
     remaining_bytes: u64,
     max_chunk_bytes: usize,
     terminal: bool,
+}
+
+impl FilesystemArtifactReader {
+    /// Wait for Tokio's outstanding file operation before releasing the real descriptor.
+    /// A caller retaining quota/read pins must keep them until this future completes.
+    pub async fn close(self) {
+        let descriptor = self.reader.into_inner().into_std().await;
+        drop(descriptor);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeleteReceiptPruneOutcome {
+    Pruned,
+    AlreadyAbsent,
 }
 
 impl ArtifactChunkReader for FilesystemArtifactReader {
@@ -220,7 +243,7 @@ impl FilesystemArtifactStore {
             .canonicalize()
             .map_err(|error| store_error("canonicalize artifact root", error))?;
         let mut created_child = false;
-        for child in [".multipart", "objects", ".deleted"] {
+        for child in [".multipart", "objects", ".deleted", ".quarantine"] {
             let path = root.join(child);
             match std::fs::create_dir(&path) {
                 Ok(()) => {
@@ -252,7 +275,20 @@ impl FilesystemArtifactStore {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| store_error("sync artifact root directory", error))?;
         }
+        let deleted_root = std::fs::symlink_metadata(root.join(".deleted"))
+            .map_err(|error| store_error("inspect stable artifact lock root", error))?;
         Ok(Self {
+            quarantine_root: Arc::new(std::fs::File::from(
+                open(
+                    &root.join(".quarantine"),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|error| {
+                    ArtifactStoreError::new(format!("pin quarantine directory: {error}"))
+                })?,
+            )),
+            deleted_root_identity: (deleted_root.dev(), deleted_root.ino()),
             root: Arc::new(root),
             #[cfg(test)]
             test_hooks: Arc::new(FilesystemTestHooks::default()),
@@ -272,6 +308,11 @@ impl FilesystemArtifactStore {
     #[cfg(test)]
     fn arm_complete_stage_exists_pause(&self) -> Arc<OneShotPause> {
         arm_one_shot_pause(&self.test_hooks.after_complete_stage_exists)
+    }
+
+    #[cfg(test)]
+    fn arm_complete_artifact_lock_pause(&self) -> Arc<OneShotPause> {
+        arm_one_shot_pause(&self.test_hooks.after_complete_artifact_lock)
     }
 
     #[cfg(test)]
@@ -313,6 +354,13 @@ impl FilesystemArtifactStore {
     #[cfg(test)]
     async fn pause_after_complete_stage_exists(&self) {
         if let Some(pause) = take_one_shot_pause(&self.test_hooks.after_complete_stage_exists) {
+            pause.pause().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_after_complete_artifact_lock(&self) {
+        if let Some(pause) = take_one_shot_pause(&self.test_hooks.after_complete_artifact_lock) {
             pause.pause().await;
         }
     }
@@ -523,6 +571,8 @@ impl FilesystemArtifactStore {
                 .parent()
                 .ok_or_else(|| ArtifactStoreError::new("artifact tombstone parent is missing"))?;
             self.compact_tombstone(&tombstone).await?;
+            self.prune_tombstones_except(key, expected_generation)
+                .await?;
             sync_directory(object_parent).await?;
             sync_directory(tombstone_parent).await?;
             return Ok(ArtifactDeleteOutcome::AlreadyDeleted);
@@ -555,47 +605,391 @@ impl FilesystemArtifactStore {
         key: &ArtifactKey,
         retained_generation: ArtifactObjectGeneration,
     ) -> Result<(), ArtifactObjectError> {
-        let key_directory = self.deleted_key_path(key);
-        let retained_name = encode_generation(retained_generation);
-        let mut entries = fs::read_dir(&key_directory).await.map_err(|error| {
-            ArtifactObjectError::Store(store_error("read artifact tombstones for pruning", error))
-        })?;
-        while let Some(entry) = entries.next_entry().await.map_err(|error| {
-            ArtifactObjectError::Store(store_error("read artifact tombstone for pruning", error))
-        })? {
-            if entry.file_name().to_str() == Some(retained_name.as_str()) {
-                continue;
+        let store = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            prune_superseded_tombstones(&store, &key, retained_generation)
+        })
+        .await
+        .map_err(|error| {
+            ArtifactObjectError::Store(ArtifactStoreError::new(format!(
+                "superseded artifact pruning task failed: {error}"
+            )))
+        })?
+    }
+}
+
+impl FilesystemArtifactStore {
+    async fn deleted_root_guard(
+        &self,
+        exclusive: bool,
+    ) -> Result<std::fs::File, ArtifactStoreError> {
+        let path = self.root.join(".deleted");
+        let identity = self.deleted_root_identity;
+        tokio::task::spawn_blocking(move || lock_stable_deleted_root(&path, identity, exclusive))
+            .await
+            .map_err(|error| {
+                ArtifactStoreError::new(format!("artifact root lock task failed: {error}"))
+            })?
+    }
+    /// Inspect only a fixed-size committed receipt, key binding and data file metadata.
+    /// This does not hash or read artifact payload bytes and does not publish an orphan.
+    pub async fn inspect_committed(
+        &self,
+        namespace: &ArtifactNamespace,
+        key: &ArtifactKey,
+    ) -> Result<Option<ArtifactWriteReceipt>, ArtifactObjectError> {
+        namespace
+            .authorize(key)
+            .map_err(|_| ArtifactObjectError::NamespaceDenied)?;
+        let store = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock_stable_deleted_root(
+                &store.root.join(".deleted"),
+                store.deleted_root_identity,
+                false,
+            )?;
+            inspect_committed_receipt(&store, &key)
+        })
+        .await
+        .map_err(|error| {
+            ArtifactObjectError::Store(ArtifactStoreError::new(format!(
+                "artifact receipt inspection task failed: {error}"
+            )))
+        })?
+    }
+    /// Exact metadata-only inspection for legacy deleted-marker inventory.
+    pub async fn inspect_delete_receipt(
+        &self,
+        namespace: &ArtifactNamespace,
+        key: &ArtifactKey,
+        generation: ArtifactObjectGeneration,
+    ) -> Result<Option<ArtifactWriteReceipt>, ArtifactObjectError> {
+        namespace
+            .authorize(key)
+            .map_err(|_| ArtifactObjectError::NamespaceDenied)?;
+        let store = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock_stable_deleted_root(
+                &store.root.join(".deleted"),
+                store.deleted_root_identity,
+                false,
+            )?;
+            inspect_deleted_receipt(&store, &key, generation)
+        })
+        .await
+        .map_err(|error| {
+            ArtifactObjectError::Store(ArtifactStoreError::new(format!(
+                "delete receipt inspection task failed: {error}"
+            )))
+        })?
+    }
+    /// The caller must already have durable cleanup authority, an elapsed retry horizon, and no
+    /// reader/writer pins. Pruning never proves deletion and never authorizes quota release.
+    /// The stable exclusive root lock excludes every committed mutation, including old waiters
+    /// that opened a per-key directory before pruning. The root lock directory is never removed.
+    pub async fn prune_delete_receipt(
+        &self,
+        namespace: &ArtifactNamespace,
+        key: &ArtifactKey,
+        generation: ArtifactObjectGeneration,
+    ) -> Result<DeleteReceiptPruneOutcome, ArtifactObjectError> {
+        namespace
+            .authorize(key)
+            .map_err(|_| ArtifactObjectError::NamespaceDenied)?;
+        let store = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock_stable_deleted_root(
+                &store.root.join(".deleted"),
+                store.deleted_root_identity,
+                true,
+            )?;
+            prune_deleted_receipt(&store, &key, generation)
+        })
+        .await
+        .map_err(|error| {
+            ArtifactObjectError::Store(ArtifactStoreError::new(format!(
+                "delete receipt pruning task failed: {error}"
+            )))
+        })?
+    }
+    async fn delete_exact_owned(
+        &self,
+        namespace: &ArtifactNamespace,
+        key: &ArtifactKey,
+        expected_generation: ArtifactObjectGeneration,
+    ) -> Result<ArtifactDeleteOutcome, ArtifactObjectError> {
+        let _stable_root_guard = self.deleted_root_guard(false).await?;
+        namespace
+            .authorize(key)
+            .map_err(|_| ArtifactObjectError::NamespaceDenied)?;
+        let object = self.object_path(key);
+        let preliminary_live = read_optional_commit_metadata(&object).await?;
+        if let Some(live_metadata) = preliminary_live {
+            if live_metadata.object_generation() != expected_generation {
+                return Err(ArtifactObjectError::GenerationMismatch);
             }
-            let file_type = entry.file_type().await.map_err(|error| {
-                ArtifactObjectError::Store(store_error(
-                    "inspect artifact tombstone for pruning",
-                    error,
-                ))
-            })?;
-            if !file_type.is_dir() || file_type.is_symlink() {
-                return Err(ArtifactObjectError::IntegrityMismatch);
+        } else if !fs::try_exists(self.deleted_key_path(key))
+            .await
+            .map_err(|error| store_error("inspect artifact tombstone namespace", error))?
+        {
+            return Err(ArtifactObjectError::NotAvailable);
+        }
+        #[cfg(test)]
+        self.pause_after_delete_live_read().await;
+
+        let tombstone_parent = self.ensure_tombstone_parent(key).await?;
+        let _artifact_lock = acquire_artifact_file_lock(&tombstone_parent)
+            .await
+            .map_err(|error| store_error("lock artifact object", error))?;
+        let live_metadata = read_optional_commit_metadata(&object).await?;
+        let Some(live_metadata) = live_metadata else {
+            return self.resolve_absent_delete(key, expected_generation).await;
+        };
+        if live_metadata.object_generation() != expected_generation {
+            return Err(ArtifactObjectError::GenerationMismatch);
+        }
+        let tombstone = self.tombstone_path(key, expected_generation);
+        match fs::rename(&object, &tombstone).await {
+            Ok(()) => {
+                let object_parent = object
+                    .parent()
+                    .ok_or_else(|| ArtifactStoreError::new("artifact object parent is missing"))?;
+                sync_directory(object_parent).await?;
+                sync_directory(&tombstone_parent).await?;
+                self.compact_tombstone(&tombstone).await?;
+                self.prune_tombstones_except(key, expected_generation)
+                    .await?;
+                Ok(ArtifactDeleteOutcome::Deleted)
             }
-            for name in ["data", "key", "receipt", "receipt.pending", "lock"] {
-                match fs::remove_file(entry.path().join(name)).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(ArtifactObjectError::Store(store_error(
-                            "remove superseded artifact tombstone file",
-                            error,
-                        )));
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::AlreadyExists
+                        | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                let raced_live = read_optional_commit_metadata(&object).await?;
+                if let Some(raced_live) = raced_live {
+                    if raced_live.object_generation() != expected_generation {
+                        return Err(ArtifactObjectError::GenerationMismatch);
+                    }
+                    if self
+                        .exact_tombstone_exists(key, expected_generation)
+                        .await?
+                    {
+                        return Err(ArtifactObjectError::IntegrityMismatch);
+                    }
+                    return Err(ArtifactObjectError::Store(store_error(
+                        "delete exact artifact object",
+                        error,
+                    )));
+                }
+                self.resolve_absent_delete(key, expected_generation).await
+            }
+            Err(error) => Err(ArtifactObjectError::Store(store_error(
+                "delete exact artifact object",
+                error,
+            ))),
+        }
+    }
+    async fn complete_verified_owned(
+        &self,
+        upload_id: &MultipartUploadId,
+        receipt: &ArtifactWriteReceipt,
+    ) -> Result<(), ArtifactStoreError> {
+        let _stable_root_guard = self.deleted_root_guard(false).await?;
+        let parsed_upload_id = parse_upload_id(upload_id)?;
+        if receipt.object_generation() != object_generation_for_upload_id(upload_id.as_str()) {
+            return Err(ArtifactStoreError::new(
+                "multipart completion generation does not match upload",
+            ));
+        }
+        let stage = self.stage_path(upload_id)?;
+        let destination = self.object_path(receipt.key());
+        let tenant_directory = self
+            .root
+            .join("objects")
+            .join(receipt.key().tenant_id().to_string());
+        let session_directory = tenant_directory.join(receipt.key().session_id().to_string());
+        let artifact_lock_directory =
+            self.ensure_tombstone_parent(receipt.key())
+                .await
+                .map_err(|error| {
+                    ArtifactStoreError::new(format!("prepare artifact object lock: {error}"))
+                })?;
+        #[cfg(test)]
+        {
+            let stage_exists = fs::try_exists(&stage)
+                .await
+                .map_err(|error| store_error("inspect multipart directory", error))?;
+            if stage_exists {
+                self.pause_after_complete_stage_exists().await;
+            }
+        }
+        let _artifact_lock = acquire_artifact_file_lock(&artifact_lock_directory)
+            .await
+            .map_err(|error| store_error("lock artifact object", error))?;
+        #[cfg(test)]
+        self.pause_after_complete_artifact_lock().await;
+        let mut published = false;
+        let attempt = async {
+            let _upload_lock = acquire_upload_file_lock(&stage)
+                .await
+                .map_err(|error| store_error("lock multipart completion", error))?;
+            if !fs::try_exists(&stage)
+                .await
+                .map_err(|error| store_error("inspect multipart directory", error))?
+            {
+                return Err(ArtifactStoreError::new(
+                    "multipart upload is not available for completion",
+                ));
+            }
+            let binding = fs::read_to_string(stage.join("key"))
+                .await
+                .map_err(|error| store_error("read multipart key binding", error))?;
+            if binding != key_binding(receipt.key()) {
+                return Err(ArtifactStoreError::new(
+                    "multipart upload belongs to another artifact",
+                ));
+            }
+            let mut encoded = [0_u8; COMMIT_METADATA_BYTES];
+            encoded[..8].copy_from_slice(COMMIT_MAGIC);
+            encoded[8..24].copy_from_slice(parsed_upload_id.as_bytes());
+            encoded[24..32].copy_from_slice(&receipt.size_bytes().to_be_bytes());
+            encoded[32..64].copy_from_slice(receipt.checksum().as_bytes());
+            match read_commit_metadata(&stage).await {
+                Ok(existing) => {
+                    if existing.upload_id != parsed_upload_id
+                        || existing.size_bytes != receipt.size_bytes()
+                        || existing.checksum != *receipt.checksum()
+                    {
+                        return Err(ArtifactStoreError::new(
+                            "staged artifact receipt conflicts with completion",
+                        ));
                     }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let pending_receipt = stage.join("receipt.pending");
+                    let mut metadata_file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&pending_receipt)
+                        .await
+                        .map_err(|error| store_error("create pending artifact receipt", error))?;
+                    #[cfg(test)]
+                    self.pause_after_complete_receipt_created().await;
+                    metadata_file
+                        .write_all(&encoded)
+                        .await
+                        .map_err(|error| store_error("write artifact receipt", error))?;
+                    metadata_file
+                        .sync_all()
+                        .await
+                        .map_err(|error| store_error("sync artifact receipt", error))?;
+                    fs::rename(&pending_receipt, stage.join("receipt"))
+                        .await
+                        .map_err(|error| store_error("publish artifact receipt", error))?;
+                }
+                Err(error) => return Err(store_error("read staged artifact receipt", error)),
             }
-            fs::remove_dir(entry.path()).await.map_err(|error| {
-                ArtifactObjectError::Store(store_error(
-                    "remove superseded artifact tombstone",
-                    error,
-                ))
-            })?;
+            sync_directory(&stage).await?;
+
+            let (actual_size, actual_checksum) = inspect_data(&stage.join("data")).await?;
+            if actual_size != receipt.size_bytes() || actual_checksum != *receipt.checksum() {
+                return Err(ArtifactStoreError::new(
+                    "multipart completion receipt does not match stored bytes",
+                ));
+            }
+            #[cfg(test)]
+            self.pause_after_complete_data_inspection().await;
+
+            for directory in [&tenant_directory, &session_directory] {
+                ensure_private_directory(directory, "artifact namespace").await?;
+            }
+            sync_directory(&tenant_directory).await?;
+            sync_directory(&self.root.join("objects")).await?;
+
+            fs::rename(&stage, &destination)
+                .await
+                .map_err(|error| store_error("commit multipart artifact", error))?;
+            published = true;
+            #[cfg(test)]
+            self.pause_after_complete_rename().await;
+            #[cfg(test)]
+            if self
+                .test_hooks
+                .complete_parent_sync_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ArtifactStoreError::new(
+                    "injected post-publish parent sync failure",
+                ));
+            }
+            sync_directory(&session_directory).await?;
+            sync_directory(&self.root.join(".multipart")).await
         }
-        sync_directory(&key_directory).await?;
-        Ok(())
+        .await;
+        let operation = match attempt {
+            Ok(()) => return Ok(()),
+            Err(operation) => operation,
+        };
+
+        match read_commit_metadata(&destination).await {
+            Ok(committed)
+                if committed.upload_id == parsed_upload_id
+                    && committed.size_bytes == receipt.size_bytes()
+                    && committed.checksum == *receipt.checksum()
+                    && committed.object_generation() == receipt.object_generation() =>
+            {
+                #[cfg(test)]
+                if self
+                    .test_hooks
+                    .complete_parent_sync_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(ArtifactStoreError::completion_uncertain(
+                        "injected completion recovery parent sync failure",
+                    ));
+                }
+                sync_directory(&session_directory).await.map_err(|error| {
+                    ArtifactStoreError::completion_uncertain(format!(
+                        "reconcile published artifact session directory: {error}"
+                    ))
+                })?;
+                sync_directory(&self.root.join(".multipart"))
+                    .await
+                    .map_err(|error| {
+                        ArtifactStoreError::completion_uncertain(format!(
+                            "reconcile published multipart directory: {error}"
+                        ))
+                    })?;
+                Ok(())
+            }
+            Ok(_) => Err(ArtifactStoreError::new(
+                "artifact was already committed by another upload",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !published => Err(operation),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(ArtifactStoreError::completion_uncertain(format!(
+                    "published artifact disappeared during completion recovery: {operation}"
+                )))
+            }
+            Err(error) => Err(ArtifactStoreError::completion_uncertain(format!(
+                "inspect published artifact during completion recovery: {error}"
+            ))),
+        }
     }
 }
 
@@ -874,76 +1268,25 @@ impl ArtifactObjectStore for FilesystemArtifactStore {
         namespace
             .authorize(key)
             .map_err(|_| ArtifactObjectError::NamespaceDenied)?;
-        let object = self.object_path(key);
-        let preliminary_live = read_optional_commit_metadata(&object).await?;
-        if let Some(live_metadata) = preliminary_live {
-            if live_metadata.object_generation() != expected_generation {
-                return Err(ArtifactObjectError::GenerationMismatch);
-            }
-        } else if !fs::try_exists(self.deleted_key_path(key))
-            .await
-            .map_err(|error| store_error("inspect artifact tombstone namespace", error))?
-        {
-            return Err(ArtifactObjectError::NotAvailable);
-        }
+        let store = self.clone();
+        let namespace = namespace.clone();
+        let key = key.clone();
         #[cfg(test)]
-        self.pause_after_delete_live_read().await;
-
-        let tombstone_parent = self.ensure_tombstone_parent(key).await?;
-        let _artifact_lock = acquire_artifact_file_lock(&tombstone_parent)
-            .await
-            .map_err(|error| store_error("lock artifact object", error))?;
-        let live_metadata = read_optional_commit_metadata(&object).await?;
-        let Some(live_metadata) = live_metadata else {
-            return self.resolve_absent_delete(key, expected_generation).await;
-        };
-        if live_metadata.object_generation() != expected_generation {
-            return Err(ArtifactObjectError::GenerationMismatch);
-        }
-        let tombstone = self.tombstone_path(key, expected_generation);
-        match fs::rename(&object, &tombstone).await {
-            Ok(()) => {
-                let object_parent = object
-                    .parent()
-                    .ok_or_else(|| ArtifactStoreError::new("artifact object parent is missing"))?;
-                sync_directory(object_parent).await?;
-                sync_directory(&tombstone_parent).await?;
-                self.compact_tombstone(&tombstone).await?;
-                self.prune_tombstones_except(key, expected_generation)
-                    .await?;
-                Ok(ArtifactDeleteOutcome::Deleted)
+        let metadata_pause = OPTIONAL_METADATA_STAT_PAUSE.try_with(Arc::clone).ok();
+        tokio::spawn(async move {
+            let operation = store.delete_exact_owned(&namespace, &key, expected_generation);
+            #[cfg(test)]
+            if let Some(slot) = metadata_pause {
+                return OPTIONAL_METADATA_STAT_PAUSE.scope(slot, operation).await;
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::AlreadyExists
-                        | io::ErrorKind::DirectoryNotEmpty
-                ) =>
-            {
-                let raced_live = read_optional_commit_metadata(&object).await?;
-                if let Some(raced_live) = raced_live {
-                    if raced_live.object_generation() != expected_generation {
-                        return Err(ArtifactObjectError::GenerationMismatch);
-                    }
-                    if self
-                        .exact_tombstone_exists(key, expected_generation)
-                        .await?
-                    {
-                        return Err(ArtifactObjectError::IntegrityMismatch);
-                    }
-                    return Err(ArtifactObjectError::Store(store_error(
-                        "delete exact artifact object",
-                        error,
-                    )));
-                }
-                self.resolve_absent_delete(key, expected_generation).await
-            }
-            Err(error) => Err(ArtifactObjectError::Store(store_error(
-                "delete exact artifact object",
-                error,
-            ))),
-        }
+            operation.await
+        })
+        .await
+        .map_err(|error| {
+            ArtifactObjectError::Store(ArtifactStoreError::new(format!(
+                "owned artifact deletion task failed: {error}"
+            )))
+        })?
     }
 }
 
@@ -1081,191 +1424,16 @@ impl ArtifactMultipartStore for FilesystemArtifactStore {
         upload_id: &MultipartUploadId,
         receipt: &ArtifactWriteReceipt,
     ) -> Result<(), ArtifactStoreError> {
-        let parsed_upload_id = parse_upload_id(upload_id)?;
-        if receipt.object_generation() != object_generation_for_upload_id(upload_id.as_str()) {
-            return Err(ArtifactStoreError::new(
-                "multipart completion generation does not match upload",
-            ));
-        }
-        let stage = self.stage_path(upload_id)?;
-        let destination = self.object_path(receipt.key());
-        let tenant_directory = self
-            .root
-            .join("objects")
-            .join(receipt.key().tenant_id().to_string());
-        let session_directory = tenant_directory.join(receipt.key().session_id().to_string());
-        let artifact_lock_directory =
-            self.ensure_tombstone_parent(receipt.key())
-                .await
-                .map_err(|error| {
-                    ArtifactStoreError::new(format!("prepare artifact object lock: {error}"))
-                })?;
-        #[cfg(test)]
-        {
-            let stage_exists = fs::try_exists(&stage)
-                .await
-                .map_err(|error| store_error("inspect multipart directory", error))?;
-            if stage_exists {
-                self.pause_after_complete_stage_exists().await;
-            }
-        }
-        let _artifact_lock = acquire_artifact_file_lock(&artifact_lock_directory)
+        let store = self.clone();
+        let upload_id = upload_id.clone();
+        let receipt = receipt.clone();
+        tokio::spawn(async move { store.complete_verified_owned(&upload_id, &receipt).await })
             .await
-            .map_err(|error| store_error("lock artifact object", error))?;
-        let mut published = false;
-        let attempt = async {
-            let _upload_lock = acquire_upload_file_lock(&stage)
-                .await
-                .map_err(|error| store_error("lock multipart completion", error))?;
-            if !fs::try_exists(&stage)
-                .await
-                .map_err(|error| store_error("inspect multipart directory", error))?
-            {
-                return Err(ArtifactStoreError::new(
-                    "multipart upload is not available for completion",
-                ));
-            }
-            let binding = fs::read_to_string(stage.join("key"))
-                .await
-                .map_err(|error| store_error("read multipart key binding", error))?;
-            if binding != key_binding(receipt.key()) {
-                return Err(ArtifactStoreError::new(
-                    "multipart upload belongs to another artifact",
-                ));
-            }
-            let mut encoded = [0_u8; COMMIT_METADATA_BYTES];
-            encoded[..8].copy_from_slice(COMMIT_MAGIC);
-            encoded[8..24].copy_from_slice(parsed_upload_id.as_bytes());
-            encoded[24..32].copy_from_slice(&receipt.size_bytes().to_be_bytes());
-            encoded[32..64].copy_from_slice(receipt.checksum().as_bytes());
-            match read_commit_metadata(&stage).await {
-                Ok(existing) => {
-                    if existing.upload_id != parsed_upload_id
-                        || existing.size_bytes != receipt.size_bytes()
-                        || existing.checksum != *receipt.checksum()
-                    {
-                        return Err(ArtifactStoreError::new(
-                            "staged artifact receipt conflicts with completion",
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    let pending_receipt = stage.join("receipt.pending");
-                    let mut metadata_file = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(&pending_receipt)
-                        .await
-                        .map_err(|error| store_error("create pending artifact receipt", error))?;
-                    #[cfg(test)]
-                    self.pause_after_complete_receipt_created().await;
-                    metadata_file
-                        .write_all(&encoded)
-                        .await
-                        .map_err(|error| store_error("write artifact receipt", error))?;
-                    metadata_file
-                        .sync_all()
-                        .await
-                        .map_err(|error| store_error("sync artifact receipt", error))?;
-                    fs::rename(&pending_receipt, stage.join("receipt"))
-                        .await
-                        .map_err(|error| store_error("publish artifact receipt", error))?;
-                }
-                Err(error) => return Err(store_error("read staged artifact receipt", error)),
-            }
-            sync_directory(&stage).await?;
-
-            let (actual_size, actual_checksum) = inspect_data(&stage.join("data")).await?;
-            if actual_size != receipt.size_bytes() || actual_checksum != *receipt.checksum() {
-                return Err(ArtifactStoreError::new(
-                    "multipart completion receipt does not match stored bytes",
-                ));
-            }
-            #[cfg(test)]
-            self.pause_after_complete_data_inspection().await;
-
-            for directory in [&tenant_directory, &session_directory] {
-                ensure_private_directory(directory, "artifact namespace").await?;
-            }
-            sync_directory(&tenant_directory).await?;
-            sync_directory(&self.root.join("objects")).await?;
-
-            fs::rename(&stage, &destination)
-                .await
-                .map_err(|error| store_error("commit multipart artifact", error))?;
-            published = true;
-            #[cfg(test)]
-            self.pause_after_complete_rename().await;
-            #[cfg(test)]
-            if self
-                .test_hooks
-                .complete_parent_sync_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(ArtifactStoreError::new(
-                    "injected post-publish parent sync failure",
-                ));
-            }
-            sync_directory(&session_directory).await?;
-            sync_directory(&self.root.join(".multipart")).await
-        }
-        .await;
-        let operation = match attempt {
-            Ok(()) => return Ok(()),
-            Err(operation) => operation,
-        };
-
-        match read_commit_metadata(&destination).await {
-            Ok(committed)
-                if committed.upload_id == parsed_upload_id
-                    && committed.size_bytes == receipt.size_bytes()
-                    && committed.checksum == *receipt.checksum()
-                    && committed.object_generation() == receipt.object_generation() =>
-            {
-                #[cfg(test)]
-                if self
-                    .test_hooks
-                    .complete_parent_sync_failures
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-                {
-                    return Err(ArtifactStoreError::completion_uncertain(
-                        "injected completion recovery parent sync failure",
-                    ));
-                }
-                sync_directory(&session_directory).await.map_err(|error| {
-                    ArtifactStoreError::completion_uncertain(format!(
-                        "reconcile published artifact session directory: {error}"
-                    ))
-                })?;
-                sync_directory(&self.root.join(".multipart"))
-                    .await
-                    .map_err(|error| {
-                        ArtifactStoreError::completion_uncertain(format!(
-                            "reconcile published multipart directory: {error}"
-                        ))
-                    })?;
-                Ok(())
-            }
-            Ok(_) => Err(ArtifactStoreError::new(
-                "artifact was already committed by another upload",
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound && !published => Err(operation),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Err(ArtifactStoreError::completion_uncertain(format!(
-                    "published artifact disappeared during completion recovery: {operation}"
-                )))
-            }
-            Err(error) => Err(ArtifactStoreError::completion_uncertain(format!(
-                "inspect published artifact during completion recovery: {error}"
-            ))),
-        }
+            .map_err(|error| {
+                ArtifactStoreError::completion_uncertain(format!(
+                    "owned artifact completion task failed: {error}"
+                ))
+            })?
     }
 
     async fn abort(&self, upload_id: &MultipartUploadId) -> Result<(), ArtifactStoreError> {
@@ -1287,6 +1455,517 @@ impl ArtifactMultipartStore for FilesystemArtifactStore {
         };
         remove_multipart_stage(&multipart_directory, &stage, upload_lock).await
     }
+}
+
+fn open_private_directory(path: &Path) -> Result<Option<std::fs::File>, ArtifactObjectError> {
+    let descriptor = match open(
+        path,
+        OFlag::O_RDONLY
+            | OFlag::O_DIRECTORY
+            | OFlag::O_NOFOLLOW
+            | OFlag::O_NONBLOCK
+            | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+        Err(error) => {
+            return Err(ArtifactObjectError::Store(ArtifactStoreError::new(
+                format!("open private artifact directory: {error}"),
+            )));
+        }
+    };
+    let directory = std::fs::File::from(descriptor);
+    let metadata = directory
+        .metadata()
+        .map_err(|error| store_error("inspect private artifact directory", error))?;
+    if !metadata.is_dir()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+    {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    revalidate_directory(path, &directory)?;
+    Ok(Some(directory))
+}
+fn revalidate_directory(path: &Path, directory: &std::fs::File) -> Result<(), ArtifactObjectError> {
+    let pinned = directory
+        .metadata()
+        .map_err(|error| store_error("inspect pinned artifact directory", error))?;
+    let linked = std::fs::symlink_metadata(path)
+        .map_err(|error| store_error("revalidate private artifact directory", error))?;
+    if !linked.is_dir()
+        || linked.file_type().is_symlink()
+        || linked.dev() != pinned.dev()
+        || linked.ino() != pinned.ino()
+    {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    Ok(())
+}
+fn lock_stable_deleted_root(
+    path: &Path,
+    identity: (u64, u64),
+    exclusive: bool,
+) -> Result<std::fs::File, ArtifactStoreError> {
+    let directory = open_private_directory(path)
+        .map_err(|error| {
+            ArtifactStoreError::new(format!("inspect stable artifact lock root: {error}"))
+        })?
+        .ok_or_else(|| ArtifactStoreError::new("stable artifact lock root is missing"))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| store_error("inspect stable artifact lock root", error))?;
+    if (metadata.dev(), metadata.ino()) != identity {
+        return Err(ArtifactStoreError::new("stable artifact lock root changed"));
+    }
+    if exclusive {
+        directory.lock()
+    } else {
+        directory.lock_shared()
+    }
+    .map_err(|error| store_error("lock stable artifact root", error))?;
+    revalidate_directory(path, &directory).map_err(|error| {
+        ArtifactStoreError::new(format!("revalidate stable artifact lock root: {error}"))
+    })?;
+    Ok(directory)
+}
+fn open_private_regular(path: &Path) -> Result<Option<std::fs::File>, ArtifactObjectError> {
+    let descriptor = match open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(nix::errno::Errno::ELOOP) => return Err(ArtifactObjectError::IntegrityMismatch),
+        Err(error) => {
+            return Err(ArtifactObjectError::Store(ArtifactStoreError::new(
+                format!("open artifact receipt file: {error}"),
+            )));
+        }
+    };
+    let file = std::fs::File::from(descriptor);
+    let metadata = file
+        .metadata()
+        .map_err(|error| store_error("inspect artifact receipt file", error))?;
+    // Older stores created files using the process umask. Their containing namespaces are
+    // private; require an immutable regular inode owned by this effective user, with no other
+    // writers, rather than rejecting historical owner-only directory / 0644 layouts.
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != nix::unistd::Uid::effective().as_raw()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    let linked = std::fs::symlink_metadata(path)
+        .map_err(|error| store_error("revalidate artifact receipt file", error))?;
+    if !linked.is_file()
+        || linked.file_type().is_symlink()
+        || linked.dev() != metadata.dev()
+        || linked.ino() != metadata.ino()
+    {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    Ok(Some(file))
+}
+fn read_bounded_metadata(
+    path: &Path,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, ArtifactObjectError> {
+    let Some(file) = open_private_regular(path)? else {
+        return Ok(None);
+    };
+    let before = file
+        .metadata()
+        .map_err(|error| store_error("inspect bounded artifact metadata", error))?;
+    if before.len() > maximum as u64 {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    let mut bytes = Vec::with_capacity(maximum + 1);
+    (&file)
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| store_error("read bounded artifact metadata", error))?;
+    let after = file
+        .metadata()
+        .map_err(|error| store_error("reinspect bounded artifact metadata", error))?;
+    let linked = std::fs::symlink_metadata(path)
+        .map_err(|error| store_error("revalidate bounded artifact metadata", error))?;
+    if bytes.len() > maximum
+        || bytes.len() as u64 != before.len()
+        || after.len() != before.len()
+        || after.mtime() != before.mtime()
+        || after.mtime_nsec() != before.mtime_nsec()
+        || after.ctime() != before.ctime()
+        || after.ctime_nsec() != before.ctime_nsec()
+        || after.nlink() != 1
+        || after.uid() != before.uid()
+        || after.mode() != before.mode()
+        || !linked.is_file()
+        || linked.file_type().is_symlink()
+        || linked.dev() != after.dev()
+        || linked.ino() != after.ino()
+    {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    Ok(Some(bytes))
+}
+fn bounded_commit_metadata(
+    directory: &Path,
+) -> Result<Option<CommitMetadata>, ArtifactObjectError> {
+    let Some(bytes) = read_bounded_metadata(&directory.join("receipt"), COMMIT_METADATA_BYTES)?
+    else {
+        return Ok(None);
+    };
+    if bytes.len() != COMMIT_METADATA_BYTES || &bytes[..8] != COMMIT_MAGIC {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    let upload_id =
+        Uuid::from_slice(&bytes[8..24]).map_err(|_| ArtifactObjectError::IntegrityMismatch)?;
+    if upload_id.get_version() != Some(uuid::Version::SortRand) {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    let size_bytes = u64::from_be_bytes(
+        bytes[24..32]
+            .try_into()
+            .map_err(|_| ArtifactObjectError::IntegrityMismatch)?,
+    );
+    let checksum = ArtifactChecksum::new(
+        bytes[32..64]
+            .try_into()
+            .map_err(|_| ArtifactObjectError::IntegrityMismatch)?,
+    );
+    Ok(Some(CommitMetadata {
+        upload_id,
+        size_bytes,
+        checksum,
+    }))
+}
+fn checked_entries(directory: &Path, allowed: &[&str]) -> Result<Vec<String>, ArtifactObjectError> {
+    let mut names = Vec::with_capacity(allowed.len());
+    for entry in std::fs::read_dir(directory)
+        .map_err(|error| store_error("inspect artifact receipt entries", error))?
+    {
+        let entry = entry.map_err(|error| store_error("inspect artifact receipt entry", error))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ArtifactObjectError::IntegrityMismatch)?;
+        if names.len() >= allowed.len() || !allowed.contains(&name.as_str()) {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+fn validate_key_binding(
+    directory: &Path,
+    key: &ArtifactKey,
+    required: bool,
+) -> Result<(), ArtifactObjectError> {
+    match read_bounded_metadata(&directory.join("key"), 111)? {
+        Some(bytes) if bytes == key_binding(key).as_bytes() => Ok(()),
+        None if !required => Ok(()),
+        _ => Err(ArtifactObjectError::IntegrityMismatch),
+    }
+}
+fn validate_data_identity(
+    directory: &Path,
+    metadata: CommitMetadata,
+    required: bool,
+) -> Result<(), ArtifactObjectError> {
+    let data = open_private_regular(&directory.join("data"))?;
+    match data {
+        Some(data)
+            if data
+                .metadata()
+                .map_err(|error| store_error("inspect artifact data length", error))?
+                .len()
+                == metadata.size_bytes =>
+        {
+            Ok(())
+        }
+        None if !required => Ok(()),
+        _ => Err(ArtifactObjectError::IntegrityMismatch),
+    }
+}
+fn validate_namespace_chain(base: &Path, key: &ArtifactKey) -> Result<bool, ArtifactObjectError> {
+    for path in [
+        base.to_path_buf(),
+        base.join(key.tenant_id().to_string()),
+        base.join(key.tenant_id().to_string())
+            .join(key.session_id().to_string()),
+    ] {
+        if open_private_directory(&path)?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+fn write_receipt(key: &ArtifactKey, metadata: CommitMetadata) -> ArtifactWriteReceipt {
+    ArtifactWriteReceipt {
+        key: key.clone(),
+        size_bytes: metadata.size_bytes,
+        checksum: metadata.checksum,
+        object_generation: metadata.object_generation(),
+    }
+}
+fn inspect_committed_receipt(
+    store: &FilesystemArtifactStore,
+    key: &ArtifactKey,
+) -> Result<Option<ArtifactWriteReceipt>, ArtifactObjectError> {
+    if !validate_namespace_chain(&store.root.join("objects"), key)? {
+        return Ok(None);
+    }
+    let path = store.object_path(key);
+    let Some(directory) = open_private_directory(&path)? else {
+        return Ok(None);
+    };
+    checked_entries(&path, &["data", "key", "receipt", "lock"])?;
+    let metadata = bounded_commit_metadata(&path)?.ok_or(ArtifactObjectError::IntegrityMismatch)?;
+    validate_key_binding(&path, key, true)?;
+    validate_data_identity(&path, metadata, true)?;
+    if let Some(lock) = open_private_regular(&path.join("lock"))?
+        && lock
+            .metadata()
+            .map_err(|error| store_error("inspect committed lock marker", error))?
+            .len()
+            != 0
+    {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    revalidate_directory(&path, &directory)?;
+    if bounded_commit_metadata(&path)? != Some(metadata) {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    Ok(Some(write_receipt(key, metadata)))
+}
+fn inspect_deleted_receipt(
+    store: &FilesystemArtifactStore,
+    key: &ArtifactKey,
+    generation: ArtifactObjectGeneration,
+) -> Result<Option<ArtifactWriteReceipt>, ArtifactObjectError> {
+    if !validate_namespace_chain(&store.root.join(".deleted"), key)? {
+        return Ok(None);
+    }
+    let key_path = store.deleted_key_path(key);
+    if open_private_directory(&key_path)?.is_none() {
+        return Ok(None);
+    }
+    let path = store.tombstone_path(key, generation);
+    let Some(directory) = open_private_directory(&path)? else {
+        return Ok(None);
+    };
+    let entries = checked_entries(
+        &path,
+        &["data", "key", "receipt", "receipt.pending", "lock"],
+    )?;
+    let Some(metadata) = bounded_commit_metadata(&path)? else {
+        if entries.iter().any(|name| name != "lock") {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+        return Ok(None);
+    };
+    if metadata.object_generation() != generation {
+        return Err(ArtifactObjectError::GenerationMismatch);
+    }
+    validate_key_binding(&path, key, false)?;
+    validate_data_identity(&path, metadata, false)?;
+    for name in ["lock", "receipt.pending"] {
+        if let Some(file) = open_private_regular(&path.join(name))?
+            && file
+                .metadata()
+                .map_err(|error| store_error("inspect deleted marker", error))?
+                .len()
+                != 0
+        {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+    }
+    revalidate_directory(&path, &directory)?;
+    if bounded_commit_metadata(&path)? != Some(metadata) {
+        return Err(ArtifactObjectError::IntegrityMismatch);
+    }
+    Ok(Some(write_receipt(key, metadata)))
+}
+fn sync_directory_blocking(path: &Path) -> Result<(), ArtifactObjectError> {
+    let directory = open_private_directory(path)?.ok_or(ArtifactObjectError::IntegrityMismatch)?;
+    directory
+        .sync_all()
+        .map_err(|error| store_error("sync pruned artifact namespace", error))?;
+    Ok(())
+}
+fn remove_empty_parent(path: &Path) -> Result<bool, ArtifactObjectError> {
+    let Some(directory) = open_private_directory(path)? else {
+        return Ok(false);
+    };
+    let mut entries = std::fs::read_dir(path)
+        .map_err(|error| store_error("inspect empty artifact namespace", error))?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|error| store_error("inspect empty artifact namespace entry", error))?;
+        return Ok(false);
+    }
+    revalidate_directory(path, &directory)?;
+    std::fs::remove_dir(path)
+        .map_err(|error| store_error("remove empty artifact namespace", error))?;
+    sync_directory_blocking(
+        path.parent()
+            .ok_or(ArtifactObjectError::IntegrityMismatch)?,
+    )?;
+    Ok(true)
+}
+
+fn prune_superseded_tombstones(
+    store: &FilesystemArtifactStore,
+    key: &ArtifactKey,
+    retained_generation: ArtifactObjectGeneration,
+) -> Result<(), ArtifactObjectError> {
+    let key_directory = store.deleted_key_path(key);
+    let retained_name = encode_generation(retained_generation);
+    let mut validated = Vec::new();
+    for entry in std::fs::read_dir(&key_directory)
+        .map_err(|error| store_error("read superseded artifact tombstones", error))?
+    {
+        let entry = entry.map_err(|error| store_error("read superseded artifact marker", error))?;
+        if entry.file_name().to_str() == Some(retained_name.as_str()) {
+            continue;
+        }
+        if validated.len() >= MAX_MULTIPART_SCAN_BATCH {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+        let path = entry.path();
+        let directory =
+            open_private_directory(&path)?.ok_or(ArtifactObjectError::IntegrityMismatch)?;
+        let metadata =
+            bounded_commit_metadata(&path)?.ok_or(ArtifactObjectError::IntegrityMismatch)?;
+        let generation = metadata.object_generation();
+        if entry.file_name().to_str() != Some(encode_generation(generation).as_str()) {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+        let receipt = inspect_deleted_receipt(store, key, generation)?
+            .ok_or(ArtifactObjectError::IntegrityMismatch)?;
+        if receipt != write_receipt(key, metadata) {
+            return Err(ArtifactObjectError::IntegrityMismatch);
+        }
+        let names = checked_entries(
+            &path,
+            &["data", "key", "receipt", "receipt.pending", "lock"],
+        )?;
+        revalidate_directory(&path, &directory)?;
+        validated.push((path, directory, names));
+    }
+    // Validate every sibling before changing any of them. A malformed filename, receipt,
+    // hardlink or unexpected file never grants authority to remove another generation.
+    for (path, directory, names) in validated {
+        revalidate_directory(&path, &directory)?;
+        for name in ["data", "key", "receipt.pending", "lock", "receipt"] {
+            if names.iter().any(|existing| existing == name) {
+                std::fs::remove_file(path.join(name)).map_err(|error| {
+                    store_error("remove superseded artifact marker file", error)
+                })?;
+            }
+        }
+        directory
+            .sync_all()
+            .map_err(|error| store_error("sync superseded artifact marker", error))?;
+        std::fs::remove_dir(&path)
+            .map_err(|error| store_error("remove superseded artifact marker", error))?;
+    }
+    sync_directory_blocking(&key_directory)
+}
+
+fn prune_deleted_receipt(
+    store: &FilesystemArtifactStore,
+    key: &ArtifactKey,
+    generation: ArtifactObjectGeneration,
+) -> Result<DeleteReceiptPruneOutcome, ArtifactObjectError> {
+    let objects = store.root.join("objects");
+    if validate_namespace_chain(&objects, key)?
+        && open_private_directory(&store.object_path(key))?.is_some()
+    {
+        return Err(ArtifactObjectError::GenerationMismatch);
+    }
+    let deleted = store.root.join(".deleted");
+    let mut removed = false;
+    if validate_namespace_chain(&deleted, key)? {
+        let key_directory = store.deleted_key_path(key);
+        if let Some(pinned_key) = open_private_directory(&key_directory)? {
+            let expected = encode_generation(generation);
+            for entry in std::fs::read_dir(&key_directory)
+                .map_err(|error| store_error("inspect exact deletion namespace", error))?
+            {
+                let entry =
+                    entry.map_err(|error| store_error("inspect exact deletion marker", error))?;
+                if entry.file_name().to_str() != Some(expected.as_str()) {
+                    return Err(ArtifactObjectError::GenerationMismatch);
+                }
+            }
+            let marker = store.tombstone_path(key, generation);
+            if let Some(marker_directory) = open_private_directory(&marker)? {
+                let names = checked_entries(&marker, &["receipt", "lock"])?;
+                if let Some(metadata) = bounded_commit_metadata(&marker)?
+                    && metadata.object_generation() != generation
+                {
+                    return Err(ArtifactObjectError::GenerationMismatch);
+                }
+                for name in &names {
+                    let file = open_private_regular(&marker.join(name))?
+                        .ok_or(ArtifactObjectError::IntegrityMismatch)?;
+                    if name == "lock"
+                        && file
+                            .metadata()
+                            .map_err(|error| store_error("inspect exact marker lock", error))?
+                            .len()
+                            != 0
+                    {
+                        return Err(ArtifactObjectError::IntegrityMismatch);
+                    }
+                }
+                revalidate_directory(&marker, &marker_directory)?;
+                // Preserve exact receipt authority until all other marker files are gone.
+                for name in ["lock", "receipt"] {
+                    if names.iter().any(|existing| existing == name) {
+                        std::fs::remove_file(marker.join(name)).map_err(|error| {
+                            store_error("prune exact artifact deletion marker", error)
+                        })?;
+                    }
+                }
+                marker_directory
+                    .sync_all()
+                    .map_err(|error| store_error("sync exact marker pruning", error))?;
+                std::fs::remove_dir(&marker)
+                    .map_err(|error| store_error("remove exact artifact deletion marker", error))?;
+                pinned_key
+                    .sync_all()
+                    .map_err(|error| store_error("sync deletion key namespace", error))?;
+                removed = true;
+            }
+            remove_empty_parent(&key_directory)?;
+        }
+    }
+    for base in [&deleted, &objects] {
+        let tenant = base.join(key.tenant_id().to_string());
+        let session = tenant.join(key.session_id().to_string());
+        // All mutating committed operations hold the stable shared root lock, so parent
+        // reclamation under this exclusive root guard cannot race a new namespace creator.
+        if validate_namespace_chain(base, key)? {
+            remove_empty_parent(&session)?;
+        }
+        if open_private_directory(&tenant)?.is_some() {
+            remove_empty_parent(&tenant)?;
+        }
+        sync_directory_blocking(base)?;
+    }
+    Ok(if removed {
+        DeleteReceiptPruneOutcome::Pruned
+    } else {
+        DeleteReceiptPruneOutcome::AlreadyAbsent
+    })
 }
 
 fn parse_upload_id(upload_id: &MultipartUploadId) -> Result<Uuid, ArtifactStoreError> {
@@ -1619,7 +2298,7 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use browserd_core::{ArtifactId, SessionId, TenantId};
 
@@ -1821,6 +2500,7 @@ mod tests {
                 .expect_err("paused completion should be cancelled")
                 .is_cancelled()
         );
+        pause.resume();
 
         assert!(
             store
@@ -1917,6 +2597,7 @@ mod tests {
                 .expect_err("paused completion should be cancelled")
                 .is_cancelled()
         );
+        pause.resume();
 
         store
             .complete_verified(&upload_id, &receipt)
@@ -2289,13 +2970,431 @@ mod tests {
         assert_eq!(committed.bytes(), &third_bytes);
     }
 
+    #[tokio::test]
+    async fn committed_inspection_reads_metadata_without_hashing_payload() {
+        let (_directory, store, namespace, key) = test_store();
+        let (upload, receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"original")).await;
+        assert_eq!(store.inspect_committed(&namespace, &key).await, Ok(None));
+        store
+            .complete_verified(&upload, &receipt)
+            .await
+            .expect("fixture should commit");
+        assert_eq!(
+            store.inspect_committed(&namespace, &key).await,
+            Ok(Some(receipt.clone()))
+        );
+        fs::write(store.object_path(&key).join("data"), b"modified")
+            .await
+            .expect("same-length payload should change");
+        assert_eq!(
+            store.inspect_committed(&namespace, &key).await,
+            Ok(Some(receipt))
+        );
+        assert!(
+            store.read_verified(&key).await.is_err(),
+            "metadata inventory must not imply payload integrity"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_inspection_rejects_wrong_scope_size_binding_and_oversized_receipt() {
+        for invalid in ["size", "binding", "receipt"] {
+            let (_directory, store, namespace, key) = test_store();
+            let (upload, receipt) =
+                begin_test_upload(&store, &key, Bytes::from_static(b"bounded")).await;
+            store
+                .complete_verified(&upload, &receipt)
+                .await
+                .expect("fixture should commit");
+            let wrong_scope = ArtifactNamespace::new(TenantId::new(), key.session_id().clone());
+            assert_eq!(
+                store.inspect_committed(&wrong_scope, &key).await,
+                Err(ArtifactObjectError::NamespaceDenied)
+            );
+            let object = store.object_path(&key);
+            match invalid {
+                "size" => fs::write(object.join("data"), b"short")
+                    .await
+                    .expect("fixture data should change"),
+                "binding" => fs::write(
+                    object.join("key"),
+                    key_binding(&ArtifactKey::new(
+                        TenantId::new(),
+                        SessionId::new(),
+                        ArtifactId::new(),
+                    )),
+                )
+                .await
+                .expect("fixture binding should change"),
+                _ => fs::write(object.join("receipt"), vec![0; COMMIT_METADATA_BYTES + 1])
+                    .await
+                    .expect("oversized receipt should be written"),
+            }
+            assert_eq!(
+                store.inspect_committed(&namespace, &key).await,
+                Err(ArtifactObjectError::IntegrityMismatch)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_inspection_rejects_symlinks_hardlinks_and_fifo_without_blocking() {
+        for invalid in ["symlink", "hardlink", "fifo"] {
+            let (directory, store, namespace, key) = test_store();
+            let (upload, receipt) =
+                begin_test_upload(&store, &key, Bytes::from_static(b"private")).await;
+            store
+                .complete_verified(&upload, &receipt)
+                .await
+                .expect("fixture should commit");
+            let receipt_path = store.object_path(&key).join("receipt");
+            let outside = directory.path().join("outside-receipt");
+            if invalid == "hardlink" {
+                std::fs::hard_link(&receipt_path, &outside)
+                    .expect("fixture should gain a hardlink");
+            } else {
+                std::fs::rename(&receipt_path, &outside).expect("fixture receipt should move");
+                if invalid == "symlink" {
+                    std::os::unix::fs::symlink(&outside, &receipt_path)
+                        .expect("fixture should have a symlink");
+                } else {
+                    nix::unistd::mkfifo(&receipt_path, Mode::from_bits_truncate(0o600))
+                        .expect("fixture should have a FIFO");
+                }
+            }
+            assert_eq!(
+                tokio::time::timeout(RACE_TIMEOUT, store.inspect_committed(&namespace, &key))
+                    .await
+                    .expect("nonregular receipt must never block"),
+                Err(ArtifactObjectError::IntegrityMismatch)
+            );
+            assert!(
+                outside.exists(),
+                "receipt rejection must not delete another link or target"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_marker_inspection_and_pruning_reclaim_empty_namespaces_idempotently() {
+        let (_directory, store, namespace, key) = test_store();
+        let (upload, receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"expired")).await;
+        let generation = receipt.object_generation();
+        assert_eq!(
+            store
+                .inspect_delete_receipt(&namespace, &key, generation)
+                .await,
+            Ok(None)
+        );
+        store
+            .complete_verified(&upload, &receipt)
+            .await
+            .expect("fixture should commit");
+        assert_eq!(
+            store
+                .prune_delete_receipt(&namespace, &key, generation)
+                .await,
+            Err(ArtifactObjectError::GenerationMismatch)
+        );
+        store
+            .delete_exact(&namespace, &key, generation)
+            .await
+            .expect("fixture should delete");
+        assert_eq!(
+            store
+                .inspect_delete_receipt(&namespace, &key, generation)
+                .await,
+            Ok(Some(receipt))
+        );
+        let stable =
+            std::fs::metadata(store.root.join(".deleted")).expect("stable lock inode should exist");
+        assert_eq!(
+            store
+                .prune_delete_receipt(&namespace, &key, generation)
+                .await,
+            Ok(DeleteReceiptPruneOutcome::Pruned)
+        );
+        for base in [".deleted", "objects"] {
+            assert!(
+                !store
+                    .root
+                    .join(base)
+                    .join(key.tenant_id().to_string())
+                    .exists(),
+                "empty tenant and session directories should be removed"
+            );
+        }
+        let after =
+            std::fs::metadata(store.root.join(".deleted")).expect("stable root must survive");
+        assert_eq!((stable.dev(), stable.ino()), (after.dev(), after.ino()));
+        assert_eq!(
+            store
+                .prune_delete_receipt(&namespace, &key, generation)
+                .await,
+            Ok(DeleteReceiptPruneOutcome::AlreadyAbsent)
+        );
+        assert_eq!(
+            store.delete_exact(&namespace, &key, generation).await,
+            Err(ArtifactObjectError::NotAvailable)
+        );
+        let (next_upload, next_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"recreated")).await;
+        store
+            .complete_verified(&next_upload, &next_receipt)
+            .await
+            .expect("same key should recreate safely");
+        assert_eq!(
+            store
+                .prune_delete_receipt(&namespace, &key, generation)
+                .await,
+            Err(ArtifactObjectError::GenerationMismatch)
+        );
+        assert_eq!(
+            store.inspect_committed(&namespace, &key).await,
+            Ok(Some(next_receipt))
+        );
+    }
+
+    #[tokio::test]
+    async fn pruning_invalid_markers_never_removes_the_exact_receipt() {
+        for invalid in ["unknown", "payload", "hardlink", "symlink", "generation"] {
+            let (directory, store, namespace, key) = test_store();
+            let (upload, receipt) =
+                begin_test_upload(&store, &key, Bytes::from_static(b"marker")).await;
+            let generation = receipt.object_generation();
+            store
+                .complete_verified(&upload, &receipt)
+                .await
+                .expect("fixture should commit");
+            store
+                .delete_exact(&namespace, &key, generation)
+                .await
+                .expect("fixture should delete");
+            let marker = store.tombstone_path(&key, generation);
+            let receipt_path = marker.join("receipt");
+            match invalid {
+                "unknown" => std::fs::write(marker.join("extra"), b"unknown")
+                    .expect("fixture extra should exist"),
+                "payload" => std::fs::write(marker.join("data"), b"marker")
+                    .expect("uncompacted payload should exist"),
+                "hardlink" => {
+                    std::fs::hard_link(&receipt_path, directory.path().join("other-link"))
+                        .expect("fixture should have extra link")
+                }
+                "symlink" => {
+                    std::fs::rename(&receipt_path, directory.path().join("real-receipt"))
+                        .expect("fixture receipt should move");
+                    std::os::unix::fs::symlink(
+                        directory.path().join("real-receipt"),
+                        &receipt_path,
+                    )
+                    .expect("fixture receipt should be symlink");
+                }
+                _ => {
+                    let mut bytes =
+                        std::fs::read(&receipt_path).expect("fixture receipt should read");
+                    bytes[8..24].copy_from_slice(Uuid::now_v7().as_bytes());
+                    std::fs::write(&receipt_path, bytes).expect("fixture generation should change");
+                }
+            }
+            assert!(
+                store
+                    .prune_delete_receipt(&namespace, &key, generation)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                std::fs::symlink_metadata(receipt_path).is_ok(),
+                "invalid marker must retain exact receipt entry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_complete_keeps_stable_and_key_locks_until_owned_transaction_finishes() {
+        let (_directory, store, namespace, key) = test_store();
+        let (first_upload, first_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"first")).await;
+        store
+            .complete_verified(&first_upload, &first_receipt)
+            .await
+            .expect("first fixture should commit");
+        store
+            .delete_exact(&namespace, &key, first_receipt.object_generation())
+            .await
+            .expect("first fixture should delete");
+        let old_key_inode = std::fs::metadata(store.deleted_key_path(&key))
+            .expect("per-key lock directory should exist")
+            .ino();
+        let (next_upload, next_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"second")).await;
+        let pause = store.arm_complete_artifact_lock_pause();
+        let completing_store = store.clone();
+        let completion_receipt = next_receipt.clone();
+        let completion = tokio::spawn(async move {
+            completing_store
+                .complete_verified(&next_upload, &completion_receipt)
+                .await
+        });
+        wait_for_pause(&pause).await;
+        let pruning_store = store.clone();
+        let pruning_namespace = namespace.clone();
+        let pruning_key = key.clone();
+        let mut prune = tokio::spawn(async move {
+            pruning_store
+                .prune_delete_receipt(
+                    &pruning_namespace,
+                    &pruning_key,
+                    first_receipt.object_generation(),
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut prune)
+                .await
+                .is_err(),
+            "exclusive prune must wait for already-open per-key lock holders"
+        );
+        completion.abort();
+        assert!(
+            completion
+                .await
+                .expect_err("caller completion should cancel")
+                .is_cancelled()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut prune)
+                .await
+                .is_err(),
+            "caller cancellation must not release the underlying global lock"
+        );
+        assert_eq!(
+            std::fs::metadata(store.deleted_key_path(&key))
+                .expect("old key directory must stay linked")
+                .ino(),
+            old_key_inode
+        );
+        pause.resume();
+        assert_eq!(
+            tokio::time::timeout(RACE_TIMEOUT, prune)
+                .await
+                .expect("owned completion should eventually release root lock")
+                .expect("prune task should join"),
+            Err(ArtifactObjectError::GenerationMismatch)
+        );
+        assert_eq!(
+            store.inspect_committed(&namespace, &key).await,
+            Ok(Some(next_receipt))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_retry_finishes_superseded_marker_cleanup_after_two_generation_crash() {
+        let (_directory, store, namespace, key) = test_store();
+        let (first_upload, first_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"first")).await;
+        store
+            .complete_verified(&first_upload, &first_receipt)
+            .await
+            .expect("first fixture should commit");
+        store
+            .delete_exact(&namespace, &key, first_receipt.object_generation())
+            .await
+            .expect("first fixture should delete");
+        let first_marker = store.tombstone_path(&key, first_receipt.object_generation());
+        let (second_upload, second_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"second")).await;
+        store
+            .complete_verified(&second_upload, &second_receipt)
+            .await
+            .expect("second fixture should commit");
+        let second_marker = store.tombstone_path(&key, second_receipt.object_generation());
+        fs::rename(store.object_path(&key), &second_marker)
+            .await
+            .expect("simulate crash immediately after delete rename");
+        assert_eq!(
+            store
+                .delete_exact(&namespace, &key, second_receipt.object_generation())
+                .await,
+            Ok(ArtifactDeleteOutcome::AlreadyDeleted)
+        );
+        assert!(
+            !first_marker.exists(),
+            "exact retry must finish validated superseded-marker deletion"
+        );
+        assert!(
+            !second_marker.join("data").exists(),
+            "exact retry must finish payload compaction"
+        );
+        assert_eq!(
+            store
+                .inspect_delete_receipt(&namespace, &key, second_receipt.object_generation())
+                .await,
+            Ok(Some(second_receipt.clone()))
+        );
+        assert_eq!(
+            store
+                .prune_delete_receipt(&namespace, &key, second_receipt.object_generation())
+                .await,
+            Ok(DeleteReceiptPruneOutcome::Pruned)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_retry_rejects_superseded_marker_with_mismatched_filename() {
+        let (_directory, store, namespace, key) = test_store();
+        let (first_upload, first_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"first")).await;
+        store
+            .complete_verified(&first_upload, &first_receipt)
+            .await
+            .expect("first fixture should commit");
+        store
+            .delete_exact(&namespace, &key, first_receipt.object_generation())
+            .await
+            .expect("first fixture should delete");
+        let wrong_marker = store.deleted_key_path(&key).join("foreign-generation");
+        fs::rename(
+            store.tombstone_path(&key, first_receipt.object_generation()),
+            &wrong_marker,
+        )
+        .await
+        .expect("fixture old marker should have wrong name");
+        let (second_upload, second_receipt) =
+            begin_test_upload(&store, &key, Bytes::from_static(b"second")).await;
+        store
+            .complete_verified(&second_upload, &second_receipt)
+            .await
+            .expect("second fixture should commit");
+        let second_marker = store.tombstone_path(&key, second_receipt.object_generation());
+        fs::rename(store.object_path(&key), &second_marker)
+            .await
+            .expect("simulate interrupted delete");
+        assert_eq!(
+            store
+                .delete_exact(&namespace, &key, second_receipt.object_generation())
+                .await,
+            Err(ArtifactObjectError::IntegrityMismatch)
+        );
+        assert!(
+            wrong_marker.join("receipt").exists(),
+            "unvalidated sibling must never be deleted"
+        );
+        assert!(
+            second_marker.join("receipt").exists(),
+            "exact deletion authority must survive rejection"
+        );
+    }
+
     #[test]
     fn completion_and_abort_sync_the_multipart_parent_after_removing_stage_entries() {
         let source = include_str!("filesystem.rs");
         let completion = source
-            .split("    async fn complete_verified(")
+            .split("    async fn complete_verified_owned(")
             .nth(1)
-            .and_then(|tail| tail.split("    async fn abort(").next())
+            .and_then(|tail| tail.split("impl FilesystemMultipartJanitor").next())
             .expect("completion source");
         let after_publish = completion
             .split("fs::rename(&stage, &destination)")

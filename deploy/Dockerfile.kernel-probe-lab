@@ -1,0 +1,12 @@
+# Container-only dependencies for an isolated native kernel measurement.
+# The launcher pins the locally built image ID; Chromium and daemon bytes are
+# separately pinned from the private input inventory and copied into tmpfs.
+ARG BASE_IMAGE=golang:1.26.6-bookworm
+FROM ${BASE_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive TZ=UTC
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       bubblewrap ca-certificates clamav-daemon clamav-freshclam iproute2 \
+       python3 redis-server util-linux \
+    && rm -rf /var/lib/apt/lists/*
+ENTRYPOINT []

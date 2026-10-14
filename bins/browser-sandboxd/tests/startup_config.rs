@@ -75,3 +75,72 @@ fn malformed_chromium_digest_fails_before_startup_mutation() {
     assert!(!temporary.path().join("epoch").exists());
     assert!(!temporary.path().join("journal").exists());
 }
+
+#[test]
+fn missing_native_artifact_root_fails_before_startup_mutation() {
+    let temporary = tempfile::Builder::new()
+        .prefix("sandboxd-native-root-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .expect("private test directory");
+    let output = sandboxd_command(temporary.path())
+        .env(
+            "BROWSERD_CHROMIUM_BINARY_SHA256",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        .output()
+        .expect("sandboxd should execute");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("BROWSERD_CHROMIUM_ARTIFACT_ROOT is required")
+    );
+    assert!(!temporary.path().join("sandboxd.sock").exists());
+    assert!(!temporary.path().join("epoch").exists());
+    assert!(!temporary.path().join("journal").exists());
+}
+
+#[test]
+fn artifact_without_native_catalog_fails_before_startup_mutation() {
+    let temporary = tempfile::Builder::new()
+        .prefix("sandboxd-native-catalog-")
+        .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        .expect("private test directory");
+    let mut command = sandboxd_command(temporary.path());
+    let binary_digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    let resource_digest =
+        browserd_chromium::Sha256Digest::from_hex(&"01".repeat(32)).expect("resource digest");
+    let identity = browserd_chromium::ChromiumArtifactIdentity {
+        binary_digest: browserd_chromium::Sha256Digest::from_hex(binary_digest)
+            .expect("fixture digest"),
+        product_version: "153.0.8010.12".into(),
+        chromium_revision: "971a7443b0c9b0a9b2860529b33331b76077ec62".into(),
+        browser_protocol_schema_digest: resource_digest,
+        js_protocol_schema_digest: resource_digest,
+        launch_profile_digest: browserd_chromium::Sha256Digest::from_hex(&"02".repeat(32))
+            .expect("catalog digest"),
+        extension_bundle_digest: resource_digest,
+        font_bundle_digest: resource_digest,
+        certificate_runtime_bundle_digest: resource_digest,
+    };
+    std::fs::write(
+        temporary.path().join("compatibility.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "identity":identity,"files":[{"relative_path":"chrome","digest":binary_digest}]
+        }))
+        .expect("manifest JSON"),
+    )
+    .expect("fixture manifest");
+    let output = command
+        .env("BROWSERD_CHROMIUM_BINARY_SHA256", binary_digest)
+        .env("BROWSERD_CHROMIUM_ARTIFACT_ROOT", temporary.path())
+        .output()
+        .expect("sandboxd should execute");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Chromium native process profile catalog verification failed")
+    );
+    assert!(!temporary.path().join("sandboxd.sock").exists());
+    assert!(!temporary.path().join("epoch").exists());
+    assert!(!temporary.path().join("journal").exists());
+}

@@ -16,6 +16,171 @@ use uuid::Uuid;
 
 const DAY: Duration = MINIMUM_EVENT_RETENTION;
 
+#[path = "support/event_outbox_projection.rs"]
+mod projection_cases;
+
+#[tokio::test]
+async fn redis_projection_retention_gaps_parallel_and_legacy_conformance() {
+    let Some(fixture) = fixture("projection").await else {
+        return;
+    };
+    projection_cases::source_lanes_are_independent_and_survive_retention(
+        fixture.store.as_ref(),
+        &TenantId::new(),
+    )
+    .await;
+    projection_cases::retry_after_retention_does_not_resurrect(
+        fixture.store.as_ref(),
+        &TenantId::new(),
+    )
+    .await;
+    projection_cases::gaps_fail_without_blocking_other_sessions(
+        fixture.store.as_ref(),
+        &TenantId::new(),
+    )
+    .await;
+    projection_cases::concurrent_relays_append_once(fixture.store.as_ref(), &TenantId::new()).await;
+    projection_cases::normal_append_can_precede_projection(
+        fixture.store.as_ref(),
+        &TenantId::new(),
+    )
+    .await;
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_projection_watermark_survives_payload_ttl_restart_and_legacy_writes() {
+    let Some(fixture) = fixture("projection-ttl").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let first = projection_cases::projection(&tenant, &session, 1);
+    fixture
+        .store
+        .append_projection(first.clone(), at(0))
+        .await
+        .expect("first projection");
+    fixture
+        .store
+        .append(action_terminal(&tenant, &session, 4), at(1))
+        .await
+        .expect("normal append");
+    fixture
+        .store
+        .mark_delivered(&tenant, EventCursor::from_position(2))
+        .await
+        .expect("delivered");
+    let namespace = format!("{}:event-outbox:{{{tenant}}}", fixture.prefix);
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("valid endpoint");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg(format!("{namespace}:meta"))
+        .query_async(&mut connection)
+        .await
+        .expect("meta TTL");
+    assert_eq!(
+        ttl, -1,
+        "normal append and delivery must not expire projection watermarks"
+    );
+    for suffix in ["events", "index", "bytime"] {
+        let _: i64 = redis::cmd("PEXPIRE")
+            .arg(format!("{namespace}:{suffix}"))
+            .arg(1)
+            .query_async(&mut connection)
+            .await
+            .expect("shorten payload TTL");
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let restarted = RedisEventOutbox::connect(fixture.config.clone())
+        .await
+        .expect("reconnect");
+    restarted
+        .append_projection(first, at(90_000))
+        .await
+        .expect("retry pruned projection");
+    let page = restarted
+        .read_from(&tenant, EventCursor::start(), 10, at(90_000))
+        .await
+        .expect("expired payload page");
+    assert!(page.events().is_empty());
+    assert!(
+        page.cursor_expired(),
+        "permanent cursor records the expired payload gap"
+    );
+    restarted
+        .append_projection(
+            projection_cases::projection(&tenant, &session, 2),
+            at(90_001),
+        )
+        .await
+        .expect("next projection");
+    let next = restarted
+        .read_from(&tenant, EventCursor::from_position(2), 10, at(90_001))
+        .await
+        .expect("next page");
+    assert_eq!(next.events().len(), 1);
+    assert_eq!(
+        next.next_cursor().position(),
+        3,
+        "payload TTL must not reset the tenant cursor"
+    );
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_projection_sequence_is_exact_above_lua_integer_precision() {
+    let Some(fixture) = fixture("projection-large-seq").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let namespace = format!("{}:event-outbox:{{{tenant}}}", fixture.prefix);
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("valid endpoint");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let previous = 9_007_199_254_740_991_u64;
+    let _: i64 = redis::cmd("HSET")
+        .arg(format!("{namespace}:meta"))
+        .arg(format!("@projection:{session}"))
+        .arg(previous.to_string())
+        .arg("projection_persistent")
+        .arg("1")
+        .query_async(&mut connection)
+        .await
+        .expect("seed durable highwater");
+    fixture
+        .store
+        .append_projection(
+            projection_cases::projection(&tenant, &session, previous + 2),
+            at(0),
+        )
+        .await
+        .expect_err("exact gap above f64 precision");
+    for sequence in [previous + 1, previous + 2] {
+        fixture
+            .store
+            .append_projection(
+                projection_cases::projection(&tenant, &session, sequence),
+                at(0),
+            )
+            .await
+            .expect("exact contiguous sequence");
+    }
+    let page = fixture
+        .store
+        .read_from(&tenant, EventCursor::start(), 10, at(0))
+        .await
+        .expect("events");
+    assert_eq!(page.events().len(), 2);
+    cleanup(&fixture).await;
+}
+
 struct RedisFixture {
     config: RedisEventOutboxConfig,
     store: Arc<RedisEventOutbox>,
@@ -332,5 +497,33 @@ async fn redis_retention_prunes_aged_events_and_reports_the_gap() {
     assert_eq!(page.events().len(), 1);
     assert_eq!(page.events()[0].cursor().position(), 3);
 
+    cleanup(&fixture).await;
+}
+
+#[path = "support/event_outbox_notifications.rs"]
+mod notification_cases;
+
+#[tokio::test]
+async fn redis_notifications_preserve_all_nine_typed_kinds_and_immutable_wire() {
+    let Some(fixture) = fixture("notifications").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    notification_cases::all_kinds(fixture.store.as_ref(), &tenant, at(0)).await;
+    let before = fixture
+        .store
+        .read_from(&tenant, EventCursor::start(), 20, at(0))
+        .await
+        .expect("before restart");
+    let reopened = RedisEventOutbox::connect(fixture.config.clone())
+        .await
+        .expect("reopen");
+    assert_eq!(
+        reopened
+            .read_from(&tenant, EventCursor::start(), 20, at(0))
+            .await
+            .expect("restored typed state"),
+        before
+    );
     cleanup(&fixture).await;
 }

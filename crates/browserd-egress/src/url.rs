@@ -33,6 +33,7 @@ pub struct CanonicalUrl {
     host: String,
     port: u16,
     path_and_query: String,
+    wire_path_and_query: String,
 }
 
 impl CanonicalUrl {
@@ -65,6 +66,10 @@ impl CanonicalUrl {
                 host: String::new(),
                 port: 0,
                 path_and_query: remainder
+                    .split_once('#')
+                    .map_or(remainder, |(before, _)| before)
+                    .to_owned(),
+                wire_path_and_query: remainder
                     .split_once('#')
                     .map_or(remainder, |(before, _)| before)
                     .to_owned(),
@@ -148,6 +153,13 @@ impl CanonicalUrl {
                 (path, Some(query))
             });
         let path = if path.is_empty() { "/" } else { path };
+        // Authority validation does not authorize rewriting an origin's request
+        // target. Keep its separators, escaping, dot segments and query order.
+        let mut wire_path_and_query = path.to_owned();
+        if let Some(query) = query {
+            wire_path_and_query.push('?');
+            wire_path_and_query.push_str(query);
+        }
         let mut segments = Vec::new();
         for segment in path.split('/') {
             match segment {
@@ -173,6 +185,7 @@ impl CanonicalUrl {
             host,
             port,
             path_and_query,
+            wire_path_and_query,
         })
     }
 
@@ -194,6 +207,12 @@ impl CanonicalUrl {
     #[must_use]
     pub fn path_and_query(&self) -> &str {
         &self.path_and_query
+    }
+
+    /// Validated origin-form bytes, retained separately from the policy view.
+    #[must_use]
+    pub fn wire_path_and_query(&self) -> &str {
+        &self.wire_path_and_query
     }
 
     pub(crate) fn is_default_port(&self) -> bool {

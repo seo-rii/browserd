@@ -69,6 +69,10 @@ fn sequential_allocations_increment_the_durable_record() -> Result<(), Box<dyn E
 fn concurrent_processes_allocate_unique_contiguous_epochs() -> Result<(), Box<dyn Error>> {
     const PROCESS_COUNT: usize = 12;
 
+    // CLOEXEC takes effect only at exec, so a child being spawned would briefly
+    // keep a concurrent listener/control socket alive even after its owner
+    // closes it. Serialize this fork/exec window with capability cleanup tests.
+    let _listener_test = crate::daemon_tests::LISTENER_TEST_LOCK.blocking_lock();
     let directory = TemporaryDirectory::create("processes")?;
     let state_path = directory.path().join("daemon.epoch");
     let executable = std::env::current_exe()?;

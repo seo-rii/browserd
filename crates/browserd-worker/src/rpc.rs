@@ -11,10 +11,14 @@ use async_trait::async_trait;
 use browserd_actions::{
     ActionKind, ActionSequence, ActionSnapshot, ActionSnapshotFacts,
     ApprovalDecision as ActionApprovalDecision, CanonicalRequestHash as ActionCanonicalRequestHash,
-    IdempotencyKey as ActionIdempotencyKey, KnownFailureReason, ResolutionAnnotation,
-    ResolutionKind, TerminalDetail,
+    IdempotencyKey as ActionIdempotencyKey, JournalSessionScope, KnownFailureReason,
+    ResolutionAnnotation, ResolutionKind, TerminalCustodyReceipt, TerminalCustodyRequirement,
+    TerminalDetail,
 };
-use browserd_artifacts::{ArtifactContentSource, ArtifactState};
+use browserd_artifacts::{
+    ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactKey,
+    ArtifactObjectGeneration, ArtifactState,
+};
 use browserd_core::{
     ActionId, ApprovalId, ArtifactId, LeaseId, OperationId, PageId, PrincipalId, SessionId,
     TenantId, WorkerId,
@@ -22,8 +26,9 @@ use browserd_core::{
 use browserd_features::BuiltinFeature;
 use browserd_operations::CanonicalRequestHash as CreateCanonicalRequestHash;
 use browserd_policy::{
-    ActionArgumentsHash, ActionType, ApprovalDecision, ApprovalState, CanonicalActionProposal,
-    CredentialRefsHash, NodeReference, Origin,
+    ActionArgumentsHash, ActionType, ApprovalContextScope, ApprovalDecision, ApprovalState,
+    CanonicalActionProposal, CredentialRefsHash, NodeReference, Origin, TypedActionPayload,
+    TypedActionProposalBinding,
 };
 use browserd_session::{OwnershipFence, SessionLifecycle, SessionTime};
 use nix::fcntl::{Flock, FlockArg, OFlag, open};
@@ -39,12 +44,17 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ActionApprovalRequirement, ActionStatus, ArtifactUpload, AuthenticatedPeer, ChromiumDriver,
-    CreateSessionCommand, SandboxClient, WorkerActionSnapshot, WorkerApprovalSnapshot,
-    WorkerArtifactSnapshot, WorkerControlPlane, WorkerError, WorkerPageSnapshot,
+    ActionApprovalRequirement, ActionStatus, ArtifactPublication, ArtifactScanVerdict,
+    ArtifactUpload, AuthenticatedPeer, ChromiumDriver, CreateSessionCommand, SandboxClient,
+    WorkerActionSnapshot, WorkerApprovalSnapshot, WorkerArtifactSnapshot, WorkerControlPlane,
+    WorkerError, WorkerPageSnapshot,
 };
 
-pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 22;
+mod artifact_streams;
+mod viewer;
+pub use viewer::*;
+
+pub const WORKER_RPC_PROTOCOL_VERSION: u16 = 33;
 pub const WORKER_SESSION_OPTIONS_VERSION: u16 = 1;
 
 const MAX_WORKER_ACTION_URL_BYTES: usize = 8 * 1024;
@@ -52,10 +62,16 @@ const MAX_WORKER_ACTION_TEXT_BYTES: usize = 16 * 1024;
 const MAX_WORKER_KEY_BYTES: usize = 64;
 const MAX_WORKER_SCROLL_DELTA: u64 = 1_000_000;
 const MAX_WORKER_SELECTOR_BYTES: usize = 8 * 1024;
+const MAX_WORKER_FRAME_PATH_DEPTH: usize = 8;
+const MAX_WORKER_FRAME_PATH_BYTES: usize = 32 * 1024;
 const MAX_WORKER_NODE_REF_BYTES: usize = 1024;
 const MAX_WORKER_ATTRIBUTE_NAME_BYTES: usize = 256;
 const MAX_WORKER_SELECT_VALUES: usize = 1024;
 const MAX_WORKER_EVALUATE_BYTES: usize = 64 * 1024;
+/// A 4 MiB result serializes as a JSON byte array at up to four bytes per byte. The
+/// remaining bound covers the finite ownership, digest, approval and custody envelope.
+pub const MAX_WORKER_ACTION_RPC_FRAME_BYTES: usize =
+    4 * browserd_actions::MAX_SNAPSHOT_RESULT_CONTENT_BYTES + 256 * 1024;
 const MAX_WORKER_WAIT_QUIET_MS: u64 = 300_000;
 
 fn valid_worker_node_ref(node_ref: &str) -> bool {
@@ -182,9 +198,17 @@ pub enum WorkerActionCommand {
         node_ref: String,
         value: String,
     },
+    FillSecret {
+        node_ref: String,
+        secret_ref: String,
+    },
     SelectOption {
         node_ref: String,
         values: Vec<String>,
+    },
+    SetFiles {
+        node_ref: String,
+        artifact_ids: Vec<ArtifactId>,
     },
     Evaluate {
         expression: String,
@@ -209,6 +233,8 @@ pub enum WorkerActionCommand {
     },
     QueryAll {
         selector: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        frame_path: Vec<String>,
     },
     GetText {
         node_ref: String,
@@ -231,6 +257,22 @@ pub enum WorkerActionCommand {
     },
     GetUrl,
     GetTitle,
+    Screenshot {
+        #[serde(default)]
+        options: browserd_features::ScreenshotOptions,
+    },
+    Pdf {
+        #[serde(default)]
+        options: browserd_features::PdfOptions,
+    },
+    Scrape {
+        #[serde(default)]
+        options: browserd_features::ScrapeOptions,
+    },
+    Checkpoint {
+        #[serde(default)]
+        origins: Vec<String>,
+    },
 }
 
 impl WorkerActionCommand {
@@ -253,12 +295,34 @@ impl WorkerActionCommand {
             Self::Fill { node_ref, value } => {
                 valid_worker_node_ref(node_ref) && value.len() <= MAX_WORKER_ACTION_TEXT_BYTES
             }
+            Self::FillSecret {
+                node_ref,
+                secret_ref,
+            } => {
+                valid_worker_node_ref(node_ref)
+                    && node_ref.trim() == node_ref
+                    && !secret_ref.is_empty()
+                    && secret_ref.len() <= 1024
+                    && secret_ref.trim() == secret_ref
+                    && !secret_ref.chars().any(char::is_control)
+            }
             Self::SelectOption { node_ref, values } => {
                 valid_worker_node_ref(node_ref)
                     && values.len() <= MAX_WORKER_SELECT_VALUES
                     && values
                         .iter()
                         .all(|value| value.len() <= MAX_WORKER_ACTION_TEXT_BYTES)
+            }
+            Self::SetFiles {
+                node_ref,
+                artifact_ids,
+            } => {
+                valid_worker_node_ref(node_ref)
+                    && (1..=128).contains(&artifact_ids.len())
+                    && artifact_ids
+                        .iter()
+                        .enumerate()
+                        .all(|(index, id)| !artifact_ids[..index].contains(id))
             }
             Self::Evaluate { expression } => {
                 !expression.is_empty() && expression.len() <= MAX_WORKER_EVALUATE_BYTES
@@ -279,10 +343,20 @@ impl WorkerActionCommand {
                 delta_x.unsigned_abs() <= MAX_WORKER_SCROLL_DELTA
                     && delta_y.unsigned_abs() <= MAX_WORKER_SCROLL_DELTA
             }
-            Self::QueryAll { selector } => {
-                !selector.is_empty()
-                    && selector.len() <= MAX_WORKER_SELECTOR_BYTES
-                    && !selector.chars().any(char::is_control)
+            Self::QueryAll {
+                selector,
+                frame_path,
+            } => {
+                let valid_selector = |selector: &str| {
+                    !selector.is_empty()
+                        && selector.len() <= MAX_WORKER_SELECTOR_BYTES
+                        && !selector.chars().any(char::is_control)
+                };
+                valid_selector(selector)
+                    && frame_path.len() <= MAX_WORKER_FRAME_PATH_DEPTH
+                    && frame_path.iter().all(|selector| valid_selector(selector))
+                    && frame_path.iter().map(String::len).sum::<usize>()
+                        <= MAX_WORKER_FRAME_PATH_BYTES
             }
             Self::GetText { node_ref } => valid_worker_node_ref(node_ref),
             Self::GetHtml { node_ref } => node_ref.as_deref().is_none_or(valid_worker_node_ref),
@@ -295,6 +369,17 @@ impl WorkerActionCommand {
             Self::GetProperties { node_ref }
             | Self::GetComputedStyle { node_ref }
             | Self::ExtractTable { node_ref } => valid_worker_node_ref(node_ref),
+            Self::Screenshot { options } => options.validate(),
+            Self::Pdf { options } => options.validate(),
+            Self::Scrape { options } => options.validate(),
+            Self::Checkpoint { origins } => {
+                origins.len() <= 16
+                    && origins.iter().enumerate().all(|(index, value)| {
+                        value.len() <= 2048
+                            && Origin::parse(value).is_ok_and(|origin| origin.as_str() == value)
+                            && !origins[..index].contains(value)
+                    })
+            }
             Self::Reload
             | Self::GoBack
             | Self::GoForward
@@ -307,7 +392,11 @@ impl WorkerActionCommand {
     #[must_use]
     pub const fn kind(&self) -> ActionKind {
         match self {
-            Self::GetUrl
+            Self::Screenshot { .. }
+            | Self::Checkpoint { .. }
+            | Self::Pdf { .. }
+            | Self::Scrape { .. }
+            | Self::GetUrl
             | Self::GetTitle
             | Self::Snapshot
             | Self::QueryAll { .. }
@@ -329,7 +418,9 @@ impl WorkerActionCommand {
             | Self::Check { .. }
             | Self::Uncheck { .. }
             | Self::Fill { .. }
+            | Self::FillSecret { .. }
             | Self::SelectOption { .. }
+            | Self::SetFiles { .. }
             | Self::Evaluate { .. }
             | Self::WaitFor { .. }
             | Self::HandleDialog { .. }
@@ -339,15 +430,32 @@ impl WorkerActionCommand {
         }
     }
 
-    /// The privileged built-in feature this command requires, if any.
-    ///
-    /// `evaluate` maps to [`BuiltinFeature::PrivilegedEvaluate`] so the worker can gate it on the
-    /// session's feature profile before dispatch (SPEC D-18). Other commands are covered by the
-    /// core navigation/input features and need no privileged-profile gate here.
+    #[must_use]
+    pub fn capture_command(&self) -> Option<browserd_features::CaptureCommand> {
+        match self {
+            Self::Screenshot { options } => Some(browserd_features::CaptureCommand::Screenshot {
+                options: options.clone(),
+            }),
+            Self::Pdf { options } => Some(browserd_features::CaptureCommand::Pdf {
+                options: options.clone(),
+            }),
+            Self::Scrape { options } => Some(browserd_features::CaptureCommand::Scrape {
+                options: options.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The feature registry admission required before dispatch.
+    /// `evaluate` additionally requires the privileged profile (SPEC D-18).
     #[must_use]
     pub const fn required_feature(&self) -> Option<BuiltinFeature> {
         match self {
             Self::Evaluate { .. } => Some(BuiltinFeature::PrivilegedEvaluate),
+            Self::Screenshot { .. } => Some(BuiltinFeature::Screenshot),
+            Self::Pdf { .. } => Some(BuiltinFeature::Pdf),
+            Self::Scrape { .. } => Some(BuiltinFeature::Scrape),
+            Self::Checkpoint { .. } => Some(BuiltinFeature::Checkpoint),
             _ => None,
         }
     }
@@ -560,6 +668,15 @@ pub struct WorkerCreateSessionReceipt {
     pub worker_epoch: u64,
     pub placement_version: u64,
     pub existing: bool,
+    #[serde(default)]
+    pub restored_checkpoint: Option<WorkerCheckpointRestoreReceipt>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerCheckpointRestoreReceipt {
+    pub checkpoint_ref: String,
+    pub source_session_id: SessionId,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -586,6 +703,15 @@ pub struct WorkerSessionReceipt {
     pub fence: WorkerSessionFence,
     pub lifecycle: WorkerSessionLifecycle,
     pub primary_page_id: PageId,
+}
+
+/// Read-only ownership evidence, available while an exact worker is draining or unready.
+/// This receipt never grants session creation or new action admission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerSessionOwnershipReceipt {
+    pub worker_id: WorkerId,
+    pub session: WorkerSessionReceipt,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -616,10 +742,88 @@ pub struct WorkerActionReceipt {
     pub terminal_detail: Option<TerminalDetail>,
     pub result: Option<Vec<u8>>,
     pub resolution: Option<ResolutionAnnotation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody: Option<Box<TerminalCustodyReceipt>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custody_requirement: Option<TerminalCustodyRequirement>,
+}
+
+/// Authenticated historical WAL proof. Serving ownership may be newer than the original scope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTerminalCustodyReceipt {
+    pub worker_id: WorkerId,
+    pub worker_epoch: u64,
+    pub receipt: Box<TerminalCustodyReceipt>,
+}
+
+impl WorkerTerminalCustodyReceipt {
+    pub fn validate_for(
+        &self,
+        serving_worker_id: &WorkerId,
+        serving_worker_epoch: u64,
+        scope: &JournalSessionScope,
+        action_id: &ActionId,
+        action_sequence: ActionSequence,
+        kind: ActionKind,
+    ) -> Result<(), WorkerRpcError> {
+        if scope.validate().is_err()
+            || self.receipt.validate().is_err()
+            || serving_worker_epoch == 0
+            || scope.original_worker_id() != serving_worker_id
+            || scope.fence().worker_epoch > serving_worker_epoch
+            || action_sequence.get() == 0
+            || self.worker_id != *serving_worker_id
+            || self.worker_epoch != serving_worker_epoch
+            || self.receipt.scope() != scope
+            || self.receipt.action_id() != action_id
+            || self.receipt.action_sequence() != action_sequence
+            || self.receipt.kind() != kind
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTerminalCustodyAck {
+    pub worker_id: WorkerId,
+    pub worker_epoch: u64,
+    pub receipt_sha256: [u8; 32],
 }
 
 impl WorkerActionReceipt {
     pub fn to_action_snapshot(&self) -> Result<ActionSnapshot, WorkerRpcError> {
+        self.to_action_snapshot_with_result_budget(browserd_actions::ActionResultBudget::Standard)
+    }
+
+    /// The authenticated caller supplies the profile from its immutable accepted action claim.
+    /// A result body or a remote peer cannot request a larger allowance here.
+    pub fn to_action_snapshot_with_result_budget(
+        &self,
+        result_budget: browserd_actions::ActionResultBudget,
+    ) -> Result<ActionSnapshot, WorkerRpcError> {
+        if (self.terminal_detail.is_none() && self.custody_requirement.is_some())
+            || (self.custody.is_some()
+                && self.custody_requirement == Some(TerminalCustodyRequirement::Unsupported))
+            || self.custody.as_ref().is_some_and(|custody| {
+                custody.validate().is_err()
+                    || custody.tenant_id() != &self.fence.tenant_id
+                    || custody.session_id() != &self.fence.session_id
+                    || custody.fence().worker_epoch != self.fence.worker_epoch
+                    || custody.fence().placement_version != self.fence.placement_version
+                    || custody.fence().session_incarnation != self.fence.session_incarnation
+                    || custody.action_id() != &self.action_id
+                    || custody.action_sequence() != self.action_sequence
+                    || custody.kind() != self.kind
+                    || Some(custody.terminal()) != self.terminal_detail
+                    || custody.resolution() != self.resolution.as_ref()
+            })
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
         let state = match self.status {
             WorkerActionStatus::PendingApproval => browserd_core::ActionState::PendingApproval,
             WorkerActionStatus::Queued => browserd_core::ActionState::ReadyToDispatch,
@@ -680,20 +884,25 @@ impl WorkerActionReceipt {
         {
             return Err(WorkerRpcError::Protocol);
         }
-        ActionSnapshot::from_facts(ActionSnapshotFacts {
-            action_id: self.action_id.clone(),
-            action_sequence: self.action_sequence,
-            idempotency_key: ActionIdempotencyKey::new(self.idempotency_key.clone()),
-            canonical_request_hash: ActionCanonicalRequestHash::new(self.canonical_request_hash),
-            kind: self.kind,
-            state,
-            dispatch_acknowledged: self.dispatch_acknowledged,
-            approval_decision: self.approval_decision,
-            terminal_detail: self.terminal_detail,
-            resolution: self.resolution.clone(),
-            // Validated above to be Some only for a succeeded action whose bytes match the digest.
-            result_content: self.result.clone(),
-        })
+        ActionSnapshot::from_facts_with_result_budget(
+            ActionSnapshotFacts {
+                action_id: self.action_id.clone(),
+                action_sequence: self.action_sequence,
+                idempotency_key: ActionIdempotencyKey::new(self.idempotency_key.clone()),
+                canonical_request_hash: ActionCanonicalRequestHash::new(
+                    self.canonical_request_hash,
+                ),
+                kind: self.kind,
+                state,
+                dispatch_acknowledged: self.dispatch_acknowledged,
+                approval_decision: self.approval_decision,
+                terminal_detail: self.terminal_detail,
+                resolution: self.resolution.clone(),
+                // Validated above to be Some only for a succeeded action whose bytes match the digest.
+                result_content: self.result.clone(),
+            },
+            result_budget,
+        )
         .map_err(|_| WorkerRpcError::Protocol)
     }
 }
@@ -860,6 +1069,121 @@ pub struct WorkerArtifactReceipt {
     pub source: WorkerArtifactSource,
     pub origin: String,
     pub object_generation: [u8; 32],
+    #[serde(default)]
+    pub display_filename: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerArtifactScanVerdict {
+    Clean,
+    Quarantined,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRetainedArtifactScope {
+    pub worker_id: WorkerId,
+    pub worker_epoch: u64,
+    pub tenant_id: TenantId,
+    pub session_id: SessionId,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactPublicationWire {
+    pub original_worker_id: WorkerId,
+    pub artifact: WorkerArtifactReceipt,
+    pub scan_verdict: Option<WorkerArtifactScanVerdict>,
+    pub published_at_unix_millis: u64,
+    pub expires_at_unix_millis: u64,
+    #[serde(default)]
+    pub scan_attestation: Option<Box<crate::ArtifactScanAttestation>>,
+}
+impl ArtifactPublicationWire {
+    pub fn to_publication(&self) -> Result<ArtifactPublication, WorkerError> {
+        if self.artifact.state != WorkerArtifactState::Available {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        let fence = &self.artifact.fence;
+        let source = match self.artifact.source {
+            WorkerArtifactSource::ClientUpload => ArtifactContentSource::ClientUpload,
+            WorkerArtifactSource::BrowserDownload => ArtifactContentSource::BrowserDownload,
+            WorkerArtifactSource::Generated => ArtifactContentSource::Generated,
+        };
+        let scan = self.scan_verdict.map(|scan| match scan {
+            WorkerArtifactScanVerdict::Clean => ArtifactScanVerdict::Clean,
+            WorkerArtifactScanVerdict::Quarantined => ArtifactScanVerdict::Quarantined,
+            WorkerArtifactScanVerdict::Rejected => ArtifactScanVerdict::Rejected,
+        });
+        ArtifactPublication::new_with_scan_attestation(
+            ArtifactKey::new(
+                fence.tenant_id.clone(),
+                fence.session_id.clone(),
+                self.artifact.artifact_id.clone(),
+            ),
+            OwnershipFence::new(
+                self.original_worker_id.clone(),
+                fence.worker_epoch,
+                fence.placement_version,
+                fence.session_incarnation,
+            ),
+            ArtifactContentMetadata::new(
+                self.artifact.size_bytes,
+                ArtifactChecksum::new(self.artifact.checksum_sha256),
+                self.artifact.content_type.clone(),
+                source,
+                self.artifact.origin.clone(),
+            )
+            .map_err(|_| WorkerError::InvalidConfiguration)?,
+            ArtifactObjectGeneration::new(self.artifact.object_generation),
+            scan,
+            self.artifact.display_filename.clone(),
+            self.published_at_unix_millis,
+            self.expires_at_unix_millis,
+            self.scan_attestation.as_deref().cloned(),
+        )
+    }
+    pub fn from_publication(publication: &ArtifactPublication) -> Self {
+        let fence = publication.original_fence();
+        let metadata = publication.metadata();
+        Self {
+            original_worker_id: fence.worker_id().clone(),
+            artifact: WorkerArtifactReceipt {
+                fence: WorkerSessionFence {
+                    tenant_id: publication.key().tenant_id().clone(),
+                    session_id: publication.key().session_id().clone(),
+                    worker_epoch: fence.worker_epoch(),
+                    placement_version: fence.placement_version(),
+                    session_incarnation: fence.session_incarnation(),
+                },
+                artifact_id: publication.key().artifact_id().clone(),
+                state: WorkerArtifactState::Available,
+                size_bytes: metadata.size_bytes(),
+                checksum_sha256: *metadata.checksum().as_bytes(),
+                content_type: metadata.content_type().to_owned(),
+                source: artifact_source(metadata.source()),
+                origin: metadata.origin().to_owned(),
+                object_generation: *publication.object_generation().as_bytes(),
+                display_filename: publication.display_filename().map(str::to_owned),
+            },
+            scan_verdict: publication.scan_verdict().map(|scan| match scan {
+                ArtifactScanVerdict::Clean => WorkerArtifactScanVerdict::Clean,
+                ArtifactScanVerdict::Quarantined => WorkerArtifactScanVerdict::Quarantined,
+                ArtifactScanVerdict::Rejected => WorkerArtifactScanVerdict::Rejected,
+            }),
+            published_at_unix_millis: publication.published_at_unix_millis(),
+            expires_at_unix_millis: publication.expires_at_unix_millis(),
+            scan_attestation: publication.scan_attestation().cloned().map(Box::new),
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRetainedArtifactReceipt {
+    pub serving_worker_id: WorkerId,
+    pub serving_worker_epoch: u64,
+    pub publication: ArtifactPublicationWire,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -895,6 +1219,23 @@ pub struct WorkerCanonicalActionProposal {
     pub node_ref: Option<String>,
     pub credential_refs_hash: [u8; 32],
     pub expires_at_unix_millis: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_typed_proposal_binding"
+    )]
+    pub typed_binding: Option<Box<TypedActionProposalBinding>>,
+}
+
+fn deserialize_typed_proposal_binding<'de, D>(
+    deserializer: D,
+) -> Result<Option<Box<TypedActionProposalBinding>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Missing is the only legacy encoding. An explicitly damaged v2 value must not
+    // silently become a valid v1 proposal.
+    Box::<TypedActionProposalBinding>::deserialize(deserializer).map(Some)
 }
 
 impl WorkerCanonicalActionProposal {
@@ -925,6 +1266,7 @@ impl WorkerCanonicalActionProposal {
                 .map(|node_ref| node_ref.as_str().to_owned()),
             credential_refs_hash: *proposal.credential_refs_hash().as_bytes(),
             expires_at_unix_millis: proposal.expires_at_unix_ms(),
+            typed_binding: proposal.typed_binding().cloned().map(Box::new),
         }
     }
 
@@ -936,8 +1278,23 @@ impl WorkerCanonicalActionProposal {
         {
             return Err(WorkerRpcError::Protocol);
         }
-        let current_origin =
-            Origin::parse(&self.current_origin).map_err(|_| WorkerRpcError::Protocol)?;
+        let current_origin = match self.typed_binding.as_deref() {
+            Some(binding)
+                if matches!(binding.context_scope, ApprovalContextScope::BrowserContext)
+                    && matches!(binding.payload, TypedActionPayload::Checkpoint { .. })
+                    && self.current_origin == "browserd:context" =>
+            {
+                Origin::browser_context_scope()
+            }
+            Some(binding)
+                if matches!(binding.context_scope, ApprovalContextScope::OpaqueDocument)
+                    && matches!(binding.payload, TypedActionPayload::Browser { .. })
+                    && self.current_origin == "null" =>
+            {
+                Origin::opaque_document_scope()
+            }
+            _ => Origin::parse(&self.current_origin).map_err(|_| WorkerRpcError::Protocol)?,
+        };
         let action_type = match &self.action_type {
             WorkerApprovalActionType::Click => ActionType::Click,
             WorkerApprovalActionType::Fill => ActionType::Fill,
@@ -966,7 +1323,7 @@ impl WorkerCanonicalActionProposal {
                 .map_err(|_| WorkerRpcError::Protocol)?;
         let credential_refs_hash = CredentialRefsHash::from_bytes(&self.credential_refs_hash)
             .map_err(|_| WorkerRpcError::Protocol)?;
-        Ok(CanonicalActionProposal::new(
+        let proposal = CanonicalActionProposal::new(
             self.tenant_id.clone(),
             self.requester_principal_id.clone(),
             self.session_id.clone(),
@@ -981,7 +1338,13 @@ impl WorkerCanonicalActionProposal {
             node_ref,
             credential_refs_hash,
             self.expires_at_unix_millis,
-        ))
+        );
+        match self.typed_binding.as_deref() {
+            Some(binding) => proposal
+                .with_typed_binding(binding.clone())
+                .map_err(|_| WorkerRpcError::Protocol),
+            None => Ok(proposal),
+        }
     }
 }
 
@@ -1003,6 +1366,12 @@ impl WorkerApprovalReceipt {
             || proposal.session_id() != &self.fence.session_id
             || proposal.session_incarnation() != self.fence.session_incarnation
             || proposal.hash().as_bytes() != &self.proposal_hash
+            || proposal.typed_binding().is_some_and(|binding| {
+                binding.action_id != self.action_id
+                    || binding.fence.worker_epoch != self.fence.worker_epoch
+                    || binding.fence.placement_version != self.fence.placement_version
+                    || binding.fence.session_incarnation != self.fence.session_incarnation
+            })
         {
             return Err(WorkerRpcError::Protocol);
         }
@@ -1018,11 +1387,51 @@ impl WorkerApprovalReceipt {
     deny_unknown_fields
 )]
 pub enum WorkerRpcRequest {
+    PendingNotifications {
+        expected_worker_id: WorkerId,
+        expected_worker_epoch: u64,
+        family: browserd_core::NotificationSourceFamily,
+        cursor: Option<String>,
+        limit: usize,
+    },
+    AckNotification {
+        expected_worker_id: WorkerId,
+        expected_worker_epoch: u64,
+        ack: Box<browserd_core::NotificationAck>,
+    },
+    PendingControlEvents {
+        limit: usize,
+    },
+    AckControlEvent {
+        event: WorkerControlEvent,
+    },
+    ViewerOpen(WorkerViewerOpenRequest),
+    ViewerPoll(WorkerViewerPollRequest),
+    ViewerMessage(WorkerViewerMessageRequest),
+    ViewerClose(WorkerViewerCloseRequest),
     Probe {
         expected_worker_epoch: u64,
     },
     CreateSession(WorkerCreateSessionRequest),
+    CapacityStatus {
+        expected_worker_epoch: u64,
+    },
+    ReserveSession(crate::WorkerReservationRequest),
+    CommitReservedSession(crate::WorkerReservationToken),
+    InspectSessionReservation(crate::WorkerReservationToken),
+    CancelSessionReservation(crate::WorkerReservationToken),
+    AckSessionReservation(crate::WorkerReservationToken),
+    RenewReservedSession {
+        token: crate::WorkerReservationToken,
+        renewal_nonce: LeaseId,
+        expected_lease_revision: u64,
+        requested_ttl_millis: u64,
+    },
     GetSession {
+        fence: WorkerSessionFence,
+    },
+    InspectSession {
+        expected_worker_id: WorkerId,
         fence: WorkerSessionFence,
     },
     CloseSession {
@@ -1064,6 +1473,24 @@ pub enum WorkerRpcRequest {
         fence: WorkerSessionFence,
         action_id: ActionId,
     },
+    GetTerminalCustody {
+        expected_serving_worker_id: WorkerId,
+        expected_serving_worker_epoch: u64,
+        scope: JournalSessionScope,
+        action_id: ActionId,
+        action_sequence: ActionSequence,
+        kind: ActionKind,
+    },
+    AckTerminalCustody {
+        expected_serving_worker_id: WorkerId,
+        expected_serving_worker_epoch: u64,
+        receipt: Box<TerminalCustodyReceipt>,
+    },
+    ReleaseTerminalCustody {
+        expected_serving_worker_id: WorkerId,
+        expected_serving_worker_epoch: u64,
+        receipt: Box<TerminalCustodyReceipt>,
+    },
     CancelAction {
         fence: WorkerSessionFence,
         action_id: ActionId,
@@ -1083,9 +1510,57 @@ pub enum WorkerRpcRequest {
         content_type: String,
         now_unix_millis: u64,
     },
+    UploadNamedArtifact {
+        fence: WorkerSessionFence,
+        bytes: Vec<u8>,
+        content_type: String,
+        display_filename: String,
+        now_unix_millis: u64,
+    },
+    ListArtifacts {
+        fence: WorkerSessionFence,
+        after: Option<ArtifactId>,
+        limit: usize,
+    },
     GetArtifact {
         fence: WorkerSessionFence,
         artifact_id: ArtifactId,
+    },
+    OpenArtifact {
+        fence: WorkerSessionFence,
+        artifact_id: ArtifactId,
+    },
+    ReadArtifact {
+        fence: WorkerSessionFence,
+        stream_id: LeaseId,
+        sequence: u64,
+    },
+    CloseArtifact {
+        fence: WorkerSessionFence,
+        stream_id: LeaseId,
+    },
+    ListRetainedArtifacts {
+        scope: WorkerRetainedArtifactScope,
+        after: Option<ArtifactId>,
+        limit: usize,
+    },
+    GetRetainedArtifact {
+        scope: WorkerRetainedArtifactScope,
+        artifact_id: ArtifactId,
+    },
+    OpenRetainedArtifact {
+        scope: WorkerRetainedArtifactScope,
+        publication: ArtifactPublicationWire,
+        max_chunk_bytes: usize,
+    },
+    ReadRetainedArtifact {
+        scope: WorkerRetainedArtifactScope,
+        stream_id: LeaseId,
+        sequence: u64,
+    },
+    CloseRetainedArtifact {
+        scope: WorkerRetainedArtifactScope,
+        stream_id: LeaseId,
     },
     GetApproval {
         fence: WorkerSessionFence,
@@ -1145,16 +1620,64 @@ impl WorkerRpcFailure {
     deny_unknown_fields
 )]
 pub enum WorkerRpcResponse {
+    Notifications {
+        worker_id: WorkerId,
+        worker_epoch: u64,
+        page: Box<crate::WorkerNotificationPage>,
+    },
+    NotificationAck {
+        worker_id: WorkerId,
+        worker_epoch: u64,
+        ack: Box<browserd_core::NotificationAck>,
+    },
+    ControlEvents(Vec<WorkerControlEvent>),
+    Viewer(WorkerViewerSnapshot),
     Probe(WorkerProbeReceipt),
     SessionCreated(WorkerCreateSessionReceipt),
+    Capacity(crate::WorkerCapacityReceipt),
+    SessionReservation(Box<crate::WorkerReservationReceipt>),
+    ReservedSessionRenewed(Box<crate::WorkerReservedSessionRenewReceipt>),
     Session(WorkerSessionReceipt),
+    SessionOwnership(WorkerSessionOwnershipReceipt),
     SessionClosed(WorkerSessionReceipt),
     Pages(Vec<WorkerPageReceipt>),
     Page(WorkerPageReceipt),
     PageClosed(WorkerPageReceipt),
     Action(WorkerActionReceipt),
+    TerminalCustody(WorkerTerminalCustodyReceipt),
+    TerminalCustodyAck(WorkerTerminalCustodyAck),
+    TerminalCustodyRelease(WorkerTerminalCustodyAck),
     ArtifactStored(WorkerArtifactReceipt),
     Artifact(WorkerArtifactReceipt),
+    Artifacts(Vec<WorkerArtifactReceipt>),
+    ArtifactOpened {
+        fence: WorkerSessionFence,
+        stream_id: LeaseId,
+        artifact: WorkerArtifactReceipt,
+    },
+    ArtifactChunk {
+        fence: WorkerSessionFence,
+        stream_id: LeaseId,
+        sequence: u64,
+        bytes: Option<Vec<u8>>,
+    },
+    RetainedArtifacts(Vec<WorkerRetainedArtifactReceipt>),
+    RetainedArtifact(WorkerRetainedArtifactReceipt),
+    RetainedArtifactOpened {
+        receipt: WorkerRetainedArtifactReceipt,
+        stream_id: LeaseId,
+    },
+    RetainedArtifactChunk {
+        scope: WorkerRetainedArtifactScope,
+        stream_id: LeaseId,
+        sequence: u64,
+        bytes: Vec<u8>,
+        end: bool,
+    },
+    RetainedArtifactClosed {
+        scope: WorkerRetainedArtifactScope,
+        stream_id: LeaseId,
+    },
     Approvals(Vec<WorkerApprovalReceipt>),
     Approval(WorkerApprovalReceipt),
     Empty,
@@ -1245,6 +1768,7 @@ pub struct WorkerControlPlaneRpcHandler<D, S> {
     peer: AuthenticatedPeer,
     operation_bindings: Arc<Mutex<HashMap<(TenantId, String), OperationBinding>>>,
     operation_binding_capacity: usize,
+    artifact_streams: Arc<artifact_streams::ArtifactStreams>,
 }
 
 impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
@@ -1279,6 +1803,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
             peer,
             operation_bindings: Arc::new(Mutex::new(HashMap::new())),
             operation_binding_capacity: capacity,
+            artifact_streams: Arc::new(artifact_streams::ArtifactStreams::new(
+                128,
+                Duration::from_secs(60),
+            )),
         }
     }
 
@@ -1415,6 +1943,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerRpcHandler for WorkerControlPlan
             peer: self.peer.clone(),
             operation_bindings: self.operation_bindings.clone(),
             operation_binding_capacity: self.operation_binding_capacity,
+            artifact_streams: self.artifact_streams.clone(),
         };
         let result = tokio::task::spawn_blocking(move || handler.handle_request(request)).await;
         match result {
@@ -1429,11 +1958,190 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerRpcHandler for WorkerControlPlan
 }
 
 impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
+    fn action_receipt(
+        &self,
+        fence: &WorkerSessionFence,
+        snapshot: WorkerActionSnapshot,
+    ) -> Result<WorkerActionReceipt, WorkerRpcFailure> {
+        let ownership = OwnershipFence::new(
+            self.worker.config.worker_id.clone(),
+            fence.worker_epoch,
+            fence.placement_version,
+            fence.session_incarnation,
+        );
+        let custody = if snapshot.terminal_detail.is_some() {
+            self.worker
+                .terminal_custody_receipt(
+                    &self.peer,
+                    &fence.tenant_id,
+                    &fence.session_id,
+                    &snapshot.action_id,
+                    &ownership,
+                )
+                // Preserve a known durable result if transfer evidence is unavailable. With
+                // no custody receipt the gateway cannot ACK and the WAL stays charged.
+                .ok()
+                .flatten()
+                .map(Box::new)
+        } else {
+            None
+        };
+        // Normal action receipts come from this process's original live journal. Historical
+        // reads never declare Unsupported merely because the serving process has no pool.
+        let requirement = snapshot.terminal_detail.map(|_| {
+            if self.worker.action_journal_pool.is_some() {
+                TerminalCustodyRequirement::Required
+            } else {
+                TerminalCustodyRequirement::Unsupported
+            }
+        });
+        Ok(action_receipt(fence, snapshot, custody, requirement))
+    }
+
     fn handle_request(
         &self,
         request: WorkerRpcRequest,
     ) -> Result<WorkerRpcResponse, WorkerRpcFailure> {
+        if !matches!(
+            &request,
+            WorkerRpcRequest::AckTerminalCustody { .. }
+                | WorkerRpcRequest::PendingNotifications { .. }
+                | WorkerRpcRequest::AckNotification { .. }
+                | WorkerRpcRequest::ReleaseTerminalCustody { .. }
+                | WorkerRpcRequest::GetTerminalCustody { .. }
+        ) {
+            self.artifact_streams.prune()?;
+        }
         match request {
+            WorkerRpcRequest::PendingNotifications {
+                expected_worker_id,
+                expected_worker_epoch,
+                family,
+                cursor,
+                limit,
+            } => {
+                let page = self
+                    .worker
+                    .pending_notifications(
+                        &self.peer,
+                        &expected_worker_id,
+                        expected_worker_epoch,
+                        family,
+                        cursor.as_deref(),
+                        limit,
+                    )
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::Notifications {
+                    worker_id: self.worker.config.worker_id.clone(),
+                    worker_epoch: self.worker.config.worker_epoch,
+                    page: Box::new(page),
+                })
+            }
+            WorkerRpcRequest::AckNotification {
+                expected_worker_id,
+                expected_worker_epoch,
+                ack,
+            } => {
+                self.worker
+                    .ack_notification(&self.peer, &expected_worker_id, expected_worker_epoch, &ack)
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::NotificationAck {
+                    worker_id: self.worker.config.worker_id.clone(),
+                    worker_epoch: self.worker.config.worker_epoch,
+                    ack,
+                })
+            }
+            WorkerRpcRequest::GetTerminalCustody {
+                expected_serving_worker_id,
+                expected_serving_worker_epoch,
+                scope,
+                action_id,
+                action_sequence,
+                kind,
+            } => {
+                let receipt = self
+                    .worker
+                    .get_terminal_custody(
+                        &self.peer,
+                        &expected_serving_worker_id,
+                        expected_serving_worker_epoch,
+                        &scope,
+                        &action_id,
+                        action_sequence,
+                        kind,
+                    )
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::TerminalCustody(
+                    WorkerTerminalCustodyReceipt {
+                        worker_id: self.worker.config.worker_id.clone(),
+                        worker_epoch: self.worker.config.worker_epoch,
+                        receipt: Box::new(receipt),
+                    },
+                ))
+            }
+            WorkerRpcRequest::ReleaseTerminalCustody {
+                expected_serving_worker_id,
+                expected_serving_worker_epoch,
+                receipt,
+            } => {
+                self.worker
+                    .release_terminal_custody(
+                        &self.peer,
+                        &expected_serving_worker_id,
+                        expected_serving_worker_epoch,
+                        &receipt,
+                    )
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::TerminalCustodyRelease(
+                    WorkerTerminalCustodyAck {
+                        worker_id: self.worker.config.worker_id.clone(),
+                        worker_epoch: self.worker.config.worker_epoch,
+                        receipt_sha256: receipt.digest(),
+                    },
+                ))
+            }
+            WorkerRpcRequest::AckTerminalCustody {
+                expected_serving_worker_id,
+                expected_serving_worker_epoch,
+                receipt,
+            } => {
+                self.worker
+                    .ack_terminal_custody(
+                        &self.peer,
+                        &expected_serving_worker_id,
+                        expected_serving_worker_epoch,
+                        &receipt,
+                    )
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::TerminalCustodyAck(
+                    WorkerTerminalCustodyAck {
+                        worker_id: self.worker.config.worker_id.clone(),
+                        worker_epoch: self.worker.config.worker_epoch,
+                        receipt_sha256: receipt.digest(),
+                    },
+                ))
+            }
+            WorkerRpcRequest::PendingControlEvents { limit } => {
+                if !(1..=MAX_CONTROL_EVENT_PAGE).contains(&limit) {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        "invalid control event page size",
+                    ));
+                }
+                self.worker
+                    .pending_control_events(&self.peer, limit)
+                    .map(WorkerRpcResponse::ControlEvents)
+                    .map_err(worker_failure)
+            }
+            WorkerRpcRequest::AckControlEvent { event } => self
+                .worker
+                .ack_control_event(&self.peer, &event)
+                .map(|()| WorkerRpcResponse::Empty)
+                .map_err(worker_failure),
+            WorkerRpcRequest::ViewerOpen(request) => self.handle_viewer_open(request),
+            WorkerRpcRequest::ViewerPoll(request) => self.handle_viewer_poll(request),
+            WorkerRpcRequest::ViewerMessage(request) => self.handle_viewer_message(request),
+            WorkerRpcRequest::ViewerClose(request) => self.handle_viewer_close(request),
             WorkerRpcRequest::Probe {
                 expected_worker_epoch,
             } => {
@@ -1445,7 +2153,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         "probe does not match this worker epoch",
                     ));
                 }
-                if !self.worker.is_ready() {
+                if !self.worker.control_plane_qualified() {
                     return Err(WorkerRpcFailure::new(
                         WorkerRpcFailureCode::NotReady,
                         "worker readiness qualification failed",
@@ -1454,10 +2162,67 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 Ok(WorkerRpcResponse::Probe(WorkerProbeReceipt {
                     worker_id: self.worker.config.worker_id.clone(),
                     worker_epoch: self.worker.config.worker_epoch,
-                    ready: true,
+                    ready: self.worker.is_ready(),
                 }))
             }
+            WorkerRpcRequest::CapacityStatus {
+                expected_worker_epoch,
+            } => self
+                .worker
+                .capacity_status(&self.peer, expected_worker_epoch)
+                .map(WorkerRpcResponse::Capacity)
+                .map_err(worker_failure),
+            WorkerRpcRequest::ReserveSession(request) => self
+                .worker
+                .reserve_session(&self.peer, request)
+                .map(Box::new)
+                .map(WorkerRpcResponse::SessionReservation)
+                .map_err(worker_failure),
+            WorkerRpcRequest::CommitReservedSession(token) => self
+                .worker
+                .commit_reserved_session(&self.peer, &token)
+                .map(Box::new)
+                .map(WorkerRpcResponse::SessionReservation)
+                .map_err(worker_failure),
+            WorkerRpcRequest::InspectSessionReservation(token) => self
+                .worker
+                .inspect_session_reservation(&self.peer, &token)
+                .map(Box::new)
+                .map(WorkerRpcResponse::SessionReservation)
+                .map_err(worker_failure),
+            WorkerRpcRequest::CancelSessionReservation(token) => self
+                .worker
+                .cancel_session_reservation(&self.peer, &token)
+                .map(Box::new)
+                .map(WorkerRpcResponse::SessionReservation)
+                .map_err(worker_failure),
+            WorkerRpcRequest::AckSessionReservation(token) => self
+                .worker
+                .ack_session_reservation(&self.peer, &token)
+                .map(Box::new)
+                .map(WorkerRpcResponse::SessionReservation)
+                .map_err(worker_failure),
+            WorkerRpcRequest::RenewReservedSession {
+                token,
+                renewal_nonce,
+                expected_lease_revision,
+                requested_ttl_millis,
+            } => self
+                .worker
+                .renew_reserved_session(
+                    &self.peer,
+                    &token,
+                    renewal_nonce,
+                    expected_lease_revision,
+                    requested_ttl_millis,
+                )
+                .map(Box::new)
+                .map(WorkerRpcResponse::ReservedSessionRenewed)
+                .map_err(worker_failure),
             WorkerRpcRequest::CreateSession(request) => {
+                if self.worker.config.admission_policy.is_some() {
+                    return Err(worker_failure(WorkerError::InvalidConfiguration));
+                }
                 if !request.is_valid() {
                     return Err(WorkerRpcFailure::new(
                         WorkerRpcFailureCode::InvalidRequest,
@@ -1475,10 +2240,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 // a safe strengthening), and reject only a request for stronger isolation than the
                 // worker can deliver (BRD-001). Both requested and effective are recorded durably
                 // by the gateway session resource.
-                let effective_isolation = self.worker.driver.effective_isolation();
-                if !request
-                    .requested_isolation
-                    .satisfied_by(effective_isolation)
+                if !self
+                    .worker
+                    .driver
+                    .supports_requested_isolation(request.requested_isolation)
                 {
                     return Err(WorkerRpcFailure::new(
                         WorkerRpcFailureCode::InvalidRequest,
@@ -1502,7 +2267,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 let binding_key = (request.tenant_id.clone(), request.idempotency_key.clone());
                 let tenant_id = request.tenant_id.clone();
                 let options = request.options.clone();
-                let outcome = self.worker.create_session_with_options(
+                let outcome = self.worker.create_session_with_placement(
                     &self.peer,
                     CreateSessionCommand {
                         tenant_id: request.tenant_id,
@@ -1512,6 +2277,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                         session_incarnation: request.session_incarnation,
                     },
                     &options,
+                    request.requested_isolation,
                     SessionTime::new(request.now_unix_millis),
                 );
                 let outcome = match outcome {
@@ -1540,11 +2306,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     tenant_id,
                     session_id: outcome.session_id,
                     session_incarnation: request.session_incarnation,
-                    effective_isolation: self.worker.driver.effective_isolation(),
+                    effective_isolation: outcome.effective_isolation,
                     primary_page_id: outcome.primary_page_id,
                     worker_epoch: request.expected_worker_epoch,
                     placement_version: request.placement_version,
                     existing: outcome.existing,
+                    restored_checkpoint: outcome.restored_checkpoint.map(|restored| {
+                        WorkerCheckpointRestoreReceipt {
+                            checkpoint_ref: restored.checkpoint_ref,
+                            source_session_id: restored.source_session_id,
+                        }
+                    }),
                 };
                 let mut bindings = self.operation_bindings.lock().map_err(|_| {
                     WorkerRpcFailure::new(
@@ -1588,6 +2360,28 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     .map_err(worker_failure)?;
                 Ok(WorkerRpcResponse::Session(
                     self.session_receipt(&fence, snapshot.lifecycle)?,
+                ))
+            }
+            WorkerRpcRequest::InspectSession {
+                expected_worker_id,
+                fence,
+            } => {
+                if expected_worker_id != self.worker.config.worker_id {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::FenceMismatch,
+                        "session inspection does not match this worker",
+                    ));
+                }
+                let ownership = self.ownership_fence(&fence)?;
+                let snapshot = self
+                    .worker
+                    .get_session(&self.peer, &fence.session_id, &ownership)
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::SessionOwnership(
+                    WorkerSessionOwnershipReceipt {
+                        worker_id: self.worker.config.worker_id.clone(),
+                        session: self.session_receipt(&fence, snapshot.lifecycle)?,
+                    },
                 ))
             }
             WorkerRpcRequest::CloseSession {
@@ -1767,7 +2561,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     .worker
                     .get_action(&self.peer, &fence.session_id, &action_id, &ownership)
                     .map_err(worker_failure)?;
-                Ok(WorkerRpcResponse::Action(action_receipt(&fence, snapshot)))
+                Ok(WorkerRpcResponse::Action(
+                    self.action_receipt(&fence, snapshot)?,
+                ))
             }
             WorkerRpcRequest::GetAction { fence, action_id } => {
                 let ownership = self.ownership_fence(&fence)?;
@@ -1775,7 +2571,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     .worker
                     .get_action(&self.peer, &fence.session_id, &action_id, &ownership)
                     .map_err(worker_failure)?;
-                Ok(WorkerRpcResponse::Action(action_receipt(&fence, snapshot)))
+                Ok(WorkerRpcResponse::Action(
+                    self.action_receipt(&fence, snapshot)?,
+                ))
             }
             WorkerRpcRequest::CancelAction {
                 fence,
@@ -1797,7 +2595,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     .worker
                     .get_action(&self.peer, &fence.session_id, &action_id, &ownership)
                     .map_err(worker_failure)?;
-                Ok(WorkerRpcResponse::Action(action_receipt(&fence, snapshot)))
+                Ok(WorkerRpcResponse::Action(
+                    self.action_receipt(&fence, snapshot)?,
+                ))
             }
             WorkerRpcRequest::ResolveAction {
                 fence,
@@ -1825,7 +2625,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     .worker
                     .get_action(&self.peer, &fence.session_id, &action_id, &ownership)
                     .map_err(worker_failure)?;
-                Ok(WorkerRpcResponse::Action(action_receipt(&fence, snapshot)))
+                Ok(WorkerRpcResponse::Action(
+                    self.action_receipt(&fence, snapshot)?,
+                ))
             }
             WorkerRpcRequest::StoreArtifact {
                 fence,
@@ -1855,6 +2657,71 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                     &fence, snapshot,
                 )))
             }
+            WorkerRpcRequest::UploadNamedArtifact {
+                fence,
+                bytes,
+                content_type,
+                display_filename,
+                now_unix_millis,
+            } => {
+                if !crate::valid_artifact_display_filename(&display_filename) {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        "artifact display filename must be a bounded basename",
+                    ));
+                }
+                let ownership = self.ownership_fence(&fence)?;
+                let artifact_id = self
+                    .worker
+                    .upload_artifact_named(
+                        &self.peer,
+                        &fence.session_id,
+                        &ownership,
+                        ArtifactUpload {
+                            bytes,
+                            content_type,
+                        },
+                        display_filename,
+                        SessionTime::new(now_unix_millis),
+                    )
+                    .map_err(worker_failure)?;
+                let snapshot = self
+                    .worker
+                    .get_artifact(&self.peer, &fence.session_id, &artifact_id, &ownership)
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::ArtifactStored(artifact_receipt(
+                    &fence, snapshot,
+                )))
+            }
+            WorkerRpcRequest::ListArtifacts {
+                fence,
+                after,
+                limit,
+            } => {
+                if !(1..=101).contains(&limit) {
+                    return Err(WorkerRpcFailure::new(
+                        WorkerRpcFailureCode::InvalidRequest,
+                        "artifact list limit must be 1..=101",
+                    ));
+                }
+                let ownership = self.ownership_fence(&fence)?;
+                let snapshots = self
+                    .worker
+                    .list_artifacts(
+                        &self.peer,
+                        &fence.session_id,
+                        &ownership,
+                        after.as_ref(),
+                        limit,
+                    )
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::Artifacts(
+                    snapshots
+                        .into_iter()
+                        .map(|snapshot| artifact_receipt(&fence, snapshot))
+                        .collect(),
+                ))
+            }
             WorkerRpcRequest::GetArtifact { fence, artifact_id } => {
                 let ownership = self.ownership_fence(&fence)?;
                 let snapshot = self
@@ -1864,6 +2731,171 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlaneRpcHandler<D, S> {
                 Ok(WorkerRpcResponse::Artifact(artifact_receipt(
                     &fence, snapshot,
                 )))
+            }
+            WorkerRpcRequest::OpenArtifact { fence, artifact_id } => {
+                let ownership = self.ownership_fence(&fence)?;
+                let snapshot = self
+                    .worker
+                    .get_artifact(&self.peer, &fence.session_id, &artifact_id, &ownership)
+                    .map_err(worker_failure)?;
+                let reader = self
+                    .worker
+                    .open_artifact(
+                        &self.peer,
+                        &fence.session_id,
+                        &artifact_id,
+                        &ownership,
+                        64 * 1024,
+                    )
+                    .map_err(worker_failure)?;
+                let stream_id = self.artifact_streams.open(fence.clone(), reader)?;
+                Ok(WorkerRpcResponse::ArtifactOpened {
+                    fence: fence.clone(),
+                    stream_id,
+                    artifact: artifact_receipt(&fence, snapshot),
+                })
+            }
+            WorkerRpcRequest::ReadArtifact {
+                fence,
+                stream_id,
+                sequence,
+            } => {
+                let ownership = self.ownership_fence(&fence)?;
+                let session = self
+                    .worker
+                    .get_session(&self.peer, &fence.session_id, &ownership)
+                    .map_err(worker_failure)?;
+                if session.lifecycle != SessionLifecycle::Ready {
+                    let _ = self.artifact_streams.close(&fence, &stream_id);
+                    return Err(worker_failure(WorkerError::DependencyUnavailable));
+                }
+                let bytes = self.artifact_streams.read(&fence, &stream_id, sequence)?;
+                Ok(WorkerRpcResponse::ArtifactChunk {
+                    fence,
+                    stream_id,
+                    sequence,
+                    bytes,
+                })
+            }
+            WorkerRpcRequest::CloseArtifact { fence, stream_id } => {
+                self.ownership_fence(&fence)?;
+                self.artifact_streams.close(&fence, &stream_id)?;
+                Ok(WorkerRpcResponse::Empty)
+            }
+            WorkerRpcRequest::ListRetainedArtifacts {
+                scope,
+                after,
+                limit,
+            } => {
+                let publications = self
+                    .worker
+                    .list_retained_artifacts(
+                        &self.peer,
+                        &scope.worker_id,
+                        scope.worker_epoch,
+                        &scope.tenant_id,
+                        &scope.session_id,
+                        after.as_ref(),
+                        limit,
+                    )
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::RetainedArtifacts(
+                    publications
+                        .iter()
+                        .map(|publication| retained_receipt(&scope, publication))
+                        .collect(),
+                ))
+            }
+            WorkerRpcRequest::GetRetainedArtifact { scope, artifact_id } => {
+                let key = ArtifactKey::new(
+                    scope.tenant_id.clone(),
+                    scope.session_id.clone(),
+                    artifact_id,
+                );
+                let publication = self
+                    .worker
+                    .get_retained_artifact(&self.peer, &scope.worker_id, scope.worker_epoch, &key)
+                    .map_err(worker_failure)?;
+                Ok(WorkerRpcResponse::RetainedArtifact(retained_receipt(
+                    &scope,
+                    &publication,
+                )))
+            }
+            WorkerRpcRequest::OpenRetainedArtifact {
+                scope,
+                publication,
+                max_chunk_bytes,
+            } => {
+                let publication = publication.to_publication().map_err(worker_failure)?;
+                if publication.key().tenant_id() != &scope.tenant_id
+                    || publication.key().session_id() != &scope.session_id
+                {
+                    return Err(worker_failure(WorkerError::StaleFence));
+                }
+                let reader = self
+                    .worker
+                    .open_retained_artifact(
+                        &self.peer,
+                        &scope.worker_id,
+                        scope.worker_epoch,
+                        &publication,
+                        max_chunk_bytes,
+                    )
+                    .map_err(worker_failure)?;
+                let now = self
+                    .worker
+                    .authorize_retained_artifact_scope(
+                        &self.peer,
+                        &scope.worker_id,
+                        scope.worker_epoch,
+                    )
+                    .map_err(worker_failure)?;
+                let stream_id = self.artifact_streams.open_retained(
+                    scope.clone(),
+                    publication.clone(),
+                    reader,
+                    now,
+                )?;
+                Ok(WorkerRpcResponse::RetainedArtifactOpened {
+                    receipt: retained_receipt(&scope, &publication),
+                    stream_id,
+                })
+            }
+            WorkerRpcRequest::ReadRetainedArtifact {
+                scope,
+                stream_id,
+                sequence,
+            } => {
+                let now = self
+                    .worker
+                    .authorize_retained_artifact_scope(
+                        &self.peer,
+                        &scope.worker_id,
+                        scope.worker_epoch,
+                    )
+                    .map_err(worker_failure)?;
+                let bytes = self
+                    .artifact_streams
+                    .read_retained(&scope, &stream_id, sequence, now)?;
+                let end = bytes.is_none();
+                Ok(WorkerRpcResponse::RetainedArtifactChunk {
+                    scope,
+                    stream_id,
+                    sequence,
+                    bytes: bytes.unwrap_or_default(),
+                    end,
+                })
+            }
+            WorkerRpcRequest::CloseRetainedArtifact { scope, stream_id } => {
+                self.worker
+                    .authorize_retained_artifact_scope(
+                        &self.peer,
+                        &scope.worker_id,
+                        scope.worker_epoch,
+                    )
+                    .map_err(worker_failure)?;
+                self.artifact_streams.close_retained(&scope, &stream_id)?;
+                Ok(WorkerRpcResponse::RetainedArtifactClosed { scope, stream_id })
             }
             WorkerRpcRequest::GetApproval { fence, approval_id } => {
                 let ownership = self.ownership_fence(&fence)?;
@@ -2419,6 +3451,118 @@ impl WorkerRpcClient {
         }
     }
 
+    pub async fn get_terminal_custody(
+        &self,
+        expected_serving_worker_id: WorkerId,
+        expected_serving_worker_epoch: u64,
+        scope: JournalSessionScope,
+        action_id: ActionId,
+        action_sequence: ActionSequence,
+        kind: ActionKind,
+    ) -> Result<WorkerTerminalCustodyReceipt, WorkerRpcError> {
+        if scope.validate().is_err()
+            || expected_serving_worker_epoch == 0
+            || scope.original_worker_id() != &expected_serving_worker_id
+            || scope.fence().worker_epoch > expected_serving_worker_epoch
+            || action_sequence.get() == 0
+        {
+            return Err(WorkerRpcError::InvalidRequest);
+        }
+        match self
+            .exchange(WorkerRpcRequest::GetTerminalCustody {
+                expected_serving_worker_id: expected_serving_worker_id.clone(),
+                expected_serving_worker_epoch,
+                scope: scope.clone(),
+                action_id: action_id.clone(),
+                action_sequence,
+                kind,
+            })
+            .await?
+        {
+            WorkerRpcResponse::TerminalCustody(receipt) => {
+                receipt.validate_for(
+                    &expected_serving_worker_id,
+                    expected_serving_worker_epoch,
+                    &scope,
+                    &action_id,
+                    action_sequence,
+                    kind,
+                )?;
+                Ok(receipt)
+            }
+            WorkerRpcResponse::Failure(failure) => Err(WorkerRpcError::Remote(failure)),
+            _ => Err(WorkerRpcError::Protocol),
+        }
+    }
+
+    pub async fn ack_terminal_custody(
+        &self,
+        expected_serving_worker_id: WorkerId,
+        expected_serving_worker_epoch: u64,
+        receipt: TerminalCustodyReceipt,
+    ) -> Result<WorkerTerminalCustodyAck, WorkerRpcError> {
+        receipt.validate().map_err(|_| WorkerRpcError::Protocol)?;
+        if expected_serving_worker_epoch == 0
+            || receipt.original_worker_id() != &expected_serving_worker_id
+            || receipt.fence().worker_epoch > expected_serving_worker_epoch
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
+        let expected_digest = receipt.digest();
+        match self
+            .exchange(WorkerRpcRequest::AckTerminalCustody {
+                expected_serving_worker_id: expected_serving_worker_id.clone(),
+                expected_serving_worker_epoch,
+                receipt: Box::new(receipt),
+            })
+            .await?
+        {
+            WorkerRpcResponse::TerminalCustodyAck(ack)
+                if ack.worker_id == expected_serving_worker_id
+                    && ack.worker_epoch == expected_serving_worker_epoch
+                    && ack.receipt_sha256 == expected_digest =>
+            {
+                Ok(ack)
+            }
+            WorkerRpcResponse::Failure(failure) => Err(WorkerRpcError::Remote(failure)),
+            _ => Err(WorkerRpcError::Protocol),
+        }
+    }
+
+    pub async fn release_terminal_custody(
+        &self,
+        expected_serving_worker_id: WorkerId,
+        expected_serving_worker_epoch: u64,
+        receipt: TerminalCustodyReceipt,
+    ) -> Result<WorkerTerminalCustodyAck, WorkerRpcError> {
+        receipt.validate().map_err(|_| WorkerRpcError::Protocol)?;
+        if expected_serving_worker_epoch == 0
+            || receipt.original_worker_id() != &expected_serving_worker_id
+            || receipt.fence().worker_epoch > expected_serving_worker_epoch
+        {
+            return Err(WorkerRpcError::Protocol);
+        }
+        let expected_digest = receipt.digest();
+        match self
+            .exchange(WorkerRpcRequest::ReleaseTerminalCustody {
+                expected_serving_worker_id: expected_serving_worker_id.clone(),
+                expected_serving_worker_epoch,
+                receipt: Box::new(receipt),
+            })
+            .await?
+        {
+            WorkerRpcResponse::TerminalCustodyRelease(ack)
+                if ack.worker_id == expected_serving_worker_id
+                    && ack.worker_epoch == expected_serving_worker_epoch
+                    && ack.receipt_sha256 == expected_digest =>
+            {
+                Ok(ack)
+            }
+            WorkerRpcResponse::Failure(failure) => Err(WorkerRpcError::Remote(failure)),
+            _ => Err(WorkerRpcError::Protocol),
+        }
+    }
+
     pub async fn cancel_action(
         &self,
         fence: WorkerSessionFence,
@@ -2469,7 +3613,10 @@ impl WorkerRpcClient {
         &self,
         request: WorkerRpcRequest,
     ) -> Result<WorkerArtifactReceipt, WorkerRpcError> {
-        if !matches!(request, WorkerRpcRequest::StoreArtifact { .. }) {
+        if !matches!(
+            request,
+            WorkerRpcRequest::StoreArtifact { .. } | WorkerRpcRequest::UploadNamedArtifact { .. }
+        ) {
             return Err(WorkerRpcError::InvalidRequest);
         }
         match self.exchange(request).await? {
@@ -2804,7 +3951,7 @@ async fn write_frame(
         .map_err(|error| WorkerRpcError::Io(error.to_string()))
 }
 
-const fn session_lifecycle(lifecycle: SessionLifecycle) -> WorkerSessionLifecycle {
+pub(crate) const fn session_lifecycle(lifecycle: SessionLifecycle) -> WorkerSessionLifecycle {
     match lifecycle {
         SessionLifecycle::Creating => WorkerSessionLifecycle::Creating,
         SessionLifecycle::Ready => WorkerSessionLifecycle::Ready,
@@ -2841,6 +3988,8 @@ fn page_receipt(fence: &WorkerSessionFence, snapshot: WorkerPageSnapshot) -> Wor
 fn action_receipt(
     fence: &WorkerSessionFence,
     snapshot: WorkerActionSnapshot,
+    custody: Option<Box<TerminalCustodyReceipt>>,
+    custody_requirement: Option<TerminalCustodyRequirement>,
 ) -> WorkerActionReceipt {
     WorkerActionReceipt {
         fence: fence.clone(),
@@ -2855,6 +4004,8 @@ fn action_receipt(
         terminal_detail: snapshot.terminal_detail,
         result: snapshot.result,
         resolution: snapshot.resolution,
+        custody,
+        custody_requirement,
     }
 }
 
@@ -2896,6 +4047,18 @@ fn artifact_receipt(
         source: artifact_source(snapshot.source),
         origin: snapshot.origin,
         object_generation: *snapshot.object_generation.as_bytes(),
+        display_filename: snapshot.display_filename,
+    }
+}
+
+fn retained_receipt(
+    scope: &WorkerRetainedArtifactScope,
+    publication: &ArtifactPublication,
+) -> WorkerRetainedArtifactReceipt {
+    WorkerRetainedArtifactReceipt {
+        serving_worker_id: scope.worker_id.clone(),
+        serving_worker_epoch: scope.worker_epoch,
+        publication: ArtifactPublicationWire::from_publication(publication),
     }
 }
 

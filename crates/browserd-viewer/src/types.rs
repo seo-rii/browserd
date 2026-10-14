@@ -2,8 +2,10 @@ use std::fmt;
 use std::time::Duration;
 
 use browserd_core::{LeaseId, PageId, SessionId, TenantId};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ViewerScopes {
     read: bool,
     control: bool,
@@ -39,10 +41,11 @@ impl ViewerScopes {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ViewerTicket(pub(crate) LeaseId);
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ConnectionId(pub(crate) LeaseId);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ViewerConnection {
     pub(crate) id: ConnectionId,
     pub(crate) tenant_id: TenantId,
@@ -207,6 +210,7 @@ impl ControlSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlError {
+    DurabilityUnavailable,
     InvalidPolicy,
     InvalidLeaseTtl,
     TimeOverflow,

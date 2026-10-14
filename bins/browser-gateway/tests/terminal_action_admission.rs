@@ -24,7 +24,8 @@ use browserd_auth::{
 use browserd_coordination::{
     ClaimGatewayAction, CoordinationActorConfig, GatewayActionClaimOutcome,
     GatewayActionCoordination, GatewayActionCoordinationError, GatewayActionPlacement,
-    GatewayActionSnapshot, SessionLossClaim, SessionLossOutcome,
+    GatewayActionSnapshot, MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome,
+    SessionLossReceipt,
 };
 use browserd_core::{
     ActionId, ErrorCode, PageId, PrincipalId, SessionId, SessionLifecycle, TenantId, WorkerId,
@@ -32,7 +33,7 @@ use browserd_core::{
 use browserd_worker::{
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
     WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerRpcResponse, WorkerSessionLifecycle, WorkerSessionOwnershipReceipt, WorkerSessionReceipt,
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::Algorithm;
@@ -91,21 +92,35 @@ impl GatewayWorkerClient for LifecycleWorker {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
     fn request(&self, request: WorkerRpcRequest) -> Result<WorkerRpcResponse, WorkerRpcError> {
-        let WorkerRpcRequest::GetSession { fence } = request else {
-            return Err(WorkerRpcError::InvalidRequest);
+        let (fence, inspected_worker) = match request {
+            WorkerRpcRequest::GetSession { fence } => (fence, None),
+            WorkerRpcRequest::InspectSession {
+                expected_worker_id,
+                fence,
+            } => (fence, Some(expected_worker_id)),
+            _ => return Err(WorkerRpcError::InvalidRequest),
         };
         if fence.tenant_id != self.tenant_id || fence.session_id != self.session_id {
             return Err(WorkerRpcError::Protocol);
         }
-        Ok(WorkerRpcResponse::Session(WorkerSessionReceipt {
+        let receipt = WorkerSessionReceipt {
             fence,
             lifecycle: self.lifecycle,
             primary_page_id: self.page_id.clone(),
-        }))
+        };
+        Ok(if let Some(worker_id) = inspected_worker {
+            WorkerRpcResponse::SessionOwnership(WorkerSessionOwnershipReceipt {
+                worker_id,
+                session: receipt,
+            })
+        } else {
+            WorkerRpcResponse::Session(receipt)
+        })
     }
 
     fn enqueue_action(
@@ -120,6 +135,7 @@ impl GatewayWorkerClient for LifecycleWorker {
 #[derive(Default)]
 struct ClaimProbeStore {
     claim_calls: AtomicUsize,
+    losses: MemoryGatewayActionStore,
 }
 
 impl ClaimProbeStore {
@@ -246,19 +262,29 @@ impl GatewayActionCoordination for ClaimProbeStore {
 
     async fn mark_session_lost(
         &self,
-        _claim: &SessionLossClaim,
-        _now: DateTime<Utc>,
+        claim: &SessionLossClaim,
+        now: DateTime<Utc>,
     ) -> Result<SessionLossOutcome, GatewayActionCoordinationError> {
-        self.reject()
+        self.losses.mark_session_lost(claim, now).await
+    }
+
+    async fn ensure_session_lost(
+        &self,
+        proposed: &SessionLossClaim,
+        now: DateTime<Utc>,
+    ) -> Result<SessionLossReceipt, GatewayActionCoordinationError> {
+        self.losses.ensure_session_lost(proposed, now).await
     }
 
     async fn materialize_session_loss(
         &self,
-        _claim: &SessionLossClaim,
-        _limit: usize,
-        _now: DateTime<Utc>,
+        claim: &SessionLossClaim,
+        limit: usize,
+        now: DateTime<Utc>,
     ) -> Result<usize, GatewayActionCoordinationError> {
-        self.reject()
+        self.losses
+            .materialize_session_loss(claim, limit, now)
+            .await
     }
 }
 

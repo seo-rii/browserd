@@ -12,7 +12,8 @@ mod streaming;
 mod token;
 
 pub use filesystem::{
-    FilesystemArtifactReader, FilesystemArtifactStore, FilesystemMultipartJanitor, VerifiedArtifact,
+    DeleteReceiptPruneOutcome, FilesystemArtifactReader, FilesystemArtifactStore,
+    FilesystemMultipartJanitor, VerifiedArtifact,
 };
 pub use integrity::{ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource};
 pub use janitor::{

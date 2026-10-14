@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -6,10 +7,20 @@ import {
   BrowserdError,
   DispatchUncertainError,
   EventGapError,
+  type ArtifactListPage,
   type FetchLike,
 } from "../src/index.ts";
 
 type Call = { url: string; init: RequestInit };
+
+const fixture = JSON.parse(readFileSync(new URL("../../fixtures/http_contract.json", import.meta.url), "utf8"));
+function wire(name: string, changes: Record<string, unknown> = {}, traceId = fixture.ids.trace): unknown {
+  const response = structuredClone(fixture.responses[name]);
+  const wrapper = ["operation", "session", "page", "ownership", "artifact", "approval"].find((key) => Object.hasOwn(response.data, key));
+  Object.assign(wrapper ? response.data[wrapper] : response.data, changes);
+  response.trace_id = traceId;
+  return response;
+}
 
 function jsonResponse(status: number, body: unknown, headers: HeadersInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -30,8 +41,26 @@ function scripted(responses: Array<Response | Error>): { fetch: FetchLike; calls
   return { fetch, calls };
 }
 
+test("query_all forwards frame paths without adding one to legacy actions", async () => {
+  const transport = scripted(Array.from({ length: 3 }, () => jsonResponse(200, wire("action_queued", {
+    action_id: "act-query", status: "succeeded",
+  }))));
+  const client = new BrowserdClient({ baseUrl: "https://api.example", fetch: transport.fetch });
+  for (const action of [
+    { type: "query_all" as const, selector: "input" },
+    { type: "query_all" as const, selector: "input", frame_path: [] },
+    { type: "query_all" as const, selector: "input", frame_path: ["iframe#outer", "iframe#inner"] },
+  ]) {
+    const body = { page_id: "page-1", if_session_incarnation: 1, execution_timeout_ms: 30_000, action };
+    await client.createAction("session-1", body);
+    assert.deepEqual(JSON.parse(String(transport.calls.at(-1)?.init.body)), body);
+  }
+  assert.equal(Object.hasOwn(JSON.parse(String(transport.calls[0].init.body)).action, "frame_path"), false);
+});
+
 test("matches every API public route with escaped identifiers and bounded query parameters", async () => {
-  const transport = scripted(Array.from({ length: 24 }, () => jsonResponse(200, {})));
+  const responses = ["operation_queued", "operation_queued", "operation_queued", "sessions", "session", "session", "ownership", "ownership", "pages", "page", "page_deleted", "page", "action_queued", "action_queued", "action_queued", "action_queued", "event_page", "viewer_ticket", "artifact", "artifact", "artifact_download", "approvals", "approval", "approval"].map((name) => jsonResponse(200, wire(name)));
+  const transport = scripted(responses);
   const client = new BrowserdClient({ baseUrl: "https://api.example/", token: "secret", fetch: transport.fetch });
 
   await client.createSession({ isolation: "shared_context" }, { idempotencyKey: "idem-session", waitMs: 500 });
@@ -113,7 +142,7 @@ test("validates base URL and never propagates credentials, token, query, or frag
 });
 
 test("sets authorization, request ID, idempotency and Prefer headers", async () => {
-  const transport = scripted([jsonResponse(202, { operation: { id: "op-1", state: "queued" }, trace_id: "trace-1" })]);
+  const transport = scripted([jsonResponse(202, wire("operation_queued", { id: "op-1" }, "trace-1"))]);
   const client = new BrowserdClient({ baseUrl: "https://api.example", token: "token", fetch: transport.fetch });
   await client.createSession({}, { requestId: "req-1", idempotencyKey: "idem-1", waitMs: 123 });
   const headers = new Headers(transport.calls[0]!.init.headers);
@@ -122,7 +151,7 @@ test("sets authorization, request ID, idempotency and Prefer headers", async () 
   assert.equal(headers.get("idempotency-key"), "idem-1");
   assert.equal(headers.get("prefer"), "wait=123");
 
-  const read = scripted([jsonResponse(200, { id: "ses-1" })]);
+  const read = scripted([jsonResponse(200, wire("session", { id: "ses-1" }))]);
   const readClient = new BrowserdClient({ baseUrl: "https://api.example", fetch: read.fetch });
   await readClient.getSession("ses-1", { requestId: "req-read" });
   assert.equal(new Headers(read.calls[0]!.init.headers).get("x-request-id"), "req-read");
@@ -163,9 +192,10 @@ test("never replays artifact download-token creation after dispatch uncertainty"
 });
 
 test("retries replay-safe artifact metadata reads", async () => {
+  const artifact = { id: "art-1", state: "available", display_filename: "첨부 문서.txt" };
   const transport = scripted([
     new TypeError("connection reset"),
-    jsonResponse(200, { artifact_id: "art-1", state: "committed" }),
+    jsonResponse(200, { data: { artifact }, trace_id: "trace-artifact" }),
   ]);
   const client = new BrowserdClient({
     baseUrl: "https://api.example",
@@ -173,12 +203,71 @@ test("retries replay-safe artifact metadata reads", async () => {
     maxRetries: 1,
     sleep: async () => {},
   });
-  assert.equal((await client.getArtifact("ses-1", "art-1")).state, "committed");
+  assert.deepEqual(await client.getArtifact("ses-1", "art-1"), { ...artifact, trace_id: "trace-artifact" });
   assert.equal(transport.calls.length, 2);
 });
 
+test("lists artifact pages using the HTTP envelope and an encoded continuation cursor", async () => {
+  const first: ArtifactListPage = {
+    artifacts: [
+      { id: "art-1", state: "available", size_bytes: 0, content_type: "application/octet-stream", display_filename: "한".repeat(85) },
+      { id: "art-2", state: "available", display_filename: null },
+      { id: "art-3", state: "available" },
+    ],
+    next_cursor: "art/a?&after=other +한글",
+  };
+  const last: ArtifactListPage = { artifacts: [], next_cursor: null };
+  const transport = scripted([
+    jsonResponse(200, { data: first, trace_id: "trace-1" }),
+    jsonResponse(200, { data: last, trace_id: "trace-2" }),
+  ]);
+  const client = new BrowserdClient({ baseUrl: "https://api.example/proxy/", fetch: transport.fetch });
+  const page = await client.listArtifacts("ses/a?&한글", { requestId: "req-list" });
+  assert.deepEqual(page, { ...first, trace_id: "trace-1" });
+  assert.deepEqual(await client.listArtifacts("ses/a?&한글", { after: page.next_cursor!, limit: 100 }), { ...last, trace_id: "trace-2" });
+  const initial = new URL(transport.calls[0]!.url);
+  assert.equal(initial.pathname, "/proxy/v1/sessions/ses%2Fa%3F%26%ED%95%9C%EA%B8%80/artifacts");
+  assert.deepEqual([...initial.searchParams], [["limit", "50"]]);
+  const next = new URL(transport.calls[1]!.url);
+  assert.deepEqual([...next.searchParams], [["after", first.next_cursor], ["limit", "100"]]);
+  assert.equal(next.hash, "");
+  for (const call of transport.calls) {
+    assert.equal(call.init.method, "GET");
+    assert.equal(call.init.body, undefined);
+    assert.equal(new Headers(call.init.headers).get("idempotency-key"), null);
+  }
+  assert.equal(new Headers(transport.calls[0]!.init.headers).get("x-request-id"), "req-list");
+});
+
+test("rejects invalid artifact limits and dot path identifiers before transport", async () => {
+  const transport = scripted([]);
+  const client = new BrowserdClient({ baseUrl: "https://api.example", fetch: transport.fetch });
+  for (const limit of [0, 101, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    await assert.rejects(client.listArtifacts("ses-1", { limit }), RangeError);
+  }
+  for (const sessionId of ["", ".", ".."]) {
+    await assert.rejects(client.listArtifacts(sessionId), TypeError);
+  }
+  assert.equal(transport.calls.length, 0);
+});
+
+test("retries artifact listing as a read while preserving pagination and request identity", async () => {
+  const page: ArtifactListPage = { artifacts: [], next_cursor: null };
+  const transport = scripted([new Error("reset"), jsonResponse(200, { data: page, trace_id: "trace-list" })]);
+  const client = new BrowserdClient({
+    baseUrl: "https://api.example", fetch: transport.fetch, maxRetries: 1, sleep: async () => {},
+  });
+  assert.deepEqual(await client.listArtifacts("ses-1", { after: "art-1", limit: 1, requestId: "req-list" }), { ...page, trace_id: "trace-list" });
+  assert.equal(transport.calls.length, 2);
+  assert.equal(transport.calls[0]!.url, transport.calls[1]!.url);
+  for (const call of transport.calls) {
+    assert.equal(new Headers(call.init.headers).get("x-request-id"), "req-list");
+    assert.equal(new Headers(call.init.headers).get("idempotency-key"), null);
+  }
+});
+
 test("returns OUTCOME_UNKNOWN as a terminal value and never replays it", async () => {
-  const transport = scripted([jsonResponse(200, { action_id: "act-1", status: "outcome_unknown", retryable: false, trace_id: "trace-3" })]);
+  const transport = scripted([jsonResponse(200, wire("action_unknown", { action_id: "act-1" }, "trace-3"))]);
   const client = new BrowserdClient({ baseUrl: "https://api.example", fetch: transport.fetch, maxRetries: 3 });
   const result = await client.createAction("ses-1", { action: { type: "click" } });
   assert.equal(result.status, "outcome_unknown");
@@ -188,12 +277,12 @@ test("returns OUTCOME_UNKNOWN as a terminal value and never replays it", async (
 });
 
 test("retries reads and explicitly pre-dispatch errors, retaining one idempotency key", async () => {
-  const read = scripted([jsonResponse(503, { error: { code: "worker_unavailable", message: "retry", retryable: true, details: {}, trace_id: "t1" } }), jsonResponse(200, { id: "ses-1" })]);
+  const read = scripted([jsonResponse(503, { error: { code: "worker_unavailable", message: "retry", retryable: true, details: {}, trace_id: "t1" } }), jsonResponse(200, wire("session", { id: "ses-1" }))]);
   const readClient = new BrowserdClient({ baseUrl: "https://api.example", fetch: read.fetch, maxRetries: 1, sleep: async () => {} });
   assert.equal((await readClient.getSession("ses-1")).id, "ses-1");
   assert.equal(read.calls.length, 2);
 
-  const action = scripted([jsonResponse(503, { error: { code: "action_admission_timeout", message: "not dispatched", retryable: true, details: {}, trace_id: "t2" } }), jsonResponse(202, { action_id: "act-1", status: "queued" })]);
+  const action = scripted([jsonResponse(503, { error: { code: "action_admission_timeout", message: "not dispatched", retryable: true, details: {}, trace_id: "t2" } }), jsonResponse(202, wire("action_queued", { action_id: "act-1" }))]);
   const actionClient = new BrowserdClient({ baseUrl: "https://api.example", fetch: action.fetch, maxRetries: 1, sleep: async () => {} });
   await actionClient.createAction("ses-1", { action: { type: "screenshot" } });
   assert.equal(action.calls.length, 2);
@@ -240,15 +329,15 @@ test("reports an undecodable mutating response as dispatch uncertainty", async (
 
 test("polls operations to a terminal state and resumes event cursor", async () => {
   const operation = scripted([
-    jsonResponse(200, { id: "op-1", state: "creating" }),
-    jsonResponse(200, { id: "op-1", state: "succeeded", session_id: "ses-1" }),
+    jsonResponse(200, wire("operation_queued", { id: "op-1", state: "creating" })),
+    jsonResponse(200, wire("operation_succeeded", { id: "op-1" })),
   ]);
   const client = new BrowserdClient({ baseUrl: "https://api.example", fetch: operation.fetch, sleep: async () => {} });
   assert.equal((await client.waitForOperation("op-1", { intervalMs: 0, maxPolls: 2 })).state, "succeeded");
 
   const events = scripted([
-    jsonResponse(200, { events: [{ event_id: "ev-1", type: "operation.state_changed" }], next_cursor: "cur-2" }),
-    jsonResponse(200, { events: [{ event_id: "ev-2", type: "action.state_changed" }], next_cursor: "cur-3" }),
+    jsonResponse(200, wire("event_page", { events: [{ ...fixture.responses.event_page.data.events[0], event_id: "ev-1" }], next_cursor: "cur-2" })),
+    jsonResponse(200, wire("event_page", { events: [{ ...fixture.responses.event_page.data.events[0], event_id: "ev-2", kind: "action.state_changed" }], next_cursor: "cur-3" })),
   ]);
   const eventClient = new BrowserdClient({ baseUrl: "https://api.example", fetch: events.fetch, sleep: async () => {} });
   const received = [];
@@ -258,7 +347,7 @@ test("polls operations to a terminal state and resumes event cursor", async () =
 });
 
 test("event resume surfaces retention gaps instead of silently skipping state", async () => {
-  const events = scripted([jsonResponse(200, { events: [], gap: true, latest_cursor: "cur-latest" })]);
+  const events = scripted([jsonResponse(200, wire("event_gap", { next_cursor: "cur-latest" }))]);
   const client = new BrowserdClient({ baseUrl: "https://api.example", fetch: events.fetch });
   await assert.rejects(async () => {
     for await (const _event of client.resumeEvents({ cursor: "cur-expired", maxPolls: 1 })) {

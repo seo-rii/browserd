@@ -91,6 +91,8 @@ pub enum DedicatedEgressListenerError {
     InspectListener(String),
     #[error("the dedicated egress listener has an invalid local address: {0}")]
     InvalidListenerAddress(SocketAddr),
+    #[error("native network namespace helper failed: {0}")]
+    NativeHelper(String),
 }
 
 /// Creates a loopback listener in the exact pinned namespace without changing the caller thread.
@@ -170,6 +172,53 @@ fn configure_listener(listener: &TcpListener) -> Result<(), DedicatedEgressListe
     fcntl(listener, FcntlArg::F_SETFL(status_flags))
         .map_err(|error| DedicatedEgressListenerError::ConfigureListener(error.to_string()))?;
     Ok(())
+}
+
+pub(crate) fn adopt_native_listener(
+    descriptor: OwnedFd,
+    address: SocketAddr,
+    namespace_identity: NetworkNamespaceIdentity,
+) -> Result<DedicatedEgressListener, DedicatedEgressListenerError> {
+    let listener = TcpListener::from(descriptor);
+    let observed = listener
+        .local_addr()
+        .map_err(|error| DedicatedEgressListenerError::InspectListener(error.to_string()))?;
+    if observed != address || address.ip() != Ipv4Addr::LOCALHOST || address.port() == 0 {
+        return Err(DedicatedEgressListenerError::InvalidListenerAddress(
+            observed,
+        ));
+    }
+    use nix::sys::socket::{GetSockOpt, sockopt};
+    if !sockopt::AcceptConn
+        .get(&listener)
+        .map_err(|error| DedicatedEgressListenerError::InspectListener(error.to_string()))?
+        || sockopt::SockType
+            .get(&listener)
+            .map_err(|error| DedicatedEgressListenerError::InspectListener(error.to_string()))?
+            != nix::sys::socket::SockType::Stream
+    {
+        return Err(DedicatedEgressListenerError::NativeHelper(
+            "returned descriptor is not a listening stream".into(),
+        ));
+    }
+    let flags = fcntl(&listener, FcntlArg::F_GETFD)
+        .map_err(|error| DedicatedEgressListenerError::InspectListener(error.to_string()))?;
+    let status = fcntl(&listener, FcntlArg::F_GETFL)
+        .map_err(|error| DedicatedEgressListenerError::InspectListener(error.to_string()))?;
+    if !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)
+        || !OFlag::from_bits_truncate(status).contains(OFlag::O_NONBLOCK)
+    {
+        return Err(DedicatedEgressListenerError::NativeHelper(
+            "returned listener flags are unsafe".into(),
+        ));
+    }
+    Ok(DedicatedEgressListener {
+        descriptor: listener.into(),
+        receipt: DedicatedEgressListenerReceipt {
+            address,
+            namespace_identity,
+        },
+    })
 }
 
 fn require_current_namespace(

@@ -1,5 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/action_wait.rs"]
+mod action_wait;
+#[path = "support/safety.rs"]
+mod safety;
+#[path = "support/webhooks.rs"]
+mod webhooks;
+
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +45,172 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct StaticAuth {
     principal: AuthenticatedPrincipal,
+}
+
+struct DownloadFixture {
+    consumed: AtomicBool,
+    aborted: Arc<AtomicBool>,
+}
+
+struct DownloadChunks {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    aborted: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl browserd_http::ArtifactBody for DownloadChunks {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ApiError> {
+        Ok(self.chunks.pop_front())
+    }
+    fn abort(&mut self) {
+        self.aborted.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl browserd_http::ArtifactTransport for DownloadFixture {
+    fn present_token(&self, _token: &DownloadToken) -> Option<String> {
+        None
+    }
+    async fn consume(
+        &self,
+        _principal: &AuthenticatedPrincipal,
+        _session: &SessionId,
+        _artifact: &browserd_core::ArtifactId,
+        _secret: &str,
+    ) -> Result<browserd_http::ArtifactDownloadBody, ApiError> {
+        if self.consumed.swap(true, Ordering::SeqCst) {
+            return Err(ApiError::invalid_request("consumed"));
+        }
+        Ok(browserd_http::ArtifactDownloadBody {
+            size_bytes: 5,
+            stream: Box::new(DownloadChunks {
+                chunks: [b"he".to_vec(), b"llo".to_vec()].into(),
+                aborted: Arc::clone(&self.aborted),
+            }),
+        })
+    }
+}
+
+#[tokio::test]
+async fn artifact_content_stream_keeps_admission_and_uses_fixed_safe_headers()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Arc::new(DownloadFixture {
+        consumed: AtomicBool::new(false),
+        aborted: Arc::new(AtomicBool::new(false)),
+    });
+    let app = browserd_http::router_with_artifacts(
+        HttpConfig::default().with_admission_limits(1, 1, 1)?,
+        Arc::new(InMemoryApiService::default()),
+        Arc::new(StaticAuth {
+            principal: principal(&["artifact:read"])?,
+        }),
+        Arc::new(RejectViewer),
+        Arc::new(StaticReadiness(true)),
+        Some(fixture.clone()),
+    );
+    let path = format!(
+        "/v1/sessions/{}/artifacts/{}/content",
+        SessionId::new(),
+        browserd_core::ArtifactId::new()
+    );
+    let request = || {
+        Request::builder()
+            .uri(&path)
+            .header("authorization", "Bearer valid")
+            .header("x-browserd-download-token", "a".repeat(64))
+            .body(Body::empty())
+    };
+    let response = app.clone().oneshot(request()?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "application/octet-stream"
+    );
+    assert_eq!(
+        response.headers()["content-disposition"],
+        "attachment; filename=\"artifact.bin\""
+    );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+    assert_eq!(
+        app.clone().oneshot(request()?).await?.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        response.into_body().collect().await?.to_bytes().as_ref(),
+        b"hello"
+    );
+    assert!(fixture.aborted.load(Ordering::SeqCst));
+    assert_eq!(
+        app.oneshot(request()?).await?.status(),
+        StatusCode::NOT_FOUND
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_scope_and_duplicate_token_reject_before_consuming_and_drop_aborts()
+-> Result<(), Box<dyn Error>> {
+    let fixture = Arc::new(DownloadFixture {
+        consumed: AtomicBool::new(false),
+        aborted: Arc::new(AtomicBool::new(false)),
+    });
+    let path = format!(
+        "/v1/sessions/{}/artifacts/{}/content",
+        SessionId::new(),
+        browserd_core::ArtifactId::new()
+    );
+    for (scopes, duplicate, expected) in [
+        (&[][..], false, StatusCode::FORBIDDEN),
+        (&["artifact:read"][..], true, StatusCode::BAD_REQUEST),
+    ] {
+        let app = browserd_http::router_with_artifacts(
+            HttpConfig::default(),
+            Arc::new(InMemoryApiService::default()),
+            Arc::new(StaticAuth {
+                principal: principal(scopes)?,
+            }),
+            Arc::new(RejectViewer),
+            Arc::new(StaticReadiness(true)),
+            Some(fixture.clone()),
+        );
+        let mut request = Request::builder()
+            .uri(&path)
+            .header("authorization", "Bearer valid")
+            .header("x-browserd-download-token", "a".repeat(64));
+        if duplicate {
+            request = request.header("x-browserd-download-token", "b".repeat(64));
+        }
+        assert_eq!(
+            app.oneshot(request.body(Body::empty())?).await?.status(),
+            expected
+        );
+        assert!(!fixture.consumed.load(Ordering::SeqCst));
+    }
+    let app = browserd_http::router_with_artifacts(
+        HttpConfig::default(),
+        Arc::new(InMemoryApiService::default()),
+        Arc::new(StaticAuth {
+            principal: principal(&["artifact:read"])?,
+        }),
+        Arc::new(RejectViewer),
+        Arc::new(StaticReadiness(true)),
+        Some(fixture.clone()),
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(&path)
+                .header("authorization", "Bearer valid")
+                .header("x-browserd-download-token", "a".repeat(64))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    assert!(fixture.aborted.load(Ordering::SeqCst));
+    Ok(())
 }
 
 impl Authenticator for StaticAuth {
@@ -136,6 +309,231 @@ impl ViewerTransport for CountingViewer {
 }
 
 struct ErrorService(ErrorCode);
+
+#[tokio::test]
+async fn query_all_http_preserves_frame_paths_and_rejects_invalid_routes_before_service()
+-> Result<(), Box<dyn Error>> {
+    #[derive(Default)]
+    struct QueryService(Mutex<Vec<Vec<String>>>);
+    impl ApiService for QueryService {
+        fn execute(
+            &self,
+            principal: &AuthenticatedPrincipal,
+            request: ApiRequest,
+        ) -> Result<ApiResponse, ApiError> {
+            request.authorize(principal)?;
+            request.validate()?;
+            if let ApiRequest::SubmitAction(command) = request
+                && let browserd_api::ActionPayload::QueryAll { frame_path, .. } =
+                    command.body.action
+            {
+                self.0.lock().expect("paths").push(frame_path);
+            }
+            Err(ApiError::new(ErrorCode::Internal, "query reached fixture"))
+        }
+    }
+    let service = Arc::new(QueryService::default());
+    let uri = format!("/v1/sessions/{}/actions", SessionId::new());
+    let body = |path: Option<serde_json::Value>| {
+        let mut body = serde_json::json!({
+            "page_id":browserd_core::PageId::new(),"if_session_incarnation":1,"execution_timeout_ms":30000,
+            "action":{"type":"query_all","selector":"input"},
+        });
+        if let Some(path) = path {
+            body["action"]["frame_path"] = path;
+        }
+        body
+    };
+    for (scopes, path, expected) in [
+        (vec!["browser:act"], None, StatusCode::INTERNAL_SERVER_ERROR),
+        (
+            vec!["browser:act"],
+            Some(serde_json::json!([])),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            vec!["browser:act"],
+            Some(serde_json::json!(["iframe#outer", "iframe#inner"])),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            vec!["session:read"],
+            Some(serde_json::json!(["iframe"])),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            vec!["browser:act"],
+            Some(serde_json::json!(vec!["iframe"; 9])),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            vec!["browser:act"],
+            Some(serde_json::json!(vec!["a".repeat(8192); 5])),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = app(service.clone(), principal(&scopes)?)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&uri)
+                    .header("authorization", "Bearer valid")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", Uuid::new_v4().to_string())
+                    .body(Body::from(body(path).to_string()))?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+    }
+    assert_eq!(
+        *service.0.lock().expect("paths"),
+        vec![
+            Vec::<String>::new(),
+            vec![],
+            vec!["iframe#outer".to_owned(), "iframe#inner".to_owned()],
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_secret_http_requires_both_scopes_and_a_reference_only_body()
+-> Result<(), Box<dyn Error>> {
+    let body = serde_json::json!({
+        "page_id":browserd_core::PageId::new(), "if_session_incarnation":1, "execution_timeout_ms":30000,
+        "action":{"type":"fill_secret", "node_ref":"0000000000000001", "secret_ref":"credential.login"}
+    });
+    let uri = format!("/v1/sessions/{}/actions", SessionId::new());
+    for (scopes, expected) in [
+        (vec!["browser:act"], StatusCode::FORBIDDEN),
+        (vec!["secret:use"], StatusCode::FORBIDDEN),
+        (
+            vec!["browser:act", "secret:use"],
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let response = app(
+            Arc::new(ErrorService(ErrorCode::Internal)),
+            principal(&scopes)?,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+        assert_eq!(response.status(), expected);
+    }
+    let mut plaintext = body.clone();
+    plaintext["action"]["value"] = serde_json::json!("synthetic-plaintext-not-a-secret");
+    let mut invalid_ref = body.clone();
+    invalid_ref["action"]["secret_ref"] = serde_json::json!(" invalid ");
+    let mut missing_ref = body;
+    missing_ref["action"]
+        .as_object_mut()
+        .ok_or("action object")?
+        .remove("secret_ref");
+    for invalid in [plaintext, invalid_ref, missing_ref] {
+        let response = app(
+            Arc::new(ErrorService(ErrorCode::Internal)),
+            principal(&["browser:act", "secret:use"])?,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(invalid.to_string()))?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_files_http_keeps_artifact_scope_and_rejects_duplicate_ids_or_paths()
+-> Result<(), Box<dyn Error>> {
+    let body = serde_json::json!({
+        "page_id":browserd_core::PageId::new(), "if_session_incarnation":1, "execution_timeout_ms":30000,
+        "action":{"type":"set_files", "node_ref":"0000000000000001", "artifact_ids":[browserd_core::ArtifactId::new()]}
+    });
+    let uri = format!("/v1/sessions/{}/actions", SessionId::new());
+    for (scopes, expected) in [
+        (vec!["browser:act"], StatusCode::FORBIDDEN),
+        (vec!["artifact:read"], StatusCode::FORBIDDEN),
+        (
+            vec!["browser:act", "artifact:read"],
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    ] {
+        let response = app(
+            Arc::new(ErrorService(ErrorCode::Internal)),
+            principal(&scopes)?,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+        assert_eq!(response.status(), expected);
+    }
+    let mut duplicate = body.clone();
+    let id = duplicate["action"]["artifact_ids"][0].clone();
+    duplicate["action"]["artifact_ids"] = serde_json::json!([id.clone(), id]);
+    let mut path = body.clone();
+    path["action"]["paths"] = serde_json::json!(["/tmp/file"]);
+    let mut invalid_id = body;
+    invalid_id["action"]["artifact_ids"] = serde_json::json!(["/tmp/file"]);
+    for invalid in [duplicate, path, invalid_id] {
+        let response = app(
+            Arc::new(ErrorService(ErrorCode::Internal)),
+            principal(&["browser:act", "artifact:read"])?,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&uri)
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", Uuid::new_v4().to_string())
+                .body(Body::from(invalid.to_string()))?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_upload_http_validates_filename_before_service_dispatch()
+-> Result<(), Box<dyn Error>> {
+    for (name, expected) in [
+        ("첨부 문서.txt", StatusCode::INTERNAL_SERVER_ERROR),
+        ("../file", StatusCode::BAD_REQUEST),
+        ("a\\b", StatusCode::BAD_REQUEST),
+        (".", StatusCode::BAD_REQUEST),
+        ("..", StatusCode::BAD_REQUEST),
+    ] {
+        let response = app(Arc::new(ErrorService(ErrorCode::Internal)), principal(&["artifact:upload"])?)
+            .oneshot(Request::builder().method(Method::POST).uri(format!("/v1/sessions/{}/artifacts/uploads", SessionId::new()))
+                .header("authorization", "Bearer valid").header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"display_filename":name,"declared_content_type":"text/plain","expected_size_bytes":1,"data_base64":"YQ=="}).to_string()))?).await?;
+        assert_eq!(response.status(), expected);
+    }
+    Ok(())
+}
 
 impl ApiService for ErrorService {
     fn execute(
@@ -288,6 +686,238 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+struct ArtifactListService {
+    requests: Mutex<Vec<browserd_api::ArtifactListRequest>>,
+    artifact: browserd_core::ArtifactId,
+    display_filename: Option<String>,
+}
+
+impl ApiService for ArtifactListService {
+    fn execute(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        request: ApiRequest,
+    ) -> Result<ApiResponse, ApiError> {
+        request.authorize(principal)?;
+        request.validate()?;
+        let session = match &request {
+            ApiRequest::ListArtifacts(request) => &request.session_id,
+            ApiRequest::GetArtifact(request) => &request.session_id,
+            ApiRequest::UploadArtifact(request) => &request.session_id,
+            _ => return Err(ApiError::invalid_request("unexpected artifact request")),
+        };
+        let artifact = browserd_api::ArtifactMetadata {
+            key: ArtifactKey::new(
+                principal.tenant_id().clone(),
+                session.clone(),
+                self.artifact.clone(),
+            ),
+            state: browserd_artifacts::ArtifactState::Available,
+            checksum_sha256: Some([7; 32]),
+            size_bytes: Some(4),
+            content_type: Some("application/octet-stream".to_owned()),
+            source_origin: Some("/profile/private/download-path".to_owned()),
+            display_filename: self.display_filename.clone(),
+        };
+        match request {
+            ApiRequest::ListArtifacts(request) => {
+                self.requests.lock().unwrap().push(request);
+                Ok(ApiResponse::Artifacts(ApiEnvelope::new(
+                    browserd_api::ArtifactListPage {
+                        items: vec![artifact],
+                        next_cursor: Some(self.artifact.clone()),
+                    },
+                )))
+            }
+            ApiRequest::GetArtifact(_) => Ok(ApiResponse::Artifact(ApiEnvelope::new(artifact))),
+            ApiRequest::UploadArtifact(_) => {
+                Ok(ApiResponse::ArtifactUpload(ApiEnvelope::new(artifact)))
+            }
+            _ => Err(ApiError::invalid_request("unexpected artifact request")),
+        }
+    }
+}
+
+#[tokio::test]
+async fn artifact_discovery_route_preserves_defaults_cursor_and_safe_metadata()
+-> Result<(), Box<dyn Error>> {
+    let service = Arc::new(ArtifactListService {
+        requests: Mutex::new(Vec::new()),
+        artifact: browserd_core::ArtifactId::new(),
+        display_filename: Some("첨부 문서.txt".to_owned()),
+    });
+    let session = SessionId::new();
+    let cursor = browserd_core::ArtifactId::new();
+    let app = app(service.clone(), principal(&["artifact:read"])?);
+    for suffix in [String::new(), format!("?after={cursor}&limit=2")] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sessions/{session}/artifacts{suffix}"))
+                    .header("authorization", "Bearer valid")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(
+            body["data"]["artifacts"][0],
+            serde_json::json!({
+                "id":service.artifact.to_string(), "state":"available", "size_bytes":4,
+                "content_type":"application/octet-stream", "display_filename":"첨부 문서.txt"
+            })
+        );
+        assert_eq!(body["data"]["next_cursor"], service.artifact.to_string());
+        assert!(!body.to_string().contains("/profile/private"));
+    }
+    let requests = service.requests.lock().unwrap();
+    assert_eq!(requests[0].session_id, session);
+    assert_eq!(requests[0].after, None);
+    assert_eq!(requests[0].limit, 50);
+    assert_eq!(requests[1].after.as_ref(), Some(&cursor));
+    assert_eq!(requests[1].limit, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_responses_expose_only_optional_bounded_display_basenames()
+-> Result<(), Box<dyn Error>> {
+    let cases = [
+        (None, true),
+        (Some("첨부 문서.txt".to_owned()), true),
+        (Some("한".repeat(85)), true),
+        (Some("a".repeat(255)), true),
+        (Some(format!("{}a", "한".repeat(85))), false),
+        (Some("a".repeat(256)), false),
+        (Some(String::new()), false),
+        (Some(".".to_owned()), false),
+        (Some("..".to_owned()), false),
+        (Some("../private/file".to_owned()), false),
+        (Some("private\\file".to_owned()), false),
+        (Some("name\r\nheader".to_owned()), false),
+        (Some("name\u{7f}".to_owned()), false),
+    ];
+    for (name, valid) in cases {
+        let artifact = browserd_core::ArtifactId::new();
+        let service = Arc::new(ArtifactListService {
+            requests: Mutex::new(Vec::new()),
+            artifact: artifact.clone(),
+            display_filename: name.clone(),
+        });
+        let session = SessionId::new();
+        let app = app(service, principal(&["artifact:read", "artifact:upload"])?);
+        for (method, suffix) in [
+            (Method::GET, String::new()),
+            (Method::GET, format!("/{artifact}")),
+            (Method::POST, "/uploads".to_owned()),
+        ] {
+            let upload = method == Method::POST;
+            let request_body = if upload {
+                Body::from(
+                    serde_json::json!({"display_filename":"input.txt","expected_size_bytes":1,"data_base64":"YQ=="})
+                        .to_string(),
+                )
+            } else {
+                Body::empty()
+            };
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(format!("/v1/sessions/{session}/artifacts{suffix}"))
+                        .header("authorization", "Bearer valid")
+                        .header("content-type", "application/json")
+                        .body(request_body)?,
+                )
+                .await?;
+            let expected_status = if !valid {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else if upload {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(response.status(), expected_status, "{suffix}, {name:?}");
+            let body = body_json(response).await;
+            assert!(!body.to_string().contains("/profile/private"));
+            if valid {
+                let metadata = if suffix.is_empty() {
+                    &body["data"]["artifacts"][0]
+                } else {
+                    &body["data"]["artifact"]
+                };
+                assert_eq!(metadata["display_filename"], serde_json::json!(name));
+                assert_eq!(metadata["id"], artifact.to_string());
+            } else {
+                assert!(body.get("data").is_none());
+                assert!(!body.to_string().contains("display_filename"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_discovery_rejects_unknown_duplicate_malformed_and_out_of_bounds_queries()
+-> Result<(), Box<dyn Error>> {
+    let service = Arc::new(ArtifactListService {
+        requests: Mutex::new(Vec::new()),
+        artifact: browserd_core::ArtifactId::new(),
+        display_filename: None,
+    });
+    let session = SessionId::new();
+    let cursor = browserd_core::ArtifactId::new();
+    let app = app(service.clone(), principal(&["artifact:read"])?);
+    for query in [
+        "unknown=1".to_owned(),
+        "limit=1&limit=2".to_owned(),
+        "limit=2&%6cimit=3".to_owned(),
+        format!("after={cursor}&after={cursor}"),
+        "after=not-an-artifact".to_owned(),
+        "after=".to_owned(),
+        "limit=0".to_owned(),
+        "limit=101".to_owned(),
+        "limit=-1".to_owned(),
+        "limit=invalid".to_owned(),
+        "after=%zz".to_owned(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/sessions/{session}/artifacts?{query}"))
+                    .header("authorization", "Bearer valid")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "query {query}");
+    }
+    assert!(service.requests.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn artifact_discovery_requires_artifact_read_scope() -> Result<(), Box<dyn Error>> {
+    let service = Arc::new(ArtifactListService {
+        requests: Mutex::new(Vec::new()),
+        artifact: browserd_core::ArtifactId::new(),
+        display_filename: None,
+    });
+    let response = app(service.clone(), principal(&["session:read"])?)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/sessions/{}/artifacts", SessionId::new()))
+                .header("authorization", "Bearer valid")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(service.requests.lock().unwrap().is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn health_request_ids_and_fail_closed_readiness_are_exposed() -> Result<(), Box<dyn Error>> {
     let app = app(Arc::new(InMemoryApiService::default()), principal(&[])?);
@@ -377,6 +1007,47 @@ async fn create_session_is_strict_bounded_and_returns_202() -> Result<(), Box<dy
         )
         .await?;
     assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_restore_requires_both_scopes_without_claiming_a_denied_idempotency_key()
+-> Result<(), Box<dyn Error>> {
+    let service = Arc::new(InMemoryApiService::default());
+    let tenant = TenantId::new();
+    let mut body: serde_json::Value = serde_json::from_str(include_str!(
+        "../../browserd-api/tests/session_create_fixture.json"
+    ))?;
+    body["checkpoint_ref"] = serde_json::json!("opaque-checkpoint");
+    let key = Uuid::new_v4().to_string();
+    for (scopes, expected) in [
+        (vec!["session:create"], StatusCode::FORBIDDEN),
+        (vec!["checkpoint:read"], StatusCode::FORBIDDEN),
+        (
+            vec!["session:create", "checkpoint:create"],
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            vec!["session:create", "checkpoint:read"],
+            StatusCode::ACCEPTED,
+        ),
+    ] {
+        let response = app(
+            service.clone(),
+            principal_for_tenant(tenant.clone(), &scopes)?,
+        )
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/sessions")
+                .header("authorization", "Bearer valid")
+                .header("content-type", "application/json")
+                .header("idempotency-key", &key)
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?;
+        assert_eq!(response.status(), expected);
+    }
     Ok(())
 }
 
@@ -1101,5 +1772,162 @@ async fn ingress_admission_rejects_overflow_mutations_but_keeps_the_read_lane_op
         )
         .await?;
     assert_ne!(after.status(), StatusCode::SERVICE_UNAVAILABLE);
+    Ok(())
+}
+
+#[tokio::test]
+async fn approval_get_and_list_share_safe_review_summary_and_require_read_scope()
+-> Result<(), Box<dyn Error>> {
+    use browserd_api::{ApprovalCatalog, ApprovalListQuery, ApprovalResource};
+    use browserd_policy::{
+        ActionArgumentsHash, ApprovalContextScope, ApprovalNodeBinding, ApprovalState,
+        ApprovalWorkerFence, CanonicalActionProposal, CredentialRefsHash, NodeReference, Origin,
+        TypedActionPayload, TypedActionProposalBinding,
+    };
+    struct ReviewService {
+        catalog: ApprovalCatalog,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ApiService for ReviewService {
+        fn execute(
+            &self,
+            principal: &AuthenticatedPrincipal,
+            request: ApiRequest,
+        ) -> Result<ApiResponse, ApiError> {
+            request.authorize(principal)?;
+            request.validate()?;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match request {
+                ApiRequest::GetApproval(id) => self
+                    .catalog
+                    .get(principal.tenant_id(), id)
+                    .map(ApiEnvelope::new)
+                    .map(ApiResponse::Approval),
+                ApiRequest::ListApprovals(query) => self
+                    .catalog
+                    .list(principal.tenant_id(), &query)
+                    .map(ApiEnvelope::new)
+                    .map(ApiResponse::Approvals),
+                _ => Err(ApiError::invalid_request("unexpected approval request")),
+            }
+        }
+    }
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let action = ActionId::new();
+    let id = Uuid::now_v7();
+    let payload = TypedActionPayload::FillSecret {
+        node: ApprovalNodeBinding {
+            node_ref: "opaque-node".to_owned(),
+            binding_sha256: [2; 32],
+            role: Some("textbox".to_owned()),
+            name: Some("Account login".to_owned()),
+        },
+        secret_ref: "credentials/login".to_owned(),
+        grant_metadata_sha256: [3; 32],
+    };
+    let proposal = CanonicalActionProposal::new(
+        tenant.clone(),
+        PrincipalId::new(),
+        session.clone(),
+        1,
+        browserd_core::PageId::new(),
+        2,
+        3,
+        Origin::parse("https://login.test")?,
+        4,
+        payload.action_kind().legacy_action_type(),
+        ActionArgumentsHash::digest(b"reference only"),
+        Some(NodeReference::new("opaque-node")?),
+        CredentialRefsHash::digest(["credentials/login"]),
+        9000,
+    )
+    .with_typed_binding(TypedActionProposalBinding {
+        schema_version: 2,
+        action_id: action.clone(),
+        sequence: 1,
+        fence: ApprovalWorkerFence {
+            worker_id: browserd_core::WorkerId::new("review-worker")?,
+            worker_epoch: 5,
+            placement_version: 6,
+            session_incarnation: 1,
+        },
+        policy_digest: [7; 32],
+        target_binding_sha256: [8; 32],
+        context_scope: ApprovalContextScope::HttpOrigin {
+            origin: "https://login.test".to_owned(),
+        },
+        payload,
+    })?;
+    let service = Arc::new(ReviewService {
+        catalog: ApprovalCatalog::default(),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    service.catalog.upsert(ApprovalResource {
+        approval_id: id,
+        tenant_id: tenant.clone(),
+        session_id: session,
+        action_id: action,
+        state: ApprovalState::Pending,
+        proposal,
+    })?;
+    // A decider does not gain read permission implicitly.
+    let paths = [format!("/v1/approvals/{id}"), "/v1/approvals".to_owned()];
+    for path in &paths {
+        let response = app(
+            service.clone(),
+            principal_for_tenant(tenant.clone(), &["approval:decide"])?,
+        )
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer valid")
+                .body(Body::empty())?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(service.calls.load(Ordering::SeqCst), 0);
+    let mut responses = Vec::new();
+    for path in paths {
+        let response = app(
+            service.clone(),
+            principal_for_tenant(tenant.clone(), &["approval:read"])?,
+        )
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer valid")
+                .body(Body::empty())?,
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        responses.push(body_json(response).await);
+    }
+    let get = &responses[0]["data"]["approval"];
+    assert_eq!(get, &responses[1]["data"]["approvals"][0]);
+    assert_eq!(get["summary"]["action_kind"], "fill_secret");
+    assert_eq!(get["summary"]["secret_ref"], "credentials/login");
+    assert_eq!(get["summary"]["node_role"], "textbox");
+    assert_eq!(get["summary"]["node_name"], "Account login");
+    assert_eq!(get["summary"]["context"]["origin"], "https://login.test");
+    assert_eq!(get["summary"]["expires_at_unix_millis"], 9000);
+    assert_eq!(get["summary"]["policy_digest"], "07".repeat(32));
+    for private_field in [
+        "payload",
+        "grant_metadata_sha256",
+        "binding_sha256",
+        "credential_refs_hash",
+    ] {
+        assert!(!responses[0].to_string().contains(private_field));
+    }
+    assert_eq!(
+        service
+            .catalog
+            .list(&tenant, &ApprovalListQuery::default())?
+            .items()
+            .len(),
+        1
+    );
     Ok(())
 }

@@ -420,6 +420,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": spec.dedicated_egress(),
                 "chromium_binary_digest": spec.chromium_binary_digest(),
+                "process_profile": spec.process_profile(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::LaunchFenceMismatch,
@@ -434,6 +435,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": spec.dedicated_egress(),
                 "chromium_binary_digest": spec.chromium_binary_digest(),
+                "process_profile": spec.process_profile(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::LaunchFenceMismatch,
@@ -448,6 +450,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": spec.dedicated_egress(),
                 "chromium_binary_digest": spec.chromium_binary_digest(),
+                "process_profile": spec.process_profile(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::LaunchFenceMismatch,
@@ -462,6 +465,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": excessive_ttl,
                 "chromium_binary_digest": spec.chromium_binary_digest(),
+                "process_profile": spec.process_profile(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::InvalidLease,
@@ -476,6 +480,7 @@ async fn rpc_rejects_conflicting_identities_and_unvalidated_immutable_bindings()
                 "tenant_id": spec.tenant_id(),
                 "dedicated_egress": uninitialized_digest,
                 "chromium_binary_digest": spec.chromium_binary_digest(),
+                "process_profile": spec.process_profile(),
                 "lease_ttl_ms": 80
             }),
             RpcFailureCode::InvalidEgressPolicyBinding,

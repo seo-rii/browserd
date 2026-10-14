@@ -256,7 +256,8 @@ impl ProxyRequest {
         let upstream_head = if kind == ProxyRequestKind::ConnectTunnel {
             Vec::new()
         } else {
-            let mut head = format!("{method} {} HTTP/1.1\r\n", url.path_and_query()).into_bytes();
+            let mut head =
+                format!("{method} {} HTTP/1.1\r\n", url.wire_path_and_query()).into_bytes();
             let host = if url.host().contains(':') {
                 format!("[{}]", url.host())
             } else {

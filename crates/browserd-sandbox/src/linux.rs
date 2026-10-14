@@ -1,8 +1,15 @@
+mod context_routes;
+use crate::{
+    ContextEgressBinding, ContextEgressReleaseReceipt, ContextEgressRequest, ContextRoutePhase,
+};
+use context_routes::ContextRuntimeRoute;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -10,21 +17,26 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use browserd_core::{EgressFence, LeaseId, ShardFence, ShardId, TenantId};
-use browserd_launch_gate::APPROVAL_FRAME;
+use browserd_launch_gate::{
+    APPROVAL_FRAME, ScratchSender, configure_scratch_receiver, receive_scratch_offer_from_child,
+};
 use nix::errno::Errno;
 use nix::fcntl::{
     FcntlArg, FdFlag, OFlag, OpenHow, ResolveFlag, SealFlag, fcntl, open, openat, openat2,
 };
 use nix::sys::memfd::{MFdFlags, memfd_create};
 use nix::sys::signal::Signal;
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
 use nix::sys::statfs::fstatfs;
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
 use nix::unistd::{pipe2, write as write_fd};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::watch;
 
 use crate::journal::{
     FilePreparedShardJournal, PreparedShardCleanupFailure, PreparedShardCleanupPermit,
@@ -33,9 +45,10 @@ use crate::journal::{
     PreparedShardRecoveryLocators,
 };
 use crate::{
-    CleanupReason, DedicatedEgressSpec, InspectResources, LaunchSpec,
-    MAX_DEDICATED_EGRESS_LEASE_TTL, SandboxBackend, SandboxCapabilities, SandboxError,
-    SandboxHandle,
+    ChromiumProcessProfile, CleanupReason, DedicatedEgressSpec, EgressPolicyBinding,
+    InspectResources, LaunchSpec, MAX_DEDICATED_EGRESS_LEASE_TTL, SANDBOX_SCRATCH_MAX_BYTES,
+    SANDBOX_SCRATCH_PATH, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
+    SandboxScratch, validate_scratch_directory,
 };
 
 /// Chromium's fixed command-input descriptor for `--remote-debugging-pipe`.
@@ -49,6 +62,9 @@ const PREPARED_CHILD_EXIT_POLL: Duration = Duration::from_millis(5);
 const PIPEFS_MAGIC: u64 = 0x5049_5045;
 const NSFS_MAGIC: u64 = 0x6e73_6673;
 const MAX_CHROMIUM_EXECUTABLE_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_CHROMIUM_RUNTIME_CHILDREN: usize = 4096;
+const SANDBOX_NOFILE_LIMIT: nix::libc::rlim_t = 65_536;
+const PRIVATE_CHILD_STDERR_MAX_BYTES: usize = 16 * 1024;
 const CHROMIUM_EXECUTABLE_SEALS: SealFlag = SealFlag::F_SEAL_WRITE
     .union(SealFlag::F_SEAL_GROW)
     .union(SealFlag::F_SEAL_SHRINK)
@@ -111,45 +127,9 @@ impl ChromiumRuntime {
     ) -> Result<Self, SandboxError> {
         let host_executable = host_executable.into();
         validate_absolute_path(&host_executable)?;
-        let relative_executable = host_executable
-            .strip_prefix(Path::new("/"))
-            .map_err(|_| SandboxError::Backend("unsafe Chromium executable path".into()))?;
-        let filesystem_root = open(
-            Path::new("/"),
-            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|error| SandboxError::Backend(format!("open filesystem root: {error}")))?;
-        let source = openat2(
-            &filesystem_root,
-            relative_executable,
-            OpenHow::new()
-                .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
-                .resolve(
-                    ResolveFlag::RESOLVE_BENEATH
-                        | ResolveFlag::RESOLVE_NO_MAGICLINKS
-                        | ResolveFlag::RESOLVE_NO_SYMLINKS,
-                ),
-        )
-        .map_err(|error| {
-            SandboxError::Backend(format!("securely open Chromium executable: {error}"))
-        })?;
-        let metadata = fstat(&source).map_err(|error| {
-            SandboxError::Backend(format!("inspect Chromium executable: {error}"))
-        })?;
-        if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFREG)
-            || metadata.st_mode & 0o111 == 0
-            || metadata.st_size <= 0
-            || usize::try_from(metadata.st_size)
-                .ok()
-                .is_none_or(|size| size > MAX_CHROMIUM_EXECUTABLE_BYTES)
-        {
-            return Err(SandboxError::Backend(
-                "Chromium executable must be a nonempty bounded regular executable".into(),
-            ));
-        }
+        let source = open_runtime_source(&host_executable, true)?;
         Self::pin(
-            fs::File::from(source),
+            source,
             Some(host_executable),
             sandbox_executable,
             expected_digest,
@@ -285,6 +265,145 @@ impl ChromiumRuntime {
     }
 }
 
+fn open_runtime_source(path: &Path, executable: bool) -> Result<fs::File, SandboxError> {
+    validate_absolute_path(path)?;
+    let root = open(
+        Path::new("/"),
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SandboxError::Backend(format!("open runtime root: {error}")))?;
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| SandboxError::Backend("unsafe runtime path".into()))?;
+    let source = openat2(
+        &root,
+        relative,
+        OpenHow::new()
+            .flags(OFlag::O_RDONLY | OFlag::O_CLOEXEC)
+            .resolve(
+                ResolveFlag::RESOLVE_BENEATH
+                    | ResolveFlag::RESOLVE_NO_MAGICLINKS
+                    | ResolveFlag::RESOLVE_NO_SYMLINKS,
+            ),
+    )
+    .map_err(|error| SandboxError::Backend(format!("securely open runtime file: {error}")))?;
+    let metadata = fstat(&source)
+        .map_err(|error| SandboxError::Backend(format!("inspect runtime file: {error}")))?;
+    let bound = if executable {
+        MAX_CHROMIUM_EXECUTABLE_BYTES
+    } else {
+        128 * 1024 * 1024
+    };
+    if !SFlag::from_bits_truncate(metadata.st_mode).contains(SFlag::S_IFREG)
+        || (executable && metadata.st_mode & 0o111 == 0)
+        || metadata.st_size <= 0
+        || usize::try_from(metadata.st_size)
+            .ok()
+            .is_none_or(|size| size > bound)
+    {
+        return Err(SandboxError::Backend(
+            "runtime file must be a bounded regular file with required permissions".into(),
+        ));
+    }
+    Ok(fs::File::from(source))
+}
+
+/// Immutable resource capabilities selected by a verified, binary-bound catalog.
+#[derive(Clone, Debug)]
+pub struct NativeProcessResources {
+    binary_digest: crate::ChromiumBinaryDigest,
+    catalog_digest: crate::ChromiumBinaryDigest,
+    icu: ChromiumRuntime,
+    locales: HashMap<String, ChromiumRuntime>,
+    time_zones: Vec<String>,
+}
+
+impl NativeProcessResources {
+    pub fn new(
+        binary_digest: crate::ChromiumBinaryDigest,
+        catalog_digest: crate::ChromiumBinaryDigest,
+        icu_path: impl AsRef<Path>,
+        icu_digest: crate::ChromiumBinaryDigest,
+        locales: Vec<(String, PathBuf, crate::ChromiumBinaryDigest)>,
+        time_zones: Vec<String>,
+    ) -> Result<Self, SandboxError> {
+        if locales.is_empty()
+            || time_zones.is_empty()
+            || locales.len() > 256
+            || time_zones.len() > 1024
+            || binary_digest == crate::ChromiumBinaryDigest::new([0; 32])
+        {
+            return Err(SandboxError::Backend(
+                "invalid native resource catalog".into(),
+            ));
+        }
+        let mut pinned_locales = HashMap::new();
+        for (locale, source, digest) in locales {
+            for time_zone in &time_zones {
+                ChromiumProcessProfile::native_locale(
+                    locale.clone(),
+                    time_zone.clone(),
+                    catalog_digest,
+                    digest,
+                    icu_digest,
+                )?;
+            }
+            let source = open_runtime_source(&source, false)?;
+            let pinned = ChromiumRuntime::pin(
+                source.take(128 * 1024 * 1024 + 1),
+                None,
+                "/native-resource",
+                digest,
+            )?;
+            if pinned_locales.insert(locale, pinned).is_some() {
+                return Err(SandboxError::Backend("duplicate native locale".into()));
+            }
+        }
+        let icu = ChromiumRuntime::pin(
+            open_runtime_source(icu_path.as_ref(), false)?.take(128 * 1024 * 1024 + 1),
+            None,
+            "/native-resource",
+            icu_digest,
+        )?;
+        Ok(Self {
+            binary_digest,
+            catalog_digest,
+            icu,
+            locales: pinned_locales,
+            time_zones,
+        })
+    }
+
+    fn select(&self, profile: &ChromiumProcessProfile) -> Result<&ChromiumRuntime, SandboxError> {
+        let ChromiumProcessProfile::NativeLocaleV1 {
+            locale,
+            time_zone,
+            catalog_digest,
+            locale_pak_digest,
+            icu_data_digest,
+            ..
+        } = profile
+        else {
+            return Err(SandboxError::Backend("native profile required".into()));
+        };
+        let pak = self
+            .locales
+            .get(locale)
+            .ok_or_else(|| SandboxError::Backend("unsupported native locale".into()))?;
+        if *catalog_digest != self.catalog_digest
+            || *locale_pak_digest != pak.binary_digest()
+            || *icu_data_digest != self.icu.binary_digest()
+            || !self.time_zones.contains(time_zone)
+        {
+            return Err(SandboxError::Backend(
+                "native profile resource binding mismatch".into(),
+            ));
+        }
+        Ok(pak)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchGateRuntime {
     host_executable: PathBuf,
@@ -320,6 +439,13 @@ impl ReadOnlyMount {
     }
 }
 
+fn is_chromium_parent_mount(mount: &ReadOnlyMount, chromium: &ChromiumRuntime) -> bool {
+    chromium
+        .sandbox_executable
+        .parent()
+        .is_some_and(|parent| parent != Path::new("/") && mount.destination == parent)
+}
+
 #[derive(Clone, Debug)]
 pub struct LinuxSandboxConfig {
     cgroup_root: PathBuf,
@@ -328,10 +454,12 @@ pub struct LinuxSandboxConfig {
     chromium: ChromiumRuntime,
     launch_gate: LaunchGateRuntime,
     read_only_mounts: Vec<ReadOnlyMount>,
+    native_profiles: Option<NativeProcessResources>,
     limits: CgroupLimits,
     seccomp_fd: i32,
     termination_grace: Duration,
     poll_interval: Duration,
+    browser_files: bool,
 }
 
 impl LinuxSandboxConfig {
@@ -392,6 +520,16 @@ impl LinuxSandboxConfig {
             || ["/proc", "/dev", "/sys", "/tmp", "/profile"]
                 .into_iter()
                 .any(|protected| launch_gate.sandbox_executable.starts_with(protected))
+            || [
+                "/proc",
+                "/dev",
+                "/sys",
+                "/tmp",
+                "/profile",
+                SANDBOX_SCRATCH_PATH,
+            ]
+            .into_iter()
+            .any(|protected| chromium.sandbox_executable.starts_with(protected))
             || launch_gate
                 .sandbox_executable
                 .starts_with(&chromium.sandbox_executable)
@@ -432,9 +570,25 @@ impl LinuxSandboxConfig {
             if mount.destination.starts_with(&chromium.sandbox_executable)
                 || chromium.sandbox_executable.starts_with(&mount.destination)
             {
-                return Err(SandboxError::Backend(
-                    "runtime mount overlaps Chromium executable".into(),
-                ));
+                // The exact executable-parent directory supplies baseline ICU/pak/V8 resources.
+                // Its children are projected without the executable basename; the executable
+                // is copied from the sealed capability into the private guest root afterwards.
+                // Broader ancestors, the executable itself, and its descendants stay forbidden.
+                if !is_chromium_parent_mount(mount, &chromium) {
+                    return Err(SandboxError::Backend(
+                        "runtime mount overlaps Chromium executable".into(),
+                    ));
+                }
+                if mount.source.starts_with(&cgroup_root)
+                    || mount.source.starts_with(&sandbox_root)
+                    || ["/tmp", "/var/tmp", "/dev/shm", "/run/user", "/proc", "/sys"]
+                        .iter()
+                        .any(|mutable| mount.source.starts_with(mutable))
+                {
+                    return Err(SandboxError::Backend(
+                        "Chromium parent runtime source is mutable".into(),
+                    ));
+                }
             }
         }
         Ok(Self {
@@ -444,11 +598,69 @@ impl LinuxSandboxConfig {
             chromium,
             launch_gate,
             read_only_mounts,
+            native_profiles: None,
             limits,
             seccomp_fd,
             termination_grace,
             poll_interval,
+            browser_files: false,
         })
+    }
+
+    /// Enables a private, physically bounded browser-file tmpfs and the authenticated directory
+    /// capability exchange before launch approval. A missing/invalid offer fails the launch closed.
+    /// Legacy deny-only configurations omit this capability; download consumers must require it.
+    #[must_use]
+    pub fn with_browser_files(mut self) -> Self {
+        self.browser_files = true;
+        self
+    }
+
+    pub fn with_native_profiles(
+        mut self,
+        resources: NativeProcessResources,
+    ) -> Result<Self, SandboxError> {
+        let parent = self
+            .chromium
+            .sandbox_executable
+            .parent()
+            .filter(|path| *path != Path::new("/"))
+            .ok_or_else(|| {
+                SandboxError::Backend(
+                    "native profile requires a private executable directory".into(),
+                )
+            })?;
+        let locale_directory = parent.join("locales");
+        let icu_path = parent.join("icudtl.dat");
+        if resources.binary_digest != self.chromium.binary_digest()
+            || self
+                .chromium
+                .sandbox_executable
+                .starts_with(&locale_directory)
+            || locale_directory.starts_with(&self.chromium.sandbox_executable)
+            || self.chromium.sandbox_executable == icu_path
+            || ["/proc", "/dev", "/sys", "/tmp", "/profile"]
+                .iter()
+                .any(|path| parent.starts_with(path))
+            || self
+                .launch_gate
+                .sandbox_executable
+                .starts_with(&locale_directory)
+            || self.launch_gate.sandbox_executable.starts_with(&icu_path)
+            || self.read_only_mounts.iter().any(|mount| {
+                !is_chromium_parent_mount(mount, &self.chromium)
+                    && (mount.destination.starts_with(&locale_directory)
+                        || locale_directory.starts_with(&mount.destination)
+                        || mount.destination.starts_with(&icu_path)
+                        || icu_path.starts_with(&mount.destination))
+            })
+        {
+            return Err(SandboxError::Backend(
+                "unsafe native resource mount configuration".into(),
+            ));
+        }
+        self.native_profiles = Some(resources);
+        Ok(self)
     }
 }
 
@@ -472,6 +684,51 @@ pub trait SandboxFilesystem: Send + Sync + 'static {
     fn is_file(&self, path: &Path) -> Result<bool, SandboxError>;
     fn is_writable(&self, path: &Path) -> Result<bool, SandboxError>;
     fn contains_symlink(&self, path: &Path) -> Result<bool, SandboxError>;
+    fn read_directory(&self, path: &Path) -> Result<Vec<PathBuf>, SandboxError> {
+        validate_absolute_path(path)?;
+        let root = open(
+            Path::new("/"),
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(|error| SandboxError::Backend(format!("open runtime directory root: {error}")))?;
+        let directory = openat2(
+            &root,
+            path.strip_prefix("/")
+                .map_err(|_| SandboxError::Backend("unsafe runtime directory".into()))?,
+            OpenHow::new()
+                .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                .resolve(
+                    ResolveFlag::RESOLVE_BENEATH
+                        | ResolveFlag::RESOLVE_NO_SYMLINKS
+                        | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+                ),
+        )
+        .map_err(|error| SandboxError::Backend(format!("pin runtime directory: {error}")))?;
+        let metadata = fstat(&directory).map_err(|error| {
+            SandboxError::Backend(format!("inspect runtime directory: {error}"))
+        })?;
+        if metadata.st_uid != 0 || metadata.st_mode & 0o222 != 0 {
+            return Err(SandboxError::Backend(
+                "runtime directory must be root-owned and immutable".into(),
+            ));
+        }
+        let entries = fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+            .map_err(|error| SandboxError::Backend(format!("read runtime directory: {error}")))?;
+        let mut children = Vec::new();
+        for entry in entries {
+            if children.len() == MAX_CHROMIUM_RUNTIME_CHILDREN {
+                return Err(SandboxError::Backend(
+                    "runtime directory has too many children".into(),
+                ));
+            }
+            let entry = entry.map_err(|error| {
+                SandboxError::Backend(format!("read runtime directory entry: {error}"))
+            })?;
+            children.push(path.join(entry.file_name()));
+        }
+        Ok(children)
+    }
     fn create_directory(&self, path: &Path) -> Result<(), SandboxError>;
     fn write_file(&self, path: &Path, value: &str) -> Result<(), SandboxError>;
     fn read_file(&self, path: &Path) -> Result<String, SandboxError>;
@@ -590,10 +847,28 @@ impl SandboxFilesystem for StdSandboxFilesystem {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "ChildIdentityWire")]
 pub struct ChildIdentity {
     pid: u32,
     start_time_ticks: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildIdentityWire {
+    pid: u32,
+    start_time_ticks: u64,
+}
+
+impl TryFrom<ChildIdentityWire> for ChildIdentity {
+    type Error = &'static str;
+    fn try_from(value: ChildIdentityWire) -> Result<Self, Self::Error> {
+        if value.pid == 0 || value.start_time_ticks == 0 {
+            return Err("process identity requires nonzero PID and start time");
+        }
+        Ok(Self::new(value.pid, value.start_time_ticks))
+    }
 }
 
 impl ChildIdentity {
@@ -611,7 +886,8 @@ impl ChildIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkNamespaceIdentity {
     device: u64,
     inode: u64,
@@ -689,6 +965,21 @@ impl PinnedNetworkNamespace {
     #[must_use]
     pub const fn identity(&self) -> NetworkNamespaceIdentity {
         self.identity
+    }
+
+    pub(crate) fn owning_user_namespace(&self) -> Result<OwnedFd, SandboxError> {
+        // SAFETY: this ioctl returns a newly owned close-on-exec namespace descriptor for the
+        // owner of the still-pinned NET capability. It cannot select a different namespace.
+        let raw =
+            unsafe { nix::libc::ioctl(self.descriptor.as_raw_fd(), nix::libc::NS_GET_USERNS) };
+        if raw < 0 {
+            return Err(SandboxError::Backend(format!(
+                "network namespace owner: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: NS_GET_USERNS transferred exactly one fresh descriptor to this process.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
     fn clone_for_owner(&self) -> Self {
@@ -823,6 +1114,9 @@ pub enum ProcessSignal {
 pub struct ChromiumCdpPipes {
     command_writer: OwnedFd,
     event_reader: OwnedFd,
+    egress_proxy_binding: Option<DedicatedEgressProxyBinding>,
+    scratch: Option<SandboxScratch>,
+    unbound_scratch: Option<OwnedFd>,
 }
 
 impl ChromiumCdpPipes {
@@ -883,7 +1177,54 @@ impl ChromiumCdpPipes {
         Ok(Self {
             command_writer,
             event_reader,
+            egress_proxy_binding: None,
+            scratch: None,
+            unbound_scratch: None,
         })
+    }
+
+    /// Attaches exact ingress metadata once without changing either pipe capability.
+    pub fn with_egress_proxy_binding(
+        mut self,
+        binding: DedicatedEgressProxyBinding,
+    ) -> Result<Self, SandboxError> {
+        binding.validate()?;
+        if self.egress_proxy_binding.is_some() {
+            return Err(SandboxError::Backend(
+                "CDP ingress proxy binding is already attached".into(),
+            ));
+        }
+        if let Some(directory) = self.unbound_scratch.take() {
+            self.scratch = Some(SandboxScratch::from_launch_fd(directory, binding.clone())?);
+        }
+        self.egress_proxy_binding = Some(binding);
+        Ok(self)
+    }
+
+    pub fn with_scratch(mut self, scratch: SandboxScratch) -> Result<Self, SandboxError> {
+        if self.scratch.is_some()
+            || self.unbound_scratch.is_some()
+            || self.egress_proxy_binding.as_ref() != Some(scratch.metadata().binding())
+        {
+            return Err(SandboxError::LaunchFenceMismatch);
+        }
+        self.scratch = Some(scratch);
+        Ok(self)
+    }
+
+    #[must_use]
+    pub const fn scratch(&self) -> Option<&SandboxScratch> {
+        self.scratch.as_ref()
+    }
+
+    #[must_use]
+    pub fn take_scratch(&mut self) -> Option<SandboxScratch> {
+        self.scratch.take()
+    }
+
+    #[must_use]
+    pub const fn egress_proxy_binding(&self) -> Option<&DedicatedEgressProxyBinding> {
+        self.egress_proxy_binding.as_ref()
     }
 
     #[must_use]
@@ -908,8 +1249,11 @@ pub struct SpawnRequest {
     arguments: Vec<OsString>,
     inherited_fds: Vec<i32>,
     child_only_inherited_fds: Vec<i32>,
+    seccomp_fd: i32,
     chromium_executable: fs::File,
+    _native_resource_files: Vec<fs::File>,
     cgroup_procs_path: PathBuf,
+    browser_files: bool,
 }
 
 impl SpawnRequest {
@@ -1025,6 +1369,7 @@ pub trait LinuxProcessBackend: Send + Sync + 'static {
 #[derive(Debug)]
 struct OwnedLinuxChild {
     _monitor: std::process::Child,
+    stderr_drain: Option<std::thread::JoinHandle<()>>,
     bootstrap_pid: Option<u32>,
     bootstrap_pidfd: Option<OwnedFd>,
     cgroup_events: fs::File,
@@ -1036,11 +1381,38 @@ struct OwnedLinuxChild {
     identity: Option<ChildIdentity>,
     sandbox_pidfd: Option<OwnedFd>,
     execution_gate: Option<OwnedFd>,
+    scratch_required: bool,
+    scratch_validated: bool,
+    scratch_sender: Option<ScratchSender>,
     info_reader: Option<tokio::fs::File>,
     info_bytes: Vec<u8>,
     info_eof: bool,
     bootstrap_process_signalled: bool,
     bootstrap_monitor_reaped: bool,
+}
+
+impl OwnedLinuxChild {
+    async fn finish_stderr_drain(&mut self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while self
+            .stderr_drain
+            .as_ref()
+            .is_some_and(|drain| !drain.is_finished())
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(PREPARED_CHILD_EXIT_POLL).await;
+        }
+        if self
+            .stderr_drain
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(drain) = self.stderr_drain.take()
+        {
+            let _ = drain.join();
+        }
+        // A delayed diagnostic reader still owns its pipe and continues draining until EOF.
+        // Dropping a JoinHandle detaches that thread; it never blocks process/cgroup cleanup.
+    }
 }
 
 static EMERGENCY_GATE_QUARANTINE: OnceLock<StdMutex<HashMap<String, Vec<OwnedLinuxChild>>>> =
@@ -1118,17 +1490,147 @@ struct StdLinuxProcessRegistry {
 // fail-closed launch helper and can never release Chromium.
 static STD_LINUX_PROCESS_REGISTRY: OnceLock<StdLinuxProcessRegistry> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
+struct PrivateChildStderr {
+    file: fs::File,
+    retained: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct StdLinuxProcessBackend {
     registry: &'static StdLinuxProcessRegistry,
+    private_stderr: Option<Arc<StdMutex<PrivateChildStderr>>>,
 }
 
 impl Default for StdLinuxProcessBackend {
     fn default() -> Self {
         Self {
             registry: STD_LINUX_PROCESS_REGISTRY.get_or_init(StdLinuxProcessRegistry::default),
+            private_stderr: None,
         }
     }
+}
+
+impl StdLinuxProcessBackend {
+    /// Opt in to bounded private startup diagnostics through an already pinned, exclusively
+    /// created file. Raw stderr never enters RPC receipts or ordinary daemon logs. At most 16KiB
+    /// total is retained for this backend and its clones; all later child output is discarded.
+    pub fn with_private_child_stderr(mut self, file: fs::File) -> Result<Self, SandboxError> {
+        let metadata = fstat(&file).map_err(|_| {
+            SandboxError::Backend("private child stderr metadata unavailable".into())
+        })?;
+        let flags = fcntl(&file, FcntlArg::F_GETFD)
+            .map_err(|_| SandboxError::Backend("private child stderr flags unavailable".into()))?;
+        let access = fcntl(&file, FcntlArg::F_GETFL)
+            .map_err(|_| SandboxError::Backend("private child stderr access unavailable".into()))?;
+        if SFlag::from_bits_truncate(metadata.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+            || metadata.st_mode & 0o7777 != 0o600
+            || metadata.st_uid != nix::unistd::geteuid().as_raw()
+            || metadata.st_nlink != 1
+            || metadata.st_size != 0
+            || !FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC)
+            || access & nix::libc::O_ACCMODE != nix::libc::O_WRONLY
+            || access & nix::libc::O_APPEND != 0
+        {
+            return Err(SandboxError::Backend(
+                "private child stderr sink is not an empty owned mode-0600 write-only file".into(),
+            ));
+        }
+        self.private_stderr = Some(Arc::new(StdMutex::new(PrivateChildStderr {
+            file,
+            retained: 0,
+        })));
+        Ok(self)
+    }
+
+    fn stderr_stdio(&self) -> Result<(Stdio, Option<std::thread::JoinHandle<()>>), SandboxError> {
+        let Some(sink) = self.private_stderr.clone() else {
+            return Ok((Stdio::null(), None));
+        };
+        let (reader, writer) = pipe2(OFlag::O_CLOEXEC)
+            .map_err(|_| SandboxError::Backend("private child stderr pipe unavailable".into()))?;
+        // Start the owner before spawning any child. Even spawn/identity errors close the writer
+        // through Command ownership, while a retained child is continuously drained to EOF.
+        let drain = std::thread::Builder::new()
+            .name("browserd-private-stderr".into())
+            .spawn(move || {
+                let mut reader = fs::File::from(reader);
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let count = match reader.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(count) => count,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    let Ok(mut sink) = sink.lock() else {
+                        continue;
+                    };
+                    let keep =
+                        count.min(PRIVATE_CHILD_STDERR_MAX_BYTES.saturating_sub(sink.retained));
+                    if keep != 0 {
+                        // A sink write error disables retention, but must never stop draining a child.
+                        let result = sink
+                            .file
+                            .write_all_at(&buffer[..keep], sink.retained as u64);
+                        sink.retained = if result.is_ok() {
+                            sink.retained + keep
+                        } else {
+                            PRIVATE_CHILD_STDERR_MAX_BYTES
+                        };
+                    }
+                }
+            })
+            .map_err(|_| SandboxError::Backend("private child stderr drain unavailable".into()))?;
+        Ok((Stdio::from(writer), Some(drain)))
+    }
+}
+
+fn independent_seccomp_reader(raw_descriptor: i32) -> Result<OwnedFd, SandboxError> {
+    // SAFETY: SpawnRequest's caller retains the configured descriptor through spawn; this borrow
+    // only inspects it. Opening its proc capability creates a new open-file description, not dup's
+    // shared offset, while fstat before/after binds it to the same regular filter inode.
+    let original = unsafe { BorrowedFd::borrow_raw(raw_descriptor) };
+    let before = fstat(original)
+        .map_err(|error| SandboxError::Backend(format!("seccomp source metadata: {error}")))?;
+    let instruction_bytes = std::mem::size_of::<nix::libc::sock_filter>() as i64;
+    if SFlag::from_bits_truncate(before.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG
+        || before.st_size <= 0
+        || before.st_size > i64::from(nix::libc::BPF_MAXINSNS) * instruction_bytes
+        || before.st_size % instruction_bytes != 0
+    {
+        return Err(SandboxError::Backend(
+            "seccomp input must be a bounded regular cBPF file".into(),
+        ));
+    }
+    let reader = open(
+        format!("/proc/self/fd/{raw_descriptor}").as_str(),
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| SandboxError::Backend(format!("independent seccomp reader: {error}")))?;
+    let reopened = fstat(&reader)
+        .map_err(|error| SandboxError::Backend(format!("seccomp reader metadata: {error}")))?;
+    let after = fstat(original)
+        .map_err(|error| SandboxError::Backend(format!("seccomp source recheck: {error}")))?;
+    let identity = |metadata: &nix::sys::stat::FileStat| {
+        (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_size,
+            metadata.st_mtime,
+            metadata.st_mtime_nsec,
+            metadata.st_ctime,
+            metadata.st_ctime_nsec,
+        )
+    };
+    if identity(&before) != identity(&reopened) || identity(&before) != identity(&after) {
+        return Err(SandboxError::Backend(
+            "seccomp filter identity changed while reopening".into(),
+        ));
+    }
+    Ok(reader)
 }
 
 fn read_proc_identity(pid: u32) -> Result<Option<(u32, u64)>, SandboxError> {
@@ -1335,6 +1837,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                 ));
             }
         }
+        let seccomp_reader = independent_seccomp_reader(request.seccomp_fd)?;
         let (cdp_command_reader, cdp_command_writer) = pipe2(OFlag::O_CLOEXEC)
             .map_err(|error| SandboxError::Backend(format!("CDP command pipe: {error}")))?;
         let (cdp_event_reader, cdp_event_writer) = pipe2(OFlag::O_CLOEXEC)
@@ -1393,23 +1896,65 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             )
             .map_err(|error| SandboxError::Backend(format!("sandbox cgroup events: {error}")))?,
         );
-        let (gate_read, gate_write) = pipe2(OFlag::O_CLOEXEC)
-            .map_err(|error| SandboxError::Backend(format!("execution gate: {error}")))?;
+        let (gate_read, gate_write) = if request.browser_files {
+            let (child, parent) = socketpair(
+                AddressFamily::Unix,
+                SockType::SeqPacket,
+                None,
+                SockFlag::SOCK_CLOEXEC,
+            )
+            .map_err(|error| SandboxError::Backend(format!("execution gate socket: {error}")))?;
+            configure_scratch_receiver(parent.as_fd()).map_err(|error| {
+                SandboxError::Backend(format!("execution gate credentials: {error}"))
+            })?;
+            (child, parent)
+        } else {
+            pipe2(OFlag::O_CLOEXEC)
+                .map_err(|error| SandboxError::Backend(format!("execution gate: {error}")))?
+        };
         let (info_read, info_write) = pipe2(OFlag::O_CLOEXEC)
             .map_err(|error| SandboxError::Backend(format!("sandbox PID pipe: {error}")))?;
         let mut command = Command::new(request.program());
+        let (stderr, stderr_drain) = self.stderr_stdio()?;
         let cgroup_procs_fd = cgroup_procs.as_raw_fd();
         let cdp_command_reader_fd = cdp_command_reader.as_raw_fd();
         let cdp_event_writer_fd = cdp_event_writer.as_raw_fd();
+        let seccomp_reader_fd = seccomp_reader.as_raw_fd();
+        let seccomp_child_fd = request.seccomp_fd;
         let mut child_only_inherited_fds = request.child_only_inherited_fds.clone();
         child_only_inherited_fds.push(info_write.as_raw_fd());
-        // SAFETY: this callback runs after fork and before exec. It performs only one libc write
-        // through a descriptor opened by the parent, followed by async-signal-safe fcntl/dup2 calls.
+        // SAFETY: this callback runs after fork and before exec. It uses fixed-size stack data and
+        // Linux getrlimit/setrlimit calls, one libc write through a parent-opened descriptor, then
+        // async-signal-safe fcntl/dup2 calls. No resource limit in the supervisor is changed.
         // Writing 0 attaches the calling bootstrap itself, so the supervisor never resolves a
         // reusable numeric PID. The CDP sources were relocated away from targets 3/4 in the parent,
         // preventing either dup2 from clobbering the other source.
         unsafe {
             command.pre_exec(move || {
+                let mut inherited_nofile = nix::libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut inherited_nofile) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Never use bootstrap privileges to raise an inherited hard limit. An environment
+                // unable to supply the fixed launch limit must reject the launch before exec.
+                if inherited_nofile.rlim_max < SANDBOX_NOFILE_LIMIT {
+                    return Err(std::io::Error::from_raw_os_error(nix::libc::EPERM));
+                }
+                for (resource, maximum) in [
+                    (nix::libc::RLIMIT_CORE, 0),
+                    (nix::libc::RLIMIT_NOFILE, SANDBOX_NOFILE_LIMIT),
+                ] {
+                    let limit = nix::libc::rlimit {
+                        rlim_cur: maximum,
+                        rlim_max: maximum,
+                    };
+                    if nix::libc::setrlimit(resource, &limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 let membership = b"0\n";
                 let written = nix::libc::write(
                     cgroup_procs_fd,
@@ -1438,6 +1983,9 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
+                if nix::libc::dup2(seccomp_reader_fd, seccomp_child_fd) != seccomp_child_fd {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if nix::libc::dup2(cdp_command_reader_fd, CHROMIUM_CDP_READ_FD)
                     != CHROMIUM_CDP_READ_FD
                 {
@@ -1458,7 +2006,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             .env_clear()
             .stdin(Stdio::from(fs::File::from(gate_read)))
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(stderr);
         let slot = Arc::new(StdMutex::new(None));
         {
             let mut children = self
@@ -1476,7 +2024,8 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         let monitor = command
             .into_std()
             .spawn()
-            .map_err(|error| SandboxError::Backend(error.to_string()));
+            .map_err(|error| SandboxError::Backend(format!("prepared process spawn: {error}")));
+        drop(seccomp_reader);
         drop(cdp_command_reader);
         drop(cdp_event_writer);
         let monitor = match monitor {
@@ -1498,6 +2047,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         drop(info_write);
         let owned = OwnedLinuxChild {
             _monitor: monitor,
+            stderr_drain,
             bootstrap_pid: Some(bootstrap_pid),
             bootstrap_pidfd,
             cgroup_events,
@@ -1507,11 +2057,17 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             unclaimed_cdp_pipes: Some(ChromiumCdpPipes {
                 command_writer: cdp_command_writer,
                 event_reader: cdp_event_reader,
+                egress_proxy_binding: None,
+                scratch: None,
+                unbound_scratch: None,
             }),
             cdp_pipes_claimed: false,
             identity: None,
             sandbox_pidfd: None,
             execution_gate: Some(gate_write),
+            scratch_required: request.browser_files,
+            scratch_validated: false,
+            scratch_sender: None,
             info_reader: Some(tokio::fs::File::from_std(fs::File::from(info_read))),
             info_bytes: Vec::new(),
             info_eof: false,
@@ -1529,6 +2085,66 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         let mut checked_out = CheckedOutLinuxChild::new(backend_token, slot)?;
         let identity = capture_sandbox_identity(checked_out.child_mut()?).await?;
         let network_namespace = pin_sandbox_network_namespace(checked_out.child_mut()?, identity)?;
+        if request.browser_files {
+            let control = checked_out
+                .child_mut()?
+                .execution_gate
+                .as_ref()
+                .ok_or_else(|| SandboxError::Backend("scratch execution gate missing".into()))?
+                .try_clone()
+                .map_err(|error| {
+                    SandboxError::Backend(format!("scratch execution gate clone: {error}"))
+                })?;
+            fcntl(&control, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(|error| {
+                SandboxError::Backend(format!("scratch gate nonblocking: {error}"))
+            })?;
+            let control = tokio::io::unix::AsyncFd::new(control).map_err(|error| {
+                SandboxError::Backend(format!("scratch gate readiness: {error}"))
+            })?;
+            let (scratch, sender) = tokio::time::timeout(BWRAP_INFO_TIMEOUT, async {
+                loop {
+                    let mut ready = control.readable().await?;
+                    match ready.try_io(|socket| {
+                        receive_scratch_offer_from_child(
+                            socket.get_ref().as_fd(),
+                            identity.pid(),
+                            nix::unistd::geteuid().as_raw(),
+                        )
+                    }) {
+                        Ok(result) => return result,
+                        Err(_) => continue,
+                    }
+                }
+            })
+            .await
+            .map_err(|_| SandboxError::Backend("scratch capability offer timed out".into()))?
+            .map_err(|error| SandboxError::Backend(format!("scratch capability offer: {error}")))?;
+            validate_scratch_directory(&scratch)?;
+            // Recheck the held child after receiving the capability, before granting authority to
+            // the directory. SCM_CREDENTIALS is checked in the receiver's PID namespace.
+            let child = checked_out.child_mut()?;
+            let current = read_proc_identity(identity.pid())?;
+            if current
+                != child
+                    .bootstrap_pid
+                    .map(|pid| (pid, identity.start_time_ticks))
+                || child
+                    .sandbox_pidfd
+                    .as_ref()
+                    .is_none_or(|pidfd| pidfd_has_exited(pidfd).unwrap_or(true))
+            {
+                return Err(SandboxError::Backend(
+                    "scratch sender exited or changed identity".into(),
+                ));
+            }
+            child
+                .unclaimed_cdp_pipes
+                .as_mut()
+                .ok_or_else(|| SandboxError::Backend("scratch CDP owner missing".into()))?
+                .unbound_scratch = Some(scratch);
+            child.scratch_validated = true;
+            child.scratch_sender = Some(sender);
+        }
         Ok(PreparedLinuxChild::new(identity, network_namespace))
     }
 
@@ -1638,6 +2254,17 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         let Some(gate) = child.execution_gate.as_ref() else {
             return Ok(());
         };
+        if child.scratch_required
+            && (!child.scratch_validated
+                || child
+                    .scratch_sender
+                    .as_ref()
+                    .is_none_or(|sender| !sender.is_held().unwrap_or(false)))
+        {
+            return Err(SandboxError::Backend(
+                "scratch capability or held sender was not valid before release".into(),
+            ));
+        }
         let written = write_fd(gate, APPROVAL_FRAME)
             .map_err(|error| SandboxError::Backend(format!("execution gate release: {error}")))?;
         if written != APPROVAL_FRAME.len() {
@@ -1646,6 +2273,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             ));
         }
         child.execution_gate = None;
+        child.scratch_sender = None;
         Ok(())
     }
 
@@ -1806,6 +2434,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
             )));
         }
         checked_out.child_mut()?.execution_gate.take();
+        checked_out.child_mut()?.finish_stderr_drain().await;
         let mut children = self
             .registry
             .children
@@ -1875,6 +2504,7 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
         }
         reap_pidfd(bootstrap_pidfd, "bootstrap process")?;
         checked_out.child_mut()?.bootstrap_monitor_reaped = true;
+        checked_out.child_mut()?.finish_stderr_drain().await;
         let mut children = self
             .registry
             .children
@@ -1978,6 +2608,11 @@ impl LinuxProcessBackend for StdLinuxProcessBackend {
 
 #[async_trait]
 pub trait EgressRouteBackend: Send + Sync + 'static {
+    async fn retire_shard(&self, _fence: &ShardFence) -> Result<(), SandboxError> {
+        Err(SandboxError::Backend(
+            "whole-shard retirement unsupported".into(),
+        ))
+    }
     /// Reserves one exact generation. `cancel_reservation` is a permanent tombstone: it must win
     /// over every concurrent or late `prepare` and `attach` completion for that generation.
     async fn prepare(&self, reservation: &ShardEgressReservation) -> Result<(), SandboxError>;
@@ -2050,6 +2685,8 @@ impl ShardEgressFence {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardEgressReservation {
+    shared: bool,
+    initial_ttl: Option<Duration>,
     fence: ShardEgressFence,
     generation: LeaseId,
     tenant_id: Option<TenantId>,
@@ -2060,6 +2697,8 @@ impl ShardEgressReservation {
     #[must_use]
     pub fn new(fence: ShardEgressFence) -> Self {
         Self {
+            shared: false,
+            initial_ttl: None,
             fence,
             generation: LeaseId::new(),
             tenant_id: None,
@@ -2070,11 +2709,25 @@ impl ShardEgressReservation {
     #[must_use]
     pub fn from_launch_spec(spec: &LaunchSpec) -> Self {
         Self {
+            shared: spec.context_route_policy().is_some(),
+            initial_ttl: None,
             fence: ShardEgressFence::new(spec.shard_id().clone(), spec.worker_epoch()),
             generation: LeaseId::new(),
             tenant_id: Some(spec.tenant_id().clone()),
             dedicated_egress: Some(spec.dedicated_egress().clone()),
         }
+    }
+
+    pub fn initial_lease_ttl(&self) -> Option<Duration> {
+        self.initial_ttl.or_else(|| {
+            self.dedicated_egress
+                .as_ref()
+                .map(DedicatedEgressSpec::initial_lease_ttl)
+        })
+    }
+
+    pub const fn is_shared(&self) -> bool {
+        self.shared
     }
 
     #[must_use]
@@ -2115,6 +2768,7 @@ impl std::hash::Hash for ShardEgressReservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShardIngressReceipt {
     attachment_generation: LeaseId,
+    proxy_address: Option<SocketAddr>,
 }
 
 impl ShardIngressReceipt {
@@ -2122,7 +2776,22 @@ impl ShardIngressReceipt {
     pub fn new() -> Self {
         Self {
             attachment_generation: LeaseId::new(),
+            proxy_address: None,
         }
+    }
+
+    /// Records the internally selected dedicated listener's fixed loopback address.
+    pub fn with_proxy_address(proxy_address: SocketAddr) -> Result<Self, SandboxError> {
+        validate_dedicated_proxy_address(proxy_address)?;
+        Ok(Self {
+            attachment_generation: LeaseId::new(),
+            proxy_address: Some(proxy_address),
+        })
+    }
+
+    #[must_use]
+    pub const fn proxy_address(&self) -> Option<SocketAddr> {
+        self.proxy_address
     }
 
     #[must_use]
@@ -2182,7 +2851,160 @@ impl ShardIngressLease {
     }
 }
 
+fn validate_dedicated_proxy_address(address: SocketAddr) -> Result<(), SandboxError> {
+    if !matches!(address, SocketAddr::V4(address) if *address.ip() == Ipv4Addr::LOCALHOST && address.port() != 0)
+    {
+        return Err(SandboxError::Backend(
+            "dedicated egress proxy must be an internally selected nonzero 127.0.0.1 endpoint"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Immutable routing metadata for one exact namespace-attached dedicated egress lease.
+///
+/// This identifies the installed route; it does not make an inactive lease active. Production
+/// pipe claims must verify the retained lease before attaching or exporting this metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "DedicatedEgressProxyBindingWire")]
+pub struct DedicatedEgressProxyBinding {
+    tenant_id: TenantId,
+    egress_fence: EgressFence,
+    policy_binding: EgressPolicyBinding,
+    namespace_identity: NetworkNamespaceIdentity,
+    reservation_generation: LeaseId,
+    attachment_generation: LeaseId,
+    proxy_address: SocketAddr,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DedicatedEgressProxyBindingWire {
+    tenant_id: TenantId,
+    egress_fence: EgressFence,
+    policy_binding: EgressPolicyBinding,
+    namespace_identity: NetworkNamespaceIdentity,
+    reservation_generation: LeaseId,
+    attachment_generation: LeaseId,
+    proxy_address: SocketAddr,
+}
+
+impl TryFrom<DedicatedEgressProxyBindingWire> for DedicatedEgressProxyBinding {
+    type Error = SandboxError;
+
+    fn try_from(wire: DedicatedEgressProxyBindingWire) -> Result<Self, Self::Error> {
+        let binding = Self {
+            tenant_id: wire.tenant_id,
+            egress_fence: wire.egress_fence,
+            policy_binding: wire.policy_binding,
+            namespace_identity: wire.namespace_identity,
+            reservation_generation: wire.reservation_generation,
+            attachment_generation: wire.attachment_generation,
+            proxy_address: wire.proxy_address,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+}
+
+impl DedicatedEgressProxyBinding {
+    pub fn from_lease(lease: &ShardIngressLease) -> Result<Self, SandboxError> {
+        let reservation = lease.reservation();
+        let dedicated = reservation.dedicated_egress().ok_or_else(|| {
+            SandboxError::Backend("ingress proxy is missing its immutable launch binding".into())
+        })?;
+        dedicated.validate()?;
+        let fence = dedicated.egress_fence();
+        if reservation.fence().shard_id() != fence.shard().shard_id()
+            || reservation.fence().worker_epoch() != fence.shard().owner().worker_epoch().get()
+        {
+            return Err(SandboxError::LaunchFenceMismatch);
+        }
+        let binding = Self {
+            tenant_id: reservation.tenant_id().cloned().ok_or_else(|| {
+                SandboxError::Backend("ingress proxy is missing its tenant binding".into())
+            })?,
+            egress_fence: fence.clone(),
+            policy_binding: dedicated.policy_binding().clone(),
+            namespace_identity: lease.namespace_identity(),
+            reservation_generation: reservation.generation().clone(),
+            attachment_generation: lease.receipt().attachment_generation().clone(),
+            proxy_address: lease.receipt().proxy_address().ok_or_else(|| {
+                SandboxError::Backend("active ingress receipt omitted its proxy address".into())
+            })?,
+        };
+        binding.validate()?;
+        Ok(binding)
+    }
+
+    fn validate(&self) -> Result<(), SandboxError> {
+        validate_dedicated_proxy_address(self.proxy_address)?;
+        self.policy_binding.validate()?;
+        if self.namespace_identity.device() == 0
+            || self.namespace_identity.inode() == 0
+            || self.reservation_generation.as_bytes() == &[0; 16]
+            || self.attachment_generation.as_bytes() == &[0; 16]
+        {
+            return Err(SandboxError::Backend(
+                "ingress proxy namespace and attachment generations must be nonzero".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn matches_launch(&self, spec: &LaunchSpec) -> bool {
+        self.validate().is_ok()
+            && spec.dedicated_egress().validate().is_ok()
+            && self.tenant_id == *spec.tenant_id()
+            && self.egress_fence == *spec.dedicated_egress().egress_fence()
+            && self.policy_binding == *spec.dedicated_egress().policy_binding()
+            && self.egress_fence.shard().shard_id() == spec.shard_id()
+            && self.egress_fence.shard().owner().worker_id() == spec.worker_id()
+            && self.egress_fence.shard().owner().worker_epoch().get() == spec.worker_epoch()
+            && self.egress_fence.shard().launch_generation() == spec.launch_generation()
+    }
+
+    #[must_use]
+    pub const fn egress_fence(&self) -> &EgressFence {
+        &self.egress_fence
+    }
+
+    #[must_use]
+    pub const fn proxy_address(&self) -> SocketAddr {
+        self.proxy_address
+    }
+
+    #[must_use]
+    pub const fn tenant_id(&self) -> &TenantId {
+        &self.tenant_id
+    }
+
+    #[must_use]
+    pub const fn policy_binding(&self) -> &EgressPolicyBinding {
+        &self.policy_binding
+    }
+
+    #[must_use]
+    pub const fn namespace_identity(&self) -> NetworkNamespaceIdentity {
+        self.namespace_identity
+    }
+
+    #[must_use]
+    pub const fn reservation_generation(&self) -> &LeaseId {
+        &self.reservation_generation
+    }
+
+    #[must_use]
+    pub const fn attachment_generation(&self) -> &LeaseId {
+        &self.attachment_generation
+    }
+}
+
 struct LinuxRuntime {
+    launch_spec: LaunchSpec,
+    context_routes: HashMap<EgressFence, ContextRuntimeRoute>,
     identity: ChildIdentity,
     backend_token: String,
     cgroup_path: PathBuf,
@@ -2198,6 +3020,7 @@ struct LinuxRuntime {
     namespaces_cleaned: bool,
     cleanup_operation: Arc<AsyncMutex<()>>,
     process_operation: Arc<AsyncMutex<()>>,
+    revoke_intent: watch::Sender<Option<Result<(), SandboxError>>>,
 }
 
 struct PreparedCleanupAttempt {
@@ -2239,6 +3062,8 @@ impl Drop for PreparedCleanupAttempt {
 impl Clone for LinuxRuntime {
     fn clone(&self) -> Self {
         Self {
+            launch_spec: self.launch_spec.clone(),
+            context_routes: self.context_routes.clone(),
             identity: self.identity,
             backend_token: self.backend_token.clone(),
             cgroup_path: self.cgroup_path.clone(),
@@ -2257,6 +3082,7 @@ impl Clone for LinuxRuntime {
             namespaces_cleaned: self.namespaces_cleaned,
             cleanup_operation: Arc::clone(&self.cleanup_operation),
             process_operation: Arc::clone(&self.process_operation),
+            revoke_intent: self.revoke_intent.clone(),
         }
     }
 }
@@ -2390,6 +3216,7 @@ where
         backend_token: &str,
         cgroup_path: &Path,
         runtime_path: &Path,
+        reservation: &ShardEgressReservation,
     ) -> Result<(), SandboxError> {
         let Some(journal) = self.prepared_journal.as_ref().map(Arc::clone) else {
             return Ok(());
@@ -2402,11 +3229,20 @@ where
         let backend_token = backend_token.to_owned();
         let cgroup_path = cgroup_path.to_path_buf();
         let runtime_path = runtime_path.to_path_buf();
+        let spec = spec.clone();
+        let generation = reservation.generation().clone();
         tokio::task::spawn_blocking(move || {
             let locators =
                 PreparedShardRecoveryLocators::new(backend_token, cgroup_path, runtime_path)?
                     .with_egress_binding(daemon_epoch, egress_fence)?;
-            journal.reserve(fence, locators).map(|_| ())
+            journal.reserve(fence.clone(), locators)?;
+            if let Some(policy) = spec.context_route_policy() {
+                journal.configure_context_routes(&fence, policy.clone())?;
+                let request = ContextEgressRequest::initial(&spec)
+                    .map_err(|_| crate::journal::PreparedShardJournalError::InvalidHistory)?;
+                journal.reserve_context_route(request, generation, daemon_epoch, false)?;
+            }
+            Ok::<(), crate::journal::PreparedShardJournalError>(())
         })
         .await
         .map_err(|error| SandboxError::Backend(format!("prepared journal task failed: {error}")))?
@@ -2528,19 +3364,6 @@ where
                         ));
                     }
                     Err(crate::journal::PreparedShardJournalError::StaleSequence { .. }) => {}
-                    Err(crate::journal::PreparedShardJournalError::CleanupStageOutOfOrder)
-                        if stage == PreparedShardCleanupStage::AbortGate
-                            && record
-                                .cleanup_progress(PreparedShardCleanupStage::RevokeEgress)?
-                                .attempts()
-                                == 0 =>
-                    {
-                        // Normal cleanup starts the egress and process branches together. The
-                        // abort branch may read the record just before the revoke branch commits
-                        // its intent, so retry that exact transient without allowing an abort to
-                        // bypass the durable revoke intent.
-                        std::thread::yield_now();
-                    }
                     Err(error) => return Err(error),
                 }
             }
@@ -2637,6 +3460,9 @@ where
                     mount.source.display()
                 )));
             }
+            if is_chromium_parent_mount(mount, &self.config.chromium) {
+                self.chromium_parent_runtime_children(mount)?;
+            }
         }
         let controllers = self
             .filesystem
@@ -2651,6 +3477,59 @@ where
             ));
         }
         Ok(())
+    }
+
+    fn chromium_parent_runtime_children(
+        &self,
+        mount: &ReadOnlyMount,
+    ) -> Result<Vec<ReadOnlyMount>, SandboxError> {
+        if !is_chromium_parent_mount(mount, &self.config.chromium)
+            || !self.filesystem.is_directory(&mount.source)?
+            || self.filesystem.is_writable(&mount.source)?
+            || self.filesystem.contains_symlink(&mount.source)?
+        {
+            return Err(SandboxError::Backend(
+                "Chromium parent runtime must be an immutable directory".into(),
+            ));
+        }
+        let executable_name = self
+            .config
+            .chromium
+            .sandbox_executable
+            .file_name()
+            .ok_or_else(|| SandboxError::Backend("missing Chromium executable basename".into()))?;
+        let mut children = self.filesystem.read_directory(&mount.source)?;
+        if children.len() > MAX_CHROMIUM_RUNTIME_CHILDREN {
+            return Err(SandboxError::Backend(
+                "runtime directory has too many children".into(),
+            ));
+        }
+        children.sort();
+        let mut projected = Vec::new();
+        for child in children {
+            validate_absolute_path(&child)?;
+            if child.parent() != Some(mount.source.as_path()) {
+                return Err(SandboxError::Backend(
+                    "runtime directory entry escaped its parent".into(),
+                ));
+            }
+            let name = child.file_name().ok_or_else(|| {
+                SandboxError::Backend("runtime directory entry has no basename".into())
+            })?;
+            if name == executable_name {
+                // Never use the mutable host executable alias, even if it has the same name.
+                continue;
+            }
+            if self.filesystem.contains_symlink(&child)?
+                || (!self.filesystem.is_file(&child)? && !self.filesystem.is_directory(&child)?)
+            {
+                return Err(SandboxError::Backend(
+                    "unsafe Chromium parent runtime entry".into(),
+                ));
+            }
+            projected.push(ReadOnlyMount::new(&child, mount.destination.join(name)));
+        }
+        Ok(projected)
     }
 
     fn provision_snapshot(
@@ -3057,15 +3936,29 @@ where
     }
 
     fn validate_chromium_binding(&self, spec: &LaunchSpec) -> Result<(), SandboxError> {
-        if spec.chromium_binary_digest() == self.config.chromium.binary_digest() {
-            Ok(())
-        } else {
-            Err(SandboxError::ChromiumBinaryDigestMismatch)
+        spec.validate()?;
+        if spec.chromium_binary_digest() != self.config.chromium.binary_digest() {
+            return Err(SandboxError::ChromiumBinaryDigestMismatch);
         }
+        if !matches!(spec.process_profile(), ChromiumProcessProfile::BaselineV1) {
+            self.config
+                .native_profiles
+                .as_ref()
+                .ok_or_else(|| {
+                    SandboxError::Backend("native profile catalog is unavailable".into())
+                })?
+                .select(spec.process_profile())?;
+        }
+        Ok(())
     }
 
     pub fn planned_spawn_request(&self, spec: &LaunchSpec) -> Result<SpawnRequest, SandboxError> {
         self.validate_chromium_binding(spec)?;
+        if spec.context_route_policy().is_some() && self.prepared_journal.is_none() {
+            return Err(SandboxError::Backend(
+                "shared routes require durable journal".into(),
+            ));
+        }
         let instance_directory = Self::instance_directory_name(spec);
         let runtime_path = self.config.sandbox_root.join(&instance_directory);
         let profile_path = runtime_path.join("profile");
@@ -3083,6 +3976,14 @@ where
             "--unshare-ipc",
             "--unshare-uts",
             "--clearenv",
+            // Chromium converts DOM file paths through the process multibyte encoding.
+            // Keep it UTF-8 even when the requested language has no installed POSIX locale.
+            "--setenv",
+            "LANG",
+            "C.UTF-8",
+            "--setenv",
+            "LC_ALL",
+            "C.UTF-8",
             "--cap-drop",
             "ALL",
             "--proc",
@@ -3093,12 +3994,6 @@ where
             "/tmp",
             "--tmpfs",
             "/dev/shm",
-            "--rlimit",
-            "core",
-            "0",
-            "--rlimit",
-            "nofile",
-            "65536",
             "--bind",
         ]
         .into_iter()
@@ -3106,10 +4001,57 @@ where
         .collect::<Vec<_>>();
         arguments.push(profile_path.into_os_string());
         arguments.push(OsString::from("/profile"));
+        if self.config.browser_files {
+            arguments.extend([
+                OsString::from("--perms"),
+                OsString::from("0700"),
+                OsString::from("--size"),
+                OsString::from(SANDBOX_SCRATCH_MAX_BYTES.to_string()),
+                OsString::from("--tmpfs"),
+                OsString::from(SANDBOX_SCRATCH_PATH),
+            ]);
+        }
+        // A parent directory bind would prevent creating the named guest executable. Project
+        // only its immediate children, excluding the executable alias. The copied executable
+        // keeps a valid /proc/self/exe pathname for Chromium's native zygote self-reexec.
+        for mount in &self.config.read_only_mounts {
+            if is_chromium_parent_mount(mount, &self.config.chromium) {
+                let children = self.chromium_parent_runtime_children(mount)?;
+                arguments.extend([
+                    OsString::from("--dir"),
+                    mount.destination.clone().into_os_string(),
+                ]);
+                for child in children {
+                    arguments.extend([
+                        OsString::from("--ro-bind"),
+                        child.source.into_os_string(),
+                        child.destination.into_os_string(),
+                    ]);
+                }
+            } else {
+                arguments.extend([
+                    OsString::from("--ro-bind"),
+                    mount.source.clone().into_os_string(),
+                    mount.destination.clone().into_os_string(),
+                ]);
+            }
+        }
+        arguments.extend([
+            OsString::from("--dir"),
+            self.config
+                .chromium
+                .sandbox_executable
+                .parent()
+                .ok_or_else(|| {
+                    SandboxError::Backend("missing Chromium executable directory".into())
+                })?
+                .as_os_str()
+                .to_owned(),
+        ]);
         arguments.extend([
             OsString::from("--perms"),
             OsString::from("0555"),
-            OsString::from("--ro-bind-data"),
+            OsString::from("--file"),
             OsString::from(chromium_executable_fd.to_string()),
             self.config
                 .chromium
@@ -3130,13 +4072,57 @@ where
                 .clone()
                 .into_os_string(),
         ]);
-        for mount in &self.config.read_only_mounts {
+        let mut native_resource_files = Vec::new();
+        if let ChromiumProcessProfile::NativeLocaleV1 {
+            locale, time_zone, ..
+        } = spec.process_profile()
+        {
+            let resources = self.config.native_profiles.as_ref().ok_or_else(|| {
+                SandboxError::Backend("native profile catalog is unavailable".into())
+            })?;
+            let pak = resources.select(spec.process_profile())?;
+            let parent = self
+                .config
+                .chromium
+                .sandbox_executable
+                .parent()
+                .ok_or_else(|| {
+                    SandboxError::Backend("missing Chromium resource directory".into())
+                })?;
+            let locale_directory = parent.join("locales");
             arguments.extend([
-                OsString::from("--ro-bind"),
-                mount.source.clone().into_os_string(),
-                mount.destination.clone().into_os_string(),
+                OsString::from("--tmpfs"),
+                locale_directory.clone().into_os_string(),
             ]);
+            for (runtime, destination) in [
+                (pak, locale_directory.join(format!("{locale}.pak"))),
+                (&resources.icu, parent.join("icudtl.dat")),
+            ] {
+                let file = runtime.launch_executable(self.config.seccomp_fd)?;
+                arguments.extend([
+                    OsString::from("--perms"),
+                    OsString::from("0444"),
+                    OsString::from("--ro-bind-data"),
+                    OsString::from(file.as_raw_fd().to_string()),
+                    destination.into_os_string(),
+                ]);
+                native_resource_files.push(file);
+            }
+            arguments.extend([
+                OsString::from("--remount-ro"),
+                locale_directory.into_os_string(),
+            ]);
+            for (name, value) in [("LANGUAGE", locale.as_str()), ("TZ", time_zone.as_str())] {
+                arguments.extend([
+                    OsString::from("--setenv"),
+                    OsString::from(name),
+                    OsString::from(value),
+                ]);
+            }
         }
+        // Nonrecursive: the named executable and its parent remain immutable, while explicit
+        // nested tmpfs/profile/scratch mounts retain their required write access.
+        arguments.extend([OsString::from("--remount-ro"), OsString::from("/")]);
         arguments.extend([
             OsString::from("--seccomp"),
             OsString::from(self.config.seccomp_fd.to_string()),
@@ -3146,6 +4132,11 @@ where
                 .sandbox_executable
                 .clone()
                 .into_os_string(),
+        ]);
+        if self.config.browser_files {
+            arguments.push(OsString::from("--export-scratch"));
+        }
+        arguments.extend([
             OsString::from("--"),
             self.config
                 .chromium
@@ -3158,12 +4149,28 @@ where
             OsString::from("--user-data-dir=/profile"),
             OsString::from("--disable-features=BackForwardCache"),
         ]);
+        if let ChromiumProcessProfile::NativeLocaleV1 { locale, .. } = spec.process_profile() {
+            arguments.extend([
+                OsString::from(format!("--lang={locale}")),
+                OsString::from(format!("--accept-lang={locale}")),
+            ]);
+            if let Some(user_agent) = spec.process_profile().user_agent() {
+                arguments.push(OsString::from(format!("--user-agent={user_agent}")));
+            }
+        }
+        let mut child_only_inherited_fds = vec![chromium_executable_fd];
+        child_only_inherited_fds.extend(native_resource_files.iter().map(AsRawFd::as_raw_fd));
+        let mut inherited_fds = vec![self.config.seccomp_fd];
+        inherited_fds.extend(&child_only_inherited_fds);
         Ok(SpawnRequest {
+            browser_files: self.config.browser_files,
             program: self.config.bwrap_executable.clone(),
             arguments,
-            inherited_fds: vec![self.config.seccomp_fd, chromium_executable_fd],
-            child_only_inherited_fds: vec![chromium_executable_fd],
+            inherited_fds,
+            child_only_inherited_fds,
+            seccomp_fd: self.config.seccomp_fd,
             chromium_executable,
+            _native_resource_files: native_resource_files,
             cgroup_procs_path: self
                 .config
                 .cgroup_root
@@ -3295,6 +4302,7 @@ where
 
     async fn provision_gated(&self, spec: &LaunchSpec) -> Result<SandboxHandle, SandboxError> {
         self.validate_chromium_binding(spec)?;
+        let context_started = tokio::time::Instant::now();
         let instance_directory = Self::instance_directory_name(spec);
         let cgroup_path = self.config.cgroup_root.join(&instance_directory);
         let runtime_path = self.config.sandbox_root.join(instance_directory);
@@ -3380,7 +4388,13 @@ where
             };
         }
         let preflight = self
-            .reserve_prepared_record(spec, &backend_token, &cgroup_path, &runtime_path)
+            .reserve_prepared_record(
+                spec,
+                &backend_token,
+                &cgroup_path,
+                &runtime_path,
+                &egress_reservation,
+            )
             .await
             .and_then(|()| self.validate_host_paths());
         if let Err(cause) = preflight {
@@ -3585,6 +4599,27 @@ where
                 ));
             }
             self.complete_prepared_effect(ingress_effect).await?;
+            let mut context_routes = HashMap::new();
+            if spec.context_route_policy().is_some() {
+                let request = ContextEgressRequest::initial(spec)?;
+                self.context_journal_phase(
+                    &request,
+                    ContextRoutePhase::Active,
+                    Some(DedicatedEgressProxyBinding::from_lease(&ingress_lease)?),
+                )
+                .await?;
+                context_routes.insert(
+                    request.egress().egress_fence().clone(),
+                    ContextRuntimeRoute {
+                        request,
+                        reservation: ingress_lease.reservation().clone(),
+                        lease: Some(ingress_lease.clone()),
+                        valid_until: context_started + spec.dedicated_egress().initial_lease_ttl(),
+                        phase: ContextRoutePhase::Active,
+                    },
+                );
+            }
+
             let mut provisions = self
                 .provisioning
                 .lock()
@@ -3607,6 +4642,8 @@ where
             runtimes.insert(
                 spec.shard_id().clone(),
                 LinuxRuntime {
+                    launch_spec: spec.clone(),
+                    context_routes,
                     identity,
                     backend_token: backend_token.clone(),
                     cgroup_path: cgroup_path.clone(),
@@ -3622,6 +4659,7 @@ where
                     namespaces_cleaned: false,
                     cleanup_operation: Arc::new(AsyncMutex::new(())),
                     process_operation: Arc::new(AsyncMutex::new(())),
+                    revoke_intent: watch::channel(None).0,
                 },
             );
             provisions.remove(spec.shard_id());
@@ -3789,9 +4827,13 @@ where
         &self,
         handle: &SandboxHandle,
     ) -> Result<ChromiumCdpPipes, SandboxError> {
+        // Match namespace cleanup's lock order so route revocation cannot interleave with the
+        // active proof and the one-shot process capability claim.
+        let cleanup_operation = self.runtime_cleanup_operation(handle)?;
+        let _cleanup_operation_guard = cleanup_operation.lock().await;
         let operation = self.runtime_process_operation(handle)?;
         let _operation_guard = operation.lock().await;
-        let (backend_token, identity) = {
+        let (backend_token, identity, network_namespace, ingress_lease) = {
             let runtimes = self
                 .runtimes
                 .lock()
@@ -3800,9 +4842,102 @@ where
                 .get(handle.shard_id())
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(runtime, handle)?;
-            (runtime.backend_token.clone(), runtime.identity)
+            if runtime.egress_revoked
+                || runtime.egress_released
+                || runtime.process_released
+                || runtime.namespaces_cleaned
+                || runtime.runtime_removed
+                || runtime.cgroup_removed
+            {
+                return Err(SandboxError::ShardNotFound);
+            }
+            (
+                runtime.backend_token.clone(),
+                runtime.identity,
+                runtime
+                    ._network_namespace
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SandboxError::Backend("runtime network namespace is closed".into())
+                    })?
+                    .clone_for_owner(),
+                runtime.ingress_lease.clone(),
+            )
         };
-        self.process.claim_cdp_pipes(&backend_token, identity).await
+        let binding = DedicatedEgressProxyBinding::from_lease(&ingress_lease)?;
+        if network_namespace.identity() != ingress_lease.namespace_identity()
+            || !self
+                .process
+                .identity_matches(&backend_token, identity)
+                .await?
+            || !self
+                .process
+                .network_namespace_matches(&backend_token, identity, &network_namespace)
+                .await?
+            || !self.egress.is_active(&ingress_lease).await?
+        {
+            return Err(SandboxError::Backend(
+                "sandbox containment changed before CDP capability claim".into(),
+            ));
+        }
+        {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            if runtime.backend_token != backend_token
+                || runtime.identity != identity
+                || runtime.ingress_lease != ingress_lease
+                || runtime
+                    ._network_namespace
+                    .as_ref()
+                    .is_none_or(|namespace| namespace.identity() != network_namespace.identity())
+                || runtime.egress_revoked
+                || runtime.egress_released
+                || runtime.process_released
+                || runtime.namespaces_cleaned
+                || runtime.runtime_removed
+                || runtime.cgroup_removed
+            {
+                return Err(SandboxError::ShardNotFound);
+            }
+        }
+        self.process
+            .claim_cdp_pipes(&backend_token, identity)
+            .await?
+            .with_egress_proxy_binding(binding)
+    }
+
+    async fn attach_context_egress(
+        &self,
+        handle: &SandboxHandle,
+        request: &ContextEgressRequest,
+        sandboxd_epoch: u64,
+        max_ttl: Duration,
+    ) -> Result<ContextEgressBinding, SandboxError> {
+        self.attach_context_route(handle, request, sandboxd_epoch, max_ttl)
+            .await
+    }
+    async fn release_context_egress(
+        &self,
+        handle: &SandboxHandle,
+        request: &ContextEgressRequest,
+        sandboxd_epoch: u64,
+    ) -> Result<ContextEgressReleaseReceipt, SandboxError> {
+        self.release_context_route(handle, request, sandboxd_epoch)
+            .await
+    }
+    async fn renew_context_egress(
+        &self,
+        handle: &SandboxHandle,
+        binding: &ContextEgressBinding,
+        ttl: Duration,
+    ) -> Result<(), SandboxError> {
+        self.renew_context_route(handle, binding, ttl).await
     }
 
     async fn renew_egress(
@@ -3815,7 +4950,7 @@ where
         }
         let operation = self.runtime_cleanup_operation(handle)?;
         let _operation_guard = operation.lock().await;
-        let lease = {
+        let (lease, shared_routes) = {
             let runtimes = self
                 .runtimes
                 .lock()
@@ -3827,9 +4962,38 @@ where
             if runtime.egress_revoked || runtime.egress_released || runtime.namespaces_cleaned {
                 return Err(SandboxError::ShardNotFound);
             }
-            runtime.ingress_lease.clone()
+            (
+                runtime.ingress_lease.clone(),
+                runtime
+                    .launch_spec
+                    .context_route_policy()
+                    .map(|_| runtime.context_routes.values().cloned().collect::<Vec<_>>()),
+            )
         };
-        self.egress.renew(&lease, lease_ttl).await
+        if let Some(routes) = shared_routes {
+            let deadline = tokio::time::Instant::now() + lease_ttl;
+            for mut row in routes {
+                if row.phase == ContextRoutePhase::Released {
+                    continue;
+                }
+                if row.phase != ContextRoutePhase::Active
+                    || row.valid_until <= tokio::time::Instant::now()
+                {
+                    return Err(SandboxError::InvalidEgressLease);
+                }
+                self.egress
+                    .renew(
+                        row.lease.as_ref().ok_or(SandboxError::ShardNotFound)?,
+                        lease_ttl,
+                    )
+                    .await?;
+                row.valid_until = deadline;
+                self.save_context_runtime(handle, row)?;
+            }
+            Ok(())
+        } else {
+            self.egress.renew(&lease, lease_ttl).await
+        }
     }
 
     async fn revoke_egress(
@@ -3839,7 +5003,7 @@ where
     ) -> Result<(), SandboxError> {
         let operation = self.runtime_cleanup_operation(handle)?;
         let _operation_guard = operation.lock().await;
-        let (lease, already_revoked, shard_fence) = {
+        let (shard_fence, revoke_intent) = {
             let state = self
                 .runtimes
                 .lock()
@@ -3849,14 +5013,73 @@ where
                 .ok_or(SandboxError::ShardNotFound)?;
             Self::validate_handle(runtime, handle)?;
             (
-                runtime.ingress_lease.clone(),
-                runtime.egress_revoked,
                 Self::runtime_shard_fence(runtime)?,
+                runtime.revoke_intent.clone(),
             )
         };
+        // Publish only the real durable intent result. The process branch must not depend on
+        // scheduler luck or wait for any context-release, retirement, or revoke network effect.
+        let retrying_failed_intent = revoke_intent.borrow().as_ref().is_some_and(Result::is_err);
+        if retrying_failed_intent {
+            revoke_intent.send_replace(None);
+        }
         let revoke_permit = self
             .begin_prepared_cleanup_stage(&shard_fence, PreparedShardCleanupStage::RevokeEgress)
-            .await?;
+            .await;
+        revoke_intent.send_replace(Some(
+            revoke_permit.as_ref().map(|_| ()).map_err(Clone::clone),
+        ));
+        let revoke_permit = revoke_permit?;
+        let context_requests = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            runtime
+                .context_routes
+                .values()
+                .map(|row| row.request.clone())
+                .collect::<Vec<_>>()
+        };
+        for request in context_requests {
+            self.release_context_route_locked(handle, &request).await?;
+        }
+        let shared_fence = {
+            let runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = runtimes
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            runtime.launch_spec.context_route_policy().map(|_| {
+                runtime
+                    .launch_spec
+                    .dedicated_egress()
+                    .egress_fence()
+                    .shard()
+                    .clone()
+            })
+        };
+        if let Some(fence) = &shared_fence {
+            self.egress.retire_shard(fence).await?;
+        }
+
+        let (lease, already_revoked) = {
+            let state = self
+                .runtimes
+                .lock()
+                .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+            let runtime = state
+                .get(handle.shard_id())
+                .ok_or(SandboxError::ShardNotFound)?;
+            Self::validate_handle(runtime, handle)?;
+            (runtime.ingress_lease.clone(), runtime.egress_revoked)
+        };
         let revoke_result = if already_revoked {
             Ok(())
         } else {
@@ -3938,6 +5161,32 @@ where
         handle: &SandboxHandle,
         _reason: CleanupReason,
     ) -> Result<(), SandboxError> {
+        if self.prepared_journal.is_some() {
+            let mut intent = {
+                let state = self
+                    .runtimes
+                    .lock()
+                    .map_err(|_| SandboxError::Backend("runtime state lock poisoned".into()))?;
+                let runtime = state
+                    .get(handle.shard_id())
+                    .ok_or(SandboxError::ShardNotFound)?;
+                Self::validate_handle(runtime, handle)?;
+                runtime.revoke_intent.subscribe()
+            };
+            loop {
+                let committed = intent.borrow_and_update().clone();
+                if let Some(result) = committed {
+                    result?;
+                    break;
+                }
+                // This await holds no process or runtime-state lock. Existing supervisor
+                // stage deadlines bound a missing/cancelled intent; caller cancellation drops
+                // only this waiter and does not consume another cleanup owner's permit.
+                intent.changed().await.map_err(|_| {
+                    SandboxError::Backend("prepared revoke intent owner unavailable".into())
+                })?;
+            }
+        }
         let process_operation = self.runtime_process_operation(handle)?;
         let _process_operation_guard = process_operation.lock().await;
         let (identity, backend_token, cgroup_path, shard_fence) = {
@@ -4251,7 +5500,7 @@ where
 
     async fn inspect(&self, handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
         self.validate_host_paths()?;
-        let (cgroup_path, ingress_lease) = {
+        let (cgroup_path, ingress_leases) = {
             let state = self
                 .runtimes
                 .lock()
@@ -4263,7 +5512,29 @@ where
             if runtime.namespaces_cleaned {
                 return Err(SandboxError::ShardNotFound);
             }
-            (runtime.cgroup_path.clone(), runtime.ingress_lease.clone())
+            let leases = if runtime.launch_spec.context_route_policy().is_some() {
+                let mut leases = Vec::new();
+                for route in runtime.context_routes.values() {
+                    match route.phase {
+                        ContextRoutePhase::Released => {}
+                        ContextRoutePhase::Active
+                            if route.valid_until > tokio::time::Instant::now() =>
+                        {
+                            leases.push(
+                                route
+                                    .lease
+                                    .clone()
+                                    .ok_or(SandboxError::InvalidEgressLease)?,
+                            );
+                        }
+                        _ => return Err(SandboxError::InvalidEgressLease),
+                    }
+                }
+                leases
+            } else {
+                vec![runtime.ingress_lease.clone()]
+            };
+            (runtime.cgroup_path.clone(), leases)
         };
         let memory_current_bytes = self
             .filesystem
@@ -4285,11 +5556,15 @@ where
                 .count(),
         )
         .map_err(|_| SandboxError::Backend("process count overflow".into()))?;
+        let mut egress_route_active = !ingress_leases.is_empty();
+        for lease in &ingress_leases {
+            egress_route_active &= self.egress.is_active(lease).await?;
+        }
         Ok(InspectResources {
             memory_current_bytes,
             memory_peak_bytes,
             process_count,
-            egress_route_active: self.egress.is_active(&ingress_lease).await?,
+            egress_route_active,
         })
     }
 }

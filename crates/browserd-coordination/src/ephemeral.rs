@@ -278,7 +278,7 @@ pub enum WorkerReadiness {
     Unready,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct WorkerCapacity {
     memory_bytes: u64,
     cpu_millis: u64,
@@ -345,7 +345,7 @@ impl WorkerCapacity {
             targets: self.targets.checked_sub(other.targets)?,
         })
     }
-    pub(crate) const fn components(self) -> [u64; 6] {
+    pub const fn components(self) -> [u64; 6] {
         [
             self.memory_bytes,
             self.cpu_millis,

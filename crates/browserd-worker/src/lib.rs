@@ -2,36 +2,95 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as browserd_worker;
+
+mod action_approval;
+mod action_journal_retention;
+mod artifact_publications;
+#[cfg(test)]
+mod artifact_publications_tests;
+mod artifact_scan_evidence;
 mod cdp_driver;
+mod checkpoint_control;
+pub mod checkpoints;
 mod chromium_owner;
+mod control_event_journal;
+mod download_publication;
+#[cfg(test)]
+mod download_publication_tests;
+mod evaluate_control;
+pub mod evaluate_policy;
+mod file_attachments;
+#[cfg(test)]
+mod file_attachments_tests;
+mod notifications;
 mod production_sandbox;
 mod rpc;
+mod runtime_safety;
+pub mod secrets;
+mod session_event_journal;
 mod shard_actor;
 mod shard_driver;
 mod target_manager;
+#[cfg(test)]
+mod typed_approval_tests;
+mod viewer;
+mod worker_admission;
+pub use worker_admission::*;
 
+pub use artifact_publications::{
+    ARTIFACT_PUBLICATION_TTL_MILLIS, ArtifactPublication, MAX_RETAINED_ARTIFACT_PAGE,
+};
+pub use artifact_scan_evidence::{ArtifactScanAttestation, ArtifactScannerObservation};
+pub use browserd_actions::{ActionJournalPool, ActionJournalPoolConfig, ActionJournalPoolLimits};
 pub use cdp_driver::CdpChromiumDriver;
+pub use checkpoints::{
+    CheckpointCookie, CheckpointError, CheckpointOriginStorage, CheckpointRestoreReceipt,
+    CheckpointSnapshot, CheckpointStorageEntry, CheckpointStore, FileCheckpointStore,
+    LoadedCheckpoint,
+};
 pub use chromium_owner::{
-    ChromiumConnectionOwner, ChromiumTargetManager, ChromiumTargetManagerBackend,
-    ChromiumTargetRoute,
+    BrowserDownloadCompletion, BrowserDownloadFile, ChromiumConnectionOwner, ChromiumTargetManager,
+    ChromiumTargetManagerBackend, ChromiumTargetRoute, OwnerContextPolicy,
+};
+pub use control_event_journal::ControlEventJournal;
+pub use evaluate_policy::{
+    PrivilegedEvaluateGrant, PrivilegedEvaluatePolicy, PrivilegedEvaluatePolicyError,
+};
+pub use notifications::{
+    MAX_NOTIFICATION_PAGE_DESCRIPTORS, MAX_NOTIFICATION_SCOPES_PER_PAGE, WorkerNotificationPage,
 };
 pub use production_sandbox::{
     CdpPipeAcceptor, ExactSandboxTermination, ProductionSandboxShardRuntime, SandboxShardRpc,
     SandboxTerminationProof, ShardLaunchDescriptor,
 };
 pub use rpc::{
-    PendingWorkerRpc, WORKER_RPC_PROTOCOL_VERSION, WORKER_SESSION_OPTIONS_VERSION,
-    WorkerActionApprovalRequirement, WorkerActionCommand, WorkerActionExecutionTimeout,
-    WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType, WorkerApprovalDecision,
-    WorkerApprovalReceipt, WorkerApprovalState, WorkerArtifactReceipt, WorkerArtifactSource,
-    WorkerArtifactState, WorkerCanonicalActionProposal, WorkerControlPlaneRpcHandler,
-    WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
-    WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerProbeReceipt, WorkerRpcBlockingClient,
+    ArtifactPublicationWire, MAX_CONTROL_EVENT_PAGE, MAX_VIEWER_JPEG_BYTES,
+    MAX_VIEWER_METADATA_BYTES, MAX_VIEWER_SAFE_INTEGER, MAX_WORKER_ACTION_RPC_FRAME_BYTES,
+    PendingWorkerRpc, ViewerClientMessage, ViewerKeyPhase, ViewerMouseButton, ViewerMousePhase,
+    WORKER_RPC_PROTOCOL_VERSION, WORKER_SESSION_OPTIONS_VERSION, WorkerActionApprovalRequirement,
+    WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerActionStatus,
+    WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
+    WorkerArtifactReceipt, WorkerArtifactScanVerdict, WorkerArtifactSource, WorkerArtifactState,
+    WorkerCanonicalActionProposal, WorkerCheckpointRestoreReceipt, WorkerControlEvent,
+    WorkerControlPlaneRpcHandler, WorkerCreateSessionReceipt, WorkerCreateSessionRequest,
+    WorkerIsolationProfile, WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerProbeReceipt,
+    WorkerRetainedArtifactReceipt, WorkerRetainedArtifactScope, WorkerRpcBlockingClient,
     WorkerRpcClient, WorkerRpcCompletionError, WorkerRpcConfig, WorkerRpcEnqueueError,
     WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
     WorkerRpcResponse, WorkerRpcServer, WorkerSessionFence, WorkerSessionLifecycle,
-    WorkerSessionOptionsV1, WorkerSessionReceipt, WorkerViewport, WorkerWaitCondition,
+    WorkerSessionOptionsV1, WorkerSessionOwnershipReceipt, WorkerSessionReceipt,
+    WorkerTerminalCustodyAck, WorkerTerminalCustodyReceipt, WorkerViewerCloseRequest,
+    WorkerViewerControl, WorkerViewerController, WorkerViewerFrame, WorkerViewerMessageRequest,
+    WorkerViewerOpenRequest, WorkerViewerPollRequest, WorkerViewerSnapshot, WorkerViewport,
+    WorkerWaitCondition,
 };
+pub use secrets::{
+    FileSecretResolver, ResolvedSecret, SecretFillError, SecretFillTarget, SecretGrant,
+    SecretResolver,
+};
+pub use session_event_journal::SessionEventJournal;
 pub use shard_actor::{
     AttachSessionOutcome, BrowserShardActor, BrowserShardActorConfig, BrowserShardRuntime,
     BrowserShardSnapshot, DetachSessionOutcome, ShardActorError, ShardRuntimeError,
@@ -57,13 +116,14 @@ use browserd_actions::{
     AcceptDecision, ActionJournalLimits, ActionKind, ActionLedger, ActionLedgerError,
     ActionRequest, ActionSequence, ApprovalDecision as ActionApprovalDecision, BrowserResult,
     CanonicalRequestHash as ActionRequestHash, DispatchDecision, DispatchPermit, FileActionJournal,
-    IdempotencyKey as ActionIdempotencyKey, KnownFailureReason, LedgerSession,
-    OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind, ResolutionOutcome,
-    ResolutionPolicy, ResultDigest, TerminalDetail, TransportLoss,
+    IdempotencyKey as ActionIdempotencyKey, JournalSessionScope, KnownFailureReason, LedgerSession,
+    ManagedActionJournal, OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind,
+    ResolutionOutcome, ResolutionPolicy, ResultDigest, TerminalCustodyReceipt, TerminalDetail,
+    TransportLoss,
 };
 use browserd_artifacts::{
     Artifact, ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactEvent,
-    ArtifactKey, ArtifactObjectGeneration, ArtifactState,
+    ArtifactKey, ArtifactObjectGeneration, ArtifactReadLimits, ArtifactState,
 };
 use browserd_core::{
     ActionId, ActionState, ArtifactId, IsolationProfile, OperationId, PageId, PrincipalId,
@@ -149,6 +209,13 @@ pub enum DependencyError {
     OutcomeUncertain,
 }
 
+/// The actual placement returned by the trusted context factory, fixed for this session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatedSessionContext {
+    pub primary_page_id: PageId,
+    pub effective_isolation: WorkerIsolationProfile,
+}
+
 /// Derives the session's effective feature profile from the trusted create options.
 ///
 /// Only the exact `privileged` profile grants privileged features; every other value, and the
@@ -220,15 +287,279 @@ pub enum ApprovedActionError {
     OutcomeUncertain,
 }
 
+/// An observation of an owned target. Digests include private actor guards, never browser data.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TypedApprovalObservation {
+    pub tenant_id: TenantId,
+    pub session_id: SessionId,
+    pub page_id: Option<PageId>,
+    pub fence: OwnershipFence,
+    pub context_scope: browserd_policy::ApprovalContextScope,
+    pub target_binding_sha256: [u8; 32],
+    pub node_binding: Option<browserd_policy::ApprovalNodeBinding>,
+    pub build_identity_sha256: [u8; 32],
+    pub live: LiveApprovalContext,
+}
+
 enum ApprovalAdmissionClockError {
     Clock(WorkerError),
     PlacementOwnershipInvalid(SessionTime),
 }
 
 pub trait ChromiumDriver: Send + Sync + 'static {
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_typed_approval_until(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _page_id: Option<&PageId>,
+        _fence: &OwnershipFence,
+        _action: &WorkerActionCommand,
+        _deadline: Instant,
+    ) -> Result<TypedApprovalObservation, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    fn execute_typed_browser_until(
+        &self,
+        _expected: &TypedApprovalObservation,
+        _payload: &[u8],
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(
+            &TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    fn execute_typed_secret_until(
+        &self,
+        _expected: &TypedApprovalObservation,
+        _secret: ResolvedSecret,
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(
+            &TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    fn execute_typed_files_until(
+        &self,
+        _expected: &TypedApprovalObservation,
+        _files: Vec<BrowserFileAttachment>,
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(
+            &TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    fn capture_typed_checkpoint_until(
+        &self,
+        _expected: &TypedApprovalObservation,
+        _origins: &[String],
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(
+            &TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<CheckpointSnapshot, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_typed_capture_until(
+        &self,
+        _expected: &TypedApprovalObservation,
+        _command: browserd_features::CaptureCommand,
+        _request: GeneratedArtifactRequest,
+        _store: Arc<dyn SandboxClient>,
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(
+            &TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<GeneratedCaptureResult, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    /// Observes the exact owned page under the effect gate and commits admission immediately
+    /// before arbitrary JavaScript starts. Implementations must never execute after a rejected
+    /// callback or replay an uncertain effect. The default implementation denies this lane.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_privileged_evaluate_until(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+        _payload: &[u8],
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        Err(ApprovedActionError::DispatchRevoked)
+    }
+
+    fn capture_checkpoint_until(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _origins: &[String],
+        _deadline: Instant,
+    ) -> Result<CheckpointSnapshot, CheckpointError> {
+        Err(CheckpointError::Rejected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn restore_checkpoint_until(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _primary_page: &PageId,
+        _fence: &OwnershipFence,
+        _snapshot: CheckpointSnapshot,
+        _deadline: Instant,
+    ) -> Result<(), CheckpointError> {
+        Err(CheckpointError::Rejected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_secret_fill_target_until(
+        &self,
+        _tenant_id: &TenantId,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+        _node_ref: &str,
+        _deadline: Instant,
+    ) -> Result<SecretFillTarget, SecretFillError> {
+        Err(SecretFillError::Rejected)
+    }
+
+    fn execute_secret_fill_until(
+        &self,
+        _target: &SecretFillTarget,
+        _secret: ResolvedSecret,
+        _deadline: Instant,
+        _authorize_and_commit: &mut dyn FnMut(&SecretFillTarget) -> Result<(), SecretFillError>,
+    ) -> Result<ActionExecutionResult, SecretFillError> {
+        Err(SecretFillError::Rejected)
+    }
+
+    fn execute_file_attachment_until(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+        _node_ref: &str,
+        _files: Vec<BrowserFileAttachment>,
+        _deadline: Instant,
+    ) -> ActionExecutionResult {
+        ActionExecutionResult::FailedKnown("files_unsupported".to_owned())
+    }
+
+    fn pending_browser_downloads(
+        &self,
+        _session_id: &SessionId,
+        _fence: &OwnershipFence,
+        _limit: usize,
+    ) -> Result<Vec<BrowserDownloadCompletion>, DependencyError> {
+        Ok(Vec::new())
+    }
+
+    fn open_browser_download(
+        &self,
+        _completion: &BrowserDownloadCompletion,
+    ) -> Result<BrowserDownloadFile, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn ack_browser_download(
+        &self,
+        _completion: &BrowserDownloadCompletion,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn reject_browser_download(
+        &self,
+        _completion: &BrowserDownloadCompletion,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn viewer_rebind(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<u64, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn viewer_start(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn viewer_stop(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn viewer_frame(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<Option<crate::WorkerViewerFrame>, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn viewer_input(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+        _transform_epoch: u64,
+        _message: &crate::ViewerClientMessage,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn viewer_cleanup(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _fence: &OwnershipFence,
+        _cleanup: &browserd_viewer::InputCleanup,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn execute_capture_until(
+        &self,
+        _session_id: &SessionId,
+        _page_id: &PageId,
+        _command: browserd_features::CaptureCommand,
+        _request: GeneratedArtifactRequest,
+        _store: Arc<dyn SandboxClient>,
+        _deadline: Instant,
+    ) -> Result<GeneratedCaptureResult, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
     fn qualify(&self) -> Result<(), DependencyError>;
     fn effective_isolation(&self) -> WorkerIsolationProfile {
         WorkerIsolationProfile::SharedContext
+    }
+    fn supports_requested_isolation(&self, requested: WorkerIsolationProfile) -> bool {
+        requested.satisfied_by(self.effective_isolation())
     }
     fn shard_managed_contexts(&self) -> bool {
         false
@@ -257,6 +588,29 @@ pub trait ChromiumDriver: Send + Sync + 'static {
         _options: &WorkerSessionOptionsV1,
     ) -> Result<PageId, DependencyError> {
         Err(DependencyError::Rejected)
+    }
+    fn create_context_owned_with_placement(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        options: Option<&WorkerSessionOptionsV1>,
+        requested: WorkerIsolationProfile,
+    ) -> Result<CreatedSessionContext, DependencyError> {
+        let effective_isolation = self.effective_isolation();
+        if !requested.satisfied_by(effective_isolation) {
+            return Err(DependencyError::Rejected);
+        }
+        let primary_page_id = match options {
+            Some(options) => {
+                self.create_context_owned_with_options(tenant_id, session_id, fence, options)?
+            }
+            None => self.create_context_owned(tenant_id, session_id, fence)?,
+        };
+        Ok(CreatedSessionContext {
+            primary_page_id,
+            effective_isolation,
+        })
     }
     fn close_context(&self, session_id: &SessionId) -> Result<(), DependencyError>;
     fn close_context_fenced(
@@ -352,6 +706,20 @@ pub trait ChromiumDriver: Send + Sync + 'static {
 }
 
 pub trait SandboxClient: Send + Sync + 'static {
+    fn pending_artifact_notifications(
+        &self,
+        _cursor: Option<&str>,
+        _max_scopes: usize,
+        _max_descriptors: usize,
+    ) -> Result<WorkerNotificationPage, DependencyError> {
+        Ok(WorkerNotificationPage::empty())
+    }
+    fn ack_artifact_notification(
+        &self,
+        _ack: &browserd_core::NotificationAck,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
     fn qualify(&self) -> Result<(), DependencyError>;
     fn provision(
         &self,
@@ -365,6 +733,62 @@ pub trait SandboxClient: Send + Sync + 'static {
         &self,
         request: &ArtifactStoreRequest,
     ) -> Result<ArtifactStoreReceipt, DependencyError>;
+
+    /// Legacy nonpersistent fixtures may accept publication without retaining it. Production
+    /// providers override this with durable metadata persistence before success.
+    fn publish_artifact(&self, _publication: &ArtifactPublication) -> Result<(), DependencyError> {
+        Ok(())
+    }
+    fn withdraw_artifact(&self, _publication: &ArtifactPublication) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn get_retained_artifact(
+        &self,
+        _key: &ArtifactKey,
+        _now_unix_millis: u64,
+    ) -> Result<Option<ArtifactPublication>, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn list_retained_artifacts(
+        &self,
+        _tenant: &TenantId,
+        _session: &SessionId,
+        _after: Option<&ArtifactId>,
+        _limit: usize,
+        _now_unix_millis: u64,
+    ) -> Result<Vec<ArtifactPublication>, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+    fn open_retained_artifact(
+        &self,
+        _publication: &ArtifactPublication,
+        _limits: ArtifactReadLimits,
+        _now_unix_millis: u64,
+    ) -> Result<Box<dyn ArtifactReadStream>, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn discard_artifact(
+        &self,
+        _receipt: &ArtifactStoreReceipt,
+        _fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn open_artifact(
+        &self,
+        _request: &ArtifactReadRequest,
+    ) -> Result<Box<dyn ArtifactReadStream>, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
+
+    fn begin_generated_artifact(
+        &self,
+        _request: &GeneratedArtifactRequest,
+    ) -> Result<Box<dyn GeneratedArtifactSink>, DependencyError> {
+        Err(DependencyError::Rejected)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -526,6 +950,7 @@ pub struct WorkerConfig {
     /// terminal-not-yet-reclaimed — so a single tenant churning create/close cannot accumulate
     /// unbounded session state ahead of reclamation (BRD-018).
     max_sessions_per_tenant: usize,
+    admission_policy: Option<WorkerAdmissionPolicy>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,6 +1043,7 @@ impl WorkerConfig {
             session_option_support: None,
             session_retention: Self::DEFAULT_SESSION_RETENTION,
             max_sessions_per_tenant: Self::DEFAULT_MAX_SESSIONS_PER_TENANT,
+            admission_policy: None,
         })
     }
 
@@ -671,6 +1097,15 @@ impl WorkerConfig {
     pub const fn worker_epoch(&self) -> u64 {
         self.worker_epoch
     }
+
+    pub fn with_fleet_admission_policy(
+        mut self,
+        policy: WorkerAdmissionPolicy,
+    ) -> Result<Self, WorkerError> {
+        policy.validate(&self.worker_id, self.max_sessions)?;
+        self.admission_policy = Some(policy);
+        Ok(self)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -689,6 +1124,8 @@ pub struct CreateSessionOutcome {
     pub primary_page_id: PageId,
     pub fence: OwnershipFence,
     pub existing: bool,
+    pub restored_checkpoint: Option<CheckpointRestoreReceipt>,
+    pub effective_isolation: WorkerIsolationProfile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -734,6 +1171,86 @@ pub struct ArtifactUpload {
     pub content_type: String,
 }
 
+/// Verified artifact content prepared by the control plane for an owned browser input.
+/// Filesystem paths cannot be supplied through this contract.
+#[derive(Clone)]
+pub struct BrowserFileAttachment {
+    key: ArtifactKey,
+    fence: OwnershipFence,
+    generation: ArtifactObjectGeneration,
+    checksum: ArtifactChecksum,
+    display_filename: String,
+    bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for BrowserFileAttachment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserFileAttachment")
+            .field("key", &self.key)
+            .field("fence", &self.fence)
+            .field("generation", &self.generation)
+            .field("display_filename", &self.display_filename)
+            .field("size_bytes", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrowserFileAttachment {
+    pub(crate) fn verified(
+        key: ArtifactKey,
+        fence: OwnershipFence,
+        generation: ArtifactObjectGeneration,
+        checksum: ArtifactChecksum,
+        display_filename: String,
+        bytes: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            key,
+            fence,
+            generation,
+            checksum,
+            display_filename,
+            bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> &ArtifactKey {
+        &self.key
+    }
+    #[must_use]
+    pub const fn fence(&self) -> &OwnershipFence {
+        &self.fence
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ArtifactObjectGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn checksum(&self) -> &ArtifactChecksum {
+        &self.checksum
+    }
+    #[must_use]
+    pub fn display_filename(&self) -> &str {
+        &self.display_filename
+    }
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(crate) fn valid_artifact_display_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value != "."
+        && value != ".."
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArtifactScanVerdict {
     Clean,
@@ -750,6 +1267,8 @@ pub struct ArtifactStoreRequest {
     expected_size_bytes: u64,
     expected_checksum: ArtifactChecksum,
     max_bytes: u64,
+    source: ArtifactContentSource,
+    origin: String,
 }
 
 impl ArtifactStoreRequest {
@@ -785,7 +1304,77 @@ impl ArtifactStoreRequest {
             expected_size_bytes,
             expected_checksum,
             max_bytes,
+            source: ArtifactContentSource::ClientUpload,
+            origin: "browserd-worker-upload".to_owned(),
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_generated(
+        tenant_id: TenantId,
+        session_id: SessionId,
+        artifact_id: ArtifactId,
+        fence: OwnershipFence,
+        bytes: Vec<u8>,
+        content_type: impl Into<String>,
+        max_bytes: u64,
+        origin: impl Into<String>,
+    ) -> Result<Self, WorkerError> {
+        let mut request = Self::new(
+            tenant_id,
+            session_id,
+            artifact_id,
+            fence,
+            bytes,
+            content_type,
+            max_bytes,
+        )?;
+        request.source = ArtifactContentSource::Generated;
+        request.origin = origin.into();
+        ArtifactContentMetadata::new(
+            request.expected_size_bytes,
+            request.expected_checksum,
+            request.declared_content_type.clone(),
+            request.source,
+            request.origin.clone(),
+        )
+        .map_err(|_| WorkerError::InvalidConfiguration)?;
+        Ok(request)
+    }
+
+    /// Browser-originated bytes admitted by the owner after exact frame/session attribution.
+    /// Local paths and Chromium-supplied names are deliberately absent from this contract.
+    pub fn new_browser_download(
+        tenant_id: TenantId,
+        session_id: SessionId,
+        artifact_id: ArtifactId,
+        fence: OwnershipFence,
+        bytes: Vec<u8>,
+        content_type: impl Into<String>,
+        max_bytes: u64,
+    ) -> Result<Self, WorkerError> {
+        let mut request = Self::new(
+            tenant_id,
+            session_id,
+            artifact_id,
+            fence,
+            bytes,
+            content_type,
+            max_bytes,
+        )?;
+        request.source = ArtifactContentSource::BrowserDownload;
+        request.origin = "browserd-worker-download".to_owned();
+        Ok(request)
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> ArtifactContentSource {
+        self.source
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     #[must_use]
@@ -831,7 +1420,9 @@ pub struct ArtifactStoreReceipt {
     checksum: ArtifactChecksum,
     detected_content_type: String,
     object_generation: ArtifactObjectGeneration,
-    scan_verdict: ArtifactScanVerdict,
+    scan_verdict: Option<ArtifactScanVerdict>,
+    source: ArtifactContentSource,
+    scan_attestation: Option<ArtifactScanAttestation>,
 }
 
 impl ArtifactStoreReceipt {
@@ -858,8 +1449,55 @@ impl ArtifactStoreReceipt {
             checksum,
             detected_content_type,
             object_generation,
-            scan_verdict,
+            scan_verdict: Some(scan_verdict),
+            source: ArtifactContentSource::ClientUpload,
+            scan_attestation: None,
         })
+    }
+
+    pub fn new_generated(
+        key: ArtifactKey,
+        size_bytes: u64,
+        checksum: ArtifactChecksum,
+        content_type: impl Into<String>,
+        object_generation: ArtifactObjectGeneration,
+    ) -> Result<Self, WorkerError> {
+        let mut receipt = Self::new(
+            key,
+            size_bytes,
+            checksum,
+            content_type,
+            object_generation,
+            ArtifactScanVerdict::Quarantined,
+        )?;
+        receipt.source = ArtifactContentSource::Generated;
+        receipt.scan_verdict = None;
+        Ok(receipt)
+    }
+
+    pub fn new_browser_download(
+        key: ArtifactKey,
+        size_bytes: u64,
+        checksum: ArtifactChecksum,
+        content_type: impl Into<String>,
+        object_generation: ArtifactObjectGeneration,
+        scan_verdict: ArtifactScanVerdict,
+    ) -> Result<Self, WorkerError> {
+        let mut receipt = Self::new(
+            key,
+            size_bytes,
+            checksum,
+            content_type,
+            object_generation,
+            scan_verdict,
+        )?;
+        receipt.source = ArtifactContentSource::BrowserDownload;
+        Ok(receipt)
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> ArtifactContentSource {
+        self.source
     }
 
     #[must_use]
@@ -888,13 +1526,169 @@ impl ArtifactStoreReceipt {
     }
 
     #[must_use]
-    pub const fn scan_verdict(&self) -> ArtifactScanVerdict {
+    pub const fn scan_verdict(&self) -> Option<ArtifactScanVerdict> {
         self.scan_verdict
     }
+
+    pub fn with_scan_attestation(
+        mut self,
+        attestation: ArtifactScanAttestation,
+    ) -> Result<Self, WorkerError> {
+        if self.scan_verdict != Some(ArtifactScanVerdict::Clean) {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        attestation.validate_receipt(
+            &self.key,
+            self.source,
+            self.object_generation,
+            self.size_bytes,
+            self.checksum,
+        )?;
+        self.scan_attestation = Some(attestation);
+        Ok(self)
+    }
+
+    pub const fn scan_attestation(&self) -> Option<&ArtifactScanAttestation> {
+        self.scan_attestation.as_ref()
+    }
+}
+
+/// A verified, namespace-bound read. This conveys no caller-provided filesystem path.
+#[derive(Clone, Debug)]
+pub struct ArtifactReadRequest {
+    key: ArtifactKey,
+    fence: OwnershipFence,
+    metadata: ArtifactContentMetadata,
+    generation: ArtifactObjectGeneration,
+    limits: ArtifactReadLimits,
+}
+
+impl ArtifactReadRequest {
+    pub fn new(
+        key: ArtifactKey,
+        fence: OwnershipFence,
+        metadata: ArtifactContentMetadata,
+        generation: ArtifactObjectGeneration,
+        max_chunk_bytes: usize,
+    ) -> Result<Self, WorkerError> {
+        let limits = ArtifactReadLimits::new(max_chunk_bytes)
+            .map_err(|_| WorkerError::InvalidConfiguration)?;
+        Ok(Self {
+            key,
+            fence,
+            metadata,
+            generation,
+            limits,
+        })
+    }
+    #[must_use]
+    pub const fn key(&self) -> &ArtifactKey {
+        &self.key
+    }
+    #[must_use]
+    pub const fn fence(&self) -> &OwnershipFence {
+        &self.fence
+    }
+    #[must_use]
+    pub const fn metadata(&self) -> &ArtifactContentMetadata {
+        &self.metadata
+    }
+    #[must_use]
+    pub const fn generation(&self) -> ArtifactObjectGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub const fn limits(&self) -> ArtifactReadLimits {
+        self.limits
+    }
+}
+
+pub trait ArtifactReadStream: Send {
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, DependencyError>;
+}
+
+/// Trusted capture reservation. The byte ceiling is reserved before Chromium produces data.
+#[derive(Clone, Debug)]
+pub struct GeneratedArtifactRequest {
+    key: ArtifactKey,
+    fence: OwnershipFence,
+    content_type: String,
+    origin: String,
+    max_bytes: u64,
+}
+
+impl GeneratedArtifactRequest {
+    pub fn new(
+        key: ArtifactKey,
+        fence: OwnershipFence,
+        content_type: impl Into<String>,
+        origin: impl Into<String>,
+        max_bytes: u64,
+    ) -> Result<Self, WorkerError> {
+        let content_type = content_type.into();
+        let origin = origin.into();
+        if max_bytes == 0 {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        ArtifactContentMetadata::new(
+            0,
+            ArtifactChecksum::new([0; 32]),
+            content_type.clone(),
+            ArtifactContentSource::Generated,
+            origin.clone(),
+        )
+        .map_err(|_| WorkerError::InvalidConfiguration)?;
+        Ok(Self {
+            key,
+            fence,
+            content_type,
+            origin,
+            max_bytes,
+        })
+    }
+    #[must_use]
+    pub const fn key(&self) -> &ArtifactKey {
+        &self.key
+    }
+    #[must_use]
+    pub const fn fence(&self) -> &OwnershipFence {
+        &self.fence
+    }
+    #[must_use]
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+    #[must_use]
+    pub const fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+}
+
+#[async_trait::async_trait]
+pub trait GeneratedArtifactSink: Send {
+    /// Maximum bytes accepted by one write; producers must split bounded chunks accordingly.
+    fn max_chunk_bytes(&self) -> usize {
+        64 * 1024
+    }
+    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), DependencyError>;
+    async fn finish(&mut self) -> Result<ArtifactStoreReceipt, DependencyError>;
+    async fn abort(&mut self) -> Result<(), DependencyError>;
+}
+
+/// Completed capture plus an exact-generation rollback handle until metadata registration commits.
+pub struct GeneratedCaptureResult {
+    pub result: Vec<u8>,
+    pub receipt: Option<ArtifactStoreReceipt>,
+    pub cleanup: Option<Box<dyn GeneratedArtifactSink>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerArtifactSnapshot {
+    pub display_filename: Option<String>,
     pub artifact_id: ArtifactId,
     pub state: ArtifactState,
     pub size_bytes: u64,
@@ -948,12 +1742,25 @@ struct ActionRecord {
     payload: Vec<u8>,
     execution_timeout: Duration,
     approval_id: Option<ApprovalId>,
+    submission_approval_binding: Option<(ProposalHash, bool)>,
+    policy_admission: Option<action_approval::TypedActionAdmission>,
+    policy_failure: Option<&'static str>,
     dispatch_permit: Option<DispatchPermit>,
 }
 
 struct ArtifactRecord {
+    publication: Option<ArtifactPublication>,
     artifact: Artifact,
     object_generation: ArtifactObjectGeneration,
+    display_filename: Option<String>,
+}
+
+#[derive(Clone)]
+struct PendingDownloadRollback {
+    completion: BrowserDownloadCompletion,
+    receipt: ArtifactStoreReceipt,
+    object_discarded: bool,
+    publication: Option<ArtifactPublication>,
 }
 
 struct ApprovalRecord {
@@ -968,12 +1775,29 @@ struct ApprovalRecord {
 
 struct SessionJournalGuard {
     path: PathBuf,
+    pool: Option<Arc<ActionJournalPool>>,
+    scope: JournalSessionScope,
     committed: bool,
+    notification_journal: Option<Arc<SessionEventJournal>>,
 }
 
 impl Drop for SessionJournalGuard {
     fn drop(&mut self) {
         if self.committed {
+            return;
+        }
+        if let Some(journal) = &self.notification_journal {
+            let _ = journal.record(
+                &self.scope,
+                browserd_core::NotificationSessionLifecycleState::Failed,
+                browserd_core::NotificationSessionExecutionState::Idle,
+                None,
+            );
+        }
+        if let Some(pool) = &self.pool {
+            // The ledger has dropped before this guard. The pool independently proves that
+            // no action was accepted and that no WAL handle is pinned before exact deletion.
+            let _ = pool.discard_unadmitted(&self.scope);
             return;
         }
         if std::fs::remove_file(&self.path).is_ok()
@@ -994,12 +1818,14 @@ type ActionIdempotencyRecord = (
 
 struct SessionState {
     tenant_id: TenantId,
+    effective_isolation: WorkerIsolationProfile,
     /// Effective feature profile fixed at session creation from the trusted create options.
     ///
     /// This gates privileged features (notably `evaluate`) at dispatch so a caller cannot enable
     /// them by placing a profile string on a per-action RPC. See SPEC D-18.
     feature_profile: FeatureProfile,
     machine: SessionMachine,
+    notification_journal: Option<Arc<SessionEventJournal>>,
     occupies_capacity: bool,
     primary_page_id: PageId,
     active_page_id: PageId,
@@ -1012,8 +1838,9 @@ struct SessionState {
     artifacts: HashMap<ArtifactId, ArtifactRecord>,
     artifact_committed_bytes: u64,
     artifact_reserved_bytes: u64,
+    pending_download_rollbacks: HashMap<ArtifactId, PendingDownloadRollback>,
     approvals: HashMap<ApprovalId, ApprovalRecord>,
-    action_ledger: ActionLedger<FileActionJournal>,
+    action_ledger: ActionLedger<ManagedActionJournal>,
     durability_degraded: bool,
     /// When a fully-closed session's in-memory state becomes eligible for reclamation (BRD-018):
     /// set to `now + session_retention` the first maintenance pass that observes the session
@@ -1029,6 +1856,41 @@ struct SessionExecutor {
     approved_dispatch_wait: Mutex<()>,
     approved_dispatch_changed: Condvar,
     cleanup_owner: Mutex<()>,
+    viewer: Mutex<Option<viewer::ViewerSession>>,
+}
+
+/// Commit notification state before installing the new live machine. A failed durable
+/// write keeps the previous machine and charges its capacity for reconciliation.
+fn install_session_machine(
+    session: &mut SessionState,
+    machine: SessionMachine,
+) -> Result<(), WorkerError> {
+    if let Some(journal) = &session.notification_journal {
+        let fence = machine.snapshot().owner_fence;
+        let scope = JournalSessionScope::new(
+            session.tenant_id.clone(),
+            machine.session_id().clone(),
+            fence.worker_id().clone(),
+            fence.as_placement_fence(),
+        )
+        .map_err(|_| WorkerError::DurabilityUnavailable)?;
+        if let Err(error) = journal.record_machine(&scope, &machine) {
+            session.durability_degraded = true;
+            return Err(error);
+        }
+    }
+    session.machine = machine;
+    Ok(())
+}
+
+fn transition_session_machine<T>(
+    session: &mut SessionState,
+    transition: impl FnOnce(&mut SessionMachine) -> Result<T, SessionError>,
+) -> Result<T, WorkerError> {
+    let mut machine = session.machine.clone();
+    let result = transition(&mut machine).map_err(map_session_error)?;
+    install_session_machine(session, machine)?;
+    Ok(result)
 }
 
 const APPROVED_DISPATCH_IDLE: u8 = 0;
@@ -1061,6 +1923,7 @@ struct WorkerState {
     draining: bool,
     stopped: bool,
     heartbeat_expires_at: Option<SessionTime>,
+    admission: worker_admission::WorkerAdmissionState,
 }
 
 pub struct WorkerControlPlane<D, S> {
@@ -1072,15 +1935,27 @@ pub struct WorkerControlPlane<D, S> {
     create_idempotency: IdempotencyRegistry,
     viewer_tickets: Option<TicketRegistry>,
     emergency_policy: Arc<EmergencyPolicy>,
+    runtime_safety: Option<runtime_safety::WorkerRuntimeSafety>,
     clock: Arc<dyn WorkerClock>,
     stopped_dispatch_terminalization_hook: Arc<dyn Fn() -> Result<(), WorkerError> + Send + Sync>,
     _fleet_epochs: WorkerEpochRegistry,
     _features: FeatureRegistry,
+    capture_admission: browserd_features::FeatureAdmission,
     /// When set, a critical audit intent is written before any action effect is dispatched; a
     /// full WAL or sink failure fails the dispatch closed so no browser effect occurs without a
     /// durable audit record (BRD-020). `None` leaves dispatch unaudited (the default for tests and
     /// deployments that have not wired an audit sink).
     audit_wal: Option<Arc<AuditWal>>,
+    privileged_evaluate_policy: PrivilegedEvaluatePolicy,
+    action_approval_policy: Option<browserd_policy::ActionApprovalPolicy>,
+    action_journal_pool: Option<Arc<ActionJournalPool>>,
+    journal_seal_cursor: Mutex<Option<SessionId>>,
+    secret_resolver: Option<Arc<dyn SecretResolver>>,
+    checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    checkpoint_cleanup_at: Mutex<Option<Instant>>,
+    checkpoint_cleanup_degraded: Arc<AtomicBool>,
+    control_event_journal: Arc<ControlEventJournal>,
+    session_event_journal: Option<Arc<SessionEventJournal>>,
 }
 
 impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
@@ -1175,16 +2050,36 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 draining: false,
                 stopped: false,
                 heartbeat_expires_at: None,
+                admission: worker_admission::WorkerAdmissionState::new(),
             }),
             create_idle: Condvar::new(),
             create_idempotency: IdempotencyRegistry::default(),
             viewer_tickets,
             emergency_policy,
+            runtime_safety: None,
             clock,
             stopped_dispatch_terminalization_hook,
             _fleet_epochs: fleet_epochs,
             _features: FeatureRegistry::builtin(),
+            capture_admission: browserd_features::FeatureAdmission::new(
+                browserd_features::FeatureConcurrencyLimits {
+                    pdf: 1,
+                    full_page_screenshot: 1,
+                    large_snapshot: 2,
+                    scrape: 1,
+                },
+            ),
             audit_wal: None,
+            privileged_evaluate_policy: PrivilegedEvaluatePolicy::default(),
+            action_approval_policy: None,
+            action_journal_pool: None,
+            journal_seal_cursor: Mutex::new(None),
+            secret_resolver: None,
+            checkpoint_store: None,
+            checkpoint_cleanup_at: Mutex::new(None),
+            checkpoint_cleanup_degraded: Arc::new(AtomicBool::new(false)),
+            control_event_journal: Arc::new(ControlEventJournal::memory()),
+            session_event_journal: None,
         }
     }
 
@@ -1196,6 +2091,84 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
     pub fn with_audit_wal(mut self, audit_wal: Arc<AuditWal>) -> Self {
         self.audit_wal = Some(audit_wal);
         self
+    }
+
+    /// Enables privileged sessions for configured tenants and checks the exact principal grant
+    /// on every evaluate action. A durable audit WAL is independently required at dispatch.
+    #[must_use]
+    pub fn with_privileged_evaluate_policy(mut self, policy: PrivilegedEvaluatePolicy) -> Self {
+        if let Some(support) = &mut self.config.session_option_support {
+            if policy.is_enabled() {
+                support.feature_profiles.insert("privileged".to_owned());
+            } else {
+                support.feature_profiles.remove("privileged");
+            }
+        }
+        self.privileged_evaluate_policy = policy;
+        self
+    }
+
+    /// Installs the worker-authoritative action policy. Production always installs a snapshot;
+    /// sensitive and mutating actions without an exact allow rule require external approval.
+    #[must_use]
+    pub fn with_action_approval_policy(
+        mut self,
+        policy: browserd_policy::ActionApprovalPolicy,
+    ) -> Self {
+        self.action_approval_policy = Some(policy);
+        self
+    }
+
+    /// Installs aggregate WAL accounting and durable terminal-custody retention.
+    #[must_use]
+    pub fn with_action_journal_pool(mut self, pool: Arc<ActionJournalPool>) -> Self {
+        self.action_journal_pool = Some(pool);
+        self
+    }
+
+    #[must_use]
+    pub fn with_secret_resolver(mut self, resolver: Arc<dyn SecretResolver>) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
+    #[must_use]
+    pub fn with_checkpoint_store(mut self, store: Arc<dyn CheckpointStore>) -> Self {
+        if let Some(support) = &mut self.config.session_option_support {
+            support.supports_checkpoint = true;
+        }
+        self.checkpoint_store = Some(store);
+        self
+    }
+
+    #[must_use]
+    pub fn with_control_event_journal(mut self, journal: Arc<ControlEventJournal>) -> Self {
+        self.control_event_journal = journal;
+        self
+    }
+
+    #[must_use]
+    pub fn with_session_event_journal(mut self, journal: Arc<SessionEventJournal>) -> Self {
+        self.session_event_journal = Some(journal);
+        self
+    }
+
+    pub fn pending_control_events(
+        &self,
+        peer: &AuthenticatedPeer,
+        limit: usize,
+    ) -> Result<Vec<WorkerControlEvent>, WorkerError> {
+        self.authorize(peer)?;
+        self.control_event_journal.pending(limit)
+    }
+
+    pub fn ack_control_event(
+        &self,
+        peer: &AuthenticatedPeer,
+        event: &WorkerControlEvent,
+    ) -> Result<(), WorkerError> {
+        self.authorize(peer)?;
+        self.control_event_journal.ack(event)
     }
 
     /// Records the mandatory pre-dispatch audit intent for an action about to cause a browser
@@ -1229,20 +2202,34 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
 
     #[must_use]
     pub fn is_ready(&self) -> bool {
+        self.control_plane_qualified() && self.runtime_safety_ready()
+    }
+
+    /// Startup qualification permits authenticated metadata/cleanup while safety is uninitialized.
+    /// Actual create/effect admissions independently require fresh runtime authority.
+    #[must_use]
+    pub fn control_plane_qualified(&self) -> bool {
         let Ok(worker) = self.state.lock() else {
             return false;
         };
-        if worker.draining || worker.stopped {
+        if worker.draining
+            || worker.stopped
+            || worker.create_cleanup_failed
+            || self.checkpoint_cleanup_degraded.load(Ordering::Acquire)
+        {
             return false;
         }
         let sessions = worker.sessions.values().cloned().collect::<Vec<_>>();
         drop(worker);
         sessions.iter().all(|executor| {
-            executor
-                .state
-                .lock()
-                .is_ok_and(|session| !session.durability_degraded)
+            executor.state.lock().is_ok_and(|session| {
+                !session.durability_degraded && session.pending_download_rollbacks.is_empty()
+            })
         }) && self.config.action_journal.qualify()
+            && self
+                .session_event_journal
+                .as_ref()
+                .is_none_or(|journal| journal.qualify())
             && self.driver.qualify().is_ok()
             && self.sandbox.qualify().is_ok()
     }
@@ -1253,7 +2240,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         command: CreateSessionCommand,
         now: SessionTime,
     ) -> Result<CreateSessionOutcome, WorkerError> {
-        self.create_session_internal(peer, command, None, now)
+        self.create_session_internal(peer, command, None, None, now, None)
     }
 
     pub fn create_session_with_options(
@@ -1263,7 +2250,18 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         options: &WorkerSessionOptionsV1,
         now: SessionTime,
     ) -> Result<CreateSessionOutcome, WorkerError> {
-        self.create_session_internal(peer, command, Some(options), now)
+        self.create_session_internal(peer, command, Some(options), None, now, None)
+    }
+
+    pub fn create_session_with_placement(
+        &self,
+        peer: &AuthenticatedPeer,
+        command: CreateSessionCommand,
+        options: &WorkerSessionOptionsV1,
+        requested: WorkerIsolationProfile,
+        now: SessionTime,
+    ) -> Result<CreateSessionOutcome, WorkerError> {
+        self.create_session_internal(peer, command, Some(options), Some(requested), now, None)
     }
 
     fn create_session_internal(
@@ -1271,10 +2269,54 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         peer: &AuthenticatedPeer,
         command: CreateSessionCommand,
         options: Option<&WorkerSessionOptionsV1>,
+        requested: Option<WorkerIsolationProfile>,
         now: SessionTime,
+        mut reservation: Option<worker_admission::WorkerCreateReservation<'_>>,
     ) -> Result<CreateSessionOutcome, WorkerError> {
         self.authorize(peer)?;
+        if self.config.admission_policy.is_some() != reservation.is_some() {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        if let Some(assignment) = self
+            .config
+            .admission_policy
+            .as_ref()
+            .and_then(WorkerAdmissionPolicy::exclusive_assignment)
+            && assignment.tenant_id() != &command.tenant_id
+        {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        let requested = match &reservation {
+            Some(reservation) => {
+                if requested != Some(reservation.token.request.request.requested_isolation) {
+                    return Err(WorkerError::InvalidConfiguration);
+                }
+                Some(self.reserved_create_isolation(&reservation.token.request)?)
+            }
+            None => requested,
+        };
+        let requested = match &self.runtime_safety {
+            Some(_) => {
+                let effective =
+                    self.runtime_create_isolation(&command.tenant_id, options, requested)?;
+                if reservation.is_some() && requested != Some(effective) {
+                    return Err(WorkerError::InvalidConfiguration);
+                }
+                Some(effective)
+            }
+            None => requested,
+        };
+        if requested.is_some_and(|profile| !self.driver.supports_requested_isolation(profile)) {
+            return Err(WorkerError::InvalidConfiguration);
+        }
         let feature_profile = feature_profile_from_options(options);
+        if feature_profile == FeatureProfile::Privileged
+            && !self
+                .privileged_evaluate_policy
+                .allows_tenant(&command.tenant_id)
+        {
+            return Err(WorkerError::InvalidConfiguration);
+        }
         let timeout_policy = match options {
             Some(options) if options.is_valid() => SessionTimeoutPolicy::new(
                 Duration::from_secs(options.ttl_seconds),
@@ -1284,13 +2326,24 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             Some(_) => return Err(WorkerError::InvalidConfiguration),
             None => self.config.timeout_policy,
         };
-        if self.driver.qualify().is_err() || self.sandbox.qualify().is_err() {
+        if options.is_some_and(|options| options.checkpoint_ref.is_some())
+            && self.checkpoint_store.is_none()
+        {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        if self.driver.qualify().is_err()
+            || self.sandbox.qualify().is_err()
+            || self
+                .session_event_journal
+                .as_ref()
+                .is_some_and(|journal| !journal.qualify())
+        {
             return Err(WorkerError::NotReady);
         }
         if command.placement_version == 0 || command.session_incarnation == 0 {
             return Err(WorkerError::InvalidConfiguration);
         }
-        let key = IdempotencyKey::new(command.idempotency_key)
+        let key = IdempotencyKey::new(command.idempotency_key.clone())
             .map_err(|_| WorkerError::InvalidConfiguration)?;
         let request_hash = CanonicalRequestHash::from_json(&Value::Array(
             command
@@ -1306,6 +2359,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             }
             if worker.draining {
                 return Err(WorkerError::Draining);
+            }
+            if worker.create_cleanup_failed
+                || self.checkpoint_cleanup_degraded.load(Ordering::Acquire)
+            {
+                return Err(WorkerError::NotReady);
+            }
+            if let Some(reservation) = &reservation {
+                worker
+                    .admission
+                    .validate_creating(reservation.token, &command)?;
             }
             let claim = self
                 .create_idempotency
@@ -1357,7 +2420,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             // (any lifecycle, so terminal-not-yet-reclaimed entries count toward its bound).
             let mut tenant_retained = 0usize;
             let occupied = worker.sessions.values().try_fold(
-                worker.creating_sessions,
+                worker.creating_sessions.saturating_add(
+                    worker
+                        .admission
+                        .pending_slots_except(reservation.as_ref().map(|r| r.token)),
+                ),
                 |count, executor| {
                     let session = executor
                         .state
@@ -1384,6 +2451,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 completion: Mutex::new(None),
                 ready: Condvar::new(),
             });
+            if let Some(reservation) = &reservation {
+                worker.admission.begin_transfer(reservation.token)?;
+            }
             worker.creating_sessions = worker.creating_sessions.saturating_add(1);
             worker.create_operations.insert(
                 operation_id.clone(),
@@ -1392,6 +2462,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             (operation_id, waiter)
         };
 
+        let create_tenant = command.tenant_id.clone();
         let creation = (|| {
             let session_id = SessionId::new();
             let fence = OwnershipFence::new(
@@ -1400,21 +2471,101 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 command.placement_version,
                 command.session_incarnation,
             );
+            let restore_deadline = Instant::now() + Duration::from_secs(30);
+            let checkpoint = options
+                .and_then(|options| options.checkpoint_ref.as_ref())
+                .map(|reference| {
+                    self.admit_runtime_operation(
+                        &command.tenant_id,
+                        &session_id,
+                        "browser:checkpoint_restore",
+                    )?;
+                    self.audit_checkpoint_restore_intent(
+                        &command.tenant_id,
+                        &session_id,
+                        reference,
+                    )?;
+                    let checkpoint = self
+                        .checkpoint_store
+                        .as_ref()
+                        .ok_or(WorkerError::InvalidConfiguration)?
+                        .load(
+                            &command.tenant_id,
+                            reference,
+                            self.clock.now()?.get(),
+                            restore_deadline,
+                        )
+                        .map_err(|_| WorkerError::DependencyUnavailable)?;
+                    if checkpoint.receipt.checkpoint_ref != *reference
+                        || checkpoint.receipt.source_session_id == session_id
+                    {
+                        return Err(WorkerError::DependencyUnavailable);
+                    }
+                    checkpoint
+                        .snapshot
+                        .validate()
+                        .map_err(|_| WorkerError::DependencyUnavailable)?;
+                    Ok(checkpoint)
+                })
+                .transpose()?;
             let journal_path = self.config.action_journal.session_path(&session_id);
-            let journal =
-                FileActionJournal::create_new(&journal_path, self.config.action_journal.limits)
-                    .map_err(|_| WorkerError::DurabilityUnavailable)?;
+            let journal_scope = JournalSessionScope::new(
+                command.tenant_id.clone(),
+                session_id.clone(),
+                self.config.worker_id.clone(),
+                fence.as_placement_fence(),
+            )
+            .map_err(|_| WorkerError::DurabilityUnavailable)?;
+            let journal = match &self.action_journal_pool {
+                Some(pool) if self.session_event_journal.is_some() => {
+                    pool.create_notifying_session(&journal_scope)
+                }
+                Some(pool) => pool.create_session(&journal_scope),
+                None => {
+                    FileActionJournal::create_new(&journal_path, self.config.action_journal.limits)
+                        .and_then(|journal| match &self.session_event_journal {
+                            Some(_) => journal.with_notification_source(
+                                browserd_core::NotificationSourceScope::new(
+                                    command.tenant_id.clone(),
+                                    self.config.worker_id.clone(),
+                                    *session_id.as_uuid(),
+                                    browserd_core::NotificationSourceFamily::ActionJournal,
+                                )
+                                .map_err(|_| {
+                                    browserd_actions::JournalError::new(
+                                        "invalid notification source",
+                                    )
+                                })?,
+                            ),
+                            None => Ok(journal),
+                        })
+                        .map(ManagedActionJournal::unmanaged)
+                        .map(Arc::new)
+                }
+            }
+            .map_err(|_| WorkerError::DurabilityUnavailable)?;
             let journal_guard = SessionJournalGuard {
                 path: journal_path,
+                pool: self.action_journal_pool.clone(),
+                scope: journal_scope,
                 committed: false,
+                notification_journal: self.session_event_journal.clone(),
             };
+            if let Some(journal) = &self.session_event_journal {
+                journal.record(
+                    &journal_guard.scope,
+                    browserd_core::NotificationSessionLifecycleState::Creating,
+                    browserd_core::NotificationSessionExecutionState::Idle,
+                    None,
+                )?;
+            }
             let action_ledger = ActionLedger::new(
                 LedgerSession::new(
                     command.tenant_id.clone(),
                     session_id.clone(),
                     fence.as_placement_fence(),
                 ),
-                Arc::new(journal),
+                journal,
             );
             let (mut machine, _) = SessionMachine::create_with_timeouts(
                 session_id.clone(),
@@ -1427,44 +2578,146 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .start(&fence, now)
                 .and_then(|_| machine.mark_running(&fence, now))
                 .map_err(map_session_error)?;
-            if !self.driver.shard_managed_contexts()
-                && self.sandbox.provision(&session_id, &fence).is_err()
-            {
-                return if self
-                    .sandbox
-                    .cleanup(&session_id, CleanupReason::BrowserFailure)
-                    .is_ok()
-                {
-                    Err(WorkerError::DependencyUnavailable)
-                } else {
-                    Err(WorkerError::CleanupFailed)
-                };
+            let effective =
+                self.runtime_create_isolation(&command.tenant_id, options, requested)?;
+            if reservation.is_some() && requested != Some(effective) {
+                return Err(WorkerError::InvalidConfiguration);
             }
-            let context = match options {
-                Some(options) => self.driver.create_context_owned_with_options(
-                    &command.tenant_id,
-                    &session_id,
-                    &fence,
-                    options,
-                ),
-                None => self
-                    .driver
-                    .create_context_owned(&command.tenant_id, &session_id, &fence),
-            };
-            let primary_page_id = match context {
-                Ok(page_id) => page_id,
+            let requested = effective;
+            if !self.driver.shard_managed_contexts() {
+                if let Some(reservation) = &mut reservation {
+                    reservation.progress.exposure_possible = true;
+                }
+                if self.sandbox.provision(&session_id, &fence).is_err() {
+                    return if self
+                        .sandbox
+                        .cleanup(&session_id, CleanupReason::BrowserFailure)
+                        .is_ok()
+                    {
+                        if let Some(reservation) = &mut reservation {
+                            reservation.confirm_disposed(&create_tenant, &session_id, &fence);
+                        }
+                        Err(WorkerError::DependencyUnavailable)
+                    } else {
+                        Err(WorkerError::CleanupFailed)
+                    };
+                }
+            }
+            // The original request hash includes the reference. Only browser creation receives
+            // a copy with it removed; the typed restore completes before any Ready receipt.
+            let driver_options = options.cloned().map(|mut options| {
+                options.checkpoint_ref = None;
+                options
+            });
+            if let Some(reservation) = &mut reservation {
+                reservation.progress.exposure_possible = true;
+            }
+            let context = self.driver.create_context_owned_with_placement(
+                &command.tenant_id,
+                &session_id,
+                &fence,
+                driver_options.as_ref(),
+                requested,
+            );
+            let context = match context {
+                Ok(context) => context,
                 Err(_) => {
                     let sandbox_clean = self.driver.shard_managed_contexts()
                         || self
                             .sandbox
                             .cleanup(&session_id, CleanupReason::BrowserFailure)
                             .is_ok();
-                    return if sandbox_clean {
+                    let driver_clean = reservation.is_none()
+                        || self
+                            .driver
+                            .close_context_fenced(&session_id, &fence)
+                            .is_ok();
+                    return if sandbox_clean && driver_clean {
+                        if let Some(reservation) = &mut reservation {
+                            reservation.confirm_disposed(&create_tenant, &session_id, &fence);
+                        }
                         Err(WorkerError::DependencyUnavailable)
                     } else {
                         Err(WorkerError::CleanupFailed)
                     };
                 }
+            };
+            if !requested.satisfied_by(context.effective_isolation)
+                || self
+                    .runtime_verify_create(&command.tenant_id, options, context.effective_isolation)
+                    .is_err()
+            {
+                let driver_clean = self
+                    .driver
+                    .close_context_fenced(&session_id, &fence)
+                    .is_ok();
+                let sandbox_clean = self.driver.shard_managed_contexts()
+                    || self
+                        .sandbox
+                        .cleanup(&session_id, CleanupReason::BrowserFailure)
+                        .is_ok();
+                return Err(if driver_clean && sandbox_clean {
+                    if let Some(reservation) = &mut reservation {
+                        reservation.confirm_disposed(&create_tenant, &session_id, &fence);
+                    }
+                    WorkerError::DependencyUnavailable
+                } else {
+                    WorkerError::CleanupFailed
+                });
+            }
+            let effective_isolation = context.effective_isolation;
+            let primary_page_id = context.primary_page_id;
+            let restored_checkpoint = if let Some(checkpoint) = checkpoint {
+                let restored = self
+                    .admit_runtime_operation(
+                        &command.tenant_id,
+                        &session_id,
+                        "browser:checkpoint_restore",
+                    )
+                    .map_err(|_| CheckpointError::Rejected)
+                    .and_then(|()| {
+                        self.driver.restore_checkpoint_until(
+                            &command.tenant_id,
+                            &session_id,
+                            &primary_page_id,
+                            &fence,
+                            checkpoint.snapshot,
+                            restore_deadline,
+                        )
+                    })
+                    .and_then(|()| {
+                        let ready_at = self
+                            .clock
+                            .now()
+                            .map_err(|_| CheckpointError::Unavailable)?
+                            .max(machine.last_observed_at());
+                        machine
+                            .renew_lease(&fence, ready_at)
+                            .map(|_| ())
+                            .map_err(|_| CheckpointError::Rejected)
+                    });
+                if restored.is_err() {
+                    let driver_clean = self
+                        .driver
+                        .close_context_fenced(&session_id, &fence)
+                        .is_ok();
+                    let sandbox_clean = self.driver.shard_managed_contexts()
+                        || self
+                            .sandbox
+                            .cleanup(&session_id, CleanupReason::BrowserFailure)
+                            .is_ok();
+                    return Err(if driver_clean && sandbox_clean {
+                        if let Some(reservation) = &mut reservation {
+                            reservation.confirm_disposed(&create_tenant, &session_id, &fence);
+                        }
+                        WorkerError::DependencyUnavailable
+                    } else {
+                        WorkerError::CleanupFailed
+                    });
+                }
+                Some(checkpoint.receipt)
+            } else {
+                None
             };
             if let Err(error) = machine
                 .register_target(&fence, TargetId::new(primary_page_id.to_string()))
@@ -1480,6 +2733,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         .cleanup(&session_id, CleanupReason::BrowserFailure)
                         .is_ok();
                 return if driver_clean && sandbox_clean {
+                    if let Some(reservation) = &mut reservation {
+                        reservation.confirm_disposed(&create_tenant, &session_id, &fence);
+                    }
                     Err(error)
                 } else {
                     Err(WorkerError::CleanupFailed)
@@ -1488,10 +2744,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             let mut pages = BTreeSet::new();
             pages.insert(primary_page_id.clone());
             let executor = Arc::new(SessionExecutor {
+                viewer: Mutex::new(None),
                 state: Mutex::new(SessionState {
                     tenant_id: command.tenant_id,
+                    effective_isolation,
                     feature_profile,
                     machine,
+                    notification_journal: self.session_event_journal.clone(),
                     occupies_capacity: true,
                     primary_page_id: primary_page_id.clone(),
                     active_page_id: primary_page_id.clone(),
@@ -1504,6 +2763,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     artifacts: HashMap::new(),
                     artifact_committed_bytes: 0,
                     artifact_reserved_bytes: 0,
+                    pending_download_rollbacks: HashMap::new(),
                     approvals: HashMap::new(),
                     action_ledger,
                     durability_degraded: false,
@@ -1522,6 +2782,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     primary_page_id,
                     fence,
                     existing: false,
+                    restored_checkpoint,
+                    effective_isolation,
                 },
                 executor,
                 journal_guard,
@@ -1579,7 +2841,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 } else if worker.draining {
                     Some(WorkerError::Draining)
                 } else {
-                    None
+                    match &journal_guard.notification_journal {
+                        Some(journal) => executor
+                            .state
+                            .lock()
+                            .map_err(|_| WorkerError::StateUnavailable)
+                            .and_then(|state| {
+                                journal.record_machine(&journal_guard.scope, &state.machine)
+                            })
+                            .err(),
+                        None => None,
+                    }
                 };
                 if let Some(error) = rejected {
                     drop(worker);
@@ -1594,6 +2866,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                             .is_ok();
                     drop(journal_guard);
                     let final_error = if driver_clean && sandbox_clean {
+                        if let Some(reservation) = &mut reservation {
+                            reservation.confirm_disposed(
+                                &create_tenant,
+                                &outcome.session_id,
+                                &outcome.fence,
+                            );
+                        }
                         error
                     } else {
                         WorkerError::CleanupFailed
@@ -1645,6 +2924,22 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         Ok(session.machine.snapshot())
     }
 
+    pub fn session_effective_isolation(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<WorkerIsolationProfile, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        validate_fence(&session, fence)?;
+        Ok(session.effective_isolation)
+    }
+
     pub fn close_session(
         &self,
         peer: &AuthenticatedPeer,
@@ -1692,10 +2987,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             } else {
                 Ok(())
             };
-        let lifecycle = session
-            .machine
-            .begin_close(fence, now)
-            .map_err(map_session_error)?;
+        let lifecycle =
+            transition_session_machine(&mut session, |machine| machine.begin_close(fence, now))?;
         let remaining_terminalization = terminalize_actions_for_shutdown(&mut session);
         let terminalization = match stopped_dispatch_terminalization {
             Ok(()) => remaining_terminalization,
@@ -1703,7 +2996,10 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         };
         if lifecycle == SessionLifecycle::Closed {
             terminalization?;
-            return Ok(session.machine.snapshot());
+            let snapshot = session.machine.snapshot();
+            drop(session);
+            let _ = self.seal_idle_action_journal(&executor);
+            return Ok(snapshot);
         }
         let mut cleanup_machine = session.machine.clone();
         drop(session);
@@ -1719,13 +3015,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .lock()
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
-        session.machine = cleanup_machine;
+        install_session_machine(&mut session, cleanup_machine)?;
         if cleanup_result.is_ok() {
             session.occupies_capacity = false;
         }
         cleanup_result.map_err(|_| WorkerError::CleanupFailed)?;
         terminalization?;
-        Ok(session.machine.snapshot())
+        let snapshot = session.machine.snapshot();
+        drop(session);
+        let _ = self.seal_idle_action_journal(&executor);
+        Ok(snapshot)
     }
 
     pub fn create_page(
@@ -1752,6 +3051,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .machine
                 .record_activity(fence, now)
                 .map_err(map_session_error)?;
+            self.admit_runtime_operation(&session.tenant_id, session_id, "browser:create_page")?;
         }
         let page_id = self
             .driver
@@ -2134,6 +3434,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         if execution_timeout.is_zero() || execution_timeout > Duration::from_secs(300) {
             return Err(WorkerError::InvalidConfiguration);
         }
+        // A gateway cannot supply target evidence or pre-approve an action. The configured
+        // worker derives it at the queue head from its owned browser and immutable policy.
+        if self.action_approval_policy.is_some() && approval.is_some() {
+            return Err(WorkerError::ApprovalEvidenceMismatch);
+        }
         let approval_binding = approval.as_ref().map(|requirement| {
             (
                 requirement.proposal.hash(),
@@ -2219,6 +3524,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             None => (None, None),
         };
         let requires_approval = approval_evidence.is_some();
+        let approval_id = requires_approval.then(ApprovalId::new);
+        let policy_pending = self.action_approval_policy.is_some();
         session
             .machine
             .record_activity(fence, now)
@@ -2235,6 +3542,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             ActionIdempotencyKey::new(idempotency_key),
             ActionRequestHash::new(durable_request_hash),
             kind,
+        )
+        .with_result_budget(
+            if matches!(
+                serde_json::from_slice::<WorkerActionCommand>(&payload),
+                Ok(WorkerActionCommand::Snapshot)
+            ) {
+                browserd_actions::ActionResultBudget::Snapshot
+            } else {
+                browserd_actions::ActionResultBudget::Standard
+            },
         );
         let acceptance = match action_identity {
             Some((action_id, action_sequence)) => session.action_ledger.accept_with_identity(
@@ -2263,9 +3580,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             }
             if durable_state == ActionState::Queued {
                 durable_state = if requires_approval {
-                    session
-                        .action_ledger
-                        .require_approval(ledger_fence, &action_id)
+                    session.action_ledger.require_approval_with_identity(
+                        ledger_fence,
+                        &action_id,
+                        approval_id
+                            .clone()
+                            .ok_or(ActionLedgerError::JournalUnavailable(
+                                browserd_actions::JournalError::new("approval identity missing"),
+                            ))?,
+                    )
+                } else if policy_pending {
+                    return Ok(ActionState::Queued);
                 } else {
                     session.action_ledger.mark_ready(ledger_fence, &action_id)
                 }?
@@ -2313,6 +3638,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         payload,
                         execution_timeout,
                         approval_id: None,
+                        submission_approval_binding: approval_binding
+                            .as_ref()
+                            .map(|(hash, _, four_eyes)| (*hash, *four_eyes)),
+                        policy_admission: None,
+                        policy_failure: None,
                         dispatch_permit: None,
                     },
                 );
@@ -2321,6 +3651,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         };
         let expected_state = if requires_approval {
             ActionState::PendingApproval
+        } else if policy_pending {
+            ActionState::Queued
         } else {
             ActionState::ReadyToDispatch
         };
@@ -2332,13 +3664,12 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         } else {
             ActionStatus::Queued
         };
-        let approval_id = requires_approval.then(ApprovalId::new);
         session.action_idempotency.insert(
             idempotency_key.to_owned(),
             (
                 request_hash,
                 requester_principal_id.clone(),
-                approval_binding,
+                approval_binding.clone(),
                 action_id.clone(),
             ),
         );
@@ -2364,6 +3695,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 payload,
                 execution_timeout,
                 approval_id: approval_id.clone(),
+                submission_approval_binding: approval_binding
+                    .as_ref()
+                    .map(|(hash, _, four_eyes)| (*hash, *four_eyes)),
+                policy_admission: None,
+                policy_failure: None,
                 dispatch_permit: None,
             },
         );
@@ -2421,21 +3757,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             ActionState::CancelledConfirmed => ActionStatus::CancelledConfirmed,
             ActionState::OutcomeUnknown => ActionStatus::OutcomeUnknown,
         };
-        let approval_binding = action
-            .approval_id
-            .as_ref()
-            .map(|approval_id| {
-                session
-                    .approvals
-                    .get(approval_id)
-                    .map(|approval| (approval.proposal.hash(), approval.require_four_eyes))
-                    .ok_or(WorkerError::StateUnavailable)
-            })
-            .transpose()?;
         let expected_request_hash = durable_action_request_hash(
             action.snapshot.canonical_request_hash,
             &action.requester_principal_id,
-            approval_binding
+            action
+                .submission_approval_binding
                 .as_ref()
                 .map(|(proposal_hash, require_four_eyes)| (proposal_hash, *require_four_eyes)),
         );
@@ -2474,6 +3800,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
         executor: &Arc<SessionExecutor>,
     ) -> Result<Option<WorkerActionSnapshot>, WorkerError> {
+        self.prepare_action_policy(session_id, fence, executor)?;
         let (
             action_id,
             page_id,
@@ -2484,6 +3811,8 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             action_feature,
             feature_profile,
             requester_principal_id,
+            policy_admission,
+            policy_failure,
         ) = {
             let mut session = executor
                 .state
@@ -2545,27 +3874,25 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     ))
                 })
                 .transpose()?;
-            session
-                .machine
-                .begin_action(fence, action_id.clone(), now)
-                .map_err(map_session_error)?;
+            let dispatch_now = now.max(session.machine.last_observed_at());
+            transition_session_machine(&mut session, |machine| {
+                machine.begin_action(fence, action_id.clone(), dispatch_now)
+            })?;
             let permit = match session
                 .action_ledger
                 .prepare_dispatch(fence.as_placement_fence(), &action_id)
             {
                 Ok(DispatchDecision::Dispatch(permit)) => permit,
                 Ok(DispatchDecision::DoNotReplay(_)) => {
-                    session
-                        .machine
-                        .finish_action(fence, &action_id, now)
-                        .map_err(map_session_error)?;
+                    transition_session_machine(&mut session, |machine| {
+                        machine.finish_action(fence, &action_id, dispatch_now)
+                    })?;
                     return Err(WorkerError::InvalidActionTransition);
                 }
                 Err(error) => {
-                    session
-                        .machine
-                        .finish_action(fence, &action_id, now)
-                        .map_err(map_session_error)?;
+                    transition_session_machine(&mut session, |machine| {
+                        machine.finish_action(fence, &action_id, dispatch_now)
+                    })?;
                     return Err(map_action_ledger_error(error));
                 }
             };
@@ -2578,8 +3905,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .ok_or(WorkerError::ActionNotFound)?;
             action.snapshot.status = ActionStatus::Running;
             action.dispatch_permit = Some(permit.clone());
+            let policy_admission = action.policy_admission.clone();
+            let policy_failure = action.policy_failure;
             executor.approved_dispatch_phase.store(
-                if approval_request.is_some() {
+                if policy_admission.is_some()
+                    || approval_request.is_some()
+                    || matches!(
+                        serde_json::from_slice::<WorkerActionCommand>(&payload),
+                        Ok(WorkerActionCommand::FillSecret { .. }
+                            | WorkerActionCommand::Evaluate { .. })
+                    )
+                {
                     APPROVED_DISPATCH_INSPECTING
                 } else {
                     APPROVED_DISPATCH_IDLE
@@ -2596,13 +3932,31 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 action_feature,
                 feature_profile,
                 requester_principal_id,
+                policy_admission,
+                policy_failure,
             )
         };
         let execution_deadline = Instant::now()
             .checked_add(execution_timeout)
             .ok_or(WorkerError::InvalidConfiguration)?;
-        let (outcome, response_error, known_failure_reason) = if action_feature
-            == Some(BuiltinFeature::PrivilegedEvaluate)
+        let command = serde_json::from_slice::<WorkerActionCommand>(&payload).ok();
+        let mut checkpoint_publication = None;
+        let is_evaluate = action_feature == Some(BuiltinFeature::PrivilegedEvaluate)
+            || matches!(command, Some(WorkerActionCommand::Evaluate { .. }));
+        let evaluate_admission = if is_evaluate {
+            self.admit_privileged_evaluate(session_id, fence, &action_id, executor)
+        } else {
+            Ok(())
+        };
+        let (mut outcome, response_error, mut known_failure_reason) = if let Some(reason) =
+            policy_failure
+        {
+            (
+                ActionExecutionResult::FailedKnown(reason.to_owned()),
+                None,
+                Some(KnownFailureReason::PolicyDenied),
+            )
+        } else if action_feature == Some(BuiltinFeature::PrivilegedEvaluate)
             && feature_profile != FeatureProfile::Privileged
         {
             // BRD-004 / SPEC D-18: a standard-profile session must not run `evaluate`. Deny it
@@ -2619,6 +3973,32 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ),
                 None,
                 Some(KnownFailureReason::PolicyDenied),
+            )
+        } else if let Err(reason) = evaluate_admission {
+            executor
+                .approved_dispatch_phase
+                .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
+            (
+                ActionExecutionResult::FailedKnown("evaluate_admission_rejected".to_owned()),
+                None,
+                Some(reason),
+            )
+        } else if policy_admission.is_none()
+            && approval_request.is_some()
+            && matches!(
+                command,
+                Some(
+                    WorkerActionCommand::FillSecret { .. } | WorkerActionCommand::Checkpoint { .. }
+                )
+            )
+        {
+            executor
+                .approved_dispatch_phase
+                .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
+            (
+                ActionExecutionResult::FailedKnown("prepared_approval_unsupported".to_owned()),
+                None,
+                Some(KnownFailureReason::NotDispatched),
             )
         } else if let Err(audit_error) =
             self.audit_dispatch_intent(session_id, &action_id, &requester_principal_id)
@@ -2637,6 +4017,42 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 None,
                 Some(KnownFailureReason::NotDispatched),
             )
+        } else if self.runtime_safety.is_some()
+            && self
+                .admit_runtime_action(session_id, fence, executor)
+                .is_err()
+        {
+            executor
+                .approved_dispatch_phase
+                .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
+            (
+                ActionExecutionResult::FailedKnown(
+                    "runtime_safety_unavailable_or_denied".to_owned(),
+                ),
+                None,
+                Some(KnownFailureReason::NotDispatched),
+            )
+        } else if let Some(admission) = policy_admission.as_ref() {
+            let (outcome, publication) = self.execute_typed_policy_action(
+                admission,
+                approval_request
+                    .as_ref()
+                    .map(|(request, _, _)| request.as_ref()),
+                &action_id,
+                &requester_principal_id,
+                &payload,
+                execution_deadline,
+                executor,
+            );
+            checkpoint_publication = publication;
+            let known = match &outcome {
+                ActionExecutionResult::FailedKnown(reason) if reason == "action_timeout" => {
+                    Some(KnownFailureReason::ExecutionTimedOut)
+                }
+                ActionExecutionResult::FailedKnown(_) => Some(KnownFailureReason::PolicyDenied),
+                _ => None,
+            };
+            (outcome, None, known)
         } else if let Some((request, feature, requester_principal_id)) = approval_request {
             let proposal = request.proposal().clone();
             let inspected = page_id
@@ -2896,12 +4312,105 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ),
             }
         } else {
-            let outcome = self.driver.execute_action_until(
-                session_id,
-                page_id.as_ref(),
-                &payload,
-                execution_deadline,
-            );
+            let capture = command
+                .as_ref()
+                .and_then(|command| command.capture_command());
+            let outcome = if is_evaluate {
+                match page_id.as_ref() {
+                    Some(page) => self.execute_privileged_evaluate(
+                        session_id,
+                        page,
+                        fence,
+                        &action_id,
+                        &requester_principal_id,
+                        &payload,
+                        execution_deadline,
+                        executor,
+                    ),
+                    None => ActionExecutionResult::FailedKnown("page_required".to_owned()),
+                }
+            } else if let Some(WorkerActionCommand::SetFiles {
+                node_ref,
+                artifact_ids,
+            }) = command.as_ref()
+            {
+                match page_id.as_ref() {
+                    Some(page) => self.execute_file_attachments(
+                        session_id,
+                        page,
+                        fence,
+                        node_ref,
+                        artifact_ids,
+                        execution_deadline,
+                        executor,
+                    ),
+                    None => ActionExecutionResult::FailedKnown("files_rejected".to_owned()),
+                }
+            } else if let Some(WorkerActionCommand::FillSecret {
+                node_ref,
+                secret_ref,
+            }) = command.as_ref()
+            {
+                match page_id.as_ref() {
+                    Some(page) => self.execute_secret_fill(
+                        session_id,
+                        page,
+                        fence,
+                        node_ref,
+                        secret_ref,
+                        &action_id,
+                        &requester_principal_id,
+                        execution_deadline,
+                        executor,
+                    ),
+                    None => ActionExecutionResult::FailedKnown("secret_rejected".to_owned()),
+                }
+            } else if let Some(WorkerActionCommand::Checkpoint { origins }) = command.as_ref() {
+                let (outcome, publication) = self.execute_checkpoint(
+                    session_id,
+                    fence,
+                    origins,
+                    &action_id,
+                    &requester_principal_id,
+                    execution_deadline,
+                    executor,
+                    None,
+                );
+                checkpoint_publication = publication;
+                outcome
+            } else if let Some(capture) = capture {
+                match page_id
+                    .as_ref()
+                    .ok_or(WorkerError::InvalidConfiguration)
+                    .and_then(|page| {
+                        self.execute_capture(
+                            session_id,
+                            page,
+                            fence,
+                            capture,
+                            &action_id,
+                            execution_deadline,
+                            executor,
+                            None,
+                        )
+                    }) {
+                    Ok(result) => ActionExecutionResult::Succeeded(result),
+                    Err(_) => ActionExecutionResult::FailedKnown(
+                        "capture_rejected_or_artifact_failed".to_owned(),
+                    ),
+                }
+            } else if self.runtime_safety.is_some() {
+                ActionExecutionResult::FailedKnown(
+                    "runtime_safety_typed_action_required".to_owned(),
+                )
+            } else {
+                self.driver.execute_action_until(
+                    session_id,
+                    page_id.as_ref(),
+                    &payload,
+                    execution_deadline,
+                )
+            };
             let known_failure_reason = matches!(
                 &outcome,
                 ActionExecutionResult::FailedKnown(reason)
@@ -2924,6 +4433,27 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .approved_dispatch_phase
                 .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
             return Err(WorkerError::InvalidActionTransition);
+        }
+        let result_budget = session
+            .action_ledger
+            .snapshot(fence.as_placement_fence(), &action_id)
+            .map_err(map_action_ledger_error)?
+            .request()
+            .result_budget();
+        if matches!(&outcome, ActionExecutionResult::Succeeded(bytes) if bytes.len() > result_budget.max_bytes())
+        {
+            outcome = if result_budget == browserd_actions::ActionResultBudget::Snapshot {
+                ActionExecutionResult::FailedKnown("snapshot_too_large".to_owned())
+            } else {
+                ActionExecutionResult::OutcomeUnknown
+            };
+        }
+        if let ActionExecutionResult::FailedKnown(reason) = &outcome {
+            known_failure_reason = match reason.as_str() {
+                "snapshot_too_large" => Some(KnownFailureReason::SnapshotTooLarge),
+                "document_changed" => Some(KnownFailureReason::DocumentChanged),
+                _ => known_failure_reason,
+            };
         }
         let completion_now = now.max(session.machine.last_observed_at());
         let mut completed_machine = session.machine.clone();
@@ -2969,10 +4499,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .get(&action_id)
                 .is_some_and(|action| action.snapshot.status == ActionStatus::Running);
             if still_running {
-                let _ =
-                    session
-                        .machine
-                        .mark_action_outcome_unknown(fence, &action_id, completion_now);
+                let _ = transition_session_machine(&mut session, |machine| {
+                    machine.mark_action_outcome_unknown(fence, &action_id, completion_now)
+                });
             }
             if let Some(action) = session.actions.get_mut(&action_id)
                 && still_running
@@ -2984,7 +4513,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
             return Err(map_action_ledger_error(error));
         }
-        session.machine = completed_machine;
+        install_session_machine(&mut session, completed_machine)?;
         match outcome {
             ActionExecutionResult::Succeeded(result) => {
                 let action = session
@@ -3015,6 +4544,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .get(&action_id)
             .map(|action| action.snapshot.clone())
             .ok_or(WorkerError::ActionNotFound)?;
+        if snapshot.status == ActionStatus::Succeeded
+            && let Some(publication) = &mut checkpoint_publication
+        {
+            publication.commit();
+        }
         executor
             .approved_dispatch_phase
             .store(APPROVED_DISPATCH_IDLE, Ordering::Release);
@@ -3044,7 +4578,18 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             let (status, approved_action) = session
                 .actions
                 .get(action_id)
-                .map(|action| (action.snapshot.status, action.approval_id.is_some()))
+                .map(|action| {
+                    (
+                        action.snapshot.status,
+                        action.approval_id.is_some()
+                            || action.policy_admission.is_some()
+                            || matches!(
+                                serde_json::from_slice::<WorkerActionCommand>(&action.payload),
+                                Ok(WorkerActionCommand::FillSecret { .. }
+                                    | WorkerActionCommand::Evaluate { .. })
+                            ),
+                    )
+                })
                 .ok_or(WorkerError::ActionNotFound)?;
             if status != ActionStatus::Running {
                 break (
@@ -3074,7 +4619,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     .action_ledger
                     .cancel_before_dispatch(fence.as_placement_fence(), action_id)
                     .map_err(map_action_ledger_error)?;
-                session.machine = next_machine;
+                install_session_machine(&mut session, next_machine)?;
                 session.action_queue.retain(|queued| queued != action_id);
                 let action = session
                     .actions
@@ -3164,17 +4709,15 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     BrowserResult::CancellationConfirmed,
                 ) {
                     session.durability_degraded = true;
-                    let _ = session.machine.mark_action_outcome_unknown(
-                        fence,
-                        action_id,
-                        completion_now,
-                    );
+                    let _ = transition_session_machine(&mut session, |machine| {
+                        machine.mark_action_outcome_unknown(fence, action_id, completion_now)
+                    });
                     if let Some(action) = session.actions.get_mut(action_id) {
                         action.snapshot.status = ActionStatus::OutcomeUnknown;
                     }
                     return Err(map_action_ledger_error(error));
                 }
-                session.machine = completed_machine;
+                install_session_machine(&mut session, completed_machine)?;
                 let action = session
                     .actions
                     .get_mut(action_id)
@@ -3250,7 +4793,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .cloned()
                 .ok_or(WorkerError::StateUnavailable)?,
         };
-        session.machine = next_machine;
+        install_session_machine(&mut session, next_machine)?;
         let action = session
             .actions
             .get_mut(action_id)
@@ -3259,12 +4802,245 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         Ok(action.snapshot.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn execute_capture(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+        command: browserd_features::CaptureCommand,
+        action_id: &ActionId,
+        deadline: Instant,
+        executor: &SessionExecutor,
+        typed: Option<(
+            &action_approval::TypedActionAdmission,
+            Option<&ApprovalRequest>,
+        )>,
+    ) -> Result<Vec<u8>, WorkerError> {
+        if !command.validate() || Instant::now() >= deadline {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        let _admission = self
+            .capture_admission
+            .acquire(command.admission_class())
+            .map_err(|_| WorkerError::CapacityExceeded)?;
+        let _cleanup_owner = executor
+            .cleanup_owner
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        let maximum = command
+            .maximum_bytes()
+            .min(self.config.artifact_limits.max_file_bytes)
+            .min(self.config.artifact_limits.max_in_flight_bytes);
+        let (key, request) = {
+            let mut session = executor
+                .state
+                .lock()
+                .map_err(|_| WorkerError::StateUnavailable)?;
+            validate_fence(&session, fence)?;
+            let reserved = session
+                .artifact_reserved_bytes
+                .checked_add(maximum)
+                .ok_or(WorkerError::CapacityExceeded)?;
+            let total = reserved
+                .checked_add(session.artifact_committed_bytes)
+                .ok_or(WorkerError::CapacityExceeded)?;
+            if reserved > self.config.artifact_limits.max_in_flight_bytes
+                || total > self.config.artifact_limits.max_committed_bytes
+            {
+                return Err(WorkerError::CapacityExceeded);
+            }
+            let key = ArtifactKey::new(
+                session.tenant_id.clone(),
+                session_id.clone(),
+                ArtifactId::new(),
+            );
+            let request = GeneratedArtifactRequest::new(
+                key.clone(),
+                fence.clone(),
+                command.content_type(),
+                "browserd-capture",
+                maximum,
+            )?;
+            session.artifact_reserved_bytes = reserved;
+            (key, request)
+        };
+        let expected_content_type = request.content_type().to_owned();
+        let store: Arc<dyn SandboxClient> = self.sandbox.clone();
+        let mut captured = if let Some((admission, approval)) = typed {
+            action_approval::begin_typed_driver(executor)
+                .and_then(|()| {
+                    self.driver.execute_typed_capture_until(
+                        &admission.observation,
+                        command,
+                        request,
+                        store,
+                        deadline,
+                        &mut |observed| {
+                            self.admit_typed_effect(
+                                admission, approval, observed, action_id, deadline, executor,
+                            )
+                        },
+                    )
+                })
+                .map_err(|_| DependencyError::Rejected)
+        } else {
+            self.driver
+                .execute_capture_until(session_id, page_id, command, request, store, deadline)
+        };
+        let mut attempted_publication = None;
+        let finalized = (|| {
+            let capture = captured
+                .as_mut()
+                .map_err(|_| WorkerError::DependencyUnavailable)?;
+            if capture.result.len() > 64 * 1024 {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            let mut session = executor
+                .state
+                .lock()
+                .map_err(|_| WorkerError::StateUnavailable)?;
+            validate_fence(&session, fence)?;
+            if session.machine.snapshot().lifecycle != SessionLifecycle::Ready
+                || session.machine.snapshot().execution
+                    != SessionExecution::Running(action_id.clone())
+                || session
+                    .actions
+                    .get(action_id)
+                    .is_none_or(|action| action.snapshot.status != ActionStatus::Running)
+                || Instant::now() >= deadline
+            {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            if let Some(receipt) = &capture.receipt {
+                if receipt.key() != &key
+                    || receipt.source() != ArtifactContentSource::Generated
+                    || receipt.scan_attestation().is_some()
+                    || receipt.scan_verdict().is_some()
+                    || receipt.size_bytes() == 0
+                    || receipt.size_bytes() > maximum
+                    || receipt.detected_content_type() != expected_content_type
+                    || capture.cleanup.is_none()
+                    || receipt
+                        .object_generation()
+                        .as_bytes()
+                        .iter()
+                        .all(|byte| *byte == 0)
+                {
+                    return Err(WorkerError::DependencyUnavailable);
+                }
+                let metadata = ArtifactContentMetadata::new(
+                    receipt.size_bytes(),
+                    *receipt.checksum(),
+                    receipt.detected_content_type(),
+                    ArtifactContentSource::Generated,
+                    "browserd-capture",
+                )
+                .map_err(|_| WorkerError::DependencyUnavailable)?;
+                let mut artifact = Artifact::new_generated(key.clone());
+                artifact
+                    .apply_materialized(ArtifactEvent::GenerationCompleted, metadata.clone())
+                    .and_then(|_| artifact.apply(ArtifactEvent::FinalizationSucceeded))
+                    .map_err(|_| WorkerError::DependencyUnavailable)?;
+                let committed = session
+                    .artifact_committed_bytes
+                    .checked_add(receipt.size_bytes())
+                    .ok_or(WorkerError::CapacityExceeded)?;
+                let publication = self.new_artifact_publication(
+                    key.clone(),
+                    fence.clone(),
+                    metadata,
+                    receipt.object_generation(),
+                    None,
+                    None,
+                    None,
+                )?;
+                attempted_publication = Some(publication.clone());
+                self.publish_authorized_artifact(&publication)?;
+                session.artifacts.insert(
+                    key.artifact_id().clone(),
+                    ArtifactRecord {
+                        publication: Some(publication),
+                        artifact,
+                        object_generation: receipt.object_generation(),
+                        display_filename: None,
+                    },
+                );
+                session.artifact_committed_bytes = committed;
+            } else if capture.cleanup.is_some() {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            Ok(std::mem::take(&mut capture.result))
+        })();
+        let mut release_reservation = finalized.is_ok() || captured.is_err();
+        if finalized.is_err() {
+            let withdrawal_confirmed = attempted_publication
+                .as_ref()
+                .is_none_or(|publication| self.sandbox.withdraw_artifact(publication).is_ok());
+            if withdrawal_confirmed && let Ok(capture) = &mut captured {
+                if let Some(mut sink) = capture.cleanup.take() {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        release_reservation = matches!(
+                            runtime.block_on(async {
+                                tokio::time::timeout(Duration::from_secs(2), sink.abort()).await
+                            }),
+                            Ok(Ok(()))
+                        );
+                    }
+                } else {
+                    release_reservation = true;
+                }
+            }
+        }
+        let mut session = executor
+            .state
+            .lock()
+            .map_err(|_| WorkerError::StateUnavailable)?;
+        if release_reservation {
+            session.artifact_reserved_bytes =
+                session.artifact_reserved_bytes.saturating_sub(maximum);
+        } else {
+            session.durability_degraded = true;
+        }
+        finalized
+    }
+
     pub fn upload_artifact(
         &self,
         peer: &AuthenticatedPeer,
         session_id: &SessionId,
         fence: &OwnershipFence,
         upload: ArtifactUpload,
+        now: SessionTime,
+    ) -> Result<ArtifactId, WorkerError> {
+        self.upload_artifact_with_name(peer, session_id, fence, upload, None, now)
+    }
+
+    pub fn upload_artifact_named(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        upload: ArtifactUpload,
+        display_filename: String,
+        now: SessionTime,
+    ) -> Result<ArtifactId, WorkerError> {
+        if !valid_artifact_display_filename(&display_filename) {
+            return Err(WorkerError::InvalidConfiguration);
+        }
+        self.upload_artifact_with_name(peer, session_id, fence, upload, Some(display_filename), now)
+    }
+
+    fn upload_artifact_with_name(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        upload: ArtifactUpload,
+        display_filename: Option<String>,
         now: SessionTime,
     ) -> Result<ArtifactId, WorkerError> {
         self.authorize(peer)?;
@@ -3311,6 +5087,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             session.artifact_reserved_bytes = projected_reserved;
             session.tenant_id.clone()
         };
+        let mut stored_receipt = None;
+        let mut attempted_publication = None;
+        let mut store_uncertain = false;
         let result = (|| {
             let _cleanup_owner = executor
                 .cleanup_owner
@@ -3338,11 +5117,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 self.config.artifact_limits.max_file_bytes,
             )?;
             let key = request.key().clone();
-            let receipt = self
-                .sandbox
-                .store_artifact(&request)
-                .map_err(|_| WorkerError::DependencyUnavailable)?;
+            let receipt = self.sandbox.store_artifact(&request).map_err(|error| {
+                store_uncertain = error == DependencyError::OutcomeUncertain;
+                WorkerError::DependencyUnavailable
+            })?;
+            if receipt.key() == &key {
+                stored_receipt = Some(receipt.clone());
+            } else {
+                store_uncertain = true;
+            }
             if receipt.key() != &key
+                || receipt.source() != ArtifactContentSource::ClientUpload
                 || receipt.size_bytes() != size_bytes
                 || receipt.checksum() != &checksum
             {
@@ -3356,15 +5141,27 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 "browserd-worker-upload",
             )
             .map_err(|_| WorkerError::DependencyUnavailable)?;
-            let mut artifact = Artifact::new_upload(key);
+            if receipt.scan_verdict() == Some(ArtifactScanVerdict::Clean) {
+                let evidence = receipt
+                    .scan_attestation()
+                    .ok_or(WorkerError::DependencyUnavailable)?;
+                evidence
+                    .validate_for(&key, fence, &metadata, receipt.object_generation())
+                    .and_then(|()| evidence.validate_at(self.clock.now()?.get()))
+                    .map_err(|_| WorkerError::DependencyUnavailable)?;
+            }
+            let mut artifact = Artifact::new_upload(key.clone());
             artifact
-                .apply_materialized(ArtifactEvent::UploadStored, metadata)
+                .apply_materialized(ArtifactEvent::UploadStored, metadata.clone())
                 .and_then(|_| artifact.apply(ArtifactEvent::ScanStarted))
                 .and_then(|_| {
                     artifact.apply(match receipt.scan_verdict() {
-                        ArtifactScanVerdict::Clean => ArtifactEvent::ScanPassed,
-                        ArtifactScanVerdict::Quarantined => ArtifactEvent::ScanQuarantined,
-                        ArtifactScanVerdict::Rejected => ArtifactEvent::ScanRejected,
+                        Some(ArtifactScanVerdict::Clean) => ArtifactEvent::ScanPassed,
+                        Some(ArtifactScanVerdict::Quarantined) => ArtifactEvent::ScanQuarantined,
+                        Some(ArtifactScanVerdict::Rejected) => ArtifactEvent::ScanRejected,
+                        None => {
+                            return Err(browserd_artifacts::ArtifactError::MetadataSourceMismatch);
+                        }
                     })
                 })
                 .map_err(|_| WorkerError::DependencyUnavailable)?;
@@ -3381,24 +5178,54 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .artifact_reserved_bytes
                 .checked_sub(size_bytes)
                 .ok_or(WorkerError::StateUnavailable)?;
+            if session.machine.snapshot().lifecycle != SessionLifecycle::Ready {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            if artifact.state() == ArtifactState::Available {
+                let publication = self.new_artifact_publication(
+                    key,
+                    fence.clone(),
+                    metadata,
+                    receipt.object_generation(),
+                    receipt.scan_verdict(),
+                    display_filename.clone(),
+                    receipt.scan_attestation().cloned(),
+                )?;
+                attempted_publication = Some(publication.clone());
+                self.publish_authorized_artifact(&publication)?;
+            }
             session.artifact_reserved_bytes = remaining_reserved;
             session.artifact_committed_bytes = projected_committed;
             session.artifacts.insert(
                 artifact_id.clone(),
                 ArtifactRecord {
+                    publication: attempted_publication.clone(),
                     artifact,
                     object_generation: receipt.object_generation(),
+                    display_filename,
                 },
             );
             Ok(artifact_id)
         })();
         if result.is_err() {
+            let withdrawal_confirmed = attempted_publication
+                .as_ref()
+                .is_none_or(|publication| self.sandbox.withdraw_artifact(publication).is_ok());
+            let cleanup_confirmed = withdrawal_confirmed
+                && !store_uncertain
+                && stored_receipt
+                    .as_ref()
+                    .is_none_or(|receipt| self.sandbox.discard_artifact(receipt, fence).is_ok());
             let mut session = match executor.state.lock() {
                 Ok(session) => session,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            session.artifact_reserved_bytes =
-                session.artifact_reserved_bytes.saturating_sub(size_bytes);
+            if cleanup_confirmed {
+                session.artifact_reserved_bytes =
+                    session.artifact_reserved_bytes.saturating_sub(size_bytes);
+            } else {
+                session.durability_degraded = true;
+            }
         }
         result
     }
@@ -3421,11 +5248,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .artifacts
             .get(artifact_id)
             .ok_or(WorkerError::ArtifactNotFound)?;
+        self.validate_artifact_record_publication(artifact, fence)?;
         let metadata = artifact
             .artifact
             .content_metadata()
             .ok_or(WorkerError::StateUnavailable)?;
         Ok(WorkerArtifactSnapshot {
+            display_filename: artifact.display_filename.clone(),
             artifact_id: artifact.artifact.key().artifact_id().clone(),
             state: artifact.artifact.state(),
             size_bytes: metadata.size_bytes(),
@@ -3435,6 +5264,59 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             origin: metadata.origin().to_owned(),
             object_generation: artifact.object_generation,
         })
+    }
+
+    pub fn open_artifact(
+        &self,
+        peer: &AuthenticatedPeer,
+        session_id: &SessionId,
+        artifact_id: &ArtifactId,
+        fence: &OwnershipFence,
+        max_chunk_bytes: usize,
+    ) -> Result<Box<dyn ArtifactReadStream>, WorkerError> {
+        self.authorize(peer)?;
+        let executor = self.session(session_id)?;
+        let (request, publication) = {
+            let session = executor
+                .state
+                .lock()
+                .map_err(|_| WorkerError::StateUnavailable)?;
+            validate_fence(&session, fence)?;
+            if session.machine.snapshot().lifecycle != SessionLifecycle::Ready {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            let record = session
+                .artifacts
+                .get(artifact_id)
+                .ok_or(WorkerError::ArtifactNotFound)?;
+            if record.artifact.state() != ArtifactState::Available {
+                return Err(WorkerError::DependencyUnavailable);
+            }
+            self.validate_artifact_record_publication(record, fence)?;
+            let publication = record
+                .publication
+                .clone()
+                .ok_or(WorkerError::ArtifactNotFound)?;
+            let request = ArtifactReadRequest::new(
+                record.artifact.key().clone(),
+                fence.clone(),
+                record
+                    .artifact
+                    .content_metadata()
+                    .cloned()
+                    .ok_or(WorkerError::StateUnavailable)?,
+                record.object_generation,
+                max_chunk_bytes,
+            )?;
+            (request, publication)
+        };
+        // Storage verification can perform I/O; never hold the session mutex across it.
+        let reader = self
+            .sandbox
+            .open_artifact(&request)
+            .map_err(|_| WorkerError::DependencyUnavailable)?;
+        self.get_session(peer, session_id, fence)?;
+        Ok(self.expiring_artifact_reader(reader, &publication))
     }
 
     pub fn approval_for_action(
@@ -3520,7 +5402,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             .map_err(|_| WorkerError::StateUnavailable)?;
         validate_fence(&session, fence)?;
         let decision_now = now.max(self.clock.now()?);
-        expire_pending_approvals(&mut session, fence, decision_now)?;
+        self.expire_action_approvals(&mut session, fence, decision_now)?;
         let action_id = session
             .approvals
             .get(approval_id)
@@ -3559,6 +5441,17 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             return Err(WorkerError::ApprovalPolicy(
                 ApprovalError::FourEyesViolation,
             ));
+        }
+        if proposal.typed_binding().is_some() {
+            self.audit_approval_event(
+                match decision {
+                    ApprovalDecision::Approve => "approve",
+                    ApprovalDecision::Deny => "deny",
+                },
+                &proposal,
+                Some(&principal_id),
+                serde_json::json!({}),
+            )?;
         }
         let mut next_machine = session.machine.clone();
         next_machine
@@ -3600,7 +5493,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 action.snapshot.status = ActionStatus::FailedKnown;
             }
         }
-        session.machine = next_machine;
+        install_session_machine(&mut session, next_machine)?;
         let approval = session
             .approvals
             .get_mut(approval_id)
@@ -3679,6 +5572,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         self.sandbox
             .heartbeat(&self.config.worker_id, self.config.worker_epoch)
             .map_err(|_| WorkerError::DependencyUnavailable)?;
+        // Backend renewal can wait behind exact native ownership operations.
+        // Renew local leases from its completion, preserving caller/session monotonicity.
+        let now = now.max(self.clock.now()?);
         let mut worker = self.lock_worker()?;
         if worker.stopped {
             return Err(WorkerError::Stopped);
@@ -3690,10 +5586,11 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 .map_err(|_| WorkerError::StateUnavailable)?;
             let fence = session.machine.snapshot().owner_fence;
             if session.machine.lifecycle() == SessionLifecycle::Ready {
-                session
-                    .machine
-                    .renew_lease(&fence, now)
-                    .map_err(map_session_error)?;
+                let renewal_now = now.max(session.machine.last_observed_at());
+                match session.machine.renew_lease(&fence, renewal_now) {
+                    Ok(_) | Err(SessionError::SessionDeadlineElapsed { .. }) => {}
+                    Err(error) => return Err(map_session_error(error)),
+                }
             }
         }
         refresh_heartbeat_deadline(&mut worker)?;
@@ -3706,19 +5603,62 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
         now: SessionTime,
     ) -> Result<usize, WorkerError> {
         self.authorize(peer)?;
+        let viewer_cleanup_failed = self.expire_viewers(peer, now).is_err();
+        let checkpoint_cleanup_failed = self.cleanup_expired_checkpoints(now).is_err();
         let worker = self.lock_worker()?;
         let sessions = worker.sessions.values().cloned().collect::<Vec<_>>();
         drop(worker);
         let mut expired = 0usize;
         let mut ownership_lost = false;
-        let mut cleanup_failed = false;
-        let mut durability_failed = false;
+        let mut cleanup_failed = viewer_cleanup_failed;
+        let mut durability_failed = checkpoint_cleanup_failed;
         'sessions: for executor in sessions {
+            {
+                let mut session = executor
+                    .state
+                    .lock()
+                    .map_err(|_| WorkerError::StateUnavailable)?;
+                if !matches!(
+                    session.machine.lifecycle(),
+                    SessionLifecycle::Creating | SessionLifecycle::Ready
+                ) {
+                    continue;
+                }
+                let snapshot = session.machine.snapshot();
+                let observed_now = now.max(session.machine.last_observed_at());
+                let due = [
+                    snapshot.lease_expires_at,
+                    snapshot.session_expires_at,
+                    snapshot.idle_expires_at,
+                ]
+                .into_iter()
+                .flatten()
+                .any(|deadline| observed_now >= deadline);
+                if !due {
+                    // Approval expiry does not need the artifact cleanup guard.
+                    if self
+                        .expire_action_approvals(&mut session, &snapshot.owner_fence, observed_now)
+                        .is_err()
+                    {
+                        durability_failed = true;
+                    }
+                    if !matches!(
+                        session
+                            .machine
+                            .expire_due(&snapshot.owner_fence, observed_now)
+                            .map_err(map_session_error)?,
+                        ExpireDecision::NotDue { .. }
+                    ) {
+                        return Err(WorkerError::StateUnavailable);
+                    }
+                    continue;
+                }
+            }
             let _cleanup_owner = executor
                 .cleanup_owner
                 .lock()
                 .map_err(|_| WorkerError::StateUnavailable)?;
-            let (mut session, approved_dispatch_phase, expiration_due) = loop {
+            let (mut session, approved_dispatch_phase, expiration_due, now) = loop {
                 let session = executor
                     .state
                     .lock()
@@ -3730,6 +5670,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     continue 'sessions;
                 }
                 let snapshot = session.machine.snapshot();
+                let observed_now = now.max(session.machine.last_observed_at());
                 let expiration_due = [
                     snapshot.lease_expires_at,
                     snapshot.session_expires_at,
@@ -3737,12 +5678,13 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                 ]
                 .into_iter()
                 .flatten()
-                .any(|deadline| now >= deadline);
+                .any(|deadline| observed_now >= deadline);
                 if !expiration_due {
                     break (
                         session,
                         executor.approved_dispatch_phase.load(Ordering::Acquire),
                         false,
+                        observed_now,
                     );
                 }
                 match executor.approved_dispatch_phase.load(Ordering::Acquire) {
@@ -3752,11 +5694,14 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         drop(session);
                         stop_or_observe_approved_dispatch(&executor);
                     }
-                    phase => break (session, phase, true),
+                    phase => break (session, phase, true, observed_now),
                 }
             };
             let fence = session.machine.snapshot().owner_fence;
-            if expire_pending_approvals(&mut session, &fence, now).is_err() {
+            if self
+                .expire_action_approvals(&mut session, &fence, now)
+                .is_err()
+            {
                 durability_failed = true;
             }
             if expiration_due
@@ -3771,11 +5716,9 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
             {
                 durability_failed = true;
             }
-            match session
-                .machine
-                .expire_due(&fence, now)
-                .map_err(map_session_error)?
-            {
+            match transition_session_machine(&mut session, |machine| {
+                machine.expire_due(&fence, now)
+            })? {
                 ExpireDecision::NotDue { .. } => {}
                 ExpireDecision::BeganExpiring => {
                     if terminalize_actions_for_shutdown(&mut session).is_err() {
@@ -3796,7 +5739,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         .lock()
                         .map_err(|_| WorkerError::StateUnavailable)?;
                     validate_fence(&session, &fence)?;
-                    session.machine = cleanup_machine;
+                    install_session_machine(&mut session, cleanup_machine)?;
                     if cleanup_result.is_ok() {
                         session.occupies_capacity = false;
                         expired = expired.saturating_add(1);
@@ -3879,9 +5822,16 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
 
         let retention_millis =
             u64::try_from(self.config.session_retention.as_millis()).unwrap_or(u64::MAX);
-        let Ok(worker) = self.lock_worker() else {
+        let Ok(mut worker) = self.lock_worker() else {
             return 0;
         };
+        if self.config.admission_policy.is_some()
+            && self
+                .refresh_admissions(&mut worker, Instant::now())
+                .is_err()
+        {
+            return 0;
+        }
         let candidates = worker
             .sessions
             .iter()
@@ -3891,13 +5841,19 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
 
         let mut reclaimable = Vec::new();
         for (session_id, executor) in candidates {
+            if self.action_journal_pool.is_some()
+                && !self.seal_idle_action_journal(&executor).unwrap_or(false)
+            {
+                continue;
+            }
             let Ok(mut session) = executor.state.lock() else {
                 continue;
             };
             let terminal = matches!(
                 session.machine.lifecycle(),
                 SessionLifecycle::Closed | SessionLifecycle::Failed
-            ) && !session.occupies_capacity;
+            ) && !session.occupies_capacity
+                && session.pending_download_rollbacks.is_empty();
             if !terminal {
                 // Not eligible (still active, or cleanup receipt not yet in): reset any watermark.
                 session.reclaim_at = None;
@@ -3934,6 +5890,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                         session.machine.lifecycle(),
                         SessionLifecycle::Closed | SessionLifecycle::Failed
                     ) && !session.occupies_capacity
+                        && session.pending_download_rollbacks.is_empty()
                 });
                 if still_terminal {
                     worker.sessions.remove(&session_id);
@@ -4014,6 +5971,7 @@ impl<D: ChromiumDriver, S: SandboxClient> WorkerControlPlane<D, S> {
                     let _ = self.close_session(peer, &session_id, &fence, now)?;
                 }
             }
+            let _ = self.seal_idle_action_journal(&executor);
         }
         if create_cleanup_failed {
             return Err(WorkerError::CleanupFailed);
@@ -4251,15 +6209,15 @@ fn terminalize_stopped_approved_dispatch(
     });
     if let Err(error) = terminalization {
         session.durability_degraded = true;
-        let _ = session
-            .machine
-            .mark_action_outcome_unknown(fence, &action_id, completion_now);
+        let _ = transition_session_machine(session, |machine| {
+            machine.mark_action_outcome_unknown(fence, &action_id, completion_now)
+        });
         if let Some(action) = session.actions.get_mut(&action_id) {
             action.snapshot.status = ActionStatus::OutcomeUnknown;
         }
         return Err(error);
     }
-    session.machine = completed_machine;
+    install_session_machine(session, completed_machine)?;
     let action = session
         .actions
         .get_mut(&action_id)
@@ -4728,6 +6686,9 @@ mod tests {
                 ArtifactObjectGeneration::new([1; ArtifactObjectGeneration::LENGTH]),
                 ArtifactScanVerdict::Clean,
             )
+            .and_then(|receipt| {
+                artifact_scan_evidence::attest_test_receipt(receipt, request.fence(), 0)
+            })
             .map_err(|_| DependencyError::Rejected)
         }
     }

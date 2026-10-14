@@ -17,6 +17,7 @@ struct LedgerState {
     last_sequence: u64,
     idempotency: HashMap<IdempotencyKey, ActionId>,
     actions: HashMap<ActionId, ActionSnapshot>,
+    approval_ids: HashMap<ActionId, browserd_core::ApprovalId>,
 }
 
 pub struct ActionLedger<J> {
@@ -63,12 +64,26 @@ where
 
             let action_id = entry.action_id().clone();
             let action_sequence = entry.action_sequence();
+            if matches!(entry.kind(), JournalEntryKind::ApprovalRequired)
+                && let Some(approval_id) = entry.approval_id()
+                && state
+                    .approval_ids
+                    .insert(action_id.clone(), approval_id.clone())
+                    .is_some()
+            {
+                return Err(invalid("approval identity is duplicated"));
+            }
             match entry.kind().clone() {
                 JournalEntryKind::Accepted {
                     idempotency_key,
                     canonical_request_hash,
                     action_kind,
                 } => {
+                    if !entry.result_budget().is_valid_for(action_kind) {
+                        return Err(invalid(
+                            "accepted action result profile contradicts its kind",
+                        ));
+                    }
                     let expected_sequence = state
                         .last_sequence
                         .checked_add(1)
@@ -85,7 +100,8 @@ where
                         idempotency_key.clone(),
                         canonical_request_hash,
                         action_kind,
-                    );
+                    )
+                    .with_result_budget(entry.result_budget());
                     let snapshot = ActionSnapshot {
                         action_id: action_id.clone(),
                         action_sequence,
@@ -277,6 +293,11 @@ where
         &self.session
     }
 
+    #[must_use]
+    pub fn notification_source(&self) -> Option<browserd_core::NotificationSourceScope> {
+        self.journal.notification_source()
+    }
+
     pub fn accept(
         &self,
         fence: PlacementFence,
@@ -311,6 +332,9 @@ where
         proposed_action_sequence: Option<ActionSequence>,
         request: ActionRequest,
     ) -> Result<AcceptDecision, ActionLedgerError> {
+        if !request.result_budget().is_valid_for(request.kind()) {
+            return Err(ActionLedgerError::InvalidResultBudget);
+        }
         if let Some(action_id) = state.idempotency.get(request.idempotency_key()) {
             let snapshot = state
                 .actions
@@ -318,6 +342,7 @@ where
                 .ok_or(ActionLedgerError::StateUnavailable)?;
             if snapshot.request().canonical_request_hash() != request.canonical_request_hash()
                 || snapshot.request().kind() != request.kind()
+                || snapshot.request().result_budget() != request.result_budget()
             {
                 return Err(ActionLedgerError::IdempotencyConflict {
                     existing_action_id: action_id.clone(),
@@ -364,7 +389,7 @@ where
             resolution: None,
             result_content: None,
         };
-        self.append(JournalEntry::new(
+        let mut accepted_entry = JournalEntry::new(
             &self.session,
             action_id.clone(),
             snapshot.action_sequence(),
@@ -373,7 +398,9 @@ where
                 canonical_request_hash: request.canonical_request_hash(),
                 action_kind: request.kind(),
             },
-        ))?;
+        );
+        accepted_entry.result_budget = request.result_budget();
+        self.append(accepted_entry)?;
 
         state.last_sequence = proposed_action_sequence.get();
         state
@@ -409,6 +436,50 @@ where
             ActionState::PendingApproval,
             JournalEntryKind::ApprovalRequired,
         )
+    }
+
+    pub fn require_approval_with_identity(
+        &self,
+        fence: PlacementFence,
+        action_id: &ActionId,
+        approval_id: browserd_core::ApprovalId,
+    ) -> Result<ActionSnapshot, ActionLedgerError> {
+        self.check_fence(fence)?;
+        let mut state = self.lock_state()?;
+        let snapshot = state
+            .actions
+            .get(action_id)
+            .cloned()
+            .ok_or(ActionLedgerError::ActionNotFound)?;
+        if snapshot.state() == ActionState::PendingApproval {
+            return if state.approval_ids.get(action_id) == Some(&approval_id) {
+                Ok(snapshot)
+            } else {
+                Err(ActionLedgerError::ActionIdentityConflict {
+                    existing_action_id: action_id.clone(),
+                })
+            };
+        }
+        if snapshot.state() != ActionState::Queued {
+            return Err(ActionLedgerError::InvalidTransition {
+                state: snapshot.state(),
+            });
+        }
+        let mut entry = JournalEntry::new(
+            &self.session,
+            action_id.clone(),
+            snapshot.action_sequence(),
+            JournalEntryKind::ApprovalRequired,
+        );
+        entry.approval_id = Some(approval_id.clone());
+        self.append(entry)?;
+        state.approval_ids.insert(action_id.clone(), approval_id);
+        let stored = state
+            .actions
+            .get_mut(action_id)
+            .ok_or(ActionLedgerError::StateUnavailable)?;
+        stored.state = ActionState::PendingApproval;
+        Ok(stored.clone())
     }
 
     pub fn grant_approval(

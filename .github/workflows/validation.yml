@@ -1,0 +1,139 @@
+name: Validation gates
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: Run real kernel/Chromium qualification on a trusted runner
+        type: boolean
+        default: false
+      soak:
+        description: Run the real 72-hour workload on a trusted runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: '2'
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  fast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+      - run: rustup show active-toolchain
+      - run: python3 scripts/validation.py fast --log-dir "$RUNNER_TEMP/browserd-validation"
+      - name: Preserve command exit metadata (private command logs stay on the runner)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-validation-report
+          path: ${{ runner.temp }}/browserd-validation/*/report.json
+          if-no-files-found: error
+
+  adapter:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: browserd
+          POSTGRES_PASSWORD: browserd-test-only
+          POSTGRES_DB: browserd_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U browserd -d browserd_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      BROWSERD_REDIS_TEST_URL: redis://127.0.0.1:6379/
+      BROWSERD_COORDINATION_TEST_DATABASE_URL: postgres://browserd:browserd-test-only@127.0.0.1:5432/browserd_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: rustup show active-toolchain
+      - run: python3 scripts/validation.py adapter --log-dir "$RUNNER_TEMP/browserd-validation"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adapter-validation-report
+          path: ${{ runner.temp }}/browserd-validation/*/report.json
+          if-no-files-found: error
+
+  process:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: rustup show active-toolchain
+      - run: python3 scripts/validation.py process --log-dir "$RUNNER_TEMP/browserd-validation"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-validation-report
+          path: ${{ runner.temp }}/browserd-validation/*/report.json
+          if-no-files-found: error
+
+  kernel:
+    # No pull-request code, secrets, or privileged host access in ordinary CI.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.kernel
+    runs-on: [self-hosted, linux, browserd-kernel]
+    timeout-minutes: 240
+    env:
+      BROWSERD_TRUSTED_VALIDATION: '1'
+      BROWSERD_KERNEL_RUNNER: ${{ vars.BROWSERD_KERNEL_RUNNER }}
+      BROWSERD_VALIDATION_CGROUP_ROOT: ${{ vars.BROWSERD_VALIDATION_CGROUP_ROOT }}
+      BROWSERD_CHROMIUM_ARTIFACT_ROOT: ${{ vars.BROWSERD_CHROMIUM_ARTIFACT_ROOT }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/validation.py kernel --log-dir "$RUNNER_TEMP/browserd-validation"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-validation-report
+          path: ${{ runner.temp }}/browserd-validation/*/report.json
+          if-no-files-found: error
+
+  soak:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.soak
+    runs-on: [self-hosted, linux, browserd-soak]
+    timeout-minutes: 4800
+    env:
+      BROWSERD_TRUSTED_VALIDATION: '1'
+      BROWSERD_SOAK_RUNNER: ${{ vars.BROWSERD_SOAK_RUNNER }}
+      BROWSERD_VALIDATION_CGROUP_ROOT: ${{ vars.BROWSERD_VALIDATION_CGROUP_ROOT }}
+      BROWSERD_CHROMIUM_ARTIFACT_ROOT: ${{ vars.BROWSERD_CHROMIUM_ARTIFACT_ROOT }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/validation.py soak --log-dir "$RUNNER_TEMP/browserd-validation"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-validation-report
+          path: ${{ runner.temp }}/browserd-validation/*/report.json
+          if-no-files-found: error
