@@ -159,8 +159,9 @@ pub(super) fn replace_file(
     name: &str,
     temp: &str,
     bytes: &[u8],
+    max_bytes: u64,
 ) -> Result<File, DependencyError> {
-    if bytes.len() > MAX_BYTES {
+    if bytes.len() as u64 > max_bytes {
         return Err(DependencyError::Rejected);
     }
     let flags =
@@ -235,7 +236,7 @@ impl Retention {
                     retired_before: 0,
                     entries: vec![],
                 };
-                replace_file(&root, NAME, TEMP, &encode(snapshot)?)?
+                replace_file(&root, NAME, TEMP, &encode(snapshot)?, MAX_BYTES as u64)?
             }
             Err(_) => return Err(DependencyError::Rejected),
         };
@@ -325,7 +326,7 @@ impl Retention {
             retired_before: self.retired_before,
             entries: self.entries.values().cloned().collect(),
         })?;
-        match replace_file(&self.root, NAME, TEMP, &bytes) {
+        match replace_file(&self.root, NAME, TEMP, &bytes, MAX_BYTES as u64) {
             Ok(file) => {
                 self.file = file;
                 self.bytes = bytes.len() as u64;
@@ -955,6 +956,7 @@ async fn compact(shared: &Arc<SharedStore>, deadline: Instant) -> Result<(), Dep
                 "quota.journal",
                 "quota.tmp",
                 &bytes,
+                MAX_BYTES as u64,
             ) {
                 Ok(file) => {
                     ledger.journal = file;
