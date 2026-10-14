@@ -616,6 +616,59 @@ fn rollback_requires_exact_tenant_source_session_full_fence_action_and_ref() {
 }
 
 #[test]
+fn rollback_waits_out_a_concurrent_store_operation_instead_of_failing() {
+    let fixture = Arc::new(Fixture::new());
+    let limits = CheckpointStoreLimits {
+        max_records: 1,
+        max_bytes: MAX_STORE_BYTES,
+        retention_ms: 1000,
+    };
+    let store = Arc::new(
+        FileCheckpointStore::open_with_limits(&fixture.root(), &fixture.key(), limits)
+            .expect("store"),
+    );
+    let receipt = fixture.save(&store, 100);
+    // Another save, load or expiry sweep owns the store state while the rollback starts.
+    let held = store.state.lock().expect("hold store state");
+    let (started, entered) = std::sync::mpsc::channel();
+    let rollback = {
+        let fixture = fixture.clone();
+        let store = store.clone();
+        let reference = receipt.checkpoint_ref.clone();
+        std::thread::spawn(move || {
+            started.send(()).expect("rollback started");
+            store.discard(
+                &fixture.tenant,
+                &fixture.session,
+                &fixture.fence,
+                &fixture.action,
+                &reference,
+            )
+        })
+    };
+    entered.recv().expect("rollback thread");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!rollback.is_finished());
+    drop(held);
+    assert_eq!(rollback.join().expect("rollback result"), Ok(()));
+    assert!(!fixture.record(&receipt).exists());
+    // The rolled-back record released its quota, so the store admits the next checkpoint.
+    assert!(
+        store
+            .save(
+                &fixture.tenant,
+                &fixture.session,
+                &fixture.fence,
+                &ActionId::new(),
+                snapshot(),
+                200,
+                deadline()
+            )
+            .is_ok()
+    );
+}
+
+#[test]
 fn quotas_invalid_limits_and_unrelated_entries_fail_closed() {
     let fixture = Fixture::new();
     let store = FileCheckpointStore::open_with_limits(
