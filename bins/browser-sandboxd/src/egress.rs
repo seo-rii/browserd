@@ -482,7 +482,10 @@ pub struct HttpEgressControl {
 
 impl HttpEgressControl {
     pub fn new(config: EgressClientConfig) -> Result<Self, EgressControlError> {
+        // The control plane is a local daemon and every request carries a bearer token, so
+        // never route it through HTTP(S)_PROXY/ALL_PROXY from the service environment.
         let client = Client::builder()
+            .no_proxy()
             .connect_timeout(config.request_timeout)
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
