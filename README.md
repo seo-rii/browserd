@@ -589,10 +589,12 @@ viewer hosting and an existing delegated cgroup v2 subtree are prerequisites.
 
    Update the four reported environment values. The helper only reads state.
 4. Start egress, sandbox, worker and gateway in that order. The unit dependencies
-   and `deploy/wait_ready.py` check startup transport reachability; `/readyz`
-   separately reports whether browser admission is ready. The sandbox wrapper
-   opens the approved seccomp filter on descriptor 5. On the first start, use the
-   authenticated safety Initialize API below after the gateway is reachable.
+   and `deploy/wait_ready.py` check startup transport reachability (egress
+   `/healthz`, gateway `/health/live`); egress `/readyz` and gateway
+   `/health/ready` separately report whether browser admission is ready. The
+   sandbox wrapper opens the approved seccomp filter on descriptor 5. On the
+   first start, use the authenticated safety Initialize API below after the
+   gateway is reachable.
    Browser effects stay closed until worker and egress independently verify that
    authority. Preserve an existing namespace instead of initializing it again.
 5. After a failed start or restart, stop the whole stack and recompute epochs.
