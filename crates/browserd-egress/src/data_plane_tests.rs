@@ -2094,3 +2094,71 @@ async fn tunnel_idle_timeout_resets_on_traffic_in_either_direction() {
     origin_task.await.expect("origin task should join");
     assert!(serve.await.expect("serve task should join").is_ok());
 }
+
+#[tokio::test]
+async fn idle_relay_holds_its_connection_slot_until_the_idle_timeout_closes_it() {
+    let idle = Duration::from_millis(100);
+    let mut quota = limits();
+    quota.idle_connection_timeout = idle;
+    let (registry, claim) = setup_with_limits(quota);
+    let (proxy_upstream, _origin) = tokio::io::duplex(4_096);
+    let mut configured = data_limits();
+    configured.idle_timeout = idle;
+    let service = DataPlane::new(
+        registry.clone(),
+        FakeResolver {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            gate: None,
+        },
+        FakeConnector {
+            targets: Arc::new(Mutex::new(Vec::new())),
+            upstream: Arc::new(Mutex::new(Some(proxy_upstream))),
+        },
+        configured,
+    )
+    .expect("limits should be valid");
+    let (mut client, server) = tokio::io::duplex(4_096);
+    client
+        .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+        .await
+        .expect("request should write");
+    let serving_claim = claim.clone();
+    let serve = tokio::spawn(async move {
+        service
+            .serve_verified_connection(
+                VerifiedRouteSource::new(serving_claim),
+                server,
+                MonotonicMillis::new(1_001),
+            )
+            .await
+    });
+    let mut established = vec![0; 39];
+    client
+        .read_exact(&mut established)
+        .await
+        .expect("CONNECT response should arrive");
+    assert_eq!(
+        registry
+            .usage(&claim)
+            .expect("usage should exist")
+            .active_connections,
+        1
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(1), serve)
+        .await
+        .expect("idle relay should close at the configured idle timeout")
+        .expect("serve task should join");
+    assert!(matches!(
+        result,
+        Err(DataPlaneError::Timeout("tunnel idle"))
+    ));
+    assert_eq!(
+        registry
+            .usage(&claim)
+            .expect("usage should exist")
+            .active_connections,
+        0,
+        "the relay close is what releases the connection slot"
+    );
+}

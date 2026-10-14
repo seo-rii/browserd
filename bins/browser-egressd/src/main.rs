@@ -21,7 +21,7 @@ use browserd_coordination::{
     SafetyObserver,
 };
 use browserd_core::{EgressFence, RuntimeSafetyCache, TenantId, WorkerId};
-use browserd_egress::{AttachmentState, DataPlaneLimits, QuotaLimits};
+use browserd_egress::{AttachmentState, QuotaLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -663,7 +663,6 @@ async fn main() -> anyhow::Result<()> {
     let daemon = Arc::new(EgressDaemon::with_runtime_safety(
         daemon_epoch,
         config.limits,
-        DataPlaneLimits::default(),
         Arc::clone(&safety_cache),
     )?);
     let control_listener = TcpListener::bind(config.control_bind)
@@ -772,7 +771,6 @@ mod tests {
                 EgressDaemon::with_runtime_safety(
                     DaemonEpoch::new(41).expect("epoch"),
                     limits,
-                    DataPlaneLimits::default(),
                     cache.clone(),
                 )
                 .expect("daemon"),

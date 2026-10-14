@@ -69,6 +69,18 @@ impl DaemonLimits {
         self.max_plan_history = capacity;
         Ok(self)
     }
+
+    /// Relay limits derived from the daemon configuration. The configured idle
+    /// connection timeout is the relay idle timeout: a route's connection slot
+    /// is released only when its relay closes, so the idle relay close is what
+    /// enforces that timeout.
+    #[must_use]
+    pub(crate) fn data_plane_limits(&self) -> DataPlaneLimits {
+        DataPlaneLimits {
+            idle_timeout: self.quotas.idle_connection_timeout,
+            ..DataPlaneLimits::default()
+        }
+    }
 }
 
 /// Immutable preparation command. All duplicated identity is derived from the
@@ -293,7 +305,6 @@ impl EgressDaemon {
     pub fn new(
         daemon_epoch: DaemonEpoch,
         limits: DaemonLimits,
-        data_plane_limits: DataPlaneLimits,
     ) -> Result<Self, DaemonControlError> {
         let routes = RouteRegistry::with_limits(
             limits.max_lease,
@@ -303,7 +314,7 @@ impl EgressDaemon {
             routes.clone(),
             TokioResolver,
             TcpConnector,
-            data_plane_limits,
+            limits.data_plane_limits(),
         )
         .map_err(|_| DaemonControlError::InvalidLimits)?;
         Ok(Self::with_registry_and_handler(
@@ -317,7 +328,6 @@ impl EgressDaemon {
     pub fn with_runtime_safety(
         daemon_epoch: DaemonEpoch,
         limits: DaemonLimits,
-        data_plane_limits: DataPlaneLimits,
         cache: Arc<browserd_core::RuntimeSafetyCache>,
     ) -> Result<Self, DaemonControlError> {
         let routes = RouteRegistry::with_limits(
@@ -329,7 +339,7 @@ impl EgressDaemon {
             routes.clone(),
             TokioResolver,
             TcpConnector,
-            data_plane_limits,
+            limits.data_plane_limits(),
         )
         .map_err(|_| DaemonControlError::InvalidLimits)?;
         Ok(Self::with_registry_and_handler(
