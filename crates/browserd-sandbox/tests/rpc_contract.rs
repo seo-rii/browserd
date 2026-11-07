@@ -2,6 +2,7 @@
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ mod cleanup_confirmation;
 #[derive(Clone, Default)]
 struct RecordingBackend {
     events: Arc<Mutex<Vec<String>>>,
+    panic_next_inspect: Arc<AtomicBool>,
 }
 
 impl RecordingBackend {
@@ -89,6 +91,10 @@ impl SandboxBackend for RecordingBackend {
     }
 
     async fn inspect(&self, _handle: &SandboxHandle) -> Result<InspectResources, SandboxError> {
+        assert!(
+            !self.panic_next_inspect.swap(false, Ordering::AcqRel),
+            "injected inspect panic"
+        );
         Ok(InspectResources {
             memory_current_bytes: 10,
             memory_peak_bytes: 20,
@@ -1418,6 +1424,88 @@ async fn local_rpc_round_trips_fenced_lifecycle_operations() {
 
     shutdown.cancel();
     assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn a_panicking_connection_task_does_not_stop_the_server_or_its_shards() {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let shutdown = CancellationToken::new();
+    let backend = RecordingBackend::default();
+    let server = SandboxRpcServer::new(supervisor(backend.clone()), rpc_config());
+    let server_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+    let client = SandboxRpcClient::new(
+        socket,
+        rpc_config().max_frame_bytes(),
+        Duration::from_millis(200),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid");
+    let shard_id = ShardId::new();
+
+    assert_eq!(
+        client
+            .create_shard(
+                launch_spec(shard_id.clone(), worker(), 9),
+                Duration::from_millis(80),
+            )
+            .await,
+        Ok(CreateShardOutcome::Created)
+    );
+    backend.panic_next_inspect.store(true, Ordering::Release);
+    assert!(matches!(
+        client
+            .inspect_resources(&shard_id, 9, launch_generation())
+            .await,
+        Err(SandboxRpcError::ConnectionClosed | SandboxRpcError::Io(_))
+    ));
+    assert!(
+        client
+            .inspect_resources(&shard_id, 9, launch_generation())
+            .await
+            .is_ok(),
+        "the server and the shard must survive another connection's panic"
+    );
+    assert!(matches!(
+        client
+            .kill_shard(
+                &shard_id,
+                9,
+                launch_generation(),
+                CleanupReason::Administrative,
+            )
+            .await,
+        Ok(KillShardOutcome::Terminated(_))
+    ));
+    assert!(!task.is_finished());
+    assert_eq!(backend.events(), ["provision", "revoke", "kill", "cleanup"]);
+
+    shutdown.cancel();
+    assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+#[tokio::test]
+async fn a_socket_that_cannot_accept_still_stops_the_server() {
+    let shutdown = CancellationToken::new();
+    let not_listening = nix::sys::socket::socket(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::Stream,
+        nix::sys::socket::SockFlag::SOCK_CLOEXEC | nix::sys::socket::SockFlag::SOCK_NONBLOCK,
+        None,
+    )
+    .expect("Unix socket is created");
+    let listener = UnixListener::from_std(std::os::unix::net::UnixListener::from(not_listening))
+        .expect("socket registers with the runtime");
+    let server = SandboxRpcServer::new(supervisor(RecordingBackend::default()), rpc_config());
+    let task = tokio::spawn(async move { server.serve(listener, shutdown).await });
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), task).await,
+        Ok(Ok(Err(SandboxRpcError::Io(_))))
+    ));
 }
 
 #[tokio::test]

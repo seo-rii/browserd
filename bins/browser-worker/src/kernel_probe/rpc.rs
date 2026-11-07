@@ -458,7 +458,6 @@ impl RpcFailure {
             SandboxRpcError::Serialization(_) => "Serialization",
             SandboxRpcError::Io(_) => "Io",
             SandboxRpcError::Remote { .. } => "Remote",
-            SandboxRpcError::ConnectionTaskFailed => "ConnectionTaskFailed",
             SandboxRpcError::ShutdownIncomplete { .. } => "ShutdownIncomplete",
         };
         let mut row = Self {
