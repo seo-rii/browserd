@@ -226,7 +226,7 @@ fn all_in_one_qualifies_worker_before_readiness_and_shuts_down_cleanly() -> Test
         .as_array()
         .ok_or("session list missing")?;
     assert_eq!(sessions.len(), 1);
-    let session_id = sessions[0]
+    let session_id = sessions[0]["id"]
         .as_str()
         .ok_or("session id missing")?
         .parse::<SessionId>()?;
