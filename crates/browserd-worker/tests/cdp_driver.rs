@@ -6542,3 +6542,196 @@ mod checkpoint_contract {
 
 #[path = "support/typed_approvals.rs"]
 mod typed_approvals;
+
+/// Inspects the approval context of a node-free click proposal bound to `page`'s owned session.
+fn spawn_approval_inspection(
+    page: &OwnedPage,
+) -> tokio::task::JoinHandle<Result<browserd_worker::LiveApprovalContext, DependencyError>> {
+    let driver = page.driver.clone();
+    let session_id = page.session_id.clone();
+    let page_id = page.page_id.clone();
+    let proposal = browserd_policy::CanonicalActionProposal::new(
+        page.tenant_id.clone(),
+        browserd_core::PrincipalId::new(),
+        page.session_id.clone(),
+        ownership_fence().session_incarnation(),
+        page.page_id.clone(),
+        1,
+        1,
+        browserd_policy::Origin::parse("https://example.test").unwrap(),
+        1,
+        browserd_policy::ActionType::Click,
+        browserd_policy::ActionArgumentsHash::digest(br#"{"type":"click"}"#),
+        None,
+        browserd_policy::CredentialRefsHash::digest(std::iter::empty::<&str>()),
+        u64::MAX,
+    );
+    tokio::task::spawn_blocking(move || {
+        driver.inspect_approval_context(&session_id, &page_id, &proposal)
+    })
+}
+
+fn approval_frame_tree(security_origin: &str) -> Value {
+    json!({
+        "frameTree": {
+            "frame": {
+                "id": "frame-flat-primary",
+                "loaderId": "loader-a",
+                "url": "https://example.test/",
+                "domainAndRegistry": "example.test",
+                "securityOrigin": security_origin,
+                "mimeType": "text/html",
+                "secureContextType": "Secure",
+                "crossOriginIsolatedContextType": "NotIsolated",
+                "gatedAPIFeatures": []
+            },
+            "childFrames": []
+        }
+    })
+}
+
+/// Answers one origin read: page script reports `script_origin`, the browser's frame tree `tree`.
+async fn answer_origin_read(
+    page: &mut OwnedPage,
+    command: &Value,
+    script_origin: &str,
+    tree: Value,
+) {
+    let answer = if command["method"] == "Runtime.evaluate" {
+        json!({"result": {"type": "string", "value": script_origin}})
+    } else {
+        tree
+    };
+    respond(&mut page.writer, command, answer).await;
+}
+
+#[tokio::test]
+async fn approval_origin_is_the_main_frame_security_origin_not_page_script() {
+    let mut page = owned_page().await;
+    let inspection = spawn_approval_inspection(&page);
+    let command = read_command(&mut page.reader).await;
+    // Page script owns `globalThis`, so a script-read origin is whatever the page planted
+    // (`globalThis = {location: {origin: "https://bank.example"}}`); the fake answers such a read
+    // with the spoof and only the frame tree with the browser's own security origin.
+    answer_origin_read(
+        &mut page,
+        &command,
+        "https://bank.example",
+        approval_frame_tree("https://example.test"),
+    )
+    .await;
+
+    let live = inspection
+        .await
+        .unwrap()
+        .expect("the live approval context should be observed");
+    assert_eq!(
+        live.current_origin,
+        browserd_policy::Origin::parse("https://example.test").unwrap()
+    );
+    assert_eq!(command["method"], "Page.getFrameTree");
+    assert_eq!(command["sessionId"], "flat-primary");
+    assert_eq!(
+        (
+            live.target_incarnation,
+            live.frame_document_epoch,
+            live.url_revision
+        ),
+        (1, 1, 1)
+    );
+    assert!(
+        has_no_command_bytes(&mut page.reader, false).await,
+        "observing the origin must not evaluate page script"
+    );
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn approval_origin_refuses_opaque_non_canonical_and_non_main_frame_origins() {
+    let mut page = owned_page().await;
+    let mut cases: Vec<_> = [
+        "null",
+        "://",
+        "file://",
+        "https://EXAMPLE.test",
+        "https://example.test/",
+        "https://example.test:443",
+    ]
+    .into_iter()
+    .map(|origin| (origin, approval_frame_tree(origin)))
+    .collect();
+    // A root that names a parent, or is not the guarded main frame, is not the page's document.
+    let mut child_root = approval_frame_tree("https://example.test");
+    child_root["frameTree"]["frame"]["parentId"] = json!("outer-frame");
+    cases.push(("https://example.test", child_root));
+    let mut other_root = approval_frame_tree("https://example.test");
+    other_root["frameTree"]["frame"]["id"] = json!("frame-other");
+    cases.push(("https://example.test", other_root));
+    let mut methods = Vec::new();
+    for (origin, tree) in cases {
+        let inspection = spawn_approval_inspection(&page);
+        let command = read_command(&mut page.reader).await;
+        answer_origin_read(&mut page, &command, origin, tree.clone()).await;
+        assert_eq!(
+            inspection.await.unwrap(),
+            Err(DependencyError::Rejected),
+            "{tree} must not bind an approval"
+        );
+        methods.push(command["method"].clone());
+    }
+    assert!(methods.iter().all(|method| method == "Page.getFrameTree"));
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+}
+
+#[tokio::test]
+async fn approval_origin_read_across_a_navigation_is_refused() {
+    let mut page = owned_page().await;
+    let inspection = spawn_approval_inspection(&page);
+    let command = read_command(&mut page.reader).await;
+    // The main frame commits a new document while the origin read is outstanding, so the
+    // answered origin may belong to either document.
+    write_message(
+        &mut page.writer,
+        frame_navigated(
+            "flat-primary",
+            "frame-flat-primary",
+            "loader-b",
+            "https://bank.example/",
+        ),
+    )
+    .await;
+    answer_origin_read(
+        &mut page,
+        &command,
+        "https://bank.example",
+        approval_frame_tree("https://bank.example"),
+    )
+    .await;
+    assert_eq!(inspection.await.unwrap(), Err(DependencyError::Rejected));
+    assert_eq!(command["method"], "Page.getFrameTree");
+    // Read-only observation stays a known refusal; it must not fail the shard closed.
+    assert!(!page.drain.0.load(Ordering::SeqCst));
+    assert!(!page.manager.is_tainted());
+
+    // Once settled, the origin is reported together with the new document's epochs.
+    let inspection = spawn_approval_inspection(&page);
+    let command = read_command(&mut page.reader).await;
+    answer_origin_read(
+        &mut page,
+        &command,
+        "https://bank.example",
+        approval_frame_tree("https://bank.example"),
+    )
+    .await;
+    let live = inspection
+        .await
+        .unwrap()
+        .expect("the settled document should be observed");
+    assert_eq!(
+        live.current_origin,
+        browserd_policy::Origin::parse("https://bank.example").unwrap()
+    );
+    assert_eq!((live.frame_document_epoch, live.url_revision), (2, 2));
+}

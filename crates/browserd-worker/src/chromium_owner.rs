@@ -4806,26 +4806,68 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         {
             return Err(OwnerActorError::UnknownOwnership);
         }
+        // Pin the document before asking for its origin, so the origin and the epochs returned
+        // below are known to describe the same document.
+        let fence = {
+            let entry = self
+                .routes
+                .get(&target_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            PageExecutionFence {
+                target_incarnation: entry.target_incarnation,
+                frame_document_epoch: entry.frame_document_epoch,
+                url_revision: entry.url_revision,
+            }
+        };
+        let main = self.main_frame_guard(&target_id)?;
+        // The origin comes from the browser's frame tree, never from page script: `globalThis`
+        // and everything reachable from it are page-writable, so a script-read origin could be
+        // spoofed into the approval binding.
         let response = self
             .command_event_first(
-                "Runtime.evaluate",
-                json!({
-                    "expression": "globalThis.location.origin",
-                    "returnByValue": true,
-                    "awaitPromise": false,
-                }),
+                "Page.getFrameTree",
+                json!({}),
                 Some(route.session_id().to_owned()),
                 None,
                 None,
                 deadline,
             )
             .await?;
-        let origin = response
-            .get("result")
-            .and_then(|result| result.get("value"))
+        // Events that precede the response are applied before it is returned, so a commit the
+        // frame tree could reflect has already moved the route. A moved document is a known,
+        // effect-free refusal rather than an uncertain outcome: the observation is read-only, and
+        // failing the shard closed would let any page tear down every session on it by navigating.
+        self.validate_frame_guard(&main)?;
+        let entry = self
+            .routes
+            .get(&target_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if entry.target_incarnation != fence.target_incarnation
+            || entry.frame_document_epoch != fence.frame_document_epoch
+            || entry.url_revision != fence.url_revision
+        {
+            return Err(OwnerActorError::Rejected);
+        }
+        let frame = response
+            .pointer("/frameTree/frame")
+            .ok_or(OwnerActorError::Rejected)?;
+        if frame.get("id").and_then(Value::as_str) != Some(main.scope.frame_id.as_str())
+            || frame.get("parentId").is_some()
+        {
+            return Err(OwnerActorError::Rejected);
+        }
+        // Approvals bind only to a canonical tuple HTTP(S) origin. An opaque document (a fresh
+        // `about:blank`, `data:`, a CSP-sandboxed page) reports no tuple origin and is refused
+        // rather than coerced into one.
+        let origin = frame
+            .get("securityOrigin")
             .and_then(Value::as_str)
-            .filter(|origin| origin.len() <= 8_192 && !origin.chars().any(char::is_control))
-            .ok_or(OwnerActorError::OutcomeUncertain)?
+            .filter(|origin| origin.len() <= 8_192)
+            .filter(|origin| {
+                browserd_policy::Origin::parse(origin)
+                    .is_ok_and(|parsed| parsed.as_str() == *origin)
+            })
+            .ok_or(OwnerActorError::Rejected)?
             .to_owned();
         // A node-bearing proposal is valid only if its handle still resolves in this document;
         // the store enforces the session/target/epoch staleness bound.
