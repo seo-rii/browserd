@@ -15,6 +15,9 @@ use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 const DAY: Duration = MINIMUM_EVENT_RETENTION;
+/// The store's per-call prune bound (`PRUNE_BATCH_LIMIT` in `event_outbox/redis.rs`), mirrored so
+/// the backlog tests can size a backlog past it and assert exactly what one call removes.
+const PRUNE_BATCH: u64 = 256;
 
 #[path = "support/event_outbox_projection.rs"]
 mod projection_cases;
@@ -260,6 +263,24 @@ async fn cleanup(fixture: &RedisFixture) {
             .await
             .expect("namespace should be deletable");
     }
+}
+
+/// The sequences still stored for `tenant`, read straight from the store's ordered index so a
+/// test can observe how much a single call pruned.
+async fn retained_seqs(fixture: &RedisFixture, tenant: &TenantId) -> Vec<u64> {
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("endpoint should validate");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("inspection connection should open");
+    let index = format!("{}:event-outbox:{{{tenant}}}:index", fixture.prefix);
+    redis::cmd("ZRANGE")
+        .arg(index)
+        .arg(0)
+        .arg(-1)
+        .query_async(&mut connection)
+        .await
+        .expect("index should be readable")
 }
 
 #[tokio::test]
@@ -525,5 +546,129 @@ async fn redis_notifications_preserve_all_nine_typed_kinds_and_immutable_wire() 
             .expect("restored typed state"),
         before
     );
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_retention_backlog_drains_in_bounded_batches() {
+    let Some(fixture) = fixture("prune-backlog").await else {
+        return;
+    };
+    let store = &fixture.store;
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+
+    // More than three batches, a second apart so the oldest-first prune order is sequence order.
+    let backlog = 3 * PRUNE_BATCH + 10;
+    for revision in 0..backlog {
+        store
+            .append(
+                action_terminal(&tenant, &session, revision),
+                at(revision as i64),
+            )
+            .await
+            .expect("backlog append");
+    }
+    let later = at(DAY.as_secs() as i64 + backlog as i64);
+
+    // Once the whole backlog has aged out, one call prunes only the oldest batch, and a consumer
+    // that already holds exactly that batch is not told about a gap.
+    let page = store
+        .read_from(&tenant, EventCursor::from_position(PRUNE_BATCH), 1, later)
+        .await
+        .expect("first drain");
+    assert!(!page.cursor_expired());
+    assert_eq!(page.events()[0].cursor().position(), PRUNE_BATCH + 1);
+    let retained = retained_seqs(&fixture, &tenant).await;
+    assert_eq!(retained.len() as u64, backlog - PRUNE_BATCH);
+    assert_eq!(retained.first(), Some(&(PRUNE_BATCH + 1)));
+
+    // The next call prunes the next batch, which that consumer had not read: a reported gap.
+    let page = store
+        .read_from(&tenant, EventCursor::from_position(PRUNE_BATCH), 1, later)
+        .await
+        .expect("second drain");
+    assert!(page.cursor_expired());
+    assert_eq!(page.events()[0].cursor().position(), 2 * PRUNE_BATCH + 1);
+    assert_eq!(
+        retained_seqs(&fixture, &tenant).await.len() as u64,
+        backlog - 2 * PRUNE_BATCH
+    );
+
+    // A source projection appends through the same bounded prune: one more batch, then its event.
+    store
+        .append_projection(projection_cases::projection(&tenant, &session, 1), later)
+        .await
+        .expect("projection after the backlog");
+    let retained = retained_seqs(&fixture, &tenant).await;
+    assert_eq!(retained.len() as u64, backlog - 3 * PRUNE_BATCH + 1);
+    assert_eq!(retained.first(), Some(&(3 * PRUNE_BATCH + 1)));
+    assert_eq!(retained.last(), Some(&(backlog + 1)));
+
+    // An append drains the remainder before recording its own event at the next sequence.
+    let fresh = store
+        .append(action_terminal(&tenant, &session, backlog), later)
+        .await
+        .expect("append after the backlog");
+    assert_eq!(fresh.cursor().position(), backlog + 2);
+    assert_eq!(
+        retained_seqs(&fixture, &tenant).await,
+        vec![backlog + 1, backlog + 2]
+    );
+
+    // Expiry is exact at the fully drained boundary: behind it is a gap, at it is not.
+    let page = store
+        .read_from(&tenant, EventCursor::from_position(backlog - 1), 10, later)
+        .await
+        .expect("read behind the drained boundary");
+    assert!(page.cursor_expired());
+    let page = store
+        .read_from(&tenant, EventCursor::from_position(backlog), 10, later)
+        .await
+        .expect("read at the drained boundary");
+    assert!(!page.cursor_expired());
+    assert_eq!(page.events().len(), 2);
+    assert_eq!(page.events()[1].event_id(), fresh.event_id());
+
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_id_anchored_resume_reports_a_hole_left_by_a_partial_prune() {
+    let Some(fixture) = fixture("prune-hole").await else {
+        return;
+    };
+    let store = &fixture.store;
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+
+    // One batch plus one, all in the same millisecond. Redis orders equal scores by member string,
+    // so the oldest-first batch spares the string-greatest sequence ("99"), not the highest one.
+    let burst = PRUNE_BATCH + 1;
+    let mut ids = Vec::new();
+    for revision in 0..burst {
+        let event = store
+            .append(action_terminal(&tenant, &session, revision), at(0))
+            .await
+            .expect("burst append");
+        ids.push(event.event_id());
+    }
+    let survivor = (1..=burst)
+        .max_by_key(|seq| seq.to_string())
+        .expect("burst is non-empty");
+    assert!(survivor < burst);
+
+    // The anchored read's own prune leaves only the anchor, so every later event is gone: the page
+    // must flag that gap rather than resume silently past it.
+    let anchor = ids[(survivor - 1) as usize];
+    let page = store
+        .read_after_event_id(&tenant, Some(anchor), 10, at(DAY.as_secs() as i64))
+        .await
+        .expect("anchored read");
+    assert_eq!(retained_seqs(&fixture, &tenant).await, vec![survivor]);
+    assert!(page.cursor_expired());
+    assert!(page.events().is_empty());
+    assert_eq!(page.next_cursor().position(), survivor);
+
     cleanup(&fixture).await;
 }
