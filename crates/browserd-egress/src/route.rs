@@ -210,12 +210,15 @@ struct RouteEntry {
     planner: ConnectionPlanner,
     quota: QuotaLedger,
     cancellation: CancellationToken,
+    accepted_guards: usize,
 }
 
 #[derive(Clone, Debug)]
 struct RetiredRoute {
     claim: RouteClaim,
     final_usage: QuotaUsage,
+    accepted_guards: usize,
+    released: bool,
 }
 
 #[derive(Debug)]
@@ -294,6 +297,36 @@ pub struct RouteRegistry {
     max_lease_millis: Option<u64>,
     limits: RouteRegistryLimits,
     state: Arc<Mutex<RouteState>>,
+    runtime_safety: Option<Arc<browserd_core::RuntimeSafetyCache>>,
+    clock: RegistryClock,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegistryClock {
+    origin: tokio::time::Instant,
+}
+
+impl RegistryClock {
+    pub(crate) fn now(self) -> MonotonicMillis {
+        MonotonicMillis::new(u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AccountingClock {
+    Registry,
+    Supplied,
+}
+
+impl AccountingClock {
+    // Call only after acquiring the registry lock. Production observations must
+    // follow ledger order, including when another flow waits for that same lock.
+    fn observe(self, registry: &RouteRegistry, supplied: MonotonicMillis) -> MonotonicMillis {
+        match self {
+            Self::Registry => registry.clock.now(),
+            Self::Supplied => supplied,
+        }
+    }
 }
 
 impl RouteRegistry {
@@ -311,7 +344,21 @@ impl RouteRegistry {
                 .flatten(),
             limits,
             state: Arc::new(Mutex::new(RouteState::default())),
+            runtime_safety: None,
+            clock: RegistryClock {
+                origin: tokio::time::Instant::now(),
+            },
         }
+    }
+
+    pub(crate) const fn clock(&self) -> RegistryClock {
+        self.clock
+    }
+
+    #[must_use]
+    pub fn with_runtime_safety(mut self, cache: Arc<browserd_core::RuntimeSafetyCache>) -> Self {
+        self.runtime_safety = Some(cache);
+        self
     }
 
     pub fn prepare_shard(&self, fence: &ShardFence) -> Result<(), RouteError> {
@@ -478,6 +525,7 @@ impl RouteRegistry {
             quota: QuotaLedger::new(binding.quota_limits.clone()),
             binding,
             cancellation,
+            accepted_guards: 0,
         };
         let identity = RouteIdentity::from(&entry);
         state.active.insert(fence.clone(), entry);
@@ -521,6 +569,21 @@ impl RouteRegistry {
         let entry = state.active.get(fence).ok_or(RouteError::RouteNotFound)?;
         Self::validate_claim(&entry.claim, claim)?;
         Self::retire_route(&mut state, fence);
+        Ok(())
+    }
+
+    /// Finishes only this route after every accepted ingress capability has dropped.
+    pub(crate) fn release_route(&self, claim: &RouteClaim) -> Result<(), RouteError> {
+        let mut state = self.lock_state();
+        let retired = state
+            .retired
+            .get_mut(claim.fence())
+            .ok_or(RouteError::RouteNotFound)?;
+        Self::validate_claim(&retired.claim, claim)?;
+        if retired.accepted_guards != 0 {
+            return Err(RouteError::ShardNotDrained);
+        }
+        retired.released = true;
         Ok(())
     }
 
@@ -623,7 +686,25 @@ impl RouteRegistry {
         claim: &RouteClaim,
         now: MonotonicMillis,
     ) -> Result<RouteIngressGuard, RouteError> {
+        self.begin_ingress_with_clock(claim, now, AccountingClock::Supplied)
+            .map(|(guard, _)| guard)
+    }
+
+    pub(crate) fn begin_live_ingress(
+        &self,
+        claim: &RouteClaim,
+    ) -> Result<(RouteIngressGuard, MonotonicMillis), RouteError> {
+        self.begin_ingress_with_clock(claim, MonotonicMillis::new(0), AccountingClock::Registry)
+    }
+
+    fn begin_ingress_with_clock(
+        &self,
+        claim: &RouteClaim,
+        supplied: MonotonicMillis,
+        clock: AccountingClock,
+    ) -> Result<(RouteIngressGuard, MonotonicMillis), RouteError> {
         let mut state = self.lock_state();
+        let now = clock.observe(self, supplied);
         let (fence, shard_fence, cancellation) = {
             let entry = Self::active_entry(&mut state, claim, now)?;
             (
@@ -646,10 +727,15 @@ impl RouteRegistry {
                 .ok_or(RouteError::InconsistentRegistryState)?
         };
         let entry = Self::active_entry(&mut state, claim, now)?;
+        let next_route_guards = entry
+            .accepted_guards
+            .checked_add(1)
+            .ok_or(RouteError::InconsistentRegistryState)?;
         entry
             .quota
             .reserve_connection(now)
             .map_err(RouteError::Quota)?;
+        entry.accepted_guards = next_route_guards;
         let Some(shard) = state.shards.get_mut(shard_fence.shard_id()) else {
             if let Some(entry) = state.active.get_mut(&fence) {
                 entry.quota.cancel_connection_reservation();
@@ -657,13 +743,16 @@ impl RouteRegistry {
             return Err(RouteError::InconsistentRegistryState);
         };
         shard.active_connections = next_active_connections;
-        Ok(RouteIngressGuard {
-            registry: self.clone(),
-            fence: fence.clone(),
-            cancellation,
-            reservation: ConnectionReservationGuard::new(self.clone(), fence),
-            drain_guard: ShardDrainGuard::new(self.clone(), shard_fence),
-        })
+        Ok((
+            RouteIngressGuard {
+                registry: self.clone(),
+                fence: fence.clone(),
+                cancellation,
+                reservation: ConnectionReservationGuard::new(self.clone(), fence.clone(), clock),
+                drain_guard: ShardDrainGuard::new(self.clone(), fence),
+            },
+            now,
+        ))
     }
 
     pub fn expire_routes(&self, now: MonotonicMillis) -> usize {
@@ -702,8 +791,10 @@ impl RouteRegistry {
         connection_id: ConnectionId,
         bytes: u64,
         now: MonotonicMillis,
+        clock: AccountingClock,
     ) -> Result<(), RouteError> {
         let mut state = self.lock_state();
+        let now = clock.observe(self, now);
         let entry = Self::active_entry_by_fence(&mut state, fence, now)?;
         entry
             .quota
@@ -717,8 +808,10 @@ impl RouteRegistry {
         connection_id: ConnectionId,
         bytes: u64,
         now: MonotonicMillis,
+        clock: AccountingClock,
     ) -> Result<(), RouteError> {
         let mut state = self.lock_state();
+        let now = clock.observe(self, now);
         let entry = Self::active_entry_by_fence(&mut state, fence, now)?;
         entry
             .quota
@@ -737,8 +830,10 @@ impl RouteRegistry {
         &self,
         fence: &EgressFence,
         now: MonotonicMillis,
+        clock: AccountingClock,
     ) -> Result<ConnectionId, RouteError> {
         let mut state = self.lock_state();
+        let now = clock.observe(self, now);
         let entry = Self::active_entry_by_fence(&mut state, fence, now)?;
         entry
             .quota
@@ -753,8 +848,14 @@ impl RouteRegistry {
         }
     }
 
-    fn close_shard_connection(&self, fence: &ShardFence) {
+    fn close_shard_connection(&self, route: &EgressFence) {
         let mut state = self.lock_state();
+        if let Some(entry) = state.active.get_mut(route) {
+            entry.accepted_guards = entry.accepted_guards.saturating_sub(1);
+        } else if let Some(entry) = state.retired.get_mut(route) {
+            entry.accepted_guards = entry.accepted_guards.saturating_sub(1);
+        }
+        let fence = route.shard();
         let Some(shard) = state.shards.get_mut(fence.shard_id()) else {
             return;
         };
@@ -797,6 +898,8 @@ impl RouteRegistry {
             RetiredRoute {
                 claim: entry.claim,
                 final_usage,
+                accepted_guards: entry.accepted_guards,
+                released: false,
             },
         );
     }
@@ -860,6 +963,9 @@ pub(crate) struct RouteIngressGuard {
 }
 
 impl RouteIngressGuard {
+    pub(crate) fn runtime_safety(&self) -> Option<Arc<browserd_core::RuntimeSafetyCache>> {
+        self.registry.runtime_safety.clone()
+    }
     #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
@@ -878,8 +984,17 @@ impl RouteIngressGuard {
             drain_guard,
         } = self;
         let mut state = registry.lock_state();
+        let now = reservation.clock.observe(&registry, now);
         let entry = RouteRegistry::active_entry_by_fence(&mut state, &fence, now)?;
         entry.planner.authorize(url).map_err(RouteError::Plan)?;
+        if let Some(cache) = &registry.runtime_safety {
+            cache
+                .with_fresh_snapshot(|snapshot| {
+                    ConnectionPlanner::authorize_safety(url, Some(snapshot))
+                })
+                .map_err(|_| RouteError::RuntimeSafetyUnavailable)?
+                .map_err(RouteError::Plan)?;
+        }
         entry
             .quota
             .record_dns_query(now)
@@ -919,12 +1034,24 @@ impl PreDnsPermit {
     ) -> Result<RoutePermit, RouteError> {
         let plan = {
             let mut state = self.registry.lock_state();
+            let now = self.reservation.clock.observe(&self.registry, now);
             let entry = RouteRegistry::active_entry_by_fence(&mut state, &self.fence, now)?;
-            entry
-                .planner
-                .plan(&self.url, resolution)
-                .map_err(RouteError::Plan)?
+            match &self.registry.runtime_safety {
+                Some(cache) => cache
+                    .with_fresh_snapshot(|snapshot| {
+                        entry
+                            .planner
+                            .plan_with_safety(&self.url, resolution, Some(snapshot))
+                    })
+                    .map_err(|_| RouteError::RuntimeSafetyUnavailable)?
+                    .map_err(RouteError::Plan)?,
+                None => entry
+                    .planner
+                    .plan(&self.url, resolution)
+                    .map_err(RouteError::Plan)?,
+            }
         };
+        let clock = self.reservation.clock;
         let connection_id = self.reservation.commit(now)?;
         let Self {
             registry,
@@ -942,6 +1069,7 @@ impl PreDnsPermit {
             cancellation,
             drain_guard,
             open: true,
+            clock,
         })
     }
 }
@@ -951,21 +1079,23 @@ struct ConnectionReservationGuard {
     registry: RouteRegistry,
     fence: EgressFence,
     open: bool,
+    clock: AccountingClock,
 }
 
 impl ConnectionReservationGuard {
-    fn new(registry: RouteRegistry, fence: EgressFence) -> Self {
+    fn new(registry: RouteRegistry, fence: EgressFence, clock: AccountingClock) -> Self {
         Self {
             registry,
             fence,
             open: true,
+            clock,
         }
     }
 
     fn commit(&mut self, now: MonotonicMillis) -> Result<ConnectionId, RouteError> {
-        let connection_id = self
-            .registry
-            .commit_connection_reservation(&self.fence, now)?;
+        let connection_id =
+            self.registry
+                .commit_connection_reservation(&self.fence, now, self.clock)?;
         self.open = false;
         Ok(connection_id)
     }
@@ -994,9 +1124,27 @@ pub(crate) struct RoutePermit {
     cancellation: CancellationToken,
     drain_guard: ShardDrainGuard,
     open: bool,
+    clock: AccountingClock,
 }
 
 impl RoutePermit {
+    pub fn authorize_connect(&self) -> Result<(), RouteError> {
+        if let Some(cache) = &self.registry.runtime_safety {
+            cache
+                .with_fresh_snapshot(|snapshot| {
+                    if snapshot.domain_denied(self.plan.declared_host()) {
+                        return Err(RouteError::Plan(PlanError::EmergencyDomainDenied));
+                    }
+                    if snapshot.ip_denied(self.plan.inspected_socket_addr().as_socket_addr().ip()) {
+                        return Err(RouteError::Plan(PlanError::EmergencyIpDenied));
+                    }
+                    Ok(())
+                })
+                .map_err(|_| RouteError::RuntimeSafetyUnavailable)??;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub const fn plan(&self) -> &ConnectPlan {
         &self.plan
@@ -1016,7 +1164,7 @@ impl RoutePermit {
             return Err(RouteError::ConnectionClosed);
         }
         self.registry
-            .record_egress_bytes(&self.fence, self.connection_id, bytes, now)
+            .record_egress_bytes(&self.fence, self.connection_id, bytes, now, self.clock)
     }
 
     pub fn record_request_bytes(
@@ -1028,7 +1176,7 @@ impl RoutePermit {
             return Err(RouteError::ConnectionClosed);
         }
         self.registry
-            .record_request_bytes(&self.fence, self.connection_id, bytes, now)
+            .record_request_bytes(&self.fence, self.connection_id, bytes, now, self.clock)
     }
 
     pub fn close(&mut self) -> bool {
@@ -1052,12 +1200,12 @@ impl Drop for RoutePermit {
 #[derive(Debug)]
 struct ShardDrainGuard {
     registry: RouteRegistry,
-    fence: ShardFence,
+    fence: EgressFence,
     open: bool,
 }
 
 impl ShardDrainGuard {
-    fn new(registry: RouteRegistry, fence: ShardFence) -> Self {
+    fn new(registry: RouteRegistry, fence: EgressFence) -> Self {
         Self {
             registry,
             fence,
@@ -1082,6 +1230,7 @@ impl Drop for ShardDrainGuard {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteError {
+    RuntimeSafetyUnavailable,
     InvalidEndpoint,
     InvalidWorkerEpoch,
     InvalidRegistryConfig,

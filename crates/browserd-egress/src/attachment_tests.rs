@@ -486,3 +486,79 @@ fn equal_proxy_addresses_do_not_alias_different_full_fences() {
         Ok(AttachmentState::Active)
     );
 }
+
+#[test]
+fn shared_context_preparation_preserves_mode_identity_and_bounded_lifetime() {
+    let epoch = DaemonEpoch::new(5).expect("epoch");
+    let shard = fence(5).shard().clone();
+    let first = full_fence(shard.clone(), 1);
+    let mut registry = AttachmentRegistry::new(epoch);
+    let prepared = registry
+        .prepare_context_route(epoch, first.clone(), digest(7))
+        .expect("shared primary");
+    assert_eq!(
+        registry
+            .prepare_context_route(epoch, first.clone(), digest(7))
+            .expect("exact retry"),
+        prepared
+    );
+    assert_eq!(
+        registry.prepare(epoch, first.clone(), digest(7)),
+        Err(AttachmentError::BindingConflict)
+    );
+    assert_eq!(
+        registry.prepare(epoch, full_fence(shard.clone(), 2), digest(7)),
+        Err(AttachmentError::ShardAttachmentConflict)
+    );
+    assert_eq!(
+        registry.prepare_context_route(epoch, full_fence(shard.clone(), 2), digest(8)),
+        Err(AttachmentError::ShardAttachmentConflict)
+    );
+    let same_session = EgressFence::new(
+        shard.clone(),
+        RouteGeneration::new(2).expect("generation"),
+        first.session_id().clone(),
+        SessionIncarnation::new(2).expect("incarnation"),
+    );
+    assert_eq!(
+        registry.prepare_context_route(epoch, same_session, digest(7)),
+        Err(AttachmentError::ShardAttachmentConflict)
+    );
+    assert_eq!(
+        registry.prepare_context_route(epoch, full_fence(shard.clone(), 1), digest(7)),
+        Err(AttachmentError::ShardAttachmentConflict)
+    );
+    let mut live = vec![prepared];
+    for index in 2..=8 {
+        live.push(
+            registry
+                .prepare_context_route(epoch, full_fence(shard.clone(), index), digest(7))
+                .expect("within eight live"),
+        );
+    }
+    assert_eq!(
+        registry.prepare_context_route(epoch, full_fence(shard.clone(), 9), digest(7)),
+        Err(AttachmentError::ShardAttachmentConflict)
+    );
+    for prepared in live {
+        let cancelled = registry.cancel(&prepared).expect("cancel");
+        registry
+            .release_cancelled(&cancelled)
+            .expect("no listener release");
+    }
+    for index in 9..=500 {
+        let prepared = registry
+            .prepare_context_route(epoch, full_fence(shard.clone(), index), digest(7))
+            .expect("released slots permit next lifetime route");
+        let cancelled = registry.cancel(&prepared).expect("cancel");
+        registry.release_cancelled(&cancelled).expect("release");
+    }
+    assert_eq!(
+        registry.prepare_context_route(epoch, full_fence(shard, 501), digest(7)),
+        Err(AttachmentError::ShardAttachmentConflict)
+    );
+    assert!(matches!(
+        registry.prepare_context_route(epoch, first, digest(7)),
+        Err(AttachmentError::Terminal(AttachmentState::Released))
+    ));
+}

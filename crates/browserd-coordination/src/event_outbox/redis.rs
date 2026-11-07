@@ -35,7 +35,7 @@ use super::{
     EventCursor, EventOutbox, EventOutboxError, MAX_EVENT_PAGE_LIMIT, OutboxAggregate,
     OutboxAppend, OutboxEvent, OutboxEventKind, OutboxPage,
 };
-use crate::StoreConfig;
+use crate::{EventProjectionSource, GatewayEventProjection, StoreConfig};
 
 /// Largest value Lua's number type (an f64) represents exactly. Sequences and millisecond
 /// timestamps stay well within it, so the store uses ordinary Lua arithmetic rather than the
@@ -47,6 +47,15 @@ const MAX_SAFE_REDIS_INTEGER: u64 = 9_007_199_254_740_991;
 /// script.
 const PRUNE_FRAGMENT: &str = r#"
 local function prune(meta, events, index, bytime, now, retention)
+  -- Projection metadata survives payload TTL. Preserve a resumable gap when the idle payload
+  -- namespace expired, instead of resetting the stream or resurrecting old projections.
+  if redis.call('HEXISTS', meta, 'projection_persistent') == 1 and redis.call('EXISTS', index) == 0 then
+    local next_seq = tonumber(redis.call('HGET', meta, 'next_seq') or '0')
+    local pruned = tonumber(redis.call('HGET', meta, 'pruned_through') or '0')
+    if next_seq and pruned and next_seq > pruned then
+      redis.call('HSET', meta, 'pruned_through', next_seq)
+    end
+  end
   local cutoff = now - retention
   local stale = redis.call('ZRANGEBYSCORE', bytime, '-inf', cutoff)
   if #stale == 0 then return end
@@ -73,36 +82,85 @@ local function prune(meta, events, index, bytime, now, retention)
 end
 "#;
 
-/// Append one terminal transition, idempotent on the dedup key.
-///
+/// Shared append transaction, called by legacy appends and durable source projections.
+const APPEND_FRAGMENT: &str = r#"
+local function append_event(meta, events, index, bytime, dedup, event_id, json, created_at, retention, now, max_seq)
+  prune(meta, events, index, bytime, now, retention)
+  local existing = redis.call('HGET', events, '@dedup:' .. dedup)
+  if existing then
+    local previous = redis.call('HGET', events, existing)
+    if not previous then return {'6'} end
+    return {'2', previous, existing}
+  end
+  local next_seq = tonumber(redis.call('HGET', meta, 'next_seq') or '0') + 1
+  if next_seq > max_seq then return {'5'} end
+  local seq = string.format('%.0f', next_seq)
+  redis.call('HSET', meta, 'next_seq', seq)
+  redis.call('HSET', events, seq, json, '@dedup:' .. dedup, seq, '@dk:' .. seq, dedup, '@byid:' .. event_id, seq, '@eid:' .. seq, event_id)
+  redis.call('ZADD', index, next_seq, seq)
+  redis.call('ZADD', bytime, created_at, seq)
+  if redis.call('HEXISTS', meta, 'projection_persistent') == 1 then
+    redis.call('PERSIST', meta)
+  else
+    redis.call('PEXPIRE', meta, retention)
+  end
+  redis.call('PEXPIRE', events, retention)
+  redis.call('PEXPIRE', index, retention)
+  redis.call('PEXPIRE', bytime, retention)
+  return {'1', json, seq}
+end
+"#;
+
 /// KEYS: meta, events, index, bytime.
 /// ARGV: dedup_key, event_id, event_json, created_at_millis, retention_millis, now_millis, max_seq.
-/// Returns `{'1', json, seq}` on a fresh append, `{'2', json, seq}` on an idempotent hit,
-/// `{'5'}` on sequence overflow, `{'6'}` on corrupt state.
 fn append_script() -> String {
     format!(
-        "{PRUNE_FRAGMENT}{}",
+        "{PRUNE_FRAGMENT}{APPEND_FRAGMENT}{}",
         r#"
-prune(KEYS[1], KEYS[2], KEYS[3], KEYS[4], tonumber(ARGV[6]), tonumber(ARGV[5]))
-local existing = redis.call('HGET', KEYS[2], '@dedup:' .. ARGV[1])
-if existing then
-  local json = redis.call('HGET', KEYS[2], existing)
-  if not json then return {'6'} end
-  return {'2', json, existing}
+return append_event(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]))
+"#
+    )
+}
+
+/// The source sequence is an exact decimal string (up to i64::MAX), independent of the tenant's
+/// notification cursor. Never convert it through Lua's f64 number type.
+/// KEYS/ARGV match append_script, with ARGV[8] session_id and ARGV[9] source sequence.
+fn projection_script() -> String {
+    format!(
+        "{PRUNE_FRAGMENT}{APPEND_FRAGMENT}{}",
+        r#"
+for index, expected in ipairs({'hash', 'hash', 'zset', 'zset'}) do
+  local actual = redis.call('TYPE', KEYS[index]).ok
+  if actual ~= 'none' and actual ~= expected then return {'6'} end
 end
-local next_seq = tonumber(redis.call('HGET', KEYS[1], 'next_seq') or '0') + 1
-if next_seq > tonumber(ARGV[7]) then return {'5'} end
-redis.call('HSET', KEYS[1], 'next_seq', next_seq)
-local seq = tostring(next_seq)
-redis.call('HSET', KEYS[2], seq, ARGV[3], '@dedup:' .. ARGV[1], seq, '@dk:' .. seq, ARGV[1], '@byid:' .. ARGV[2], seq, '@eid:' .. seq, ARGV[2])
-redis.call('ZADD', KEYS[3], next_seq, seq)
-redis.call('ZADD', KEYS[4], tonumber(ARGV[4]), seq)
-local ttl = tonumber(ARGV[5])
-redis.call('PEXPIRE', KEYS[1], ttl)
-redis.call('PEXPIRE', KEYS[2], ttl)
-redis.call('PEXPIRE', KEYS[3], ttl)
-redis.call('PEXPIRE', KEYS[4], ttl)
-return {'1', ARGV[3], seq}
+local function valid_decimal(value)
+  return value:match('^%d+$') and (value == '0' or value:sub(1, 1) ~= '0')
+    and (#value < 19 or (#value == 19 and value <= '9223372036854775807'))
+end
+local function less_equal(left, right)
+  return #left < #right or (#left == #right and left <= right)
+end
+local function increment(value)
+  local digits = {}
+  local carry = 1
+  for i = #value, 1, -1 do
+    local digit = string.byte(value, i) - 48 + carry
+    if digit == 10 then digit = 0 else carry = 0 end
+    table.insert(digits, 1, string.char(48 + digit))
+  end
+  if carry == 1 then table.insert(digits, 1, '1') end
+  return table.concat(digits)
+end
+local watermark_key = '@projection:' .. ARGV[8]
+local highwater = redis.call('HGET', KEYS[1], watermark_key) or '0'
+if not valid_decimal(highwater) or not valid_decimal(ARGV[9]) or ARGV[9] == '0' then return {'6'} end
+if less_equal(ARGV[9], highwater) then return {'2'} end
+if ARGV[9] ~= increment(highwater) then return {'3'} end
+local result = append_event(KEYS[1], KEYS[2], KEYS[3], KEYS[4], ARGV[1], ARGV[2], ARGV[3], tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7]))
+if result[1] ~= '1' and result[1] ~= '2' then return result end
+redis.call('HSET', KEYS[1], watermark_key, ARGV[9], 'projection_persistent', '1')
+redis.call('PERSIST', KEYS[1])
+return {'1'}
 "#
     )
 }
@@ -163,7 +221,11 @@ if cursor > next_seq then return {'2'} end
 local delivered = tonumber(redis.call('HGET', KEYS[1], 'delivered_through') or '0')
 if cursor > delivered then
   redis.call('HSET', KEYS[1], 'delivered_through', cursor)
-  redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+  if redis.call('HEXISTS', KEYS[1], 'projection_persistent') == 1 then
+    redis.call('PERSIST', KEYS[1])
+  else
+    redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))
+  end
 end
 return {'1'}
 "#;
@@ -248,6 +310,7 @@ struct OutboxKeys {
 /// field name / sorted-set score — so it is reattached on read, exactly as the action store
 /// reattaches its sequence.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PersistedOutboxEvent {
     event_id: Uuid,
     tenant_id: TenantId,
@@ -255,6 +318,8 @@ struct PersistedOutboxEvent {
     aggregate_revision: u64,
     kind: OutboxEventKind,
     created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<super::EventStateSummary>,
 }
 
 impl PersistedOutboxEvent {
@@ -266,6 +331,7 @@ impl PersistedOutboxEvent {
             aggregate_revision: append.aggregate_revision,
             kind: append.kind,
             created_at: now,
+            summary: append.summary.clone(),
         }
     }
 
@@ -278,6 +344,7 @@ impl PersistedOutboxEvent {
             aggregate_revision: self.aggregate_revision,
             kind: self.kind,
             created_at: self.created_at,
+            summary: self.summary,
         }
     }
 }
@@ -329,21 +396,6 @@ impl RedisEventOutbox {
         }
     }
 
-    fn dedup_key(aggregate: &OutboxAggregate, revision: u64, kind: OutboxEventKind) -> String {
-        let aggregate = match aggregate {
-            OutboxAggregate::Action {
-                session_id,
-                action_id,
-            } => format!("A:{session_id}:{action_id}"),
-            OutboxAggregate::Session { session_id } => format!("S:{session_id}"),
-        };
-        let kind = match kind {
-            OutboxEventKind::ActionTerminal => "t",
-            OutboxEventKind::SessionLost => "l",
-        };
-        format!("{aggregate}:{revision}:{kind}")
-    }
-
     fn retention_millis(&self) -> Result<u64, EventOutboxError> {
         u64::try_from(self.config.store.retention().as_millis())
             .map_err(|_| EventOutboxError::RetentionTimestampOverflow)
@@ -371,7 +423,11 @@ impl RedisEventOutbox {
         if persisted.event_id.get_version() != Some(Version::SortRand) {
             return Err(EventOutboxError::InvalidRedisResponse);
         }
-        Ok(persisted.into_event(seq))
+        let event = persisted.into_event(seq);
+        event
+            .validate()
+            .map_err(|_| EventOutboxError::InvalidRedisResponse)?;
+        Ok(event)
     }
 
     fn decode_page(
@@ -450,8 +506,10 @@ impl EventOutbox for RedisEventOutbox {
         append: OutboxAppend,
         now: DateTime<Utc>,
     ) -> Result<OutboxEvent, EventOutboxError> {
+        append.validate()?;
         let keys = self.keys(&append.tenant_id);
-        let dedup_key = Self::dedup_key(&append.aggregate, append.aggregate_revision, append.kind);
+        let dedup_key =
+            super::model::dedup_key(&append.aggregate, append.aggregate_revision, append.kind);
         let event_id = Uuid::now_v7();
         let persisted = PersistedOutboxEvent::from_append(&append, event_id, now);
         let event_json = serde_json::to_string(&persisted)
@@ -489,7 +547,63 @@ impl EventOutbox for RedisEventOutbox {
         let seq = fields
             .next()
             .ok_or(EventOutboxError::InvalidRedisResponse)?;
-        Self::decode_event(&json, Self::decode_seq(&seq)?)
+        let event = Self::decode_event(&json, Self::decode_seq(&seq)?)?;
+        if !event.matches_append(&append) {
+            return Err(EventOutboxError::ConflictingEvent);
+        }
+        Ok(event)
+    }
+
+    async fn append_projection(
+        &self,
+        projection: GatewayEventProjection,
+        now: DateTime<Utc>,
+    ) -> Result<(), EventOutboxError> {
+        super::validated_projection(&projection)?;
+        let append = projection.append();
+        let keys = self.keys(projection.tenant_id());
+        let dedup_key =
+            super::model::dedup_key(&append.aggregate, append.aggregate_revision, append.kind);
+        let event_id = Uuid::now_v7();
+        let event_json =
+            serde_json::to_string(&PersistedOutboxEvent::from_append(append, event_id, now))
+                .map_err(|_| EventOutboxError::InvalidRedisResponse)?;
+        let created_at = Self::epoch_millis(now)?;
+        let retention = self.retention_millis()?;
+        // Preserve the pre-namespace terminal key so existing permanent highwaters remain valid.
+        let session_id = match projection.source() {
+            EventProjectionSource::Terminal => projection.session_id().to_string(),
+            EventProjectionSource::ViewerControl => {
+                format!("viewer_control:{}", projection.session_id())
+            }
+        };
+        let sequence = projection.sequence().to_string();
+        let response: Vec<String> = self
+            .execute(move |mut connection| async move {
+                Script::new(&projection_script())
+                    .key(keys.meta)
+                    .key(keys.events)
+                    .key(keys.index)
+                    .key(keys.bytime)
+                    .arg(dedup_key)
+                    .arg(event_id.to_string())
+                    .arg(event_json)
+                    .arg(created_at)
+                    .arg(retention)
+                    .arg(created_at)
+                    .arg(MAX_SAFE_REDIS_INTEGER)
+                    .arg(session_id)
+                    .arg(sequence)
+                    .invoke_async(&mut connection)
+                    .await
+            })
+            .await?;
+        match response.first().map(String::as_str) {
+            Some("1" | "2") => Ok(()),
+            Some("3") => Err(EventOutboxError::ProjectionGap),
+            Some("5") => Err(EventOutboxError::SequenceOverflow),
+            _ => Err(EventOutboxError::InvalidRedisResponse),
+        }
     }
 
     async fn read_from(

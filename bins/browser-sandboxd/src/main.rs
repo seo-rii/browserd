@@ -16,17 +16,47 @@ use browser_sandboxd::{
 use browserd_core::WorkerId;
 use browserd_sandbox::{
     CgroupLimits, ChromiumBinaryDigest, ChromiumRuntime, FilePreparedShardJournal,
-    LaunchGateRuntime, LinuxSandboxBackend, LinuxSandboxConfig, PreparedShardJournalLimits,
-    PreparedShardRecoveryRoots, ReadOnlyMount, SandboxRpcConfig, SandboxRpcPeerBinding,
-    SandboxRpcServer, SandboxSupervisor, StartupPreparedShardReconciler, StdLinuxProcessBackend,
-    StdSandboxFilesystem, SupervisorConfig,
+    LaunchGateRuntime, LinuxSandboxBackend, LinuxSandboxConfig, NativeProcessResources,
+    PreparedShardJournalLimits, PreparedShardRecoveryRoots, ReadOnlyMount, SandboxRpcConfig,
+    SandboxRpcPeerBinding, SandboxRpcServer, SandboxSupervisor, StartupPreparedShardReconciler,
+    StdLinuxProcessBackend, StdSandboxFilesystem, SupervisorConfig,
 };
-use nix::fcntl::{Flock, FlockArg, OFlag, open};
+use nix::fcntl::{Flock, FlockArg, OFlag, OpenHow, ResolveFlag, open, openat, openat2};
 use nix::sys::stat::{Mode, SFlag, fchmod, fstat};
+
 use serde::Deserialize;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+
+fn load_native_profile_catalog(
+    root: &Path,
+) -> anyhow::Result<browserd_chromium::VerifiedNativeProfileCatalog> {
+    let metadata =
+        std::fs::symlink_metadata(root).context("Chromium artifact root is unavailable")?;
+    if !root.is_absolute()
+        || !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!("Chromium artifact root is not trusted");
+    }
+    let manifest = root.join("compatibility.json");
+    let metadata = std::fs::symlink_metadata(&manifest)
+        .context("Chromium compatibility manifest is unavailable")?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 1024 * 1024
+        || metadata.mode() & 0o022 != 0
+    {
+        bail!("Chromium compatibility manifest is not trusted");
+    }
+    let artifact: browserd_chromium::CompatibilityArtifact =
+        serde_json::from_slice(&std::fs::read(manifest)?)
+            .context("Chromium compatibility manifest is invalid")?;
+    browserd_chromium::VerifiedNativeProfileCatalog::load(root, &artifact)
+        .context("Chromium native process profile catalog verification failed")
+}
 
 const MAX_RPC_CONNECTIONS: usize = 1024;
 const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
@@ -99,6 +129,31 @@ impl Config {
         let chromium_digest =
             ChromiumBinaryDigest::from_hex(&required("BROWSERD_CHROMIUM_BINARY_SHA256")?)
                 .context("BROWSERD_CHROMIUM_BINARY_SHA256 is invalid")?;
+        let native_catalog =
+            load_native_profile_catalog(&required_path("BROWSERD_CHROMIUM_ARTIFACT_ROOT")?)?;
+        if ChromiumBinaryDigest::from(native_catalog.binary_digest()) != chromium_digest {
+            bail!("native profile catalog belongs to another Chromium binary");
+        }
+        let (icu_path, icu_digest) = native_catalog.icu_data();
+        let native_resources = NativeProcessResources::new(
+            chromium_digest,
+            native_catalog.catalog_digest().into(),
+            icu_path,
+            icu_digest.into(),
+            native_catalog
+                .locale_resources()
+                .iter()
+                .map(|resource| {
+                    (
+                        resource.locale.clone(),
+                        resource.source.clone(),
+                        resource.digest.into(),
+                    )
+                })
+                .collect(),
+            native_catalog.time_zones().to_vec(),
+        )
+        .context("native Chromium resources could not be pinned")?;
         let chromium = ChromiumRuntime::from_path(
             required_path("BROWSERD_CHROMIUM_HOST_EXECUTABLE")?,
             required_path("BROWSERD_CHROMIUM_SANDBOX_EXECUTABLE")?,
@@ -132,7 +187,10 @@ impl Config {
             duration_ms("BROWSERD_SANDBOX_TERMINATION_GRACE_MILLIS")?,
             duration_ms("BROWSERD_SANDBOX_PROCESS_POLL_MILLIS")?,
         )
-        .context("Linux sandbox configuration is invalid")?;
+        .context("Linux sandbox configuration is invalid")?
+        .with_native_profiles(native_resources)
+        .context("native Chromium resource placement is invalid")?
+        .with_browser_files();
 
         let egress = EgressClientConfig::new(
             required("BROWSERD_EGRESS_CONTROL_URL")?
@@ -417,8 +475,79 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn open_private_child_stderr(
+    journal_directory: &Path,
+    diagnostic_path: &Path,
+) -> anyhow::Result<std::fs::File> {
+    let parent = journal_directory
+        .parent()
+        .context("private child stderr has no trusted parent")?;
+    if !journal_directory.is_absolute()
+        || journal_directory
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        || diagnostic_path != parent.join("native-preflight-child.stderr")
+    {
+        bail!("private child stderr path is outside its exact diagnostic location");
+    }
+    let root = open(
+        "/",
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .context("private child stderr root pin unavailable")?;
+    let directory = openat2(
+        &root,
+        parent.strip_prefix("/")?,
+        OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+            .resolve(
+                ResolveFlag::RESOLVE_BENEATH
+                    | ResolveFlag::RESOLVE_NO_SYMLINKS
+                    | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+            ),
+    )
+    .context("private child stderr parent pin unavailable")?;
+    let metadata = fstat(&directory).context("private child stderr parent metadata unavailable")?;
+    if metadata.st_uid != nix::unistd::geteuid().as_raw() || metadata.st_mode & 0o7777 != 0o700 {
+        bail!("private child stderr parent is not an owned mode-0700 directory");
+    }
+    let descriptor = openat(
+        &directory,
+        "native-preflight-child.stderr",
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .context("private child stderr exclusive creation failed")?;
+    Ok(std::fs::File::from(descriptor))
+}
+
+fn configured_process_backend(journal_directory: &Path) -> anyhow::Result<StdLinuxProcessBackend> {
+    let backend = StdLinuxProcessBackend::default();
+    let Some(path) = env::var_os("BROWSERD_SANDBOX_PRIVATE_CHILD_STDERR_FILE") else {
+        return Ok(backend);
+    };
+    backend
+        .with_private_child_stderr(open_private_child_stderr(
+            journal_directory,
+            Path::new(&path),
+        )?)
+        .context("private child stderr capability is unsafe")
+}
+
+fn main() -> anyhow::Result<()> {
+    // Namespace entry must execute before Tokio creates additional threads. The private helper
+    // consumes only already pinned descriptors and does not parse daemon configuration.
+    if browserd_sandbox::dispatch_native_egress_listener_helper()? {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_daemon())
+}
+
+async fn run_daemon() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -492,10 +621,11 @@ async fn main() -> anyhow::Result<()> {
 
     let filesystem =
         StdSandboxFilesystem::new(config.cgroup_root.clone(), config.runtime_root.clone())?;
+    let processes = configured_process_backend(&config.journal_directory)?;
     let backend = LinuxSandboxBackend::new(
         config.linux,
         filesystem,
-        StdLinuxProcessBackend::default(),
+        processes,
         EgressRouteAdapter::new((*egress_control).clone()),
     )
     .with_prepared_journal(Arc::clone(&journal), config.egress.daemon_epoch())?;
@@ -534,9 +664,81 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     use super::*;
+
+    #[test]
+    fn private_child_stderr_is_exclusive_and_does_not_change_journal_inventory() {
+        let directory = tempfile::tempdir().expect("private diagnostic directory should exist");
+        let journal_path = directory.path().join("journal");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&journal_path)
+            .expect("private journal directory should exist");
+        let journal = FilePreparedShardJournal::open(&journal_path).expect("journal should open");
+        let path = directory.path().join("native-preflight-child.stderr");
+        let file = open_private_child_stderr(&journal_path, &path)
+            .expect("exact private sink should create");
+        let metadata = file.metadata().expect("private sink metadata should read");
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        StdLinuxProcessBackend::default()
+            .with_private_child_stderr(file)
+            .expect("pinned exact sink should be admitted");
+        assert!(
+            open_private_child_stderr(&journal_path, &path).is_err(),
+            "existing run file must not be reused or truncated"
+        );
+        assert!(
+            open_private_child_stderr(
+                &journal_path,
+                &journal_path.join("native-preflight-child.stderr")
+            )
+            .is_err()
+        );
+        assert!(
+            open_private_child_stderr(&journal_path, &directory.path().join("other.stderr"))
+                .is_err()
+        );
+        drop(journal);
+        FilePreparedShardJournal::open(&journal_path)
+            .expect("diagnostics must never become unknown journal inventory");
+    }
+
+    #[test]
+    fn private_child_stderr_rejects_symlinks_and_non_private_parent_without_writes() {
+        let directory = tempfile::tempdir().expect("private diagnostic directory should exist");
+        let journal = directory.path().join("journal");
+        std::fs::create_dir(&journal).expect("journal directory should exist");
+        let target = directory.path().join("protected");
+        std::fs::write(&target, b"unchanged").expect("protected file should exist");
+        let path = directory.path().join("native-preflight-child.stderr");
+        std::os::unix::fs::symlink(&target, &path).expect("leaf alias should exist");
+        assert!(open_private_child_stderr(&journal, &path).is_err());
+        assert_eq!(
+            std::fs::read(&target).expect("protected file should read"),
+            b"unchanged"
+        );
+        std::fs::remove_file(&path).expect("leaf alias should remove");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("non-private parent fixture should configure");
+        assert!(open_private_child_stderr(&journal, &path).is_err());
+        assert!(!path.exists());
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private parent should restore");
+        let alias_root = tempfile::tempdir().expect("alias directory should exist");
+        let alias = alias_root.path().join("alias");
+        std::os::unix::fs::symlink(directory.path(), &alias).expect("parent alias should exist");
+        assert!(
+            open_private_child_stderr(
+                &alias.join("journal"),
+                &alias.join("native-preflight-child.stderr")
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn socket_singleton_lock_outlives_listener_and_allows_exact_stale_reclaim_after_owner_drop() {

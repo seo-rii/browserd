@@ -1105,6 +1105,218 @@ fn blocked_context_cleanup_cannot_delay_terminal_shard_cleanup() {
 }
 
 #[test]
+fn one_slow_renewal_does_not_hold_healthy_shards_behind_a_batch() {
+    struct RenewalLifecycle {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        slow: Arc<CallGate>,
+        completed: mpsc::Sender<()>,
+    }
+    impl SessionShardLifecycle for RenewalLifecycle {
+        fn qualify(&self) -> Result<(), DependencyError> {
+            Ok(())
+        }
+        fn heartbeat(&self) -> Result<(), DependencyError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let result = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.slow.block()
+            } else {
+                self.completed
+                    .send(())
+                    .map_err(|_| DependencyError::Unavailable)
+            };
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        fn terminate(&self, _: &OwnershipFence) -> Result<(), DependencyError> {
+            Ok(())
+        }
+    }
+    let (slow, entered) = CallGate::new();
+    let (completed, observed) = mpsc::channel();
+    let lifecycle = Arc::new(RenewalLifecycle {
+        calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        slow: slow.clone(),
+        completed,
+    });
+    let factory = Arc::new(FixedProvisionFactory {
+        shard: ProvisionedSessionShard::new(
+            PageId::new(),
+            Arc::new(UnavailableChromiumDriver),
+            lifecycle.clone(),
+        ),
+    });
+    let router = router(factory, Arc::new(RejectArtifacts), 32);
+    assert!(router.is_some());
+    let Some(router) = router.map(Arc::new) else {
+        return;
+    };
+    let Some(worker) = worker() else {
+        return;
+    };
+    for placement in 1..=32 {
+        assert!(
+            router
+                .create_context_owned(
+                    &TenantId::new(),
+                    &SessionId::new(),
+                    &fence(&worker, placement)
+                )
+                .is_ok()
+        );
+    }
+    let heartbeat = std::thread::spawn({
+        let router = router.clone();
+        move || SandboxClient::heartbeat(router.as_ref(), &worker, 7)
+    });
+    let started = entered.recv_timeout(TEST_TIMEOUT);
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut healthy = 0;
+    while healthy < 31 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if observed.recv_timeout(remaining).is_err() {
+            break;
+        }
+        healthy += 1;
+    }
+    slow.release();
+    let result = heartbeat.join();
+    assert!(started.is_ok());
+    assert_eq!(
+        healthy, 31,
+        "one occupied lane cannot prevent all other queued shards from renewing"
+    );
+    assert!(matches!(result, Ok(Ok(()))));
+    assert_eq!(lifecycle.calls.load(Ordering::SeqCst), 32);
+    assert!(
+        (2..=8).contains(&lifecycle.peak.load(Ordering::SeqCst)),
+        "renewal concurrency stays finite"
+    );
+    assert_eq!(
+        lifecycle.active.load(Ordering::SeqCst),
+        0,
+        "all workers are joined"
+    );
+}
+
+#[test]
+#[allow(clippy::expect_used)]
+fn renewal_deduplicates_the_full_fence_and_observes_every_failure() {
+    use browserd_core::{LaunchGeneration, OwnerFence, ShardFence, ShardId, WorkerEpoch};
+    struct FencedLifecycle {
+        fence: ShardFence,
+        calls: AtomicUsize,
+        fail: bool,
+    }
+    impl SessionShardLifecycle for FencedLifecycle {
+        fn shard_fence(&self) -> Option<ShardFence> {
+            Some(self.fence.clone())
+        }
+        fn qualify(&self) -> Result<(), DependencyError> {
+            Ok(())
+        }
+        fn heartbeat(&self) -> Result<(), DependencyError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(DependencyError::OutcomeUncertain)
+            } else {
+                Ok(())
+            }
+        }
+        fn terminate(&self, _: &OwnershipFence) -> Result<(), DependencyError> {
+            Ok(())
+        }
+    }
+    struct FenceFactory(Mutex<std::collections::VecDeque<Arc<FencedLifecycle>>>);
+    impl SessionShardFactory for FenceFactory {
+        fn qualify_daemon(&self) -> Result<(), DependencyError> {
+            Ok(())
+        }
+        fn heartbeat_daemon(&self, _: &WorkerId, _: u64) -> Result<(), DependencyError> {
+            Ok(())
+        }
+        fn create(
+            &self,
+            _: &TenantId,
+            _: &SessionId,
+            _: &OwnershipFence,
+        ) -> Result<ProvisionedSessionShard, DependencyError> {
+            let lifecycle = self
+                .0
+                .lock()
+                .map_err(|_| DependencyError::Unavailable)?
+                .pop_front()
+                .ok_or(DependencyError::Rejected)?;
+            Ok(ProvisionedSessionShard::new(
+                PageId::new(),
+                Arc::new(UnavailableChromiumDriver),
+                lifecycle,
+            ))
+        }
+    }
+    let Some(worker) = worker() else {
+        return;
+    };
+    let owner = OwnerFence::new(worker.clone(), WorkerEpoch::new(7).expect("nonzero epoch"));
+    let shard = ShardId::new();
+    let first = Arc::new(FencedLifecycle {
+        fence: ShardFence::new(
+            owner.clone(),
+            shard.clone(),
+            LaunchGeneration::new(1).expect("first generation"),
+        ),
+        calls: AtomicUsize::new(0),
+        fail: true,
+    });
+    let next = Arc::new(FencedLifecycle {
+        fence: ShardFence::new(
+            owner,
+            shard,
+            LaunchGeneration::new(2).expect("next generation"),
+        ),
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let factory = Arc::new(FenceFactory(Mutex::new(std::collections::VecDeque::from(
+        [first.clone(), first.clone(), next.clone()],
+    ))));
+    let router = router(factory, Arc::new(RejectArtifacts), 3);
+    assert!(router.is_some());
+    let Some(router) = router else {
+        return;
+    };
+    for placement in 1..=3 {
+        assert!(
+            router
+                .create_context_owned(
+                    &TenantId::new(),
+                    &SessionId::new(),
+                    &fence(&worker, placement)
+                )
+                .is_ok()
+        );
+    }
+    assert_eq!(
+        SandboxClient::heartbeat(&router, &worker, 7),
+        Err(DependencyError::OutcomeUncertain)
+    );
+    assert_eq!(
+        first.calls.load(Ordering::SeqCst),
+        1,
+        "shared physical owner renews once"
+    );
+    assert_eq!(
+        next.calls.load(Ordering::SeqCst),
+        1,
+        "a different launch generation is not hidden by deduplication or another failure"
+    );
+}
+
+#[test]
 fn heartbeat_and_qualification_cover_daemon_and_every_active_shard() {
     let factory = Arc::new(Factory::default());
     let Some(router) = router(Arc::clone(&factory), Arc::new(RejectArtifacts), 8) else {
@@ -1257,3 +1469,6 @@ fn blocking_external_health_calls_do_not_hold_the_global_router_lock() {
     assert!(close_join.is_ok());
     assert!(create_join.is_ok());
 }
+
+#[path = "support/shared_placement_router.rs"]
+mod shared_placement_router;

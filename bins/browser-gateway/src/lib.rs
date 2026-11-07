@@ -2,28 +2,56 @@
 
 #![forbid(unsafe_code)]
 
+mod action_custody;
+mod action_custody_catchup;
+mod action_recovery;
+mod action_retention;
+pub use action_retention::action_retention_limits_from_lookup;
+mod artifact_downloads;
+mod artifact_retention;
+mod fleet;
+mod fleet_config;
+pub use fleet::{GatewayFleetInventory, GatewayFleetPass, GatewayFleetPeer};
+pub use fleet_config::GatewayFleetConfig;
 pub mod config;
+mod notifications;
+#[cfg(test)]
+mod session_cache_tests;
+mod session_directory;
+mod session_loss;
+mod viewer;
+pub use viewer::{GatewayViewer, GatewayViewerError};
+mod webhooks;
+pub use webhooks::{GatewayWebhookDelivery, WebhookDeliveryPass};
+mod webhook_keys;
+mod webhook_transport;
+pub use webhook_keys::{WebhookMasterKeyRing, load_webhook_signing_keys};
+pub use webhook_transport::{
+    ReqwestWebhookTransport, WEBHOOK_EVENT_ID_HEADER, WEBHOOK_KEY_ID_HEADER,
+    WEBHOOK_REPLAY_WINDOW_SECONDS, WEBHOOK_SIGNATURE_HEADER, WEBHOOK_TIMESTAMP_HEADER,
+    WebhookTransport, verify_webhook_signature,
+};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use browserd_actions::{
     ActionDeliveryEvidence, ActionKind, ActionSnapshot, ActionSnapshotFacts, ApprovalDecision,
-    BrowserResult, CanonicalRequestHash as ActionCanonicalRequestHash, DispatchId, IdempotencyKey,
+    CanonicalRequestHash as ActionCanonicalRequestHash, DispatchId, IdempotencyKey,
     KnownFailureReason, OutcomeUnknownReason, ResolutionAnnotation, TerminalDetail, TransportLoss,
 };
 use browserd_api::{
     ActionGetRequest, ActionPayload, ActionResolveRequest, ActionSubmitCommand, ApiEnvelope,
     ApiError, ApiRequest, ApiResponse, ApprovalCatalog, ApprovalDecisionBody,
-    ApprovalDecisionRequest, ApprovalListQuery, ApprovalResource, ArtifactMetadata,
-    ArtifactRequest, CreateAuthority, IsolationRequest, PageActivateRequest, PageCreateRequest,
-    PageDeleteRequest, PageListRequest, PageResource, RuntimeApiBackend, RuntimeCreateResult,
-    SessionCatalog, SessionCreateDispatch, SessionCreateRequest, SessionResource,
-    WaitCondition as ApiWaitCondition, WaitUntil as ApiWaitUntil, public_approval_id,
+    ApprovalDecisionRequest, ApprovalListQuery, ApprovalResource, ArtifactListPage,
+    ArtifactListRequest, ArtifactMetadata, ArtifactRequest, CreateAuthority, IsolationRequest,
+    PageActivateRequest, PageCreateRequest, PageDeleteRequest, PageListRequest, PageResource,
+    RuntimeApiBackend, RuntimeCreateResult, SessionCatalog, SessionCreateDispatch,
+    SessionCreateRequest, SessionResource, WaitCondition as ApiWaitCondition,
+    WaitUntil as ApiWaitUntil, public_approval_id,
 };
 use browserd_artifacts::{
     ArtifactChecksum, ArtifactContentMetadata, ArtifactContentSource, ArtifactKey, ArtifactState,
@@ -31,18 +59,16 @@ use browserd_artifacts::{
 use browserd_auth::{AuthConfig, RevocationRegistry, ServiceTokenVerifier, VerificationKeySet};
 use browserd_coordination::{
     ClaimGatewayAction, CoordinationActorConfig, DirectoryFence, EventOutboxBlockingClient,
-    GatewayActionBlockingClient, GatewayActionCoordination, GatewayActionCoordinationError,
-    GatewayActionPlacement, GatewayActionSnapshot, MemoryGatewayActionStore,
+    GatewayActionBlockingClient, GatewayActionClaimOutcome, GatewayActionCoordination,
+    GatewayActionCoordinationError, GatewayActionPlacement, GatewayActionRecoveryCursor,
+    GatewayActionSnapshot, GatewayActionSubmissionLease, GatewayEventScanCursor,
+    MemoryGatewayActionStore,
 };
 use browserd_core::{
-    ActionId, ApprovalId, ErrorCode, IsolationProfile, PlacementFence, SessionId, SessionLifecycle,
-    TenantId, WorkerId,
+    ActionId, ApprovalId, ErrorCode, IsolationProfile, SessionId, SessionLifecycle, TenantId,
+    WorkerId,
 };
-use browserd_http::{
-    AttachedViewer, AuthenticationError, Authenticator, ConsumedViewerGrant, Readiness,
-    ViewerAttachError, ViewerGateError, ViewerTransport,
-};
-use browserd_viewer::{TicketError, TicketPolicy, TicketRegistry, ViewerScopes, ViewerTicket};
+use browserd_http::{AuthenticationError, Authenticator, Readiness};
 use browserd_worker::{
     PendingWorkerRpc, WORKER_SESSION_OPTIONS_VERSION, WorkerActionCommand,
     WorkerActionExecutionTimeout, WorkerActionReceipt, WorkerApprovalDecision,
@@ -63,6 +89,7 @@ pub enum GatewayConfigurationError {
     InvalidViewerPolicy,
     InvalidWorkerPlacement,
     ActionCoordinationUnavailable,
+    InvalidActionRetention(&'static str),
 }
 
 impl fmt::Display for GatewayConfigurationError {
@@ -132,208 +159,6 @@ impl Authenticator for GatewayAuthenticator {
             .verify_at(bearer, None, now)
             .map_err(|_| AuthenticationError)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GatewayViewerError {
-    InvalidPolicy,
-    CapacityExceeded,
-    ClockUnavailable,
-    TicketRejected,
-    StateUnavailable,
-}
-
-impl fmt::Display for GatewayViewerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "gateway viewer error: {self:?}")
-    }
-}
-
-impl std::error::Error for GatewayViewerError {}
-
-struct PresentedTicket {
-    ticket: ViewerTicket,
-    tenant_id: TenantId,
-    session_id: SessionId,
-    placement_fence: PlacementFence,
-    expires_at_millis: u64,
-}
-
-#[derive(Default)]
-struct ViewerPresentationState {
-    by_ticket: HashMap<ViewerTicket, String>,
-    by_secret: HashMap<String, PresentedTicket>,
-}
-
-pub struct GatewayViewer {
-    tickets: TicketRegistry,
-    max_outstanding: usize,
-    state: Mutex<ViewerPresentationState>,
-}
-
-impl GatewayViewer {
-    pub fn new<I, S>(
-        max_ttl: Duration,
-        allowed_origins: I,
-        max_outstanding: usize,
-    ) -> Result<Self, GatewayConfigurationError>
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        if max_outstanding == 0 {
-            return Err(GatewayConfigurationError::InvalidViewerPolicy);
-        }
-        let policy = TicketPolicy::new(max_ttl, allowed_origins)
-            .map_err(|_| GatewayConfigurationError::InvalidViewerPolicy)?;
-        Ok(Self {
-            tickets: TicketRegistry::new(policy),
-            max_outstanding,
-            state: Mutex::new(ViewerPresentationState::default()),
-        })
-    }
-
-    pub fn issue(
-        &self,
-        tenant_id: TenantId,
-        session_id: SessionId,
-        placement_fence: PlacementFence,
-        scopes: ViewerScopes,
-        ttl: Duration,
-    ) -> Result<ViewerTicket, GatewayViewerError> {
-        if placement_fence.worker_epoch == 0
-            || placement_fence.placement_version == 0
-            || placement_fence.session_incarnation == 0
-        {
-            return Err(GatewayViewerError::TicketRejected);
-        }
-        let now_millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-            .ok_or(GatewayViewerError::ClockUnavailable)?;
-        let ttl_millis =
-            u64::try_from(ttl.as_millis()).map_err(|_| GatewayViewerError::TicketRejected)?;
-        let expires_at_millis = now_millis
-            .checked_add(ttl_millis)
-            .ok_or(GatewayViewerError::TicketRejected)?;
-        let mut state = lock_viewer_state(&self.state)?;
-        let expired = state
-            .by_secret
-            .iter()
-            .filter(|(_, record)| record.expires_at_millis <= now_millis)
-            .map(|(secret, record)| (secret.clone(), record.ticket.clone()))
-            .collect::<Vec<_>>();
-        for (secret, ticket) in expired {
-            state.by_secret.remove(&secret);
-            state.by_ticket.remove(&ticket);
-            self.tickets
-                .discard(&ticket)
-                .map_err(|_| GatewayViewerError::StateUnavailable)?;
-        }
-        if state.by_secret.len() >= self.max_outstanding {
-            return Err(GatewayViewerError::CapacityExceeded);
-        }
-        let ticket = self
-            .tickets
-            .issue(
-                tenant_id.clone(),
-                session_id.clone(),
-                placement_fence.session_incarnation,
-                scopes,
-                now_millis,
-                ttl,
-            )
-            .map_err(|_| GatewayViewerError::TicketRejected)?;
-        let secret = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        state.by_ticket.insert(ticket.clone(), secret.clone());
-        state.by_secret.insert(
-            secret,
-            PresentedTicket {
-                ticket: ticket.clone(),
-                tenant_id,
-                session_id,
-                placement_fence,
-                expires_at_millis,
-            },
-        );
-        Ok(ticket)
-    }
-}
-
-#[async_trait]
-impl ViewerTransport for GatewayViewer {
-    async fn consume_ticket(
-        &self,
-        session_id: &SessionId,
-        origin: &str,
-        presented: &str,
-    ) -> Result<ConsumedViewerGrant, ViewerGateError> {
-        let now_millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-            .ok_or(ViewerGateError::TicketDenied)?;
-        let mut state =
-            lock_viewer_state(&self.state).map_err(|_| ViewerGateError::TicketDenied)?;
-        let record = state
-            .by_secret
-            .get(presented)
-            .ok_or(ViewerGateError::TicketDenied)?;
-        if &record.session_id != session_id {
-            return Err(ViewerGateError::TicketDenied);
-        }
-        let ticket = record.ticket.clone();
-        let placement_fence = record.placement_fence;
-        let result = self.tickets.consume(
-            &ticket,
-            &record.tenant_id,
-            &record.session_id,
-            placement_fence.session_incarnation,
-            origin,
-            now_millis,
-        );
-        match result {
-            Ok(connection) => {
-                state.by_secret.remove(presented);
-                state.by_ticket.remove(&ticket);
-                self.tickets
-                    .discard(&ticket)
-                    .map_err(|_| ViewerGateError::TicketDenied)?;
-                ConsumedViewerGrant::new(connection, placement_fence)
-            }
-            Err(TicketError::OriginDenied) => Err(ViewerGateError::OriginDenied),
-            Err(_) => {
-                state.by_secret.remove(presented);
-                state.by_ticket.remove(&ticket);
-                self.tickets
-                    .discard(&ticket)
-                    .map_err(|_| ViewerGateError::TicketDenied)?;
-                Err(ViewerGateError::TicketDenied)
-            }
-        }
-    }
-
-    async fn attach(
-        &self,
-        _grant: ConsumedViewerGrant,
-    ) -> Result<Box<dyn AttachedViewer>, ViewerAttachError> {
-        Err(ViewerAttachError::BackendUnavailable)
-    }
-
-    fn present_viewer_ticket(&self, ticket: &ViewerTicket) -> Option<String> {
-        lock_viewer_state(&self.state)
-            .ok()
-            .and_then(|state| state.by_ticket.get(ticket).cloned())
-    }
-}
-
-fn lock_viewer_state(
-    state: &Mutex<ViewerPresentationState>,
-) -> Result<MutexGuard<'_, ViewerPresentationState>, GatewayViewerError> {
-    state
-        .lock()
-        .map_err(|_| GatewayViewerError::StateUnavailable)
 }
 
 #[derive(Default)]
@@ -499,12 +324,29 @@ impl GatewayWorkerPlacement {
 pub struct GatewayWorkerRuntime<C> {
     client: Arc<C>,
     placement: GatewayWorkerPlacement,
-    sessions: Mutex<HashMap<(TenantId, SessionId), GatewaySessionRecord>>,
+    sessions: Mutex<BTreeMap<(TenantId, SessionId), GatewaySessionRecord>>,
+    session_gc_after: Mutex<Option<(TenantId, SessionId)>>,
     actions: GatewayActionBlockingClient,
+    durable_sessions: bool,
+    safety: Option<browserd_coordination::SafetyAuthorityBlockingClient>,
     /// Optional durable event outbox (BRD-017). When present, each terminal action transition is
     /// recorded here for at-least-once tenant notification; absent, the runtime behaves as before.
     outbox: Option<EventOutboxBlockingClient>,
+    event_scan: Mutex<GatewayEventScanCursor>,
+    recovery_scan: Mutex<GatewayActionRecoveryCursor>,
+    recovery_running: AtomicBool,
+    custody_scan: Mutex<browserd_coordination::GatewayCustodyCursor>,
+    custody_running: AtomicBool,
+    custody_catchup_scan: Mutex<GatewayActionRecoveryCursor>,
+    custody_catchup_running: AtomicBool,
+    retention_scan: Mutex<browserd_coordination::GatewayActionRetentionCursor>,
+    retention_running: AtomicBool,
     catalog: SessionCatalog,
+    downloads: Mutex<artifact_downloads::DownloadTokens>,
+    viewer: Option<Arc<GatewayViewer>>,
+    fleet: Option<Arc<fleet::GatewayFleet<C>>>,
+    notification_scan: Mutex<notifications::NotificationRelayCursor>,
+    notification_running: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -513,6 +355,7 @@ struct GatewaySessionRecord {
     action_placement: GatewayActionPlacement,
     resource: SessionResource,
     admission_lane: Arc<SessionAdmissionLane>,
+    retired_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Default)]
@@ -532,6 +375,11 @@ struct SessionAdmissionPermit {
 }
 
 impl SessionAdmissionLane {
+    fn idle(&self) -> bool {
+        self.state
+            .try_lock()
+            .is_ok_and(|state| !state.occupied && state.waiters == 0)
+    }
     fn acquire(self: &Arc<Self>) -> Result<SessionAdmissionPermit, ApiError> {
         let deadline = Instant::now() + ACTION_ADMISSION_WAIT;
         let mut state = self.state.lock().map_err(|_| {
@@ -603,7 +451,43 @@ impl<C> GatewayWorkerRuntime<C> {
     /// lock failure yields 0 and is retried on the next maintenance pass.
     #[must_use]
     pub fn reclaim_retired_sessions(&self, now: DateTime<Utc>, retention: ChronoDuration) -> usize {
-        self.catalog.reclaim(now, retention).unwrap_or(0)
+        let reclaimed = self.catalog.reclaim(now, retention).unwrap_or(0);
+        let (Ok(mut after), Ok(mut sessions)) =
+            (self.session_gc_after.try_lock(), self.sessions.try_lock())
+        else {
+            return reclaimed;
+        };
+        let mut selected: Vec<_> = match after.as_ref() {
+            Some(cursor) => sessions
+                .range((
+                    std::ops::Bound::Excluded(cursor.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take(32)
+                .map(|(key, _)| key.clone())
+                .collect(),
+            None => sessions.keys().take(32).cloned().collect(),
+        };
+        if selected.is_empty() && after.is_some() {
+            selected = sessions.keys().take(32).cloned().collect();
+        }
+        *after = selected.last().cloned();
+        for key in selected {
+            if sessions.get(&key).is_some_and(|record| {
+                record
+                    .retired_at
+                    .is_some_and(|at| now.signed_duration_since(at) >= retention)
+                    && matches!(
+                        record.resource.lifecycle,
+                        SessionLifecycle::Closed | SessionLifecycle::Failed
+                    )
+                    && record.admission_lane.idle()
+                    && Arc::strong_count(&record.admission_lane) == 1
+            }) {
+                sessions.remove(&key);
+            }
+        }
+        reclaimed
     }
 
     pub fn new(
@@ -636,36 +520,177 @@ impl<C> GatewayWorkerRuntime<C> {
         Ok(Self {
             client,
             placement,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(BTreeMap::new()),
+            session_gc_after: Mutex::new(None),
             actions,
+            durable_sessions: false,
+            safety: None,
             outbox: None,
+            event_scan: Mutex::new(GatewayEventScanCursor::default()),
+            recovery_scan: Mutex::new(GatewayActionRecoveryCursor::default()),
+            recovery_running: AtomicBool::new(false),
+            custody_scan: Mutex::new(browserd_coordination::GatewayCustodyCursor::default()),
+            custody_running: AtomicBool::new(false),
+            custody_catchup_scan: Mutex::new(GatewayActionRecoveryCursor::default()),
+            custody_catchup_running: AtomicBool::new(false),
+            retention_scan: Mutex::new(
+                browserd_coordination::GatewayActionRetentionCursor::default(),
+            ),
+            retention_running: AtomicBool::new(false),
             catalog: SessionCatalog::default(),
+            downloads: Mutex::new(artifact_downloads::DownloadTokens::default()),
+            viewer: None,
+            fleet: None,
+            notification_scan: Mutex::new(notifications::NotificationRelayCursor::default()),
+            notification_running: AtomicBool::new(false),
         })
     }
 
-    /// Attach a durable event outbox so terminal action transitions are recorded for at-least-once
-    /// tenant notification (BRD-017). Best-effort: an outbox failure never fails an action, since
-    /// the durable action store remains the source of truth.
+    /// Attach the sink for the action store's durable pending-event journal. A sink failure
+    /// leaves the projection pending for autonomous recovery without replaying browser effects.
     #[must_use]
     pub fn with_terminal_event_outbox(mut self, outbox: EventOutboxBlockingClient) -> Self {
         self.outbox = Some(outbox);
         self
     }
 
-    /// Best-effort record of a freshly-committed terminal transition to the event outbox. A
-    /// non-terminal snapshot is ignored, and an outbox error is logged and swallowed — the action
-    /// response is driven by the durable store, and a dropped event is recoverable by re-projecting
-    /// the durable terminal action.
+    /// Resolve single-host session ownership through the durable action coordinator.
+    #[must_use]
+    pub fn with_durable_session_directory(mut self) -> Self {
+        self.durable_sessions = true;
+        self
+    }
+
+    #[must_use]
+    pub fn with_runtime_safety(
+        mut self,
+        safety: browserd_coordination::SafetyAuthorityBlockingClient,
+    ) -> Self {
+        self.safety = Some(safety);
+        self
+    }
+
+    fn safety_create_isolation(
+        &self,
+        request: &SessionCreateRequest,
+    ) -> Result<IsolationRequest, ApiError> {
+        let Some(authority) = &self.safety else {
+            return Ok(request.isolation);
+        };
+        let current = authority.read().map_err(|_| {
+            ApiError::new(
+                ErrorCode::WorkerUnavailable,
+                "runtime safety authority unavailable",
+            )
+        })?;
+        if current
+            .snapshot()
+            .network_class_stopped(&request.network_class)
+        {
+            return Err(ApiError::new(
+                ErrorCode::NetworkPolicyDenied,
+                "network class is stopped",
+            ));
+        }
+        if request.checkpoint_ref.is_some() && current.snapshot().checkpoint_disabled() {
+            return Err(ApiError::invalid_request("checkpoint restore is disabled"));
+        }
+        Ok(
+            match current
+                .snapshot()
+                .effective_isolation(request.isolation.into())
+            {
+                IsolationProfile::SharedContext => IsolationRequest::SharedContext,
+                IsolationProfile::TenantDedicatedShard => IsolationRequest::TenantDedicatedShard,
+                IsolationProfile::DedicatedProcess => IsolationRequest::DedicatedProcess,
+                IsolationProfile::DedicatedWorker => IsolationRequest::DedicatedWorker,
+            },
+        )
+    }
+
+    /// Deliver one already-committed journal entry. Only a confirmed sink receipt permits
+    /// deleting the source entry; a lost response is retried with the same projection sequence.
+    fn relay_terminal_event(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+    ) -> Result<bool, ApiError> {
+        let outbox = self.outbox.as_ref().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::WorkerUnavailable,
+                "event outbox is not configured",
+            )
+        })?;
+        let Some(projection) = self
+            .actions
+            .peek_event_projection(tenant_id, session_id)
+            .map_err(action_coordination_api_error)?
+        else {
+            return Ok(false);
+        };
+        outbox
+            .append_projection(projection.clone(), Utc::now())
+            .map_err(|_| ApiError::new(ErrorCode::WorkerUnavailable, "event outbox unavailable"))?;
+        self.actions
+            .ack_event_projection(&projection)
+            .map_err(action_coordination_api_error)?;
+        Ok(true)
+    }
+
+    /// Recover notifications independently of live sessions, client polling and gateway
+    /// incarnation. Each pass examines at most `limit` sessions and relays one event per
+    /// session; loss materialization is also limited to one action per visited session.
+    pub fn reconcile_terminal_events(&self, limit: usize) -> Result<usize, ApiError> {
+        if !(1..=256).contains(&limit) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidRequest,
+                "event recovery limit must be 1..=256",
+            ));
+        }
+        if self.outbox.is_none() {
+            return Err(ApiError::new(
+                ErrorCode::WorkerUnavailable,
+                "event outbox is not configured",
+            ));
+        }
+        let mut cursor = self.event_scan.lock().map_err(|_| {
+            ApiError::new(
+                ErrorCode::WorkerUnavailable,
+                "event recovery state unavailable",
+            )
+        })?;
+        let page = self
+            .actions
+            .scan_event_sessions(cursor.clone(), limit)
+            .map_err(action_coordination_api_error)?;
+        let mut relayed = 0;
+        for session in page.sessions() {
+            if let Some(loss) = session.loss_claim() {
+                self.actions
+                    .materialize_session_loss(loss, 1, Utc::now())
+                    .map_err(action_coordination_api_error)?;
+            }
+            relayed +=
+                usize::from(self.relay_terminal_event(session.tenant_id(), session.session_id())?);
+        }
+        // Keep the previous cursor on any error. A repeated page only encounters exact
+        // journal retries, and every unacknowledged entry remains discoverable after restart.
+        *cursor = if page.is_complete() {
+            GatewayEventScanCursor::default()
+        } else {
+            page.next_cursor().clone()
+        };
+        Ok(relayed)
+    }
+
+    /// Opportunistic delivery reduces latency; the production monitor owns recovery.
     fn note_terminal_transition(&self, snapshot: &GatewayActionSnapshot) {
-        let Some(outbox) = &self.outbox else {
+        if self.outbox.is_none() || snapshot.terminal().is_none() {
             return;
-        };
-        let Some(append) = snapshot.terminal_outbox_append() else {
-            return;
-        };
-        if let Err(error) = outbox.append(append, Utc::now()) {
+        }
+        if let Err(error) = self.relay_terminal_event(snapshot.tenant_id(), snapshot.session_id()) {
             eprintln!(
-                "gateway event outbox append failed for action {} (durable state unaffected): {error:?}",
+                "gateway event projection remains pending for action {}: {error:?}",
                 snapshot.action_id()
             );
         }
@@ -738,7 +763,11 @@ fn action_coordination_api_error(error: GatewayActionCoordinationError) -> ApiEr
             ErrorCode::IdempotencyConflict
         }
         GatewayActionCoordinationError::PlacementMismatch => ErrorCode::PlacementMismatch,
-        GatewayActionCoordinationError::MutationInFlight { .. } => {
+        GatewayActionCoordinationError::MutationInFlight { .. }
+        | GatewayActionCoordinationError::ActionDispatchInFlight { .. }
+        | GatewayActionCoordinationError::RetainedActionCapacity
+        | GatewayActionCoordinationError::PendingActionCapacity
+        | GatewayActionCoordinationError::SubmissionLeaseExpired => {
             ErrorCode::ActionAdmissionTimeout
         }
         GatewayActionCoordinationError::ReconciliationRequired { .. } => {
@@ -748,15 +777,31 @@ fn action_coordination_api_error(error: GatewayActionCoordinationError) -> ApiEr
         GatewayActionCoordinationError::NotFound => ErrorCode::ActionResolutionInvalid,
         GatewayActionCoordinationError::ResolutionNotAllowed
         | GatewayActionCoordinationError::ResolutionConflict => ErrorCode::ActionResolutionInvalid,
-        GatewayActionCoordinationError::LockUnavailable
+        GatewayActionCoordinationError::UnsupportedSessionAdmission
+        | GatewayActionCoordinationError::UnsupportedSessionDirectory
+        | GatewayActionCoordinationError::SessionDirectoryCapacity
+        | GatewayActionCoordinationError::SessionDirectoryConflict
+        | GatewayActionCoordinationError::AdmissionCapacity
+        | GatewayActionCoordinationError::AdmissionConflict
+        | GatewayActionCoordinationError::AdmissionRevisionMismatch
+        | GatewayActionCoordinationError::InvalidFleetObservation
+        | GatewayActionCoordinationError::SessionActivationExpired
+        | GatewayActionCoordinationError::SessionAuthorityUnavailable
+        | GatewayActionCoordinationError::ManagedActionAdmissionRequired
+        | GatewayActionCoordinationError::LockUnavailable
         | GatewayActionCoordinationError::RedisUnavailable
         | GatewayActionCoordinationError::RedisTimedOut
         | GatewayActionCoordinationError::ActorSpawn
         | GatewayActionCoordinationError::ActorQueueFull
         | GatewayActionCoordinationError::ActorDisconnected
         | GatewayActionCoordinationError::ActorQueryTimedOut
-        | GatewayActionCoordinationError::ActorMutationTimedOut => ErrorCode::WorkerUnavailable,
-        GatewayActionCoordinationError::InvalidIdempotencyKey
+        | GatewayActionCoordinationError::ActorMutationTimedOut
+        | GatewayActionCoordinationError::RecoveryMigrationRequired
+        | GatewayActionCoordinationError::RecoveryMigrationInProgress
+        | GatewayActionCoordinationError::PendingCustodyCapacity => ErrorCode::WorkerUnavailable,
+        GatewayActionCoordinationError::InvalidSessionAdmission
+        | GatewayActionCoordinationError::InvalidSessionDirectory
+        | GatewayActionCoordinationError::InvalidIdempotencyKey
         | GatewayActionCoordinationError::InvalidPlacement
         | GatewayActionCoordinationError::InvalidSessionLossId
         | GatewayActionCoordinationError::ActionIdentityConflict { .. }
@@ -772,7 +817,25 @@ fn action_coordination_api_error(error: GatewayActionCoordinationError) -> ApiEr
         | GatewayActionCoordinationError::CorruptState
         | GatewayActionCoordinationError::InvalidRedisConfig
         | GatewayActionCoordinationError::InvalidRedisResponse
-        | GatewayActionCoordinationError::Evidence(_) => ErrorCode::Internal,
+        | GatewayActionCoordinationError::Evidence(_)
+        | GatewayActionCoordinationError::UnsupportedEventRecovery
+        | GatewayActionCoordinationError::InvalidEventScanLimit
+        | GatewayActionCoordinationError::EventSequenceOverflow
+        | GatewayActionCoordinationError::EventAckConflict
+        | GatewayActionCoordinationError::InvalidSubmissionLease
+        | GatewayActionCoordinationError::SubmissionLeaseRequired
+        | GatewayActionCoordinationError::SubmissionLeaseMismatch
+        | GatewayActionCoordinationError::SubmissionLeaseNotExpired
+        | GatewayActionCoordinationError::InvalidRecoveryScanLimit
+        | GatewayActionCoordinationError::UnsupportedActionRecovery
+        | GatewayActionCoordinationError::OfflineMigrationConfirmationRequired
+        | GatewayActionCoordinationError::UnsupportedCustodyRecovery
+        | GatewayActionCoordinationError::InvalidCustodyReceipt
+        | GatewayActionCoordinationError::CustodyAckConflict
+        | GatewayActionCoordinationError::InvalidCustodyScanLimit
+        | GatewayActionCoordinationError::UnsupportedActionRetention
+        | GatewayActionCoordinationError::InvalidRetentionScanLimit
+        | GatewayActionCoordinationError::InvalidRetentionLimits => ErrorCode::Internal,
     };
     ApiError::new(code, "gateway action coordination failed")
 }
@@ -790,26 +853,29 @@ fn coordinated_action_snapshot(
         }
         _ => None,
     };
-    ActionSnapshot::from_facts(ActionSnapshotFacts {
-        action_id: snapshot.action_id().clone(),
-        action_sequence: snapshot.action_sequence(),
-        idempotency_key: IdempotencyKey::new(snapshot.idempotency_key()),
-        canonical_request_hash: ActionCanonicalRequestHash::new(
-            *snapshot.request_hash().as_bytes(),
-        ),
-        kind: snapshot.kind(),
-        state: snapshot.state(),
-        dispatch_acknowledged: matches!(
-            snapshot.delivery(),
-            ActionDeliveryEvidence::ExposurePossible(_)
-        ),
-        approval_decision,
-        terminal_detail,
-        resolution: snapshot.resolution().cloned(),
-        // The durable ledger persists a succeeded action's result body alongside its digest, so
-        // GET, same-key resubmission, and restart all return the same bytes as the live receipt.
-        result_content: snapshot.result_content().map(<[u8]>::to_vec),
-    })
+    ActionSnapshot::from_facts_with_result_budget(
+        ActionSnapshotFacts {
+            action_id: snapshot.action_id().clone(),
+            action_sequence: snapshot.action_sequence(),
+            idempotency_key: IdempotencyKey::new(snapshot.idempotency_key()),
+            canonical_request_hash: ActionCanonicalRequestHash::new(
+                *snapshot.request_hash().as_bytes(),
+            ),
+            kind: snapshot.kind(),
+            state: snapshot.state(),
+            dispatch_acknowledged: matches!(
+                snapshot.delivery(),
+                ActionDeliveryEvidence::ExposurePossible(_)
+            ),
+            approval_decision,
+            terminal_detail,
+            resolution: snapshot.resolution().cloned(),
+            // The durable ledger persists a succeeded action's result body alongside its digest, so
+            // GET, same-key resubmission, and restart all return the same bytes as the live receipt.
+            result_content: snapshot.result_content().map(<[u8]>::to_vec),
+        },
+        snapshot.result_budget(),
+    )
     .map_err(|_| ApiError::new(ErrorCode::Internal, "durable action state is contradictory"))
 }
 
@@ -822,6 +888,12 @@ where
         tenant_id: &TenantId,
         session_id: &SessionId,
     ) -> Result<GatewaySessionRecord, ApiError> {
+        if self.fleet.is_some() {
+            return self.fleet_session_record(tenant_id, session_id);
+        }
+        if self.durable_sessions {
+            return self.durable_session_record(tenant_id, session_id);
+        }
         self.sessions
             .lock()
             .map_err(|_| ApiError::new(ErrorCode::WorkerUnavailable, "session state unavailable"))?
@@ -856,6 +928,9 @@ where
                 "session no longer accepts transitions",
             ));
         }
+        if self.durable_sessions && self.fleet.is_none() {
+            self.verify_single_host_worker_ready(&current)?;
+        }
         Ok((current, permit))
     }
 
@@ -867,8 +942,9 @@ where
     ) -> Result<(), ApiError> {
         if &expected.tenant_id != tenant_id
             || &expected.session_id != session_id
-            || expected.worker_epoch != self.placement.worker_epoch
-            || expected.placement_version != self.placement.placement_version
+            || (self.fleet.is_none()
+                && (expected.worker_epoch != self.placement.worker_epoch
+                    || expected.placement_version != self.placement.placement_version))
             || expected.session_incarnation == 0
         {
             return Err(ApiError::new(
@@ -928,8 +1004,7 @@ where
         let (record, _admission) =
             self.admit_session_transition(principal.tenant_id(), &command.session_id)?;
         let receipts = match self
-            .client
-            .request(WorkerRpcRequest::ListPages {
+            .request_worker(WorkerRpcRequest::ListPages {
                 fence: record.fence.clone(),
             })
             .map_err(|error| {
@@ -998,8 +1073,7 @@ where
         let (record, _admission) =
             self.admit_session_transition(principal.tenant_id(), &command.session_id)?;
         let receipt = match self
-            .client
-            .request(WorkerRpcRequest::CreatePage {
+            .request_worker(WorkerRpcRequest::CreatePage {
                 fence: record.fence.clone(),
                 now_unix_millis: current_unix_millis()?,
             })
@@ -1046,8 +1120,7 @@ where
         let (record, _admission) =
             self.admit_session_transition(principal.tenant_id(), &command.session_id)?;
         let receipt = match self
-            .client
-            .request(WorkerRpcRequest::ActivatePage {
+            .request_worker(WorkerRpcRequest::ActivatePage {
                 fence: record.fence.clone(),
                 page_id: command.page_id.clone(),
                 now_unix_millis: current_unix_millis()?,
@@ -1095,8 +1168,7 @@ where
         let (record, _admission) =
             self.admit_session_transition(principal.tenant_id(), &command.session_id)?;
         let receipt = match self
-            .client
-            .request(WorkerRpcRequest::ClosePage {
+            .request_worker(WorkerRpcRequest::ClosePage {
                 fence: record.fence.clone(),
                 page_id: command.page_id.clone(),
                 now_unix_millis: current_unix_millis()?,
@@ -1208,7 +1280,8 @@ where
         dispatch_id: &DispatchId,
         receipt: WorkerActionReceipt,
     ) -> Result<ActionSnapshot, ApiError> {
-        let receipt_matches = receipt.fence == record.fence
+        let receipt_matches = record.action_placement == *durable.placement()
+            && receipt.fence == record.fence
             && receipt.action_id == *durable.action_id()
             && receipt.action_sequence == durable.action_sequence()
             && receipt.idempotency_key == durable.idempotency_key()
@@ -1224,6 +1297,8 @@ where
                 TransportLoss::Ambiguous(OutcomeUnknownReason::AmbiguousTransportLoss),
             );
         }
+        let custody = self.validated_terminal_custody(durable, &receipt)?;
+        let custody_requirement = receipt.custody_requirement;
         let terminal_detail = receipt.terminal_detail;
         let worker_snapshot = match self.action_snapshot(
             tenant_id,
@@ -1235,6 +1310,7 @@ where
                 durable.idempotency_key(),
                 *durable.request_hash().as_bytes(),
                 durable.kind(),
+                durable.result_budget(),
             )),
         ) {
             Ok(snapshot) => snapshot,
@@ -1252,44 +1328,16 @@ where
         let Some(detail) = terminal_detail else {
             return Ok(worker_snapshot);
         };
-        // Persist a succeeded action's result body durably so every later read path (GET,
-        // same-key resubmission, gateway/worker restart) returns the same bytes the completing
-        // receipt carried, instead of only the digest.
-        let recorded = match detail {
-            TerminalDetail::Succeeded(digest) if worker_snapshot.result_content().is_some() => {
-                self.actions.record_worker_result(
-                    tenant_id,
-                    session_id,
-                    durable.action_id(),
-                    durable.revision(),
-                    &record.action_placement,
-                    dispatch_id,
-                    durable.action_sequence(),
-                    BrowserResult::Succeeded(digest),
-                    worker_snapshot.result_content().map(<[u8]>::to_vec),
-                    Utc::now(),
-                )
-            }
-            _ => self.actions.record_worker_terminal(
-                tenant_id,
-                session_id,
-                durable.action_id(),
-                durable.revision(),
-                &record.action_placement,
-                dispatch_id,
-                durable.action_sequence(),
-                detail,
-                Utc::now(),
-            ),
-        };
-        let effective = match recorded {
-            Ok(effective) => effective,
-            Err(error) => {
-                self.effective_action_after_race(tenant_id, session_id, durable.action_id(), error)?
-            }
-        };
-        self.note_terminal_transition(&effective);
-        coordinated_action_snapshot(&effective)
+        // Original completions and restart queries share bounded receipt CAS convergence.
+        // In particular, an exposure write can commit while its reply is lost: the original
+        // positive result must still persist after that revision changes.
+        self.persist_worker_action_snapshot(
+            durable,
+            &worker_snapshot,
+            detail,
+            custody,
+            custody_requirement,
+        )
     }
 
     fn action_snapshot(
@@ -1299,11 +1347,16 @@ where
         expected_fence: &WorkerSessionFence,
         receipt: WorkerActionReceipt,
         expected_action_id: Option<&browserd_core::ActionId>,
-        expected_submission: Option<(&str, [u8; 32], ActionKind)>,
+        expected_submission: Option<(
+            &str,
+            [u8; 32],
+            ActionKind,
+            browserd_actions::ActionResultBudget,
+        )>,
     ) -> Result<ActionSnapshot, ApiError> {
         if receipt.fence != *expected_fence
             || expected_action_id.is_some_and(|action_id| action_id != &receipt.action_id)
-            || expected_submission.is_some_and(|(key, hash, kind)| {
+            || expected_submission.is_some_and(|(key, hash, kind, _)| {
                 receipt.idempotency_key.as_str() != key
                     || receipt.canonical_request_hash != hash
                     || receipt.kind != kind
@@ -1314,12 +1367,18 @@ where
                 "worker returned a mismatched action receipt",
             ));
         }
-        let snapshot = receipt.to_action_snapshot().map_err(|_| {
-            ApiError::new(
-                ErrorCode::Internal,
-                "worker returned contradictory action facts",
-            )
-        })?;
+        let result_budget = expected_submission.map_or(
+            browserd_actions::ActionResultBudget::Standard,
+            |(_, _, _, budget)| budget,
+        );
+        let snapshot = receipt
+            .to_action_snapshot_with_result_budget(result_budget)
+            .map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    "worker returned contradictory action facts",
+                )
+            })?;
         self.validate_current_fence(tenant_id, session_id, &receipt.fence)?;
         Ok(snapshot)
     }
@@ -1329,6 +1388,23 @@ where
         principal: &browserd_auth::AuthenticatedPrincipal,
         command: ActionSubmitCommand,
     ) -> Result<ApiResponse, ApiError> {
+        self.submit_action_observed(principal, command, &mut |_| {})
+    }
+
+    fn submit_action_observed(
+        &self,
+        principal: &browserd_auth::AuthenticatedPrincipal,
+        command: ActionSubmitCommand,
+        accepted: &mut (dyn FnMut(ApiEnvelope<ActionSnapshot>) + Send),
+    ) -> Result<ApiResponse, ApiError> {
+        if self.durable_sessions
+            && self.fleet.is_none()
+            && let Some(replay) = self.replay_durable_action(principal.tenant_id(), &command)?
+        {
+            return coordinated_action_snapshot(&replay)
+                .map(ApiEnvelope::new)
+                .map(ApiResponse::Action);
+        }
         let (record, _admission) =
             self.admit_session_transition(principal.tenant_id(), &command.session_id)?;
         if matches!(
@@ -1372,8 +1448,12 @@ where
                 delta_x: *delta_x,
                 delta_y: *delta_y,
             },
-            ActionPayload::QueryAll { selector } => WorkerActionCommand::QueryAll {
+            ActionPayload::QueryAll {
+                selector,
+                frame_path,
+            } => WorkerActionCommand::QueryAll {
                 selector: selector.clone(),
+                frame_path: frame_path.clone(),
             },
             ActionPayload::GetText { node_ref } => WorkerActionCommand::GetText {
                 node_ref: node_ref.clone(),
@@ -1418,6 +1498,13 @@ where
             ActionPayload::Fill { node_ref, value } => WorkerActionCommand::Fill {
                 node_ref: node_ref.clone(),
                 value: value.clone(),
+            },
+            ActionPayload::FillSecret {
+                node_ref,
+                secret_ref,
+            } => WorkerActionCommand::FillSecret {
+                node_ref: node_ref.clone(),
+                secret_ref: secret_ref.clone(),
             },
             ActionPayload::SelectOption { node_ref, values } => WorkerActionCommand::SelectOption {
                 node_ref: node_ref.clone(),
@@ -1469,15 +1556,28 @@ where
                 prompt_text: prompt_text.clone(),
             },
             ActionPayload::Snapshot => WorkerActionCommand::Snapshot,
-            ActionPayload::FillSecret { .. }
-            | ActionPayload::SetFiles { .. }
-            | ActionPayload::NewPage { .. }
+            ActionPayload::Screenshot { options } => WorkerActionCommand::Screenshot {
+                options: options.clone(),
+            },
+            ActionPayload::Pdf { options } => WorkerActionCommand::Pdf {
+                options: options.clone(),
+            },
+            ActionPayload::Scrape { options } => WorkerActionCommand::Scrape {
+                options: options.clone(),
+            },
+            ActionPayload::SetFiles {
+                node_ref,
+                artifact_ids,
+            } => WorkerActionCommand::SetFiles {
+                node_ref: node_ref.clone(),
+                artifact_ids: artifact_ids.clone(),
+            },
+            ActionPayload::Checkpoint { origins } => WorkerActionCommand::Checkpoint {
+                origins: origins.clone(),
+            },
+            ActionPayload::NewPage { .. }
             | ActionPayload::ClosePage
-            | ActionPayload::ActivatePage
-            | ActionPayload::Screenshot
-            | ActionPayload::Pdf
-            | ActionPayload::Scrape
-            | ActionPayload::Checkpoint => {
+            | ActionPayload::ActivatePage => {
                 return Err(ApiError::invalid_request(
                     "action is not supported by the production worker",
                 ));
@@ -1497,6 +1597,15 @@ where
             *browserd_operations::CanonicalRequestHash::from_json(&canonical).as_bytes();
         let kind = action.kind();
         let idempotency_key = command.idempotency_key.to_string();
+        let claimed_at = Utc::now();
+        let admission_deadline = claimed_at + ChronoDuration::seconds(1);
+        let submission_lease = GatewayActionSubmissionLease::new(
+            Uuid::now_v7(),
+            1,
+            admission_deadline,
+            admission_deadline,
+        )
+        .map_err(action_coordination_api_error)?;
         let claim = ClaimGatewayAction::new(
             principal.tenant_id().clone(),
             command.session_id.clone(),
@@ -1506,12 +1615,29 @@ where
             kind,
             record.action_placement.clone(),
         )
+        .map_err(action_coordination_api_error)?
+        .with_result_budget(if matches!(&action, WorkerActionCommand::Snapshot) {
+            browserd_actions::ActionResultBudget::Snapshot
+        } else {
+            browserd_actions::ActionResultBudget::Standard
+        })
+        .with_submission_lease(submission_lease.clone());
+        let authority = self.authority_ref(principal.tenant_id(), &command.session_id)?;
+        let claim_outcome = match &authority {
+            Some(authority) => self
+                .actions
+                .claim_action_authorized(claim, authority, claimed_at),
+            None => self.actions.claim_action(claim, claimed_at),
+        }
         .map_err(action_coordination_api_error)?;
-        let mut durable = self
-            .actions
-            .claim_action(claim, Utc::now())
-            .map_err(action_coordination_api_error)?
-            .into_snapshot();
+        let mut durable = match claim_outcome {
+            GatewayActionClaimOutcome::Created(created) => created,
+            GatewayActionClaimOutcome::Existing(existing) => {
+                return coordinated_action_snapshot(&existing)
+                    .map(ApiEnvelope::new)
+                    .map(ApiResponse::Action);
+            }
+        };
         if durable.terminal().is_some() {
             return coordinated_action_snapshot(&durable)
                 .map(ApiEnvelope::new)
@@ -1521,17 +1647,35 @@ where
             ActionDeliveryEvidence::NotAttempted => {
                 let now_unix_millis = current_unix_millis()?;
                 let dispatch_id = DispatchId::new();
-                durable = match self.actions.arm_dispatch(
-                    principal.tenant_id(),
-                    &command.session_id,
-                    durable.action_id(),
-                    durable.revision(),
-                    &record.action_placement,
-                    dispatch_id.clone(),
-                    Utc::now(),
-                ) {
+                let armed = match &authority {
+                    Some(authority) => self.actions.arm_dispatch_owned_authorized(
+                        principal.tenant_id(),
+                        &command.session_id,
+                        durable.action_id(),
+                        durable.revision(),
+                        &record.action_placement,
+                        dispatch_id.clone(),
+                        &submission_lease,
+                        authority,
+                        Utc::now(),
+                    ),
+                    None => self.actions.arm_dispatch_owned(
+                        principal.tenant_id(),
+                        &command.session_id,
+                        durable.action_id(),
+                        durable.revision(),
+                        &record.action_placement,
+                        dispatch_id.clone(),
+                        &submission_lease,
+                        Utc::now(),
+                    ),
+                };
+                durable = match armed {
                     Ok(armed) => armed,
-                    Err(error @ GatewayActionCoordinationError::MutationInFlight { .. }) => {
+                    Err(
+                        error @ (GatewayActionCoordinationError::MutationInFlight { .. }
+                        | GatewayActionCoordinationError::ActionDispatchInFlight { .. }),
+                    ) => {
                         match self.actions.cancel_before_dispatch(
                             principal.tenant_id(),
                             &command.session_id,
@@ -1574,6 +1718,10 @@ where
                     .map(ApiResponse::Action);
             }
         };
+        // The durable claim and dispatch arm now own this action ID. Session admission
+        // remains held: the observer must never block or re-enter this runtime. A receipt
+        // acknowledges acceptance only; enqueue failure can still become NotDispatched.
+        accepted(ApiEnvelope::new(coordinated_action_snapshot(&durable)?));
         let request = WorkerRpcRequest::SubmitAction {
             fence: record.fence.clone(),
             action_id: durable.action_id().clone(),
@@ -1588,7 +1736,10 @@ where
             approval: None,
             now_unix_millis,
         };
-        let pending = match self.client.enqueue_action(request) {
+        let pending = match self
+            .client_for_fence(&record.fence)?
+            .enqueue_action(request)
+        {
             Ok(pending) => pending,
             Err(WorkerRpcEnqueueError::Full(_) | WorkerRpcEnqueueError::Closed(_)) => {
                 return self
@@ -1615,28 +1766,26 @@ where
         ) {
             Ok(exposed) => exposed,
             Err(error) => {
-                let effective = self.effective_action_after_race(
+                // Enqueue transferred ownership to the RPC actor. Keep its completion owner
+                // even when the exposure write fails or another observer commits a terminal
+                // result. The immutable dispatch arm still permits recording a positive result.
+                self.effective_action_after_race(
                     principal.tenant_id(),
                     &command.session_id,
                     durable.action_id(),
                     error,
-                )?;
-                if effective.terminal().is_some()
-                    || !matches!(
-                        effective.delivery(),
-                        ActionDeliveryEvidence::ExposurePossible(current)
-                            if current == &dispatch_id
-                    )
-                {
-                    self.note_terminal_transition(&effective);
-                    return coordinated_action_snapshot(&effective)
-                        .map(ApiEnvelope::new)
-                        .map(ApiResponse::Action);
-                }
-                effective
+                )
+                .unwrap_or_else(|_| durable.clone())
             }
         };
-        let action = match pending.wait() {
+        let completion = pending.wait();
+        if durable.terminal().is_some() {
+            self.note_terminal_transition(&durable);
+            return coordinated_action_snapshot(&durable)
+                .map(ApiEnvelope::new)
+                .map(ApiResponse::Action);
+        }
+        let action = match completion {
             Ok(WorkerRpcResponse::Action(receipt)) => self.reconcile_worker_action(
                 principal.tenant_id(),
                 &command.session_id,
@@ -1689,21 +1838,36 @@ where
                 &command.action_id,
             )
             .map_err(action_coordination_api_error)?
-            .ok_or_else(|| ApiError::new(ErrorCode::ActionResolutionInvalid, "action not found"))?;
-        if durable.terminal().is_some()
-            || matches!(durable.delivery(), ActionDeliveryEvidence::NotAttempted)
-        {
+            .ok_or_else(|| ApiError::new(ErrorCode::OperationNotFound, "action not found"))?;
+        if durable.terminal().is_some() {
             return coordinated_action_snapshot(&durable)
                 .map(ApiEnvelope::new)
                 .map(ApiResponse::Action);
         }
-        let record = self.session_record(principal.tenant_id(), &command.session_id)?;
+        if matches!(durable.delivery(), ActionDeliveryEvidence::NotAttempted) {
+            let recovered = self.recover_action_receipt(&durable)?;
+            return recovered
+                .map_or_else(|| coordinated_action_snapshot(&durable), Ok)
+                .map(ApiEnvelope::new)
+                .map(ApiResponse::Action);
+        }
+        let record = match self.session_record(principal.tenant_id(), &command.session_id) {
+            Ok(record) => record,
+            Err(error) if error.code() == ErrorCode::SessionNotFound => {
+                let recovered = self.recover_action_receipt(&durable)?;
+                return recovered
+                    .map_or_else(|| coordinated_action_snapshot(&durable), Ok)
+                    .map(ApiEnvelope::new)
+                    .map(ApiResponse::Action);
+            }
+            Err(error) => return Err(error),
+        };
         let dispatch_id = match durable.delivery() {
             ActionDeliveryEvidence::DispatchArmed(dispatch_id)
             | ActionDeliveryEvidence::ExposurePossible(dispatch_id) => dispatch_id.clone(),
             ActionDeliveryEvidence::NotAttempted => unreachable!("handled above"),
         };
-        let response = self.client.request(WorkerRpcRequest::GetAction {
+        let response = self.request_worker(WorkerRpcRequest::GetAction {
             fence: record.fence.clone(),
             action_id: command.action_id.clone(),
         });
@@ -1767,7 +1931,7 @@ where
             ActionDeliveryEvidence::DispatchArmed(dispatch_id)
             | ActionDeliveryEvidence::ExposurePossible(dispatch_id) => dispatch_id.clone(),
         };
-        let response = self.client.request(WorkerRpcRequest::CancelAction {
+        let response = self.request_worker(WorkerRpcRequest::CancelAction {
             fence: record.fence.clone(),
             action_id: command.action_id.clone(),
             now_unix_millis: current_unix_millis()?,
@@ -1829,9 +1993,8 @@ where
             current_unix_millis()?,
             command.body.basis.clone(),
         );
-        let annotation = match self
-            .client
-            .request(WorkerRpcRequest::ResolveAction {
+        let (annotation, custody, custody_requirement) = match self
+            .request_worker(WorkerRpcRequest::ResolveAction {
                 fence: record.fence.clone(),
                 action_id: command.action_id.clone(),
                 resolution,
@@ -1854,12 +2017,15 @@ where
                         "worker returned a mismatched resolution receipt",
                     ));
                 }
-                receipt.to_action_snapshot().map_err(|_| {
-                    ApiError::new(
-                        ErrorCode::Internal,
-                        "worker returned contradictory resolution facts",
-                    )
-                })?;
+                receipt
+                    .to_action_snapshot_with_result_budget(durable.result_budget())
+                    .map_err(|_| {
+                        ApiError::new(
+                            ErrorCode::Internal,
+                            "worker returned contradictory resolution facts",
+                        )
+                    })?;
+                let custody = self.validated_terminal_custody(&durable, &receipt)?;
                 let worker_annotation = receipt.resolution.ok_or_else(|| {
                     ApiError::new(
                         ErrorCode::ActionResolutionInvalid,
@@ -1875,12 +2041,12 @@ where
                         "worker resolved the action with different evidence",
                     ));
                 }
-                worker_annotation
+                (worker_annotation, custody, receipt.custody_requirement)
             }
             WorkerRpcResponse::Failure(failure)
                 if failure.code == WorkerRpcFailureCode::NotFound =>
             {
-                requested_annotation
+                (requested_annotation, None, None)
             }
             WorkerRpcResponse::Failure(failure) => {
                 return Err(worker_api_error(WorkerRpcError::Remote(failure)));
@@ -1892,13 +2058,15 @@ where
                 ));
             }
         };
-        let resolved = match self.actions.resolve_unknown(
+        let resolved = match self.actions.resolve_unknown_with_custody(
             principal.tenant_id(),
             &command.session_id,
             durable.action_id(),
             durable.revision(),
             &record.action_placement,
             annotation.clone(),
+            custody,
+            custody_requirement,
             Utc::now(),
         ) {
             Ok(resolved) => resolved,
@@ -1937,6 +2105,21 @@ where
                 "worker returned a mismatched artifact receipt",
             ));
         }
+        self.validate_current_fence(tenant_id, session_id, &receipt.fence)?;
+        Self::artifact_content_metadata(tenant_id, session_id, receipt)
+    }
+
+    fn artifact_content_metadata(
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        receipt: WorkerArtifactReceipt,
+    ) -> Result<ArtifactMetadata, ApiError> {
+        if &receipt.fence.tenant_id != tenant_id || &receipt.fence.session_id != session_id {
+            return Err(ApiError::new(
+                ErrorCode::PlacementMismatch,
+                "artifact namespace mismatch",
+            ));
+        }
         let source = match receipt.source {
             WorkerArtifactSource::ClientUpload => ArtifactContentSource::ClientUpload,
             WorkerArtifactSource::BrowserDownload => ArtifactContentSource::BrowserDownload,
@@ -1968,15 +2151,97 @@ where
             WorkerArtifactState::Deleting => ArtifactState::Deleting,
             WorkerArtifactState::Deleted => ArtifactState::Deleted,
         };
-        self.validate_current_fence(tenant_id, session_id, &receipt.fence)?;
-        Ok(ArtifactMetadata {
+        let metadata = ArtifactMetadata {
             key: ArtifactKey::new(tenant_id.clone(), session_id.clone(), receipt.artifact_id),
             state,
             checksum_sha256: Some(*content.checksum().as_bytes()),
             size_bytes: Some(content.size_bytes()),
             content_type: Some(content.content_type().to_owned()),
             source_origin: Some(content.origin().to_owned()),
-        })
+            display_filename: receipt.display_filename,
+        };
+        metadata.validate_display_filename()?;
+        Ok(metadata)
+    }
+
+    fn list_artifacts(
+        &self,
+        principal: &browserd_auth::AuthenticatedPrincipal,
+        command: ArtifactListRequest,
+    ) -> Result<ApiResponse, ApiError> {
+        command.validate()?;
+        let Some(record) = self.live_artifact_record(principal.tenant_id(), &command.session_id)?
+        else {
+            return self.list_retained_artifacts(principal, command);
+        };
+        let receipts = match self
+            .request_worker(WorkerRpcRequest::ListArtifacts {
+                fence: record.fence.clone(),
+                after: command.after.clone(),
+                limit: command.limit + 1,
+            })
+            .map_err(|error| {
+                worker_api_error_with_codes(
+                    error,
+                    ErrorCode::SessionNotFound,
+                    ErrorCode::PlacementMismatch,
+                    ErrorCode::GlobalCapacityExceeded,
+                )
+            })? {
+            WorkerRpcResponse::Artifacts(receipts) => receipts,
+            WorkerRpcResponse::Failure(failure) => {
+                return Err(worker_api_error_with_codes(
+                    WorkerRpcError::Remote(failure),
+                    ErrorCode::SessionNotFound,
+                    ErrorCode::PlacementMismatch,
+                    ErrorCode::GlobalCapacityExceeded,
+                ));
+            }
+            _ => {
+                return Err(ApiError::new(
+                    ErrorCode::Internal,
+                    "worker returned an unexpected artifact list",
+                ));
+            }
+        };
+        if receipts.len() > command.limit + 1 {
+            return Err(ApiError::new(
+                ErrorCode::Internal,
+                "worker returned an unbounded artifact list",
+            ));
+        }
+        let mut previous = command.after;
+        let mut items = Vec::with_capacity(receipts.len());
+        for receipt in receipts {
+            let id = receipt.artifact_id.clone();
+            if previous.as_ref().is_some_and(|previous| &id <= previous) {
+                return Err(ApiError::new(
+                    ErrorCode::Internal,
+                    "worker returned invalid artifact ordering",
+                ));
+            }
+            previous = Some(id.clone());
+            // Verify the extra pagination item too; a hidden cross-fence receipt
+            // must never authorize a partially accepted public page.
+            items.push(self.artifact_metadata(
+                principal.tenant_id(),
+                &command.session_id,
+                &record.fence,
+                &id,
+                receipt,
+            )?);
+        }
+        self.validate_current_fence(principal.tenant_id(), &command.session_id, &record.fence)?;
+        let next_cursor = if items.len() > command.limit {
+            items.truncate(command.limit);
+            items.last().map(|item| item.key.artifact_id().clone())
+        } else {
+            None
+        };
+        Ok(ApiResponse::Artifacts(ApiEnvelope::new(ArtifactListPage {
+            items,
+            next_cursor,
+        })))
     }
 
     fn get_artifact(
@@ -1984,10 +2249,12 @@ where
         principal: &browserd_auth::AuthenticatedPrincipal,
         command: ArtifactRequest,
     ) -> Result<ApiResponse, ApiError> {
-        let record = self.session_record(principal.tenant_id(), &command.session_id)?;
+        let Some(record) = self.live_artifact_record(principal.tenant_id(), &command.session_id)?
+        else {
+            return self.get_retained_artifact(principal, command);
+        };
         let receipt = match self
-            .client
-            .request(WorkerRpcRequest::GetArtifact {
+            .request_worker(WorkerRpcRequest::GetArtifact {
                 fence: record.fence.clone(),
                 artifact_id: command.artifact_id.clone(),
             })
@@ -2080,6 +2347,19 @@ where
             )
         })?;
         self.validate_current_fence(tenant_id, &receipt.fence.session_id, &receipt.fence)?;
+        let worker_id = self
+            .placement_authority(tenant_id, &receipt.fence.session_id)?
+            .map(|authority| authority.entry().fence().worker_id().clone())
+            .unwrap_or_else(|| self.placement.worker_id.clone());
+        if proposal
+            .typed_binding()
+            .is_some_and(|binding| binding.fence.worker_id != worker_id)
+        {
+            return Err(ApiError::new(
+                ErrorCode::PlacementMismatch,
+                "worker approval belongs to a different worker",
+            ));
+        }
         let state = match &receipt.state {
             WorkerApprovalState::Pending => browserd_policy::ApprovalState::Pending,
             WorkerApprovalState::Approved { by } => {
@@ -2115,7 +2395,7 @@ where
         let routes = self.active_approval_routes(tenant_id)?;
         let mut found = None;
         for route in routes {
-            let response = match self.client.request(WorkerRpcRequest::GetApproval {
+            let response = match self.request_worker(WorkerRpcRequest::GetApproval {
                 fence: route.fence.clone(),
                 approval_id: approval_id.clone(),
             }) {
@@ -2185,8 +2465,7 @@ where
         let mut receipt_count = 0_usize;
         for route in routes {
             let receipts = match self
-                .client
-                .request(WorkerRpcRequest::ListApprovals {
+                .request_worker(WorkerRpcRequest::ListApprovals {
                     fence: route.fence.clone(),
                 })
                 .map_err(|error| {
@@ -2269,8 +2548,7 @@ where
             ApprovalDecisionRequest::Deny => WorkerApprovalDecision::Deny,
         };
         let receipt = match self
-            .client
-            .request(WorkerRpcRequest::DecideApproval {
+            .request_worker(WorkerRpcRequest::DecideApproval {
                 fence: route.fence.clone(),
                 approval_id: approval_id.clone(),
                 decision,
@@ -2333,12 +2611,30 @@ impl<C> RuntimeApiBackend for GatewayWorkerRuntime<C>
 where
     C: GatewayWorkerClient,
 {
+    fn manages_create_admission(&self) -> bool {
+        self.fleet.is_some()
+    }
+    fn create_projection_committed(
+        &self,
+        authority: &CreateAuthority,
+        dispatch: &SessionCreateDispatch,
+        session: &SessionResource,
+    ) -> Result<(), ApiError> {
+        if self.fleet.is_some() {
+            self.ack_fleet_projection(authority.tenant_id(), dispatch.operation_id(), &session.id)?;
+        }
+        Ok(())
+    }
+
     fn create_session(
         &self,
         authority: &CreateAuthority,
         dispatch: &SessionCreateDispatch,
         request: &SessionCreateRequest,
     ) -> RuntimeCreateResult {
+        if self.fleet.is_some() {
+            return self.create_fleet_session(authority, dispatch, request);
+        }
         let now_unix_millis = match current_unix_millis() {
             Ok(now_unix_millis) => now_unix_millis,
             Err(error) => return RuntimeCreateResult::ConfirmedFailure(error),
@@ -2351,6 +2647,8 @@ where
             expected_worker_epoch: self.placement.worker_epoch,
             placement_version: self.placement.placement_version,
             session_incarnation: 1,
+            // Preserve the canonical request for exact lost-response recovery. The worker
+            // applies current safety only when starting an actual unreserved context.
             requested_isolation: match request.isolation {
                 IsolationRequest::SharedContext => WorkerIsolationProfile::SharedContext,
                 IsolationRequest::TenantDedicatedShard => {
@@ -2411,13 +2709,34 @@ where
             || receipt.worker_epoch != self.placement.worker_epoch
             || receipt.placement_version != self.placement.placement_version
             || receipt.session_incarnation != 1
+            || match (&request.checkpoint_ref, &receipt.restored_checkpoint) {
+                (None, None) => false,
+                (Some(expected), Some(restored)) => {
+                    restored.checkpoint_ref != *expected
+                        || restored.source_session_id == receipt.session_id
+                }
+                _ => true,
+            }
         {
             return RuntimeCreateResult::OutcomeUnknown(ApiError::new(
                 ErrorCode::PlacementMismatch,
                 "worker returned a mismatched creation receipt",
             ));
         }
-        let resource = SessionResource {
+        let mut metadata = request.metadata.clone();
+        metadata.remove("restored_from_checkpoint");
+        metadata.remove("recovered_from_session");
+        if let Some(restored) = &receipt.restored_checkpoint {
+            metadata.insert(
+                "restored_from_checkpoint".to_owned(),
+                restored.checkpoint_ref.clone(),
+            );
+            metadata.insert(
+                "recovered_from_session".to_owned(),
+                restored.source_session_id.to_string(),
+            );
+        }
+        let mut resource = SessionResource {
             id: receipt.session_id.clone(),
             lifecycle: SessionLifecycle::Ready,
             incarnation: receipt.session_incarnation,
@@ -2430,7 +2749,7 @@ where
                 WorkerIsolationProfile::DedicatedProcess => IsolationProfile::DedicatedProcess,
                 WorkerIsolationProfile::DedicatedWorker => IsolationProfile::DedicatedWorker,
             },
-            metadata: request.metadata.clone(),
+            metadata,
         };
         let fence = WorkerSessionFence {
             tenant_id: receipt.tenant_id,
@@ -2463,6 +2782,16 @@ where
                     ));
                 }
             };
+        if self.durable_sessions {
+            resource = match self.publish_durable_session(
+                authority.tenant_id(),
+                &action_placement,
+                &resource,
+            ) {
+                Ok(resource) => resource,
+                Err(error) => return RuntimeCreateResult::OutcomeUnknown(error),
+            };
+        }
         {
             let mut sessions = match self.sessions.lock() {
                 Ok(sessions) => sessions,
@@ -2488,6 +2817,12 @@ where
                 existing.action_placement = action_placement;
                 existing.resource = resource.clone();
             } else {
+                if sessions.len() >= 16_384 {
+                    return RuntimeCreateResult::OutcomeUnknown(ApiError::new(
+                        ErrorCode::GlobalCapacityExceeded,
+                        "session cache is full",
+                    ));
+                }
                 sessions.insert(
                     key,
                     GatewaySessionRecord {
@@ -2495,6 +2830,11 @@ where
                         action_placement,
                         resource: resource.clone(),
                         admission_lane: Arc::new(SessionAdmissionLane::default()),
+                        retired_at: matches!(
+                            resource.lifecycle,
+                            SessionLifecycle::Closed | SessionLifecycle::Failed
+                        )
+                        .then(Utc::now),
                     },
                 );
             }
@@ -2508,32 +2848,47 @@ where
         RuntimeCreateResult::Succeeded(resource)
     }
 
+    fn execute_runtime_with_action_acceptance(
+        &self,
+        principal: &browserd_auth::AuthenticatedPrincipal,
+        request: ApiRequest,
+        accepted: &mut (dyn FnMut(ApiEnvelope<ActionSnapshot>) + Send),
+    ) -> Result<ApiResponse, ApiError> {
+        match request {
+            ApiRequest::SubmitAction(command) => {
+                self.submit_action_observed(principal, command, accepted)
+            }
+            request => self.execute_runtime(principal, request),
+        }
+    }
+
     fn execute_runtime(
         &self,
         principal: &browserd_auth::AuthenticatedPrincipal,
         request: ApiRequest,
     ) -> Result<ApiResponse, ApiError> {
         match request {
-            ApiRequest::ListSessions(query) => self
-                .catalog
-                .list(principal.tenant_id(), &query)
-                .map(ApiEnvelope::new)
-                .map(ApiResponse::Sessions),
+            ApiRequest::ListSessions(query) => {
+                let page = if self.durable_sessions && self.fleet.is_none() {
+                    self.list_durable_sessions(principal.tenant_id(), &query)
+                } else {
+                    self.catalog.list(principal.tenant_id(), &query)
+                }?;
+                Ok(ApiResponse::Sessions(ApiEnvelope::new(page)))
+            }
             ApiRequest::GetSession(session_id) => {
-                let record = self
-                    .sessions
-                    .lock()
-                    .map_err(|_| {
-                        ApiError::new(ErrorCode::WorkerUnavailable, "session state unavailable")
-                    })?
-                    .get(&(principal.tenant_id().clone(), session_id.clone()))
-                    .cloned()
-                    .ok_or_else(|| {
-                        ApiError::new(ErrorCode::SessionNotFound, "session not found")
-                    })?;
+                let record = self.session_record(principal.tenant_id(), &session_id)?;
+                if self.durable_sessions
+                    && self.fleet.is_none()
+                    && matches!(
+                        record.resource.lifecycle,
+                        SessionLifecycle::Closed | SessionLifecycle::Failed
+                    )
+                {
+                    return Ok(ApiResponse::Session(ApiEnvelope::new(record.resource)));
+                }
                 let receipt = match self
-                    .client
-                    .request(WorkerRpcRequest::GetSession {
+                    .request_worker(WorkerRpcRequest::GetSession {
                         fence: record.fence.clone(),
                     })
                     .map_err(worker_api_error)?
@@ -2554,6 +2909,15 @@ where
                         ErrorCode::PlacementMismatch,
                         "worker returned a mismatched session fence",
                     ));
+                }
+                self.confirm_session_terminal(&record, receipt.lifecycle)?;
+                if self.durable_sessions && self.fleet.is_none() {
+                    self.persist_directory_phase(
+                        principal.tenant_id(),
+                        &session_id,
+                        &receipt.fence,
+                        receipt.lifecycle,
+                    )?;
                 }
                 let mut resource = record.resource;
                 resource.lifecycle = match receipt.lifecycle {
@@ -2597,6 +2961,12 @@ where
                     );
                     if advances {
                         current.resource = resource.clone();
+                        if matches!(
+                            resource.lifecycle,
+                            SessionLifecycle::Closed | SessionLifecycle::Failed
+                        ) {
+                            current.retired_at.get_or_insert_with(Utc::now);
+                        }
                     } else {
                         resource = current.resource.clone();
                     }
@@ -2606,6 +2976,13 @@ where
                 Ok(ApiResponse::Session(ApiEnvelope::new(resource)))
             }
             ApiRequest::DeleteSession(session_id) => {
+                if self.durable_sessions && self.fleet.is_none() {
+                    self.session_record(principal.tenant_id(), &session_id)?;
+                }
+                if self.fleet.is_some() {
+                    self.session_record(principal.tenant_id(), &session_id)?;
+                    self.begin_fleet_close(principal.tenant_id(), &session_id)?;
+                }
                 let record = {
                     let mut sessions = self.sessions.lock().map_err(|_| {
                         ApiError::new(ErrorCode::WorkerUnavailable, "session state unavailable")
@@ -2628,6 +3005,17 @@ where
                     record.resource.clone(),
                     Utc::now(),
                 )?;
+                if self.durable_sessions
+                    && self.fleet.is_none()
+                    && record.resource.lifecycle == SessionLifecycle::Closing
+                {
+                    self.persist_directory_phase(
+                        principal.tenant_id(),
+                        &session_id,
+                        &record.fence,
+                        WorkerSessionLifecycle::Closing,
+                    )?;
+                }
                 if matches!(
                     record.resource.lifecycle,
                     SessionLifecycle::Closed | SessionLifecycle::Failed
@@ -2639,8 +3027,7 @@ where
                 let admission_lane = Arc::clone(&record.admission_lane);
                 let _admission = admission_lane.acquire()?;
                 let receipt = match self
-                    .client
-                    .request(WorkerRpcRequest::CloseSession {
+                    .request_worker(WorkerRpcRequest::CloseSession {
                         fence: record.fence.clone(),
                         now_unix_millis: current_unix_millis()?,
                     })
@@ -2662,6 +3049,23 @@ where
                         ErrorCode::PlacementMismatch,
                         "worker returned a mismatched close fence",
                     ));
+                }
+                self.confirm_session_terminal(&record, receipt.lifecycle)?;
+                if self.durable_sessions && self.fleet.is_none() {
+                    self.persist_directory_phase(
+                        principal.tenant_id(),
+                        &session_id,
+                        &receipt.fence,
+                        receipt.lifecycle,
+                    )?;
+                }
+                if self.fleet.is_some()
+                    && matches!(
+                        receipt.lifecycle,
+                        WorkerSessionLifecycle::Closed | WorkerSessionLifecycle::Failed
+                    )
+                {
+                    self.finish_fleet_close(principal.tenant_id(), &session_id)?;
                 }
                 let mut resource = record.resource;
                 resource.lifecycle = match receipt.lifecycle {
@@ -2705,6 +3109,12 @@ where
                     );
                     if advances {
                         current.resource = resource.clone();
+                        if matches!(
+                            resource.lifecycle,
+                            SessionLifecycle::Closed | SessionLifecycle::Failed
+                        ) {
+                            current.retired_at.get_or_insert_with(Utc::now);
+                        }
                     } else {
                         resource = current.resource.clone();
                     }
@@ -2713,6 +3123,7 @@ where
                     .upsert(principal.tenant_id().clone(), resource.clone(), Utc::now())?;
                 Ok(ApiResponse::SessionClosed(ApiEnvelope::new(resource)))
             }
+            ApiRequest::IssueViewerTicket(command) => self.issue_viewer_ticket(principal, command),
             ApiRequest::ListPages(command) => self.list_pages(principal, command),
             ApiRequest::CreatePage(command) => self.create_page(principal, command),
             ApiRequest::DeletePage(command) => self.delete_page(principal, command),
@@ -2722,6 +3133,11 @@ where
             ApiRequest::CancelAction(command) => self.cancel_action(principal, command),
             ApiRequest::ResolveAction(command) => self.resolve_action(principal, command),
             ApiRequest::GetArtifact(command) => self.get_artifact(principal, command),
+            ApiRequest::ListArtifacts(command) => self.list_artifacts(principal, command),
+            ApiRequest::UploadArtifact(command) => self.upload_artifact(principal, command),
+            ApiRequest::DownloadArtifact(command) => {
+                self.issue_artifact_download(principal, command)
+            }
             ApiRequest::ListApprovals(query) => self.list_approvals(principal, query),
             ApiRequest::GetApproval(approval_id) => self.get_approval(principal, approval_id),
             ApiRequest::DecideApproval { approval_id, body } => {

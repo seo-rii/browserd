@@ -26,7 +26,10 @@ use super::{
     DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest, RenewRouteRequest,
 };
 
-static LISTENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// A concurrently spawned test child can retain CLOEXEC socket capabilities
+// between fork and exec. Keep process spawning outside listener lifecycle tests
+// so TCP refusal and control EOF describe this process's completed cleanup.
+pub(crate) static LISTENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug)]
 struct DropHandler;
@@ -105,6 +108,16 @@ fn listener() -> (std::net::SocketAddr, OwnedFd) {
     (address, OwnedFd::from(listener))
 }
 
+fn listener_copy_count(inode: u64) -> usize {
+    let descriptor = format!("socket:[{inode}]");
+    std::fs::read_dir("/proc/self/fd")
+        .expect("process descriptor directory must be readable")
+        .filter_map(Result::ok)
+        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+        .filter(|target| target.to_string_lossy() == descriptor)
+        .count()
+}
+
 fn install_request(prepared: &super::PreparedRouteResponse) -> InstallRequest {
     InstallRequest::new(
         LeaseId::new(),
@@ -148,6 +161,322 @@ async fn install_active_route(
         Some(active.clone())
     );
     (route_fence, address, active)
+}
+
+#[tokio::test]
+async fn revoking_plan_keeps_its_active_budget_until_accepted_guards_drain() {
+    struct HeldIngress {
+        accepted: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl AcceptedIngressHandler for HeldIngress {
+        async fn handle(&self, ingress: AcceptedRouteIngress) -> Result<(), IngressHandlerError> {
+            self.accepted.notify_one();
+            self.release.notified().await;
+            drop(ingress);
+            Ok(())
+        }
+    }
+    let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    let handler = Arc::new(HeldIngress {
+        accepted: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let limits = DaemonLimits::new(Duration::from_secs(30), 1, quotas())
+        .expect("limits")
+        .with_plan_history_capacity(2)
+        .expect("history");
+    let daemon =
+        Arc::new(EgressDaemon::with_handler(epoch(), limits, handler.clone()).expect("daemon"));
+    let (first_fence, address, _) = install_active_route(&daemon, 81, [81; 32]).await;
+    let client = TcpStream::connect(address)
+        .await
+        .expect("accepted connection");
+    handler.accepted.notified().await;
+    let revoke = tokio::spawn({
+        let daemon = daemon.clone();
+        let first_fence = first_fence.clone();
+        async move { daemon.revoke(epoch().get(), &first_fence).await }
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while daemon
+            .status(epoch().get(), &first_fence)
+            .expect("status")
+            .state()
+            == AttachmentState::Active
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("revocation begins");
+    let next_request = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        fence(82),
+        [82; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("next request");
+    assert!(
+        matches!(
+            daemon.prepare(next_request.clone()),
+            Err(DaemonControlError::PlanCapacityExceeded)
+        ),
+        "revocation intent alone cannot recover an undrained slot"
+    );
+    handler.release.notify_one();
+    drop(client);
+    assert_eq!(
+        revoke
+            .await
+            .expect("revoke joins")
+            .expect("drain completes")
+            .state(),
+        AttachmentState::Released
+    );
+    let next = daemon
+        .prepare(next_request)
+        .expect("actual drain recovers the slot");
+    daemon
+        .revoke(epoch().get(), next.egress_fence())
+        .await
+        .expect("cancel next");
+    daemon.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn bounded_terminal_history_keeps_exact_receipts_and_rejects_reactivation() {
+    let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    let limits = DaemonLimits::new(Duration::from_secs(30), 1, quotas())
+        .expect("limits")
+        .with_plan_history_capacity(2)
+        .expect("independent history bound");
+    let daemon = Arc::new(
+        EgressDaemon::with_handler(epoch(), limits, Arc::new(DropHandler)).expect("daemon"),
+    );
+    let first_fence = fence(71);
+    let first_request = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        first_fence.clone(),
+        [71; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("first request");
+    let first_prepared = daemon
+        .prepare(first_request.clone())
+        .expect("first prepare");
+    let (first_address, descriptor) = listener();
+    let (client_stream, server_stream) = UnixStream::pair().expect("control pair");
+    let server = tokio::spawn({
+        let daemon = daemon.clone();
+        async move {
+            daemon
+                .handle_control_stream(server_stream, Uid::current().as_raw())
+                .await
+        }
+    });
+    let active = send_listener(client_stream, install_request(&first_prepared), descriptor)
+        .await
+        .expect("actual install");
+    assert_eq!(
+        server.await.expect("server join").expect("server install"),
+        Some(active.clone())
+    );
+    assert_eq!(
+        daemon
+            .revoke(epoch().get(), &first_fence)
+            .await
+            .expect("first cleanup")
+            .state(),
+        AttachmentState::Released
+    );
+    let second = prepare(&daemon, fence(72), [72; 32]);
+    assert_eq!(
+        daemon
+            .revoke(epoch().get(), second.egress_fence())
+            .await
+            .expect("second cleanup")
+            .state(),
+        AttachmentState::Released
+    );
+    let third_request = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        fence(73),
+        [73; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("third request");
+    assert!(matches!(
+        daemon.prepare(third_request),
+        Err(DaemonControlError::PlanHistoryCapacityExceeded)
+    ));
+    assert_eq!(
+        daemon
+            .prepare(first_request)
+            .expect("exact immutable retry remains available"),
+        first_prepared
+    );
+    assert_eq!(
+        daemon
+            .status(epoch().get(), &first_fence)
+            .expect("first history")
+            .state(),
+        AttachmentState::Released
+    );
+    assert_eq!(
+        daemon
+            .status(epoch().get(), second.egress_fence())
+            .expect("second history")
+            .state(),
+        AttachmentState::Released
+    );
+    let (stale_address, stale_descriptor) = listener();
+    let (client_stream, server_stream) = UnixStream::pair().expect("old ticket pair");
+    let server = tokio::spawn({
+        let daemon = daemon.clone();
+        async move {
+            daemon
+                .handle_control_stream(server_stream, Uid::current().as_raw())
+                .await
+        }
+    });
+    assert!(
+        send_listener(
+            client_stream,
+            install_request(&first_prepared),
+            stale_descriptor
+        )
+        .await
+        .is_err(),
+        "retained old prepare cannot reactivate a terminal route"
+    );
+    assert!(server.await.expect("old ticket server joins").is_err());
+    assert!(TcpStream::connect(stale_address).await.is_err());
+    assert!(TcpStream::connect(first_address).await.is_err());
+    assert!(
+        daemon
+            .renew(
+                RenewRouteRequest::new(
+                    1,
+                    epoch().get(),
+                    first_fence.clone(),
+                    active.attachment_id(),
+                    active.activation_revision(),
+                    Duration::from_secs(10)
+                )
+                .expect("old renewal")
+            )
+            .is_err()
+    );
+    assert_eq!(
+        daemon
+            .revoke(epoch().get(), &first_fence)
+            .await
+            .expect("terminal revoke retry")
+            .state(),
+        AttachmentState::Released
+    );
+    let wrong_epoch = PreparedRouteRequest::new(
+        epoch().get() + 1,
+        TenantId::new(),
+        first_fence,
+        [71; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("wrong incarnation");
+    assert!(matches!(
+        daemon.prepare(wrong_epoch),
+        Err(DaemonControlError::DaemonEpochMismatch { .. })
+    ));
+    daemon
+        .shutdown()
+        .await
+        .expect("history remains fail closed through drain");
+}
+
+#[test]
+fn history_capacity_cannot_be_smaller_than_active_capacity() {
+    assert!(matches!(
+        DaemonLimits::new(Duration::from_secs(30), 2, quotas())
+            .expect("limits")
+            .with_plan_history_capacity(1),
+        Err(DaemonControlError::InvalidLimits)
+    ));
+}
+
+#[tokio::test]
+async fn released_plan_recovers_active_capacity_without_reviving_its_authority() {
+    let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    let daemon = Arc::new(daemon(1));
+    let (first_fence, first_address, first_active) =
+        install_active_route(&daemon, 61, [61; 32]).await;
+    let next_request = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        fence(62),
+        [62; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("next request");
+    assert!(matches!(
+        daemon.prepare(next_request.clone()),
+        Err(DaemonControlError::PlanCapacityExceeded)
+    ));
+    assert_eq!(
+        daemon
+            .revoke(epoch().get(), &first_fence)
+            .await
+            .expect("drain first")
+            .state(),
+        AttachmentState::Released
+    );
+    let next = daemon
+        .prepare(next_request)
+        .expect("released plan recovers the active slot");
+    assert_eq!(
+        daemon
+            .status(epoch().get(), &first_fence)
+            .expect("old receipt remains tracked")
+            .state(),
+        AttachmentState::Released
+    );
+    assert!(
+        daemon
+            .renew(
+                RenewRouteRequest::new(
+                    1,
+                    epoch().get(),
+                    first_fence.clone(),
+                    first_active.attachment_id(),
+                    first_active.activation_revision(),
+                    Duration::from_secs(10)
+                )
+                .expect("old renewal")
+            )
+            .is_err()
+    );
+    assert!(
+        TcpStream::connect(first_address).await.is_err(),
+        "old listener stays closed"
+    );
+    assert_eq!(
+        daemon
+            .revoke(epoch().get(), next.egress_fence())
+            .await
+            .expect("cancel second")
+            .state(),
+        AttachmentState::Released
+    );
+    daemon.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -226,15 +555,9 @@ async fn prepare_install_status_and_revoke_are_one_full_fence_transaction() {
         .expect("revoke must drain and release");
     assert_eq!(released.state(), AttachmentState::Released);
     drop(client);
-    let listener_descriptor = format!("socket:[{listener_inode}]");
-    let open_listener_copies = std::fs::read_dir("/proc/self/fd")
-        .expect("process descriptor directory must be readable")
-        .filter_map(Result::ok)
-        .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-        .filter(|target| target.to_string_lossy() == listener_descriptor)
-        .count();
     assert_eq!(
-        open_listener_copies, 0,
+        listener_copy_count(listener_inode),
+        0,
         "released attachment must close every listener capability copy"
     );
 }
@@ -393,10 +716,25 @@ async fn semantic_metadata_mismatch_is_rejected_before_fd_offer() {
 #[tokio::test]
 async fn failed_commit_announcement_revokes_the_domain_install() {
     let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    assert_failed_commit_rolls_back(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_commit_on_other_runtime_threads_closes_every_listener_copy() {
+    let _listener_test = LISTENER_TEST_LOCK.lock().await;
+    for seed in 100..116 {
+        assert_failed_commit_rolls_back(seed).await;
+    }
+}
+
+async fn assert_failed_commit_rolls_back(seed: u64) {
     let daemon = daemon(8);
-    let route_fence = fence(3);
+    let route_fence = fence(seed);
     let prepared = prepare(&daemon, route_fence.clone(), [10; 32]);
     let (address, listener) = listener();
+    let listener_inode = fstat(&listener)
+        .expect("listener identity must be readable")
+        .st_ino;
     let (client_stream, server_stream) = UnixStream::pair().expect("control pair must open");
     let client = tokio::spawn(send_listener(
         client_stream,
@@ -413,16 +751,24 @@ async fn failed_commit_announcement_revokes_the_domain_install() {
         .install_pending(pending)
         .await
         .expect_err("commit announcement must fail");
-    assert!(matches!(
-        error,
-        DaemonControlError::Commit(ServerCommitError::BeforeAnnouncement(_))
-    ));
+    assert!(
+        matches!(
+            error,
+            DaemonControlError::Commit(ServerCommitError::BeforeAnnouncement(_))
+        ),
+        "unexpected commit failure: {error:?}"
+    );
     assert_eq!(
         daemon
             .status(epoch().get(), &route_fence)
             .expect("terminal status must reconcile")
             .state(),
         AttachmentState::Released
+    );
+    assert_eq!(
+        listener_copy_count(listener_inode),
+        0,
+        "rollback must close domain and protocol listener copies before returning Released"
     );
     assert!(TcpStream::connect(address).await.is_err());
 }
@@ -493,4 +839,58 @@ fn daemon_epoch_plan_binding_and_capacity_fail_closed() {
         prepared.binding_digest(),
         BindingDigest::new([11; 32]).as_bytes()
     );
+}
+
+#[test]
+fn shared_prepare_is_explicit_and_mode_policy_and_route_identity_remain_immutable() {
+    let daemon = daemon(8);
+    let first = fence(5);
+    let second = EgressFence::new(
+        first.shard().clone(),
+        RouteGeneration::new(6).expect("route"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("incarnation"),
+    );
+    let first_request = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        first.clone(),
+        [7; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("request")
+    .with_shared_context();
+    let receipt = daemon
+        .prepare(first_request.clone())
+        .expect("shared primary");
+    assert_eq!(daemon.prepare(first_request).expect("exact retry"), receipt);
+    let second_request = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        second,
+        [7; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("request");
+    assert!(
+        daemon.prepare(second_request.clone()).is_err(),
+        "legacy path cannot share a shard"
+    );
+    assert!(daemon.prepare(second_request.with_shared_context()).is_ok());
+    let changed = PreparedRouteRequest::new(
+        epoch().get(),
+        TenantId::new(),
+        first,
+        [8; 32],
+        "public-web",
+        Duration::from_secs(10),
+    )
+    .expect("different policy")
+    .with_shared_context();
+    assert!(matches!(
+        daemon.prepare(changed),
+        Err(DaemonControlError::PlanConflict)
+    ));
 }

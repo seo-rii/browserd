@@ -4,7 +4,7 @@ mod egress;
 mod recovery;
 
 pub use egress::{
-    EgressClientConfig, EgressControlError, EgressRouteAdapter, HttpEgressControl,
-    PreparedRouteReceipt, RouteStatusReceipt, RouteStatusState,
+    EgressClientConfig, EgressControlError, EgressControlPlane, EgressRouteAdapter,
+    HttpEgressControl, PreparedRouteReceipt, RouteStatusReceipt, RouteStatusState,
 };
 pub use recovery::LinuxPreparedShardRecovery;

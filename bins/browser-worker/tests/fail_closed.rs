@@ -13,6 +13,19 @@ fn compatibility_artifact(directory: &Path) -> Option<PathBuf> {
     std::fs::write(root.join("chromium"), binary).ok()?;
     let binary_digest = Sha256Digest::from_hex(&hex::encode(Sha256::digest(binary))).ok()?;
     let bundle_digest = Sha256Digest::from_hex(&"33".repeat(32)).ok()?;
+    let catalog = serde_json::to_vec(&serde_json::json!({
+        "schema_version":1,"icu_data":"icudtl.dat",
+        "locales":[{"locale":"ko-KR","pak":"ko.pak"}],"time_zones":["Asia/Seoul"]
+    }))
+    .ok()?;
+    let icu = b"fixture ICU metadata; no real Chromium qualification";
+    let pak = b"fixture locale metadata; no real Chromium qualification";
+    std::fs::write(root.join("native-process-profiles.json"), &catalog).ok()?;
+    std::fs::write(root.join("icudtl.dat"), icu).ok()?;
+    std::fs::write(root.join("ko.pak"), pak).ok()?;
+    let catalog_digest = Sha256Digest::from_hex(&hex::encode(Sha256::digest(&catalog))).ok()?;
+    let icu_digest = Sha256Digest::from_hex(&hex::encode(Sha256::digest(icu))).ok()?;
+    let pak_digest = Sha256Digest::from_hex(&hex::encode(Sha256::digest(pak))).ok()?;
     let artifact = CompatibilityArtifact {
         identity: ChromiumArtifactIdentity {
             binary_digest,
@@ -20,12 +33,17 @@ fn compatibility_artifact(directory: &Path) -> Option<PathBuf> {
             chromium_revision: "r1234567".to_owned(),
             browser_protocol_schema_digest: bundle_digest,
             js_protocol_schema_digest: bundle_digest,
-            launch_profile_digest: bundle_digest,
+            launch_profile_digest: catalog_digest,
             extension_bundle_digest: bundle_digest,
             font_bundle_digest: bundle_digest,
             certificate_runtime_bundle_digest: bundle_digest,
         },
-        files: vec![ArtifactFile::new("chromium", binary_digest)],
+        files: vec![
+            ArtifactFile::new("chromium", binary_digest),
+            ArtifactFile::new("native-process-profiles.json", catalog_digest),
+            ArtifactFile::new("icudtl.dat", icu_digest),
+            ArtifactFile::new("ko.pak", pak_digest),
+        ],
     };
     let manifest = serde_json::to_vec(&artifact).ok()?;
     std::fs::write(root.join("compatibility.json"), manifest).ok()?;
@@ -33,7 +51,7 @@ fn compatibility_artifact(directory: &Path) -> Option<PathBuf> {
 }
 
 #[test]
-fn production_binary_never_claims_ready_without_real_qualified_dependencies() {
+fn production_binary_requires_runtime_safety_before_epoch_or_readiness() {
     let directory = tempfile::tempdir();
     assert!(directory.is_ok());
     let Some(directory) = directory.ok() else {
@@ -48,7 +66,15 @@ fn production_binary_never_claims_ready_without_real_qualified_dependencies() {
     };
     let worker_socket = directory.path().join("worker.sock");
     let sandbox_socket = directory.path().join("sandbox.sock");
+    let artifact_storage = directory.path().join("artifacts");
+    use std::os::unix::fs::PermissionsExt;
+    assert!(std::fs::create_dir(&artifact_storage).is_ok());
+    assert!(
+        std::fs::set_permissions(&artifact_storage, std::fs::Permissions::from_mode(0o700)).is_ok()
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_browser-worker"))
+        .env_remove("BROWSERD_REDIS_URL")
+        .env_remove("BROWSERD_REDIS_PREFIX")
         .env("BROWSERD_WORKER_ID", "worker-production-test")
         .env(
             "BROWSERD_WORKER_EPOCH_FILE",
@@ -63,7 +89,25 @@ fn production_binary_never_claims_ready_without_real_qualified_dependencies() {
         .env("BROWSERD_SANDBOX_SOCKET", sandbox_socket)
         .env("BROWSERD_SANDBOX_EXPECTED_SERVER_UID", "0")
         .env("BROWSERD_SANDBOXD_EPOCH", "1")
+        .env(
+            "BROWSERD_CONTROL_EVENT_JOURNAL_FILE",
+            directory.path().join("control-events.json"),
+        )
+        .env(
+            "BROWSERD_AUDIT_WAL_FILE",
+            directory.path().join("audit.wal"),
+        )
         .env("BROWSERD_CHROMIUM_ARTIFACT_ROOT", artifact_root)
+        .env("BROWSERD_ARTIFACT_ROOT", artifact_storage)
+        .env("BROWSERD_ARTIFACT_MAX_FILE_BYTES", "1048576")
+        .env("BROWSERD_ARTIFACT_MAX_WORKER_BYTES", "8388608")
+        .env("BROWSERD_ARTIFACT_MAX_WORKER_IN_FLIGHT_BYTES", "2097152")
+        .env("BROWSERD_ARTIFACT_MAX_SESSION_BYTES", "4194304")
+        .env("BROWSERD_ARTIFACT_MAX_SESSION_IN_FLIGHT_BYTES", "1048576")
+        .env("BROWSERD_ARTIFACT_MAX_RETAINED_ARTIFACTS", "128")
+        .env("BROWSERD_ARTIFACT_MAX_OPERATIONS", "8")
+        .env("BROWSERD_ARTIFACT_CHUNK_BYTES", "65536")
+        .env("BROWSERD_ARTIFACT_OPERATION_TIMEOUT_MS", "1000")
         .env("BROWSERD_EGRESS_POLICY_PROFILE", "strict")
         .env("BROWSERD_EGRESS_POLICY_DIGEST", "44".repeat(32))
         .output();
@@ -77,8 +121,10 @@ fn production_binary_never_claims_ready_without_real_qualified_dependencies() {
     assert!(
         stderr
             .ok()
-            .is_some_and(|stderr| stderr.contains("readiness qualification unavailable"))
+            .is_some_and(|stderr| stderr.contains("BROWSERD_REDIS_URL is required"))
     );
+    assert!(!directory.path().join("worker.epoch").exists());
+    assert!(!worker_socket.exists());
 }
 
 #[test]
@@ -262,6 +308,14 @@ fn production_binary_requires_chromium_artifact_before_epoch_mutation() {
         )
         .env("BROWSERD_SANDBOX_EXPECTED_SERVER_UID", "0")
         .env("BROWSERD_SANDBOXD_EPOCH", "1")
+        .env(
+            "BROWSERD_CONTROL_EVENT_JOURNAL_FILE",
+            directory.path().join("control-events.json"),
+        )
+        .env(
+            "BROWSERD_AUDIT_WAL_FILE",
+            directory.path().join("audit.wal"),
+        )
         .output();
     assert!(output.is_ok());
     let Some(output) = output.ok() else {
@@ -309,6 +363,14 @@ fn production_binary_rejects_tampered_chromium_artifact_before_epoch_mutation() 
         )
         .env("BROWSERD_SANDBOX_EXPECTED_SERVER_UID", "0")
         .env("BROWSERD_SANDBOXD_EPOCH", "1")
+        .env(
+            "BROWSERD_CONTROL_EVENT_JOURNAL_FILE",
+            directory.path().join("control-events.json"),
+        )
+        .env(
+            "BROWSERD_AUDIT_WAL_FILE",
+            directory.path().join("audit.wal"),
+        )
         .env("BROWSERD_CHROMIUM_ARTIFACT_ROOT", artifact_root)
         .env("BROWSERD_EGRESS_POLICY_PROFILE", "strict")
         .env("BROWSERD_EGRESS_POLICY_DIGEST", "44".repeat(32))
@@ -370,6 +432,14 @@ fn production_binary_rejects_invalid_chromium_identity_before_epoch_mutation() {
         )
         .env("BROWSERD_SANDBOX_EXPECTED_SERVER_UID", "0")
         .env("BROWSERD_SANDBOXD_EPOCH", "1")
+        .env(
+            "BROWSERD_CONTROL_EVENT_JOURNAL_FILE",
+            directory.path().join("control-events.json"),
+        )
+        .env(
+            "BROWSERD_AUDIT_WAL_FILE",
+            directory.path().join("audit.wal"),
+        )
         .env("BROWSERD_CHROMIUM_ARTIFACT_ROOT", artifact_root)
         .env("BROWSERD_EGRESS_POLICY_PROFILE", "strict")
         .env("BROWSERD_EGRESS_POLICY_DIGEST", "44".repeat(32))

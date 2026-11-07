@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc as std_mpsc};
@@ -11,19 +11,42 @@ use browserd_chromium::{
     ChromiumConnectionError, VerifiedChromiumDriverOwner,
 };
 use browserd_core::{IsolationProfile, PageId, SessionId, ShardFence, TenantId};
-use browserd_sandbox::{ChromiumCdpPipes, LaunchSpec};
+use browserd_sandbox::{
+    ChromiumCdpPipes, ChromiumProcessProfile, ContextEgressBinding, ContextEgressReleaseReceipt,
+    DedicatedEgressProxyBinding, LaunchSpec, SandboxScratch,
+};
 use browserd_session::OwnershipFence;
 use browserd_targets::{
-    BackendNodeId, BootstrapBackend, BootstrapStage, BootstrapStageFailure, DocumentEpoch,
-    NodeBinding, NodeHandle, NodeHandleStore, NodeResolutionContext, PausedTarget,
+    BackendNodeId, BootstrapBackend, BootstrapDisposition, BootstrapStage, BootstrapStageFailure,
+    DocumentEpoch, NodeBinding, NodeHandle, NodeHandleStore, NodeResolutionContext, PausedTarget,
     SessionIncarnation, ShardTaintReason, SnapshotId, TargetIncarnation, TargetKind, TargetTime,
     UrlRevision,
 };
+use futures::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::cdp_driver::CdpChromiumDriver;
+pub(crate) mod approvals;
+pub(crate) use approvals::{ApprovalQuery, ApprovedEffect, ApprovedResult};
+mod capture;
+mod checkpoints;
+mod context_egress;
+mod control;
+use context_egress::ContextEgressRegistry;
+pub use context_egress::OwnerContextPolicy;
+mod downloads;
+mod frames;
+#[cfg(test)]
+#[path = "../tests/common/live_chromium.rs"]
+mod live_chromium;
+mod secrets;
+mod uploads;
+mod worker_admission;
+pub use downloads::{BrowserDownloadCompletion, BrowserDownloadFile};
+use worker_admission::{OwnerAdmissionError, OwnerAdmissionTarget, OwnerTargetAdmissions};
+pub(crate) mod viewer;
 use crate::{
     CdpPipeAcceptor, ProductionTargetManager, SandboxTerminationProof, ShardRuntimeError,
     TargetBootstrapSnapshot, TargetManagerBackend, TargetManagerDrain, TargetManagerEvent,
@@ -37,6 +60,7 @@ const MAX_CONTEXTS_PER_SHARD: usize = 1_024;
 const MAX_PAGES_PER_CONTEXT: usize = 256;
 const MAX_CLOSED_PAGE_TOMBSTONES: usize = 4_096;
 const MAX_RETIRED_TARGETS: usize = 4_096;
+const MAX_NETWORK_REQUESTS: usize = 4_096;
 /// Lifecycle waits answer this far ahead of the action deadline so the reply reaches the
 /// mailbox before its own deadline expires; a mailbox timeout fails the whole owner closed.
 const LIFECYCLE_DEADLINE_RESPONSE_MARGIN: Duration = Duration::from_millis(50);
@@ -57,29 +81,28 @@ const NODE_PROPERTIES_FUNCTION: &str = "function () { const el = this; const out
 const NODE_COMPUTED_STYLE_FUNCTION: &str = "function () { const s = getComputedStyle(this); const out = {}; for (let i = 0; i < s.length; i++) { const p = s[i]; out[p] = s.getPropertyValue(p); } return out; }";
 /// Extracts a table's cells into rows of trimmed text for `extract_table`.
 const NODE_TABLE_FUNCTION: &str = "function () { const rows = this.rows ? Array.from(this.rows) : Array.from(this.querySelectorAll('tr')); return rows.map(r => Array.from(r.cells && r.cells.length ? r.cells : r.querySelectorAll('td,th')).map(c => (c.innerText != null ? c.innerText : (c.textContent || '')).trim())); }";
+/// Focus is restricted to a connected node in the selected frame document.
+const NODE_FOCUS_FUNCTION: &str = "function () { const el = this; const doc = el.ownerDocument; if (!el.isConnected || doc !== document || !doc || !doc.defaultView || doc.defaultView !== globalThis || typeof el.focus !== 'function' || el.matches(':disabled')) { return false; } el.focus(); return el.matches(':focus'); }";
 /// Blurs a resolved node for `blur`.
-const NODE_BLUR_FUNCTION: &str = "function () { this.blur(); return true; }";
+const NODE_BLUR_FUNCTION: &str = "function () { const el = this; const doc = el.ownerDocument; if (!el.isConnected || doc !== document || !doc || !doc.defaultView || doc.defaultView !== globalThis) { return false; } el.blur(); return true; }";
 /// Sets a checkbox/radio input's checked state for `check`/`uncheck`, firing input/change only on
 /// a real change. Applies only to an enabled checkbox or radio input; any other element (or a
 /// disabled one) makes no DOM change and returns `false`, which the caller turns into a rejection
 /// so a `checked` property is never fabricated on an arbitrary node (BRD-013).
-const NODE_SET_CHECKED_FUNCTION: &str = "function (desired) { const el = this; const type = (el.type || '').toLowerCase(); if ((el.tagName || '').toUpperCase() !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) { return false; } if (el.disabled) { return false; } if (!!el.checked !== desired) { el.checked = desired; el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } return true; }";
+const NODE_SET_CHECKED_FUNCTION: &str = "function (desired) { const el = this; const doc = el.ownerDocument; if (!el.isConnected || doc !== document || !doc || !doc.defaultView || doc.defaultView !== globalThis) { return false; } const type = (el.type || '').toLowerCase(); if ((el.tagName || '').toUpperCase() !== 'INPUT' || (type !== 'checkbox' && type !== 'radio')) { return false; } if (el.disabled || el.matches(':disabled')) { return false; } if (!!el.checked !== desired) { const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked'); if (desc && desc.set) { desc.set.call(el, desired); } else { el.checked = desired; } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); } return true; }";
 /// Fills a resolved node's value for `fill`. A text-bearing `<input>` or `<textarea>` is set
 /// through the native value setter so controlled (React-style) inputs observe the change; a
 /// `contenteditable` host has its text replaced. A disabled/readonly target or any other element
 /// (e.g. a plain `<div>`) makes no DOM change and returns `false`, so a mis-targeted fill never
 /// clobbers unrelated content (BRD-013). The value is never echoed back in the result.
-const NODE_FILL_FUNCTION: &str = "function (value) { const el = this; const tag = (el.tagName || '').toUpperCase(); const blocked = ['checkbox','radio','button','submit','reset','image','file','range','color','hidden']; if (tag === 'INPUT' && blocked.includes((el.type || '').toLowerCase())) { return false; } if (tag === 'INPUT' || tag === 'TEXTAREA') { if (el.disabled || el.readOnly) { return false; } el.focus(); const proto = tag === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const desc = Object.getOwnPropertyDescriptor(proto, 'value'); if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; } if (el.isContentEditable) { el.focus(); el.textContent = value; el.dispatchEvent(new Event('input', { bubbles: true })); return true; } return false; }";
+const NODE_FILL_FUNCTION: &str = "function (value) { const el = this; const doc = el.ownerDocument; if (!el.isConnected || doc !== document || !doc || !doc.defaultView || doc.defaultView !== globalThis) { return false; } const tag = (el.tagName || '').toUpperCase(); const blocked = ['checkbox','radio','button','submit','reset','image','file','range','color','hidden']; if (tag === 'INPUT' && blocked.includes((el.type || '').toLowerCase())) { return false; } if (tag === 'INPUT' || tag === 'TEXTAREA') { if (el.disabled || el.matches(':disabled') || el.readOnly) { return false; } el.focus(); const proto = tag === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const desc = Object.getOwnPropertyDescriptor(proto, 'value'); if (desc && desc.set) { desc.set.call(el, value); } else { el.value = value; } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; } if (el.isContentEditable) { el.focus(); el.textContent = value; el.dispatchEvent(new Event('input', { bubbles: true })); return true; } return false; }";
 /// Selects the requested option values in a resolved `<select>` for `select_option`. Applies only
 /// to an enabled `<select>`; any other element makes no DOM change and returns `false` (BRD-013).
-const NODE_SELECT_FUNCTION: &str = "function (values) { const el = this; if ((el.tagName || '').toUpperCase() !== 'SELECT') { return false; } if (el.disabled) { return false; } const wanted = new Set(values); for (const option of Array.from(el.options || [])) { option.selected = wanted.has(option.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
-/// Computes an actionable pointer point for `click`/`double_click`/`hover`. The element is first
-/// scrolled into view, then rejected (`ok:false`, no point) if it has no layout box, its center
-/// lies outside the viewport, or the topmost element at its center is neither it nor a descendant
-/// (occluded by an overlay). Otherwise it returns the viewport-pixel center `{ok:true, x, y}` so a
-/// pointer action lands on the requested element rather than whatever happens to sit at a stale
-/// coordinate (BRD-012).
-const NODE_ACTIONABLE_POINT_FUNCTION: &str = "function () { const el = this; if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(true); } else if (el.scrollIntoView) { el.scrollIntoView({ block: 'center', inline: 'center' }); } const rect = el.getBoundingClientRect(); if (!(rect.width > 0 && rect.height > 0)) { return { ok: false }; } const x = rect.left + rect.width / 2; const y = rect.top + rect.height / 2; const doc = el.ownerDocument; const view = doc && doc.defaultView; if (view && (x < 0 || y < 0 || x > view.innerWidth || y > view.innerHeight)) { return { ok: false }; } const hit = doc ? doc.elementFromPoint(x, y) : null; if (!hit || !(hit === el || el.contains(hit))) { return { ok: false }; } return { ok: true, x: x, y: y }; }";
+const NODE_SELECT_FUNCTION: &str = "function (values) { const el = this; const doc = el.ownerDocument; if (!el.isConnected || doc !== document || !doc || !doc.defaultView || doc.defaultView !== globalThis) { return false; } if ((el.tagName || '').toUpperCase() !== 'SELECT') { return false; } if (el.disabled || el.matches(':disabled')) { return false; } const wanted = new Set(values); for (const option of Array.from(el.options || [])) { option.selected = wanted.has(option.value); } el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return true; }";
+/// Scrolls a connected frame-document node and requires stable geometry across three animation
+/// frames, within a 250 ms ceiling (also bounded by the action deadline). The final viewport
+/// point must hit the enabled element or its descendant. The owner maps frame-local coordinates through validated ancestor content quads before input.
+const NODE_ACTIONABLE_POINT_FUNCTION: &str = "async function (timeoutMs) { const el = this; const doc = el.ownerDocument; const view = doc && doc.defaultView; const valid = () => el.isConnected && el.ownerDocument === doc && doc === document && view && view === globalThis && typeof el.getBoundingClientRect === 'function' && !el.matches(':disabled'); if (!valid()) { return { ok: false }; } if (el.scrollIntoViewIfNeeded) { el.scrollIntoViewIfNeeded(true); } else if (el.scrollIntoView) { el.scrollIntoView({ block: 'center', inline: 'center' }); } const sample = () => { const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; }; const initial = sample(); if (!(initial[2] > 0 && initial[3] > 0)) { return { ok: false }; } const until = performance.now() + Math.min(250, Math.max(1, Number(timeoutMs) || 250)); for (let frame = 0; frame < 3; frame++) { const ready = await new Promise(resolve => { const remaining = until - performance.now(); if (remaining <= 0) { resolve(false); return; } let request; const timer = view.setTimeout(() => { view.cancelAnimationFrame(request); resolve(false); }, remaining); request = view.requestAnimationFrame(() => { view.clearTimeout(timer); resolve(true); }); }); if (!ready || !valid()) { return { ok: false }; } const current = sample(); if (current.some((value, index) => Math.abs(value - initial[index]) > 0.25)) { return { ok: false }; } } const rect = el.getBoundingClientRect(); const x = rect.left + rect.width / 2; const y = rect.top + rect.height / 2; if (!(rect.width > 0 && rect.height > 0) || x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) { return { ok: false }; } const hit = doc.elementFromPoint(x, y); if (!hit || !(hit === el || el.contains(hit))) { return { ok: false }; } return { ok: true, x: x, y: y }; }";
 
 /// The immutable flattened CDP route for one attached target.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,11 +147,178 @@ pub struct ChromiumTargetManagerBackend {
     mailbox: Arc<OwnerMailbox>,
     readiness: Arc<OnceLock<TargetReadiness>>,
     target_ready_timeout: Duration,
+    context_policy: Option<OwnerContextPolicy>,
 }
 
 pub type ChromiumTargetManager<D> = ProductionTargetManager<ChromiumTargetManagerBackend, D>;
 
 impl ChromiumTargetManagerBackend {
+    #[must_use]
+    pub fn effective_context_isolation(&self) -> Option<IsolationProfile> {
+        self.context_policy
+            .as_ref()
+            .map(OwnerContextPolicy::isolation)
+    }
+
+    pub fn register_context_egress(
+        &self,
+        tenant_id: TenantId,
+        session_id: SessionId,
+        fence: OwnershipFence,
+        binding: ContextEgressBinding,
+        valid_until: Instant,
+    ) -> Result<(), ShardRuntimeError> {
+        self.mailbox
+            .request(|response| OwnerRequest::RegisterContextEgress {
+                ownership: ContextOwnership {
+                    tenant_id,
+                    session_id,
+                    fence,
+                },
+                binding: Box::new(binding),
+                valid_until,
+                response,
+            })
+            .map_err(map_actor_runtime_error)
+    }
+
+    pub fn renew_context_egress(
+        &self,
+        binding: ContextEgressBinding,
+        valid_until: Instant,
+    ) -> Result<(), ShardRuntimeError> {
+        self.mailbox
+            .request(|response| OwnerRequest::RenewContextEgress {
+                binding: Box::new(binding),
+                valid_until,
+                response,
+            })
+            .map_err(map_actor_runtime_error)
+    }
+
+    pub fn confirm_context_egress_released(
+        &self,
+        receipt: ContextEgressReleaseReceipt,
+    ) -> Result<(), ShardRuntimeError> {
+        self.mailbox
+            .request(|response| OwnerRequest::ConfirmContextEgressReleased {
+                receipt: Box::new(receipt),
+                response,
+            })
+            .map_err(map_actor_runtime_error)
+    }
+
+    pub(crate) fn dispose_context_verified_until(
+        &self,
+        session_id: SessionId,
+        fence: OwnershipFence,
+        deadline: Instant,
+    ) -> Result<(), OwnerActorError> {
+        let retired = self.mailbox.request_until(
+            |response| OwnerRequest::DisposeContextVerified {
+                session_id,
+                fence,
+                deadline,
+                response,
+            },
+            deadline,
+        )?;
+        self.wait_until_retired(&retired, Some(deadline))
+            .map_err(|_| OwnerActorError::OutcomeUncertain)
+    }
+    pub(crate) fn pending_downloads(
+        &self,
+        session_id: SessionId,
+        fence: OwnershipFence,
+        limit: usize,
+    ) -> Result<Vec<BrowserDownloadCompletion>, OwnerActorError> {
+        self.mailbox
+            .request(|response| OwnerRequest::PendingDownloads {
+                session_id,
+                fence,
+                limit,
+                response,
+            })
+    }
+    pub(crate) fn open_download(
+        &self,
+        completion: BrowserDownloadCompletion,
+    ) -> Result<BrowserDownloadFile, OwnerActorError> {
+        self.mailbox.request(|response| OwnerRequest::OpenDownload {
+            completion,
+            response,
+        })
+    }
+    pub(crate) fn ack_download(
+        &self,
+        completion: BrowserDownloadCompletion,
+    ) -> Result<(), OwnerActorError> {
+        self.mailbox
+            .request(|response| OwnerRequest::AcknowledgeDownload {
+                completion,
+                response,
+            })
+    }
+    pub(crate) fn reject_download(
+        &self,
+        completion: BrowserDownloadCompletion,
+    ) -> Result<(), OwnerActorError> {
+        self.mailbox
+            .request(|response| OwnerRequest::AcknowledgeDownload {
+                completion,
+                response,
+            })
+    }
+    pub(crate) fn viewer_rebind(
+        &self,
+        session_id: SessionId,
+        page_id: PageId,
+        fence: OwnershipFence,
+    ) -> Result<u64, OwnerActorError> {
+        self.mailbox.request(|response| OwnerRequest::ViewerRebind {
+            session_id,
+            page_id,
+            fence,
+            response,
+        })
+    }
+    pub(crate) fn viewer(
+        &self,
+        session_id: SessionId,
+        page_id: PageId,
+        fence: OwnershipFence,
+        operation: viewer::ViewerOperation,
+    ) -> Result<Option<crate::WorkerViewerFrame>, OwnerActorError> {
+        self.mailbox.request(|response| OwnerRequest::Viewer {
+            session_id,
+            page_id,
+            fence,
+            operation,
+            response,
+        })
+    }
+    pub(crate) fn execute_capture_until(
+        &self,
+        session_id: SessionId,
+        page_id: PageId,
+        command: browserd_features::CaptureCommand,
+        request: crate::GeneratedArtifactRequest,
+        store: Arc<dyn crate::SandboxClient>,
+        deadline: Instant,
+    ) -> Result<crate::GeneratedCaptureResult, OwnerActorError> {
+        self.mailbox.request_until(
+            |response| OwnerRequest::CapturePage {
+                session_id,
+                page_id,
+                command,
+                request,
+                store,
+                deadline,
+                response,
+            },
+            deadline,
+        )
+    }
     pub(crate) fn qualify(&self) -> Result<(), OwnerActorError> {
         self.mailbox
             .request(|response| OwnerRequest::Health { response })
@@ -231,21 +421,32 @@ impl ChromiumTargetManagerBackend {
             tenant_id: tenant_id.clone(),
             session_id: session_id.clone(),
             fence: fence.clone(),
+            deadline,
             response,
         };
-        match deadline {
+        let retired = match deadline {
             Some(deadline) => self.mailbox.request_until(request, deadline),
             None => self.mailbox.request(request),
         }
         .map_err(map_actor_runtime_error)?;
+        self.wait_until_retired(&retired, deadline)
+    }
+
+    fn wait_until_retired(
+        &self,
+        targets: &[String],
+        deadline: Option<Instant>,
+    ) -> Result<(), ShardRuntimeError> {
         let wait_timeout = deadline
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .unwrap_or(self.target_ready_timeout)
             .min(self.target_ready_timeout);
-        self.readiness
-            .get()
-            .ok_or(ShardRuntimeError::Unavailable)?
-            .wait_until_empty(wait_timeout)
+        let readiness = self.readiness.get().ok_or(ShardRuntimeError::Unavailable)?;
+        if self.context_policy.is_some() {
+            readiness.wait_until_targets_absent(targets, wait_timeout)
+        } else {
+            readiness.wait_until_empty(wait_timeout)
+        }
     }
 
     pub(crate) fn create_page(&self, session_id: SessionId) -> Result<PageId, OwnerActorError> {
@@ -362,6 +563,31 @@ impl ChromiumTargetManagerBackend {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_evaluate_page(
+        &self,
+        tenant_id: TenantId,
+        session_id: SessionId,
+        session_incarnation: u64,
+        page_id: PageId,
+        expected_fence: Option<OwnershipFence>,
+        deadline: Option<Instant>,
+    ) -> Result<ObservedEvaluatePage, OwnerActorError> {
+        let build = |response| OwnerRequest::ObserveEvaluatePage {
+            tenant_id,
+            session_id,
+            session_incarnation,
+            page_id,
+            expected_fence,
+            deadline,
+            response,
+        };
+        match deadline {
+            Some(deadline) => self.mailbox.request_until(build, deadline),
+            None => self.mailbox.request(build),
+        }
+    }
+
     pub(crate) fn observe_page_until(
         &self,
         tenant_id: TenantId,
@@ -432,6 +658,21 @@ impl BootstrapBackend for ChromiumTargetManagerBackend {
         target: &PausedTarget,
         stage: BootstrapStage,
     ) -> Result<(), BootstrapStageFailure> {
+        self.run_stage_with_disposition(target, stage)
+            .and_then(|disposition| {
+                if disposition == BootstrapDisposition::Completed {
+                    Ok(())
+                } else {
+                    Err(BootstrapStageFailure::Rejected)
+                }
+            })
+    }
+
+    fn run_stage_with_disposition(
+        &mut self,
+        target: &PausedTarget,
+        stage: BootstrapStage,
+    ) -> Result<BootstrapDisposition, BootstrapStageFailure> {
         self.mailbox
             .request(|response| OwnerRequest::RunStage {
                 target: target.clone(),
@@ -479,6 +720,10 @@ pub struct ChromiumConnectionOwner<D> {
     accepted: AtomicBool,
     shutdown_started: AtomicBool,
     forced_termination_spec: Option<LaunchSpec>,
+    require_egress_proxy: bool,
+    context_policy: Option<OwnerContextPolicy>,
+    downloads_enabled: AtomicBool,
+    runtime_safety: Mutex<Option<Arc<browserd_core::RuntimeSafetyCache>>>,
     sandbox_termination_confirmed: AtomicBool,
     thread: Arc<OwnerThreadControl>,
 }
@@ -496,7 +741,8 @@ struct OwnerJoinState {
 }
 
 impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
-    /// Constructs the mutually dependent CDP owner and TargetManager around one bounded ingress.
+    /// Constructs an unqualified owner for direct-browser fixtures around one bounded ingress.
+    /// Production admission uses `new_bounded_for_routed_launch`.
     pub fn new_bounded(
         expected: ChromiumArtifactIdentity,
         config: ChromiumConnectionConfig,
@@ -504,9 +750,19 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
         event_capacity: usize,
         drain: Arc<D>,
     ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
-        Self::new_bounded_with_launch_spec(expected, config, fence, event_capacity, drain, None)
+        Self::new_bounded_with_launch_spec(
+            expected,
+            config,
+            fence,
+            event_capacity,
+            drain,
+            None,
+            None,
+        )
     }
 
+    /// Binds a direct-browser functional fixture to its launch identity and profile.
+    /// This constructor does not require production egress attachment evidence.
     pub fn new_bounded_for_launch(
         expected: ChromiumArtifactIdentity,
         config: ChromiumConnectionConfig,
@@ -521,23 +777,91 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             fence,
             event_capacity,
             drain,
-            Some(launch_spec),
+            Some((launch_spec, false)),
+            None,
         )
     }
 
+    /// Requires the exact attached ingress capability before any CDP command.
+    pub fn new_bounded_for_routed_launch(
+        expected: ChromiumArtifactIdentity,
+        config: ChromiumConnectionConfig,
+        fence: ShardFence,
+        event_capacity: usize,
+        drain: Arc<D>,
+        launch_spec: LaunchSpec,
+    ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
+        Self::new_bounded_with_launch_spec(
+            expected,
+            config,
+            fence,
+            event_capacity,
+            drain,
+            Some((launch_spec, true)),
+            None,
+        )
+    }
+
+    /// Explicitly opts one verified launch into bounded context reuse. This does not supply
+    /// security qualification; the production factory must qualify the exact launch separately.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_bounded_for_pooled_launch(
+        expected: ChromiumArtifactIdentity,
+        config: ChromiumConnectionConfig,
+        fence: ShardFence,
+        event_capacity: usize,
+        drain: Arc<D>,
+        launch_spec: LaunchSpec,
+        policy: OwnerContextPolicy,
+    ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
+        let route_policy = launch_spec
+            .context_route_policy()
+            .ok_or(ShardRuntimeError::Rejected)?;
+        if (route_policy.max_live_routes() as usize) < policy.max_live_contexts()
+            || u64::from(route_policy.max_lifetime_routes()) < policy.max_lifetime_contexts()
+            || route_policy.tenant_dedicated()
+                != (policy.isolation() == IsolationProfile::TenantDedicatedShard)
+            || !policy.allows_tenant(launch_spec.tenant_id())
+        {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        Self::new_bounded_with_launch_spec(
+            expected,
+            config,
+            fence,
+            event_capacity,
+            drain,
+            Some((launch_spec, true)),
+            Some(policy),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new_bounded_with_launch_spec(
         expected: ChromiumArtifactIdentity,
         config: ChromiumConnectionConfig,
         fence: ShardFence,
         event_capacity: usize,
         drain: Arc<D>,
-        forced_termination_spec: Option<LaunchSpec>,
+        launch: Option<(LaunchSpec, bool)>,
+        context_policy: Option<OwnerContextPolicy>,
     ) -> Result<(Arc<Self>, Arc<ChromiumTargetManager<D>>), ShardRuntimeError> {
+        let (forced_termination_spec, require_egress_proxy) = match launch {
+            Some((spec, required)) => (Some(spec), required),
+            None => (None, false),
+        };
         if !config.is_valid() {
             return Err(ShardRuntimeError::Rejected);
         }
         if forced_termination_spec.as_ref().is_some_and(|launch_spec| {
             launch_spec.dedicated_egress().egress_fence().shard() != &fence
+                || launch_spec.chromium_binary_digest() != expected.binary_digest.into()
+                || launch_spec.process_profile().validate().is_err()
+                || matches!(
+                    launch_spec.process_profile(),
+                    ChromiumProcessProfile::NativeLocaleV1 { catalog_digest, .. }
+                        if *catalog_digest != expected.launch_profile_digest.into()
+                )
         }) {
             return Err(ShardRuntimeError::Rejected);
         }
@@ -563,6 +887,7 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             mailbox: mailbox.clone(),
             readiness: readiness.clone(),
             target_ready_timeout,
+            context_policy: context_policy.clone(),
         };
         let (manager, ingress) =
             ProductionTargetManager::new_bounded(fence.clone(), backend, event_capacity, drain)?;
@@ -586,6 +911,10 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             accepted: AtomicBool::new(false),
             shutdown_started: AtomicBool::new(false),
             forced_termination_spec,
+            require_egress_proxy,
+            context_policy,
+            downloads_enabled: AtomicBool::new(false),
+            runtime_safety: Mutex::new(None),
             sandbox_termination_confirmed: AtomicBool::new(false),
             thread: Arc::new(OwnerThreadControl {
                 completion,
@@ -606,7 +935,51 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
             mailbox: self.mailbox.clone(),
             readiness: self.readiness.clone(),
             target_ready_timeout: self.target_ready_timeout,
+            context_policy: self.context_policy.clone(),
         }
+    }
+
+    /// Opts a routed production owner into downloads before accepting its receipted pipes.
+    /// Acceptance then requires the exact bounded sandbox scratch capability.
+    pub fn enable_downloads(&self) -> Result<(), ShardRuntimeError> {
+        let _join = self
+            .thread
+            .join
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        if !self.require_egress_proxy
+            || self.forced_termination_spec.is_none()
+            || self.accepted.load(Ordering::Acquire)
+            || self.shutdown_started.load(Ordering::Acquire)
+        {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        self.downloads_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Binds the mutable safety authority before accepting any production pipes.
+    pub fn configure_runtime_safety(
+        &self,
+        cache: Arc<browserd_core::RuntimeSafetyCache>,
+    ) -> Result<(), ShardRuntimeError> {
+        let _join = self
+            .thread
+            .join
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        let mut bound = self
+            .runtime_safety
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        if self.accepted.load(Ordering::Acquire)
+            || self.shutdown_started.load(Ordering::Acquire)
+            || bound.is_some()
+        {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        *bound = Some(cache);
+        Ok(())
     }
 
     #[must_use]
@@ -732,7 +1105,7 @@ impl<D: TargetManagerDrain> ChromiumConnectionOwner<D> {
 
 #[async_trait]
 impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
-    async fn accept_cdp_pipes(&self, pipes: ChromiumCdpPipes) -> Result<(), ShardRuntimeError> {
+    async fn accept_cdp_pipes(&self, mut pipes: ChromiumCdpPipes) -> Result<(), ShardRuntimeError> {
         let ready_rx = {
             let mut join = self
                 .thread
@@ -740,6 +1113,36 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
                 .lock()
                 .map_err(|_| ShardRuntimeError::Unavailable)?;
             if self.shutdown_started.load(Ordering::Acquire) {
+                return Err(ShardRuntimeError::Rejected);
+            }
+            if self.accepted.load(Ordering::Acquire) {
+                return Err(ShardRuntimeError::Rejected);
+            }
+            let egress_proxy_binding = pipes.egress_proxy_binding().cloned();
+            let binding_matches = match egress_proxy_binding.as_ref() {
+                Some(binding) => self
+                    .forced_termination_spec
+                    .as_ref()
+                    .is_some_and(|spec| binding.matches_launch(spec)),
+                None => !self.require_egress_proxy,
+            };
+            if !binding_matches {
+                self.mailbox.mark_terminal();
+                self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                return Err(ShardRuntimeError::Rejected);
+            }
+            let downloads_enabled = self.downloads_enabled.load(Ordering::Acquire);
+            let scratch = pipes.take_scratch();
+            if (downloads_enabled && scratch.is_none())
+                || scratch.as_ref().is_some_and(|scratch| {
+                    !self
+                        .forced_termination_spec
+                        .as_ref()
+                        .is_some_and(|spec| scratch.metadata().matches_launch(spec))
+                })
+            {
+                self.mailbox.mark_terminal();
+                self.ingress.fail_closed(TargetManagerEvent::TransportLost);
                 return Err(ShardRuntimeError::Rejected);
             }
             if self
@@ -756,6 +1159,17 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
             let ingress = self.ingress.clone();
             let mailbox = Arc::downgrade(&self.mailbox);
             let shard_fence = self.shard_fence.clone();
+            let process_profile = self
+                .forced_termination_spec
+                .as_ref()
+                .map(|spec| spec.process_profile().clone());
+            let launch_spec = self.forced_termination_spec.clone();
+            let context_policy = self.context_policy.clone();
+            let runtime_safety = self
+                .runtime_safety
+                .lock()
+                .map_err(|_| ShardRuntimeError::Unavailable)?
+                .clone();
             let shutdown = self.thread.shutdown.clone();
             let (ready_tx, ready_rx) = oneshot::channel();
             let completion = self.thread.completion.clone();
@@ -772,6 +1186,13 @@ impl<D: TargetManagerDrain> CdpPipeAcceptor for ChromiumConnectionOwner<D> {
                         ingress,
                         mailbox,
                         shard_fence,
+                        process_profile,
+                        launch_spec,
+                        context_policy,
+                        egress_proxy_binding,
+                        scratch,
+                        downloads_enabled,
+                        runtime_safety,
                         ready: ready_tx,
                         shutdown,
                     };
@@ -831,6 +1252,13 @@ struct OwnerThreadInput<D> {
     ingress: Arc<TargetManagerIngress<D>>,
     mailbox: Weak<OwnerMailbox>,
     shard_fence: ShardFence,
+    process_profile: Option<ChromiumProcessProfile>,
+    launch_spec: Option<LaunchSpec>,
+    context_policy: Option<OwnerContextPolicy>,
+    egress_proxy_binding: Option<DedicatedEgressProxyBinding>,
+    scratch: Option<SandboxScratch>,
+    downloads_enabled: bool,
+    runtime_safety: Option<Arc<browserd_core::RuntimeSafetyCache>>,
     ready: oneshot::Sender<Result<(), ShardRuntimeError>>,
     shutdown: CancellationToken,
 }
@@ -846,6 +1274,13 @@ fn run_owner_thread<D: TargetManagerDrain>(
         ingress,
         mailbox,
         shard_fence,
+        process_profile,
+        launch_spec,
+        context_policy,
+        egress_proxy_binding,
+        scratch,
+        downloads_enabled,
+        runtime_safety,
         ready,
         shutdown,
     } = input;
@@ -861,6 +1296,32 @@ fn run_owner_thread<D: TargetManagerDrain>(
         return Err(ShardRuntimeError::Unavailable);
     };
     runtime.block_on(async move {
+        let uploads = match uploads::UploadState::new(scratch.as_ref()) {
+            Ok(uploads) => uploads,
+            Err(_) => {
+                if let Some(mailbox) = mailbox.upgrade() {
+                    mailbox.mark_terminal();
+                    mailbox.fail_closed();
+                }
+                let _ignored = ready.send(Err(ShardRuntimeError::Rejected));
+                return Err(ShardRuntimeError::Rejected);
+            }
+        };
+        let downloads = if !downloads_enabled {
+            downloads::DownloadState::disabled(scratch)
+        } else {
+            match scratch.map(downloads::DownloadDirectory::new).transpose() {
+                Ok(directory) => downloads::DownloadState::new(directory),
+                Err(_) => {
+                    if let Some(mailbox) = mailbox.upgrade() {
+                        mailbox.mark_terminal();
+                        mailbox.fail_closed();
+                    }
+                    let _ignored = ready.send(Err(ShardRuntimeError::Rejected));
+                    return Err(ShardRuntimeError::Rejected);
+                }
+            }
+        };
         let connection = ChromiumConnection::connect(pipes, &expected, config.clone()).await;
         let connection = match connection {
             Ok(connection) => connection,
@@ -876,12 +1337,17 @@ fn run_owner_thread<D: TargetManagerDrain>(
         };
         let (client, events, driver) = connection.into_verified_parts();
         let (commands, receiver) = mpsc::channel(command_capacity);
+        let (bootstrap_commands, bootstrap_receiver) = mpsc::channel(command_capacity);
+        let (control_commands, control_receiver) = mpsc::channel(control::MAX_PENDING_CONTROL);
         let Some(mailbox_handle) = mailbox.upgrade() else {
             let _ignored = ready.send(Err(ShardRuntimeError::Cancelled));
             driver.shutdown().await;
             return Err(ShardRuntimeError::Cancelled);
         };
-        if mailbox_handle.install(commands).is_err() {
+        if mailbox_handle
+            .install(commands, bootstrap_commands, control_commands)
+            .is_err()
+        {
             mailbox_handle.mark_terminal();
             mailbox_handle.fail_closed();
             let _ignored = ready.send(Err(ShardRuntimeError::Rejected));
@@ -897,19 +1363,29 @@ fn run_owner_thread<D: TargetManagerDrain>(
             driver.shutdown().await;
             return Err(ShardRuntimeError::Cancelled);
         }
-        ChromiumOwnerActor::new(
+        let mut actor = ChromiumOwnerActor::new(
             client,
             events,
             driver,
             OwnerActorContext {
+                artifact_identity: expected,
                 ingress,
                 mailbox,
                 shard_fence,
+                process_profile,
+                launch_spec,
+                context_policy,
+                egress_proxy_binding,
+                downloads,
+                uploads,
+                bootstrap_receiver,
+                control_receiver,
+                shutdown: shutdown.clone(),
             },
             config.transport.default_command_timeout,
-        )
-        .run(receiver, shutdown)
-        .await
+        );
+        actor.runtime_safety = runtime_safety;
+        actor.run(receiver, shutdown).await
     })
 }
 
@@ -950,7 +1426,11 @@ impl<D: TargetManagerDrain> FailureSink for IngressFailure<D> {
 
 enum OwnerEndpoint {
     Pending,
-    Ready(mpsc::Sender<OwnerRequest>),
+    Ready {
+        requests: mpsc::Sender<OwnerRequest>,
+        bootstrap: mpsc::Sender<OwnerRequest>,
+        control: mpsc::Sender<OwnerRequest>,
+    },
     Terminal,
 }
 
@@ -981,7 +1461,12 @@ impl OwnerMailbox {
         Ok(())
     }
 
-    fn install(&self, sender: mpsc::Sender<OwnerRequest>) -> Result<(), OwnerActorError> {
+    fn install(
+        &self,
+        requests: mpsc::Sender<OwnerRequest>,
+        bootstrap: mpsc::Sender<OwnerRequest>,
+        control: mpsc::Sender<OwnerRequest>,
+    ) -> Result<(), OwnerActorError> {
         let mut endpoint = self
             .endpoint
             .lock()
@@ -989,7 +1474,11 @@ impl OwnerMailbox {
         if !matches!(*endpoint, OwnerEndpoint::Pending) {
             return Err(OwnerActorError::Rejected);
         }
-        *endpoint = OwnerEndpoint::Ready(sender);
+        *endpoint = OwnerEndpoint::Ready {
+            requests,
+            bootstrap,
+            control,
+        };
         Ok(())
     }
 
@@ -1005,7 +1494,7 @@ impl OwnerMailbox {
             .lock()
             .map_err(|_| ShardRuntimeError::Unavailable)?;
         let sender = match &*endpoint {
-            OwnerEndpoint::Ready(sender) => sender.clone(),
+            OwnerEndpoint::Ready { requests, .. } => requests.clone(),
             OwnerEndpoint::Pending => return Err(ShardRuntimeError::Unavailable),
             OwnerEndpoint::Terminal => return Ok(()),
         };
@@ -1051,22 +1540,37 @@ impl OwnerMailbox {
         build: impl FnOnce(std_mpsc::SyncSender<Result<T, OwnerActorError>>) -> OwnerRequest,
         deadline: Option<Instant>,
     ) -> Result<T, OwnerActorError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(OwnerActorError::DeadlineBeforeDispatch);
+        }
+        let (response, receiver) = std_mpsc::sync_channel(1);
+        let request = build(response);
         let sender = {
             let endpoint = self
                 .endpoint
                 .lock()
                 .map_err(|_| OwnerActorError::Unavailable)?;
             match &*endpoint {
-                OwnerEndpoint::Ready(sender) => sender.clone(),
+                OwnerEndpoint::Ready {
+                    requests,
+                    bootstrap,
+                    control,
+                } => {
+                    if matches!(request, OwnerRequest::Health { .. }) {
+                        control.clone()
+                    } else if matches!(
+                        request,
+                        OwnerRequest::RunStage { .. } | OwnerRequest::CloseTarget { .. }
+                    ) {
+                        bootstrap.clone()
+                    } else {
+                        requests.clone()
+                    }
+                }
                 OwnerEndpoint::Pending => return Err(OwnerActorError::Unavailable),
                 OwnerEndpoint::Terminal => return Err(OwnerActorError::OutcomeUncertain),
             }
         };
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            return Err(OwnerActorError::DeadlineBeforeDispatch);
-        }
-        let (response, receiver) = std_mpsc::sync_channel(1);
-        let request = build(response);
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(OwnerActorError::DeadlineBeforeDispatch);
         }
@@ -1096,6 +1600,83 @@ impl OwnerMailbox {
 }
 
 enum OwnerRequest {
+    PrepareLegacyApproval {
+        query: approvals::LegacyApprovalQuery,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<Box<approvals::PreparedApproval>, OwnerActorError>>,
+    },
+    PrepareApproval {
+        query: approvals::ApprovalQuery,
+        files: Option<Vec<crate::BrowserFileAttachment>>,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<Box<approvals::PreparedApproval>, OwnerActorError>>,
+    },
+    ExecutePreparedApproval {
+        prepared: Box<approvals::PreparedApproval>,
+        effect: approvals::ApprovedEffect,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<approvals::ApprovedResult, OwnerActorError>>,
+    },
+    CaptureCheckpoint {
+        query: checkpoints::CheckpointQuery,
+        origins: Vec<String>,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<crate::CheckpointSnapshot, OwnerActorError>>,
+    },
+    RestoreCheckpoint {
+        query: checkpoints::CheckpointQuery,
+        primary_page: PageId,
+        snapshot: crate::CheckpointSnapshot,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+    },
+    InspectSecretTarget {
+        query: secrets::SecretTargetQuery,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<crate::SecretFillTarget, OwnerActorError>>,
+    },
+    FillSecret {
+        target: crate::SecretFillTarget,
+        secret: crate::ResolvedSecret,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<Value, OwnerActorError>>,
+    },
+    PendingDownloads {
+        session_id: SessionId,
+        fence: OwnershipFence,
+        limit: usize,
+        response: std_mpsc::SyncSender<Result<Vec<BrowserDownloadCompletion>, OwnerActorError>>,
+    },
+    OpenDownload {
+        completion: BrowserDownloadCompletion,
+        response: std_mpsc::SyncSender<Result<BrowserDownloadFile, OwnerActorError>>,
+    },
+    AcknowledgeDownload {
+        completion: BrowserDownloadCompletion,
+        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+    },
+    ViewerRebind {
+        session_id: SessionId,
+        page_id: PageId,
+        fence: OwnershipFence,
+        response: std_mpsc::SyncSender<Result<u64, OwnerActorError>>,
+    },
+    Viewer {
+        session_id: SessionId,
+        page_id: PageId,
+        fence: OwnershipFence,
+        operation: viewer::ViewerOperation,
+        response: std_mpsc::SyncSender<Result<Option<crate::WorkerViewerFrame>, OwnerActorError>>,
+    },
+    CapturePage {
+        session_id: SessionId,
+        page_id: PageId,
+        command: browserd_features::CaptureCommand,
+        request: crate::GeneratedArtifactRequest,
+        store: Arc<dyn crate::SandboxClient>,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<crate::GeneratedCaptureResult, OwnerActorError>>,
+    },
     Shutdown,
     Health {
         response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
@@ -1106,7 +1687,7 @@ enum OwnerRequest {
     RunStage {
         target: PausedTarget,
         stage: BootstrapStage,
-        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+        response: std_mpsc::SyncSender<Result<BootstrapDisposition, OwnerActorError>>,
     },
     CloseTarget {
         target_id: String,
@@ -1115,6 +1696,21 @@ enum OwnerRequest {
     TargetRoute {
         target_id: String,
         response: std_mpsc::SyncSender<Result<Option<ChromiumTargetRoute>, OwnerActorError>>,
+    },
+    RegisterContextEgress {
+        ownership: ContextOwnership,
+        binding: Box<ContextEgressBinding>,
+        valid_until: Instant,
+        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+    },
+    RenewContextEgress {
+        binding: Box<ContextEgressBinding>,
+        valid_until: Instant,
+        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+    },
+    ConfirmContextEgressReleased {
+        receipt: Box<ContextEgressReleaseReceipt>,
+        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
     },
     CreateContext {
         tenant_id: TenantId,
@@ -1128,11 +1724,18 @@ enum OwnerRequest {
         fence: OwnershipFence,
         response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
     },
+    DisposeContextVerified {
+        session_id: SessionId,
+        fence: OwnershipFence,
+        deadline: Instant,
+        response: std_mpsc::SyncSender<Result<Vec<String>, OwnerActorError>>,
+    },
     VerifyContextDisposed {
         tenant_id: TenantId,
         session_id: SessionId,
         fence: OwnershipFence,
-        response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
+        deadline: Option<Instant>,
+        response: std_mpsc::SyncSender<Result<Vec<String>, OwnerActorError>>,
     },
     CreatePage {
         session_id: SessionId,
@@ -1171,6 +1774,15 @@ enum OwnerRequest {
         deadline: Option<Instant>,
         response: std_mpsc::SyncSender<Result<ObservedPage, OwnerActorError>>,
     },
+    ObserveEvaluatePage {
+        tenant_id: TenantId,
+        session_id: SessionId,
+        session_incarnation: u64,
+        page_id: PageId,
+        expected_fence: Option<OwnershipFence>,
+        deadline: Option<Instant>,
+        response: std_mpsc::SyncSender<Result<ObservedEvaluatePage, OwnerActorError>>,
+    },
     ValidateSession {
         session_id: SessionId,
         response: std_mpsc::SyncSender<Result<(), OwnerActorError>>,
@@ -1185,10 +1797,14 @@ pub(crate) enum OwnerActorError {
     StateOverflow,
     Unavailable,
     OutcomeUncertain,
+    /// JavaScript threw after dispatch; effects are unknown but the owned transport is intact.
+    ScriptException,
     /// The navigated document committed and was then replaced before the requested lifecycle.
     NavigationInterrupted,
     /// The navigate command was acknowledged but the requested lifecycle did not arrive in time.
     NavigationTimeout,
+    /// An owned document changed before a read-only document query completed.
+    DocumentChanged,
 }
 
 #[derive(Clone, Debug)]
@@ -1235,8 +1851,13 @@ pub(crate) enum PageCommand {
         node_ref: String,
         values: Vec<String>,
     },
+    SetFiles {
+        node_ref: String,
+        files: Vec<crate::BrowserFileAttachment>,
+    },
     Evaluate {
         expression: String,
+        guard: Option<Box<EvaluateExecutionGuard>>,
     },
     WaitFor {
         predicate: String,
@@ -1261,6 +1882,7 @@ pub(crate) enum PageCommand {
     },
     QueryAll {
         selector: String,
+        frame_path: Vec<String>,
     },
     GetText {
         node_ref: String,
@@ -1298,6 +1920,32 @@ pub(crate) struct ObservedPage {
     pub(crate) node_valid: bool,
 }
 
+pub(crate) struct ObservedEvaluatePage {
+    pub(crate) page: ObservedPage,
+    pub(crate) guard: EvaluateExecutionGuard,
+}
+
+/// Opaque, actor-minted authority for one observed main-document execution realm.
+#[derive(Clone)]
+pub(crate) struct EvaluateExecutionGuard {
+    frame: frames::FrameGuard,
+    page: PageExecutionFence,
+}
+
+impl EvaluateExecutionGuard {
+    pub(crate) fn page_fence(&self) -> PageExecutionFence {
+        self.page
+    }
+}
+
+impl std::fmt::Debug for EvaluateExecutionGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EvaluateExecutionGuard")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PageExecutionFence {
     pub(crate) target_incarnation: u64,
@@ -1307,6 +1955,7 @@ pub(crate) struct PageExecutionFence {
 
 #[derive(Clone)]
 struct GuardedPageExecution {
+    viewer_transform: Option<(PageId, u64)>,
     target_id: String,
     fence: PageExecutionFence,
 }
@@ -1327,12 +1976,43 @@ enum ContextLifecycle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ContextEntry {
+    checkpoint_restore_available: bool,
     ownership: ContextOwnership,
     options: Option<WorkerSessionOptionsV1>,
     emulation_owner_target_id: Option<String>,
     lifecycle: ContextLifecycle,
     pages: BTreeMap<PageId, String>,
     closing_pages: BTreeSet<PageId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WorkerDisposalSnapshot {
+    ownership: ContextOwnership,
+    targets: BTreeMap<String, OwnerAdmissionTarget>,
+    pending_pages: BTreeMap<String, PageId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetiredOwnerTarget {
+    target: OwnerAdmissionTarget,
+    ownership: ContextOwnership,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingPolicyRejection {
+    target: OwnerAdmissionTarget,
+    ownership: ContextOwnership,
+}
+
+impl PendingPolicyRejection {
+    fn matches(&self, target: &OwnerAdmissionTarget, ownership: &ContextOwnership) -> bool {
+        self.target == *target
+            && self.ownership == *ownership
+            && matches!(
+                target.kind,
+                TargetKind::Prerender | TargetKind::Extension | TargetKind::Devtools
+            )
+    }
 }
 
 #[derive(Clone)]
@@ -1353,6 +2033,26 @@ struct TargetRouteEntry {
     network: NetworkActivity,
 }
 
+impl TargetRouteEntry {
+    fn admission_target(&self, target_id: &str) -> OwnerAdmissionTarget {
+        OwnerAdmissionTarget {
+            context_id: self.route.browser_context_id.clone(),
+            target_id: target_id.to_owned(),
+            flattened_session_id: self.route.session_id.clone(),
+            kind: self.kind.clone(),
+            target_incarnation: self.target_incarnation,
+        }
+    }
+
+    fn ownership(&self) -> ContextOwnership {
+        ContextOwnership {
+            tenant_id: self.route.tenant_id.clone(),
+            session_id: self.route.owner_session_id.clone(),
+            fence: self.route.ownership_fence.clone(),
+        }
+    }
+}
+
 /// Lifecycle of the main-frame document most recently committed on a target.
 ///
 /// `loader_id` correlates `Page.frameNavigated` with the `loaderId` a `Page.navigate`
@@ -1364,39 +2064,69 @@ struct DocumentLoadState {
     loaded: bool,
 }
 
-/// In-flight network request ledger for a target, backing `wait_for(network_quiet)` (BRD-011).
-///
-/// `in_flight` holds the CDP `requestId`s that have seen a `Network.requestWillBeSent` but no
-/// terminal `loadingFinished`/`loadingFailed` yet. `quiet_since` is the instant the ledger last
-/// held zero in-flight requests, and is `Some` exactly when `in_flight` is empty — so a quiescence
-/// check never confuses "no activity" with "activity still pending". A redirect re-uses its
-/// `requestId`, so re-inserting it is a no-op and keeps the request correctly in flight. The ledger
-/// is reset on every new main-frame document so a request torn down by navigation (which never
-/// emits a terminal event) cannot wedge quiescence forever.
+/// Bounded in-flight ledger behind `wait_for(network_quiet)`.
+/// Requests, including long streams, remain busy until a terminal event. Commit prunes only
+/// requests proved to belong to a previous loader of that frame; current-loader and unidentified
+/// requests survive so navigation cannot manufacture a quiet interval. Redirects update the same ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NetworkActivity {
-    in_flight: BTreeSet<String>,
+    in_flight: BTreeMap<String, NetworkRequest>,
     quiet_since: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NetworkRequest {
+    loader_id: Option<String>,
+    frame_id: Option<String>,
 }
 
 impl NetworkActivity {
     /// A ledger with no in-flight requests, quiet since `now`.
     fn quiet_at(now: Instant) -> Self {
         Self {
-            in_flight: BTreeSet::new(),
+            in_flight: BTreeMap::new(),
             quiet_since: Some(now),
         }
     }
 
     /// Records a newly started request, which makes the ledger non-quiet.
-    fn record_request(&mut self, request_id: String) {
-        self.in_flight.insert(request_id);
+    fn record_request(
+        &mut self,
+        request_id: String,
+        loader_id: Option<String>,
+        frame_id: Option<String>,
+    ) -> Result<(), OwnerActorError> {
+        if !self.in_flight.contains_key(&request_id) && self.in_flight.len() >= MAX_NETWORK_REQUESTS
+        {
+            return Err(OwnerActorError::StateOverflow);
+        }
+        self.in_flight.insert(
+            request_id,
+            NetworkRequest {
+                loader_id,
+                frame_id,
+            },
+        );
         self.quiet_since = None;
+        Ok(())
+    }
+
+    fn document_committed(&mut self, frame_id: &str, loader_id: Option<&str>, now: Instant) {
+        if let Some(loader_id) = loader_id {
+            self.in_flight.retain(|_, request| {
+                request.frame_id.as_deref() != Some(frame_id)
+                    || request
+                        .loader_id
+                        .as_deref()
+                        .is_none_or(|old| old == loader_id)
+            });
+        }
+        self.quiet_since = self.in_flight.is_empty().then_some(now);
     }
 
     /// Settles a request; when it drains the last in-flight request the quiet clock starts at `now`.
     fn settle_request(&mut self, request_id: &str, now: Instant) {
-        if self.in_flight.remove(request_id) && self.in_flight.is_empty() {
+        if self.in_flight.remove(request_id).is_some() && self.in_flight.is_empty() {
             self.quiet_since = Some(now);
         }
     }
@@ -1424,28 +2154,72 @@ impl NetworkActivity {
 }
 
 struct ChromiumOwnerActor<D> {
+    artifact_identity: ChromiumArtifactIdentity,
+    checkpoint_interception: Option<checkpoints::RestoreInterception>,
+    deferred_checkpoint_events: VecDeque<CdpIncoming>,
     client: CdpClient,
     events: mpsc::Receiver<CdpIncoming>,
     driver: VerifiedChromiumDriverOwner,
     ingress: Arc<TargetManagerIngress<D>>,
     mailbox: Weak<OwnerMailbox>,
     shard_fence: ShardFence,
+    /// Immutable defaults selected and verified by the production sandbox launch.
+    /// None is the unqualified, legacy CDP fixture constructor.
+    process_profile: Option<ChromiumProcessProfile>,
+    egress_proxy_binding: Option<DedicatedEgressProxyBinding>,
+    context_egress: ContextEgressRegistry,
+    downloads: downloads::DownloadState,
+    runtime_safety: Option<Arc<browserd_core::RuntimeSafetyCache>>,
+    uploads: uploads::UploadState,
     command_timeout: Duration,
+    /// TargetManager is the only producer of this bounded lane. Only its bootstrap
+    /// stages and rejection cleanup can progress inside an existing page action.
+    bootstrap_requests: mpsc::Receiver<OwnerRequest>,
+    control_requests: mpsc::Receiver<OwnerRequest>,
+    control_tasks: FuturesUnordered<control::ControlFuture>,
+    bootstrap_in_progress: bool,
+    /// An attached target with no owned context is a terminal transport violation,
+    /// even when the active request reports the existing known rejection result.
+    event_failed_closed: bool,
+    shutdown: CancellationToken,
     routes: BTreeMap<String, TargetRouteEntry>,
     contexts: BTreeMap<String, ContextEntry>,
     context_by_session: BTreeMap<SessionId, String>,
     pending_pages: BTreeMap<String, PendingPage>,
     closed_page_tombstones: BTreeMap<PageId, SessionId>,
     retired_targets: BTreeMap<String, String>,
+    retired_owned_targets: BTreeMap<String, RetiredOwnerTarget>,
+    target_admissions: OwnerTargetAdmissions,
+    /// Known forbidden kinds remain paused until the bootstrap barrier closes them.
+    /// These exact routes never hold an accepted quota reservation or reach Resume.
+    pending_policy_rejections: BTreeMap<String, PendingPolicyRejection>,
+    /// Pinned before the disposal effect; late browser snapshots may outlive detach events.
+    worker_disposals: BTreeMap<String, WorkerDisposalSnapshot>,
+    admission_clock: Instant,
     next_target_incarnation: u64,
     next_snapshot_id: u64,
     node_store: NodeHandleStore,
+    frames: frames::FrameRegistry,
+    active_frame_guard: Option<frames::FrameGuard>,
+    active_approval: Option<approvals::ActiveApproval>,
+    frame_action_active: bool,
+    viewer: viewer::ViewerState,
 }
 
 struct OwnerActorContext<D> {
+    artifact_identity: ChromiumArtifactIdentity,
     ingress: Arc<TargetManagerIngress<D>>,
     mailbox: Weak<OwnerMailbox>,
     shard_fence: ShardFence,
+    process_profile: Option<ChromiumProcessProfile>,
+    launch_spec: Option<LaunchSpec>,
+    context_policy: Option<OwnerContextPolicy>,
+    egress_proxy_binding: Option<DedicatedEgressProxyBinding>,
+    downloads: downloads::DownloadState,
+    uploads: uploads::UploadState,
+    bootstrap_receiver: mpsc::Receiver<OwnerRequest>,
+    control_receiver: mpsc::Receiver<OwnerRequest>,
+    shutdown: CancellationToken,
 }
 
 impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
@@ -1456,25 +2230,55 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         context: OwnerActorContext<D>,
         command_timeout: Duration,
     ) -> Self {
+        let context_egress = ContextEgressRegistry::new(
+            context.context_policy,
+            context.launch_spec,
+            context.egress_proxy_binding.clone(),
+        );
         Self {
+            artifact_identity: context.artifact_identity,
+            checkpoint_interception: None,
+            deferred_checkpoint_events: VecDeque::new(),
             client,
             events,
             driver,
             ingress: context.ingress,
             mailbox: context.mailbox,
             shard_fence: context.shard_fence,
+            process_profile: context.process_profile,
+            egress_proxy_binding: context.egress_proxy_binding,
+            context_egress,
+            downloads: context.downloads,
+            runtime_safety: None,
+            uploads: context.uploads,
             command_timeout,
+            bootstrap_requests: context.bootstrap_receiver,
+            control_requests: context.control_receiver,
+            control_tasks: FuturesUnordered::new(),
+            bootstrap_in_progress: false,
+            event_failed_closed: false,
+            shutdown: context.shutdown,
             routes: BTreeMap::new(),
             contexts: BTreeMap::new(),
             context_by_session: BTreeMap::new(),
             pending_pages: BTreeMap::new(),
             closed_page_tombstones: BTreeMap::new(),
             retired_targets: BTreeMap::new(),
+            retired_owned_targets: BTreeMap::new(),
+            target_admissions: OwnerTargetAdmissions::default(),
+            pending_policy_rejections: BTreeMap::new(),
+            worker_disposals: BTreeMap::new(),
+            admission_clock: Instant::now(),
             next_target_incarnation: 1,
             // Starts at 1 so a minted snapshot id is never the 0 sentinel the node store treats as
             // "not from a snapshot" (as `query_all` handles are bound).
             next_snapshot_id: 1,
+            frames: frames::FrameRegistry::default(),
+            active_frame_guard: None,
+            active_approval: None,
+            frame_action_active: false,
             node_store: NodeHandleStore::new(NODE_STORE_CAPACITY, NODE_STORE_TTL),
+            viewer: viewer::ViewerState::default(),
         }
     }
 
@@ -1485,9 +2289,35 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     ) -> Result<(), ShardRuntimeError> {
         let mut failed = false;
         loop {
+            let egress_expiry = self.context_egress.next_expiry();
+            if egress_expiry.is_some_and(|deadline| Instant::now() >= deadline) {
+                failed = true;
+                break;
+            }
+            if self.service_downloads().await.is_err() {
+                failed = true;
+                break;
+            }
             tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
+                control = self.control_requests.recv() => {
+                    if control.ok_or(OwnerActorError::OutcomeUncertain).and_then(|control| self.start_control(control)).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    if completed.ok_or(OwnerActorError::OutcomeUncertain).and_then(|completed| self.finish_control(completed)).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                () = tokio::time::sleep_until(egress_expiry.unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)).into()), if egress_expiry.is_some() => {
+                    failed = true;
+                    break;
+                }
+                () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}
                 incoming = self.events.recv() => {
                     match incoming {
                         Some(incoming) => {
@@ -1500,6 +2330,16 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                             failed = true;
                             break;
                         }
+                    }
+                }
+                bootstrap = self.bootstrap_requests.recv() => {
+                    let Some(bootstrap) = bootstrap else {
+                        failed = true;
+                        break;
+                    };
+                    if self.handle_bootstrap_request(bootstrap, None).await.is_err() {
+                        failed = true;
+                        break;
                     }
                 }
                 request = requests.recv() => {
@@ -1527,6 +2367,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         if failed {
             self.ingress.fail_closed(TargetManagerEvent::TransportLost);
         }
+        self.control_tasks.clear();
         self.driver.shutdown().await;
         if failed {
             Err(ShardRuntimeError::OutcomeUncertain)
@@ -1538,30 +2379,69 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     async fn handle_request(&mut self, request: OwnerRequest) -> Result<(), ()> {
         match request {
             OwnerRequest::Shutdown => return Ok(()),
-            OwnerRequest::Health { response } => {
-                let expected = self.driver.version().clone();
-                let result = self
-                    .command_event_first("Browser.getVersion", json!({}), None, None, None, None)
-                    .await
-                    .map_err(|_| OwnerActorError::OutcomeUncertain)
-                    .and_then(|response| {
-                        for (field, expected) in [
-                            ("protocolVersion", expected.protocol_version.as_str()),
-                            ("product", expected.product.as_str()),
-                            ("revision", expected.revision.as_str()),
-                            ("userAgent", expected.user_agent.as_str()),
-                            ("jsVersion", expected.js_version.as_str()),
-                        ] {
-                            if response.get(field).and_then(Value::as_str) != Some(expected) {
-                                return Err(OwnerActorError::OutcomeUncertain);
+            OwnerRequest::PendingDownloads {
+                session_id,
+                fence,
+                limit,
+                response,
+            } => {
+                let result =
+                    self.active_context_for_session(&session_id)
+                        .and_then(|(_, context)| {
+                            if context.ownership.fence != fence {
+                                return Err(OwnerActorError::UnknownOwnership);
                             }
+                            self.downloads.pending(&session_id, &fence, limit)
+                        });
+                if response.send(result).is_err() {
+                    return Err(());
+                }
+            }
+            OwnerRequest::OpenDownload {
+                completion,
+                response,
+            } => {
+                let result = self
+                    .active_context_for_session(&completion.session_id)
+                    .and_then(|(_, context)| {
+                        if context.ownership.fence != completion.fence
+                            || context.ownership.tenant_id != completion.tenant_id
+                        {
+                            return Err(OwnerActorError::UnknownOwnership);
                         }
                         Ok(())
-                    });
-                let failed = result.is_err();
+                    })
+                    .and_then(|()| self.downloads.open(&completion));
+                let failed = matches!(result, Err(OwnerActorError::OutcomeUncertain));
                 if response.send(result).is_err() || failed {
                     return Err(());
                 }
+            }
+            OwnerRequest::AcknowledgeDownload {
+                completion,
+                response,
+            } => {
+                let result = self
+                    .active_context_for_session(&completion.session_id)
+                    .and_then(|(_, context)| {
+                        if context.ownership.fence != completion.fence
+                            || context.ownership.tenant_id != completion.tenant_id
+                        {
+                            return Err(OwnerActorError::UnknownOwnership);
+                        }
+                        Ok(())
+                    })
+                    .and_then(|()| self.downloads.acknowledge(&completion));
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::OutcomeUncertain | OwnerActorError::StateOverflow)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            request @ OwnerRequest::Health { .. } => {
+                self.start_control(request).map_err(|_| ())?;
             }
             OwnerRequest::EnableAutoAttachAndSnapshot { response } => {
                 let result = self.enable_auto_attach_and_snapshot().await;
@@ -1570,37 +2450,49 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     return Err(());
                 }
             }
-            OwnerRequest::RunStage {
-                target,
-                stage,
-                response,
-            } => {
-                let result = self.run_stage(&target, stage).await;
-                let failed = matches!(
-                    result,
-                    Err(OwnerActorError::StateOverflow
-                        | OwnerActorError::Unavailable
-                        | OwnerActorError::OutcomeUncertain)
-                );
-                if response.send(result).is_err() || failed {
-                    return Err(());
-                }
-            }
-            OwnerRequest::CloseTarget {
-                target_id,
-                response,
-            } => {
-                let result = self.close_target(&target_id).await;
-                let failed = result.is_err();
-                if response.send(result).is_err() || failed {
-                    return Err(());
-                }
+            bootstrap @ (OwnerRequest::RunStage { .. } | OwnerRequest::CloseTarget { .. }) => {
+                self.handle_bootstrap_request(bootstrap, None)
+                    .await
+                    .map_err(|_| ())?;
             }
             OwnerRequest::TargetRoute {
                 target_id,
                 response,
             } => {
                 let result = Ok(self.routes.get(&target_id).map(|entry| entry.route.clone()));
+                if response.send(result).is_err() {
+                    return Err(());
+                }
+            }
+            OwnerRequest::RegisterContextEgress {
+                ownership,
+                binding,
+                valid_until,
+                response,
+            } => {
+                let result =
+                    self.context_egress
+                        .register(ownership, *binding, valid_until, Instant::now());
+                let failed = matches!(result, Err(OwnerActorError::StateOverflow));
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::RenewContextEgress {
+                binding,
+                valid_until,
+                response,
+            } => {
+                let result = self
+                    .context_egress
+                    .renew(*binding, valid_until, Instant::now());
+                let failed = result.is_err();
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::ConfirmContextEgressReleased { receipt, response } => {
+                let result = self.context_egress.confirm_released(*receipt);
                 if response.send(result).is_err() {
                     return Err(());
                 }
@@ -1646,14 +2538,34 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     return Err(());
                 }
             }
+            OwnerRequest::DisposeContextVerified {
+                session_id,
+                fence,
+                deadline,
+                response,
+            } => {
+                let result = self
+                    .dispose_context_verified(&session_id, &fence, deadline)
+                    .await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
             OwnerRequest::VerifyContextDisposed {
                 tenant_id,
                 session_id,
                 fence,
+                deadline,
                 response,
             } => {
                 let result = self
-                    .verify_context_disposed(&tenant_id, &session_id, &fence)
+                    .verify_context_disposed(&tenant_id, &session_id, &fence, deadline)
                     .await;
                 let failed = result.is_err();
                 if response.send(result).is_err() || failed {
@@ -1718,6 +2630,202 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     return Err(());
                 }
             }
+            OwnerRequest::ViewerRebind {
+                session_id,
+                page_id,
+                fence,
+                response,
+            } => {
+                let result = self.viewer_rebind(&session_id, &page_id, &fence);
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::Viewer {
+                session_id,
+                page_id,
+                fence,
+                operation,
+                response,
+            } => {
+                let result = self
+                    .viewer_command(&session_id, &page_id, &fence, operation)
+                    .await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::CapturePage {
+                session_id,
+                page_id,
+                command,
+                request,
+                store,
+                deadline,
+                response,
+            } => {
+                let result = self
+                    .capture_page(&session_id, &page_id, command, request, store, deadline)
+                    .await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if let Err(undelivered) = response.send(result) {
+                    if let Ok(mut capture) = undelivered.0
+                        && let Some(mut sink) = capture.cleanup.take()
+                    {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), sink.abort()).await;
+                    }
+                    return Err(());
+                }
+                if failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::PrepareLegacyApproval {
+                query,
+                deadline,
+                response,
+            } => {
+                let result = self.prepare_legacy_node_approval(query, deadline).await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::OutcomeUncertain
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::StateOverflow)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::PrepareApproval {
+                query,
+                files,
+                deadline,
+                response,
+            } => {
+                let result = self.prepare_typed_approval(query, files, deadline).await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::OutcomeUncertain
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::StateOverflow)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::ExecutePreparedApproval {
+                prepared,
+                effect,
+                deadline,
+                response,
+            } => {
+                let result = self
+                    .execute_typed_approval(prepared, effect, deadline)
+                    .await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::OutcomeUncertain
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::StateOverflow)
+                );
+                if let Err(undelivered) = response.send(result) {
+                    if let Ok(approvals::ApprovedResult::Capture(mut capture)) = undelivered.0
+                        && let Some(mut cleanup) = capture.cleanup.take()
+                    {
+                        let _ = tokio::time::timeout(Duration::from_secs(2), cleanup.abort()).await;
+                    }
+                    return Err(());
+                }
+                if failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::CaptureCheckpoint {
+                query,
+                origins,
+                deadline,
+                response,
+            } => {
+                let result = self.capture_checkpoint(&query, &origins, deadline).await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::OutcomeUncertain
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::StateOverflow)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::RestoreCheckpoint {
+                query,
+                primary_page,
+                snapshot,
+                deadline,
+                response,
+            } => {
+                let result = self
+                    .restore_checkpoint(&query, &primary_page, snapshot, deadline)
+                    .await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::OutcomeUncertain
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::StateOverflow)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::InspectSecretTarget {
+                query,
+                deadline,
+                response,
+            } => {
+                let result = self.inspect_secret_target(&query, deadline).await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
+            OwnerRequest::FillSecret {
+                target,
+                secret,
+                deadline,
+                response,
+            } => {
+                // The caller committed authorization before sending this private request.
+                let result = self
+                    .fill_secret(&target, secret, deadline)
+                    .await
+                    .map_err(|_| OwnerActorError::OutcomeUncertain);
+                let failed = result.is_err();
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
             OwnerRequest::ExecutePageCommand {
                 session_id,
                 page_id,
@@ -1768,6 +2876,35 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     return Err(());
                 }
             }
+            OwnerRequest::ObserveEvaluatePage {
+                tenant_id,
+                session_id,
+                session_incarnation,
+                page_id,
+                expected_fence,
+                deadline,
+                response,
+            } => {
+                let result = self
+                    .observe_evaluate_page(
+                        &tenant_id,
+                        &session_id,
+                        session_incarnation,
+                        &page_id,
+                        expected_fence.as_ref(),
+                        deadline,
+                    )
+                    .await;
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if response.send(result).is_err() || failed {
+                    return Err(());
+                }
+            }
             OwnerRequest::ValidateSession {
                 session_id,
                 response,
@@ -1777,6 +2914,9 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     return Err(());
                 }
             }
+        }
+        if self.event_failed_closed {
+            return Err(());
         }
         Ok(())
     }
@@ -1856,10 +2996,104 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .map_err(|_| OwnerActorError::StateOverflow)
     }
 
+    async fn handle_bootstrap_request(
+        &mut self,
+        request: OwnerRequest,
+        deadline: Option<Instant>,
+    ) -> Result<(), OwnerActorError> {
+        // Never recurse into another bootstrap stage while its CDP command is in
+        // flight. The TargetManager barrier sends the next stage after this reply.
+        self.bootstrap_in_progress = true;
+        let result = match request {
+            OwnerRequest::RunStage {
+                target,
+                stage,
+                response,
+            } => {
+                let result = match self.bootstrap_disposition(&target) {
+                    Ok(BootstrapDisposition::Completed) => {
+                        Box::pin(self.run_stage(&target, stage, deadline))
+                            .await
+                            .map(|()| BootstrapDisposition::Completed)
+                    }
+                    other => other,
+                };
+                let failed = matches!(
+                    result,
+                    Err(OwnerActorError::StateOverflow
+                        | OwnerActorError::Unavailable
+                        | OwnerActorError::OutcomeUncertain)
+                );
+                if response.send(result).is_err() || failed {
+                    Err(OwnerActorError::OutcomeUncertain)
+                } else {
+                    Ok(())
+                }
+            }
+            OwnerRequest::CloseTarget {
+                target_id,
+                response,
+            } => {
+                let result = Box::pin(self.close_target(&target_id, deadline)).await;
+                let failed = result.is_err();
+                if response.send(result).is_err() || failed {
+                    Err(OwnerActorError::OutcomeUncertain)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Err(OwnerActorError::OutcomeUncertain),
+        };
+        self.bootstrap_in_progress = false;
+        if self.event_failed_closed {
+            return Err(OwnerActorError::UnknownOwnership);
+        }
+        result
+    }
+
+    fn bootstrap_disposition(
+        &self,
+        target: &PausedTarget,
+    ) -> Result<BootstrapDisposition, OwnerActorError> {
+        let route = self.routes.get(target.target_id());
+        let context = route.and_then(|route| self.contexts.get(route.route.browser_context_id()));
+        let snapshot =
+            route.and_then(|route| self.worker_disposals.get(route.route.browser_context_id()));
+        context_egress::classify_bootstrap(
+            target,
+            route,
+            context,
+            snapshot,
+            self.retired_owned_targets.get(target.target_id()),
+            self.retired_targets.get(target.target_id()),
+            &self.shard_fence,
+        )
+    }
+
+    fn remember_retired_owner(
+        &mut self,
+        target: OwnerAdmissionTarget,
+        ownership: ContextOwnership,
+    ) -> Result<(), OwnerActorError> {
+        if self.retired_owned_targets.len() >= MAX_RETIRED_TARGETS
+            || self
+                .retired_owned_targets
+                .insert(
+                    target.target_id.clone(),
+                    RetiredOwnerTarget { target, ownership },
+                )
+                .is_some()
+        {
+            return Err(OwnerActorError::StateOverflow);
+        }
+        Ok(())
+    }
+
     async fn run_stage(
         &mut self,
         target: &PausedTarget,
         stage: BootstrapStage,
+        deadline: Option<Instant>,
     ) -> Result<(), OwnerActorError> {
         let route = self
             .routes
@@ -1889,28 +3123,79 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             {
                 return Err(OwnerActorError::UnknownOwnership);
             }
+            actor
+                .context_egress
+                .check_active(&context.ownership, Instant::now())?;
             Ok((
                 context.options.clone(),
                 context.emulation_owner_target_id.clone(),
             ))
         };
         let (options, emulation_owner_target_id) = validate_route(self)?;
+        if let Some(rejected) = self.pending_policy_rejections.get(target.target_id()) {
+            if !rejected.matches(
+                &route.admission_target(target.target_id()),
+                &route.ownership(),
+            ) {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            // This route grants only exact cleanup authority. Even a direct stage request
+            // cannot skip type rejection and bootstrap or resume an unadmitted target.
+            return if stage == BootstrapStage::AttributeOwnership {
+                Ok(())
+            } else {
+                Err(OwnerActorError::Rejected)
+            };
+        }
+        // Worker globals inherit only the immutable, verified process defaults. Their
+        // inspector sessions must not acquire page emulation leases or device metrics.
+        let native_worker = options.is_some()
+            && matches!(
+                self.process_profile,
+                Some(ChromiumProcessProfile::NativeLocaleV1 { .. })
+            )
+            && matches!(
+                target.kind(),
+                TargetKind::DedicatedWorker | TargetKind::SharedWorker | TargetKind::ServiceWorker
+            );
+        if matches!(
+            stage,
+            BootstrapStage::ValidateQuotas | BootstrapStage::ValidateCreationRate
+        ) {
+            self.target_admissions
+                .validate_reserved(
+                    &route.admission_target(target.target_id()),
+                    &route.ownership(),
+                )
+                .map_err(map_admission_error)?;
+        }
         if stage == BootstrapStage::ValidateTargetType
             && (!allowed_target_kind(target.kind())
                 || (options.is_some()
                     && match emulation_owner_target_id.as_deref() {
-                        Some(owner_target_id) => owner_target_id != target.target_id(),
-                        None => !matches!(target.kind(), TargetKind::Page),
+                        Some(owner_target_id) => {
+                            owner_target_id != target.target_id()
+                                && !matches!(target.kind(), TargetKind::Iframe)
+                                && !native_worker
+                        }
+                        None => !matches!(target.kind(), TargetKind::Page) && !native_worker,
                     }))
         {
             return Err(OwnerActorError::Rejected);
         }
         if stage == BootstrapStage::ApplyEmulation {
+            if native_worker {
+                return Ok(());
+            }
             let Some(options) = options else {
                 return Ok(());
             };
-            let mut commands = vec![
-                (
+            let mut commands = if matches!(target.kind(), TargetKind::Iframe) {
+                // Native locale/timezone defaults outlive frame handlers. The
+                // legacy CDP fixture path cannot claim child Intl inheritance.
+                Vec::new()
+            } else {
+                let mut commands = vec![(
                     "Emulation.setDeviceMetricsOverride",
                     json!({
                         "width": options.viewport.width,
@@ -1918,22 +3203,33 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         "deviceScaleFactor": options.viewport.device_scale_factor,
                         "mobile": false,
                     }),
-                ),
-                (
-                    "Emulation.setLocaleOverride",
-                    json!({"locale": options.locale}),
-                ),
-                (
-                    "Emulation.setTimezoneOverride",
-                    json!({"timezoneId": options.timezone}),
-                ),
-            ];
-            if let Some(user_agent) = options.user_agent {
-                commands.push((
-                    "Network.setUserAgentOverride",
-                    json!({"userAgent": user_agent}),
-                ));
-            }
+                )];
+                if self.process_profile.is_none() {
+                    // Only unqualified fixtures acquire inspector leases. A
+                    // bound native process must never let a detaching handler
+                    // reset locale/timezone for its surviving renderer peers.
+                    commands.extend([
+                        (
+                            "Emulation.setLocaleOverride",
+                            json!({"locale": options.locale}),
+                        ),
+                        (
+                            "Emulation.setTimezoneOverride",
+                            json!({"timezoneId": options.timezone}),
+                        ),
+                    ]);
+                }
+                commands
+            };
+            // ICU locale and HTTP/navigator language are separate Chromium
+            // settings. An empty UA keeps Chromium's native UA and client hints;
+            // copying its UA string would suppress default metadata. Apply
+            // language on every owned frame target even without a custom UA.
+            let user_agent = options.user_agent.as_deref().unwrap_or("");
+            commands.push((
+                "Network.setUserAgentOverride",
+                json!({"userAgent": user_agent, "acceptLanguage": options.locale}),
+            ));
             for (method, params) in commands {
                 validate_route(self)?;
                 self.command_event_first(
@@ -1942,11 +3238,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     Some(route.route.session_id.clone()),
                     None,
                     None,
-                    None,
+                    deadline,
                 )
                 .await?;
             }
             validate_route(self)?;
+            if matches!(target.kind(), TargetKind::Iframe) {
+                return Ok(());
+            }
             let context = self
                 .contexts
                 .get_mut(route.route.browser_context_id())
@@ -1962,10 +3261,26 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
             return Ok(());
         }
-        let command = stage_command(stage, target.kind());
-        let Some((method, params)) = command else {
+        let command = if native_worker && stage == BootstrapStage::RunFeatureHooks {
+            // No worker Runtime observer is needed: recursive attach and Network.enable
+            // are acknowledged before script execution is resumed.
+            None
+        } else {
+            stage_command(stage, target.kind())
+        };
+        let Some((method, mut params)) = command else {
             return Ok(());
         };
+        if stage == BootstrapStage::InstallRecursiveAutoAttach
+            && matches!(
+                self.process_profile,
+                Some(ChromiumProcessProfile::NativeLocaleV1 { .. })
+            )
+        {
+            // Shared and service workers attach at the browser level. A second paused attachment
+            // through a page would give one target two independently gated sessions.
+            params["filter"] = json!([{"type":"service_worker", "exclude":true}, {"type":"shared_worker", "exclude":true}, {}]);
+        }
         let result = self
             .command_event_first(
                 method,
@@ -1973,19 +3288,50 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 Some(route.route.session_id.clone()),
                 None,
                 None,
-                None,
+                deadline,
             )
             .await
             .map(|_| ());
         if result.is_ok() {
             validate_route(self)?;
+            if method == "Runtime.runIfWaitingForDebugger"
+                && matches!(target.kind(), TargetKind::Page | TargetKind::Iframe)
+            {
+                self.frames.mark_ready(target.target_id());
+            }
+            if stage == BootstrapStage::InstallLifecycleHandlers
+                && matches!(target.kind(), TargetKind::Page | TargetKind::Iframe)
+            {
+                Box::pin(self.seed_frames(target.target_id(), deadline)).await?;
+                Box::pin(self.seed_download_frames(target.target_id(), deadline)).await?;
+                validate_route(self)?;
+            }
         }
         result
     }
 
-    async fn close_target(&mut self, target_id: &str) -> Result<(), OwnerActorError> {
+    async fn close_target(
+        &mut self,
+        target_id: &str,
+        deadline: Option<Instant>,
+    ) -> Result<(), OwnerActorError> {
         if !valid_identifier(target_id) {
             return Err(OwnerActorError::Rejected);
+        }
+        let route = self
+            .routes
+            .get(target_id)
+            .ok_or(OwnerActorError::UnknownOwnership)?;
+        let admission_target = route.admission_target(target_id);
+        let ownership = route.ownership();
+        if let Some(rejected) = self.pending_policy_rejections.get(target_id) {
+            if !rejected.matches(&admission_target, &ownership) {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+        } else {
+            self.target_admissions
+                .mark_closing(&admission_target, &ownership)
+                .map_err(map_admission_error)?;
         }
         let response = self
             .command_event_first(
@@ -1994,7 +3340,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 None,
                 None,
                 None,
-                None,
+                deadline,
             )
             .await?;
         if response.get("success").and_then(Value::as_bool) != Some(true) {
@@ -2010,7 +3356,28 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         fence: OwnershipFence,
         options: Option<WorkerSessionOptionsV1>,
     ) -> Result<CreatedPage, OwnerActorError> {
-        let options_context_conflict = if options.is_some() {
+        let process_profile_matches = match self.process_profile.as_ref() {
+            None => true,
+            Some(ChromiumProcessProfile::BaselineV1) => options.is_none(),
+            Some(ChromiumProcessProfile::NativeLocaleV1 {
+                locale, time_zone, ..
+            }) => options.as_ref().is_some_and(|options| {
+                &options.locale == locale
+                    && &options.timezone == time_zone
+                    && options.user_agent.as_deref()
+                        == self
+                            .process_profile
+                            .as_ref()
+                            .and_then(ChromiumProcessProfile::user_agent)
+            }),
+        };
+        let pooled = self
+            .context_egress
+            .policy()
+            .is_some_and(OwnerContextPolicy::is_pooled);
+        let options_context_conflict = if pooled {
+            false
+        } else if options.is_some() {
             !self.contexts.is_empty()
         } else {
             self.contexts
@@ -2024,14 +3391,59 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             || fence.placement_version() == 0
             || fence.session_incarnation() == 0
             || options.as_ref().is_some_and(|options| !options.is_valid())
+            || !process_profile_matches
             || options_context_conflict
+            || (self.context_egress.policy().is_none()
+                && self.egress_proxy_binding.as_ref().is_some_and(|binding| {
+                    binding.tenant_id() != &tenant_id
+                        || binding.egress_fence().session_id() != &session_id
+                        || binding.egress_fence().session_incarnation().get()
+                            != fence.session_incarnation()
+                }))
         {
             return Err(OwnerActorError::Rejected);
+        }
+        let ownership = ContextOwnership {
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.clone(),
+            fence: fence.clone(),
+        };
+        if let Some(cache) = &self.runtime_safety {
+            cache
+                .with_fresh_snapshot(|snapshot| {
+                    let live = self.contexts.len();
+                    if snapshot
+                        .chromium_build_disabled(&self.artifact_identity.binary_digest.to_string())
+                        || snapshot.network_class_stopped(
+                            options
+                                .as_ref()
+                                .map_or("public", |options| &options.network_class),
+                        )
+                        || (pooled && snapshot.force_dedicated_process())
+                        || live >= usize::from(snapshot.max_contexts_per_shard())
+                    {
+                        Err(OwnerActorError::Rejected)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .map_err(|_| OwnerActorError::Rejected)??;
+        }
+        let egress_proxy = if self.context_egress.policy().is_some() {
+            Some(self.context_egress.for_create(&ownership, Instant::now())?)
+        } else {
+            self.egress_proxy_binding.clone()
+        };
+        let mut context_parameters = json!({"disposeOnDetach": true});
+        if let Some(binding) = egress_proxy.as_ref() {
+            context_parameters["proxyServer"] =
+                Value::String(format!("http://{}", binding.proxy_address()));
+            context_parameters["proxyBypassList"] = Value::String("<-loopback>".to_owned());
         }
         let response = self
             .command_event_first(
                 "Target.createBrowserContext",
-                json!({"disposeOnDetach": true}),
+                context_parameters,
                 None,
                 None,
                 None,
@@ -2050,6 +3462,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .insert(
                 context_id.clone(),
                 ContextEntry {
+                    checkpoint_restore_available: true,
                     ownership: ContextOwnership {
                         tenant_id,
                         session_id: session_id.clone(),
@@ -2068,10 +3481,45 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
         if self
             .context_by_session
-            .insert(session_id.clone(), context_id)
+            .insert(session_id.clone(), context_id.clone())
             .is_some()
         {
             return Err(OwnerActorError::OutcomeUncertain);
+        }
+        if self.context_egress.policy().is_some() {
+            self.context_egress.activated(&ownership)?;
+        }
+        self.target_admissions
+            .register_context(
+                &context_id,
+                &self
+                    .contexts
+                    .get(&context_id)
+                    .ok_or(OwnerActorError::OutcomeUncertain)?
+                    .ownership,
+            )
+            .map_err(map_admission_error)?;
+        if egress_proxy.is_some() {
+            let allow_downloads = self.runtime_download_admission();
+            // Record ownership before this effect, and never expose a target unless
+            // the context-scoped deny policy is acknowledged by Chromium.
+            self.command_event_first(
+                "Browser.setDownloadBehavior",
+                if allow_downloads {
+                    json!({"behavior":"allowAndName", "browserContextId":context_id, "downloadPath":self.downloads.sandbox_path(), "eventsEnabled":true})
+                } else {
+                    json!({"behavior":"deny", "browserContextId":context_id, "eventsEnabled":true})
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .map_err(|_| OwnerActorError::OutcomeUncertain)?;
+            self.downloads
+                .runtime_modes
+                .insert(context_id.clone(), allow_downloads);
         }
         self.create_page(&session_id).await
     }
@@ -2109,10 +3557,35 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .collect::<BTreeMap<_, _>>()
         };
         let original_routes = context_routes(&self.routes);
+        if self.worker_disposals.contains_key(&context_id)
+            || self.worker_disposals.len() >= MAX_CONTEXTS_PER_SHARD
+        {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
+        self.worker_disposals.insert(
+            context_id.clone(),
+            WorkerDisposalSnapshot {
+                ownership: original_context.ownership.clone(),
+                targets: original_routes
+                    .iter()
+                    .map(|(target, route)| (target.clone(), route.admission_target(target)))
+                    .collect(),
+                pending_pages: self
+                    .pending_pages
+                    .iter()
+                    .filter(|(_, pending)| pending.context_id == context_id)
+                    .map(|(target, pending)| (target.clone(), pending.page_id.clone()))
+                    .collect(),
+            },
+        );
+        self.target_admissions
+            .mark_context_closing(&context_id, &original_context.ownership)
+            .map_err(map_admission_error)?;
         self.contexts
             .get_mut(&context_id)
             .ok_or(OwnerActorError::OutcomeUncertain)?
             .lifecycle = ContextLifecycle::DisposeRequested;
+        self.close_downloads(&context_id, None).await?;
         let result = self
             .command_event_first(
                 "Target.disposeBrowserContext",
@@ -2143,10 +3616,210 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .get_mut(&context_id)
                     .ok_or(OwnerActorError::OutcomeUncertain)?
                     .lifecycle = ContextLifecycle::Active;
+                self.target_admissions
+                    .restore_context_active(&context_id, &requested_context.ownership)
+                    .map_err(map_admission_error)?;
+                self.worker_disposals.remove(&context_id);
                 Err(OwnerActorError::Rejected)
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn dispose_context_verified(
+        &mut self,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        deadline: Instant,
+    ) -> Result<Vec<String>, OwnerActorError> {
+        if Instant::now() >= deadline {
+            return Err(OwnerActorError::DeadlineBeforeDispatch);
+        }
+        let (_, context) = self.context_for_disposal(session_id, fence)?;
+        let tenant_id = context.ownership.tenant_id.clone();
+        self.dispose_context(session_id, fence).await?;
+        self.verify_context_disposed(&tenant_id, session_id, fence, Some(deadline))
+            .await
+            .map_err(|_| OwnerActorError::OutcomeUncertain)
+    }
+
+    fn context_for_disposal(
+        &self,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<(&str, &ContextEntry), OwnerActorError> {
+        let context_id = self
+            .context_by_session
+            .get(session_id)
+            .ok_or(OwnerActorError::UnknownOwnership)?;
+        let context = self
+            .contexts
+            .get(context_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if context.ownership.session_id != *session_id || &context.ownership.fence != fence {
+            return Err(OwnerActorError::UnknownOwnership);
+        }
+        Ok((context_id, context))
+    }
+
+    fn validate_disposal_snapshot(
+        &self,
+        context_id: &str,
+        snapshot: &WorkerDisposalSnapshot,
+    ) -> Result<(), OwnerActorError> {
+        let context = self
+            .contexts
+            .get(context_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if context.ownership != snapshot.ownership
+            || context.lifecycle != ContextLifecycle::Disposing
+            || self
+                .context_by_session
+                .get(&snapshot.ownership.session_id)
+                .map(String::as_str)
+                != Some(context_id)
+            || self.worker_disposals.get(context_id) != Some(snapshot)
+        {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
+        for (target, saved) in &snapshot.targets {
+            if let Some(current) = self.routes.get(target) {
+                if current.admission_target(target) != *saved
+                    || current.ownership() != snapshot.ownership
+                {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+            } else if self.retired_targets.get(target) != Some(&saved.flattened_session_id)
+                || self.retired_owned_targets.get(target)
+                    != Some(&RetiredOwnerTarget {
+                        target: saved.clone(),
+                        ownership: snapshot.ownership.clone(),
+                    })
+            {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+        }
+        for (target, page) in &snapshot.pending_pages {
+            if let Some(current) = self.pending_pages.get(target) {
+                if current.context_id != context_id || &current.page_id != page {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+            } else if self.closed_page_tombstones.get(page) != Some(&snapshot.ownership.session_id)
+            {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+        }
+        Ok(())
+    }
+
+    /// Classifies only exact, locally owned routes. A context-less worker is acceptable solely
+    /// when its target ID/kind and pinned flattened route already establish its ownership.
+    fn disposal_targets_present(
+        &self,
+        context_id: &str,
+        snapshot: &WorkerDisposalSnapshot,
+        infos: &[Value],
+    ) -> Result<bool, OwnerActorError> {
+        if infos.len() > 4_096 {
+            return Err(OwnerActorError::StateOverflow);
+        }
+        let mut observed = BTreeSet::new();
+        let mut closing_present = false;
+        for info in infos {
+            let info = info.as_object().ok_or(OwnerActorError::OutcomeUncertain)?;
+            let id = required_string(info, "targetId")?;
+            let kind = info
+                .get("type")
+                .and_then(Value::as_str)
+                .map(target_kind)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            if !observed.insert(id.clone()) {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            if let Some(saved) = snapshot.targets.get(&id) {
+                if saved.kind != kind || !snapshot_context_matches(info, context_id, &kind) {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+                closing_present = true;
+            } else if snapshot.pending_pages.contains_key(&id) {
+                if kind != TargetKind::Page
+                    || info.get("browserContextId").and_then(Value::as_str) != Some(context_id)
+                {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+                closing_present = true;
+            } else {
+                let route = self
+                    .routes
+                    .get(&id)
+                    .ok_or(OwnerActorError::UnknownOwnership)?;
+                let sibling = self
+                    .contexts
+                    .get(route.route.browser_context_id())
+                    .ok_or(OwnerActorError::UnknownOwnership)?;
+                if route.route.browser_context_id() == context_id
+                    || route.kind != kind
+                    || sibling.ownership != route.ownership()
+                    || self
+                        .context_by_session
+                        .get(&sibling.ownership.session_id)
+                        .map(String::as_str)
+                        != Some(route.route.browser_context_id())
+                    || !snapshot_context_matches(info, route.route.browser_context_id(), &kind)
+                {
+                    return Err(OwnerActorError::OutcomeUncertain);
+                }
+                self.context_egress
+                    .check_active(&sibling.ownership, Instant::now())?;
+            }
+        }
+        Ok(closing_present)
+    }
+
+    fn validate_sibling_contexts(
+        &self,
+        closing: &str,
+        ids: &[Value],
+    ) -> Result<(), OwnerActorError> {
+        if ids.len() > MAX_CONTEXTS_PER_SHARD {
+            return Err(OwnerActorError::StateOverflow);
+        }
+        let mut observed = BTreeSet::new();
+        for id in ids {
+            let id = id
+                .as_str()
+                .filter(|id| valid_identifier(id))
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            if id == closing || !observed.insert(id) {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            let context = self
+                .contexts
+                .get(id)
+                .ok_or(OwnerActorError::UnknownOwnership)?;
+            if self
+                .context_by_session
+                .get(&context.ownership.session_id)
+                .map(String::as_str)
+                != Some(id)
+                || context.ownership.fence.worker_id() != self.shard_fence.owner().worker_id()
+                || context.ownership.fence.worker_epoch()
+                    != self.shard_fence.owner().worker_epoch().get()
+            {
+                return Err(OwnerActorError::UnknownOwnership);
+            }
+            self.context_egress
+                .check_active(&context.ownership, Instant::now())?;
+        }
+        for (id, context) in &self.contexts {
+            if id != closing
+                && context.lifecycle == ContextLifecycle::Active
+                && !observed.contains(id.as_str())
+            {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+        }
+        Ok(())
     }
 
     async fn verify_context_disposed(
@@ -2154,33 +3827,64 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         tenant_id: &TenantId,
         session_id: &SessionId,
         fence: &OwnershipFence,
-    ) -> Result<(), OwnerActorError> {
-        let context_id = self
-            .context_by_session
-            .get(session_id)
-            .cloned()
-            .ok_or(OwnerActorError::UnknownOwnership)?;
-        let context = self
-            .contexts
-            .get(&context_id)
-            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        requested_deadline: Option<Instant>,
+    ) -> Result<Vec<String>, OwnerActorError> {
+        let (context_id, context) = self.context_for_disposal(session_id, fence)?;
         if &context.ownership.tenant_id != tenant_id
-            || &context.ownership.session_id != session_id
-            || &context.ownership.fence != fence
             || context.lifecycle != ContextLifecycle::Disposing
         {
             return Err(OwnerActorError::UnknownOwnership);
         }
-        let targets = self
-            .command_event_first("Target.getTargets", json!({}), None, None, None, None)
-            .await?;
-        let target_infos = targets
-            .as_object()
-            .and_then(|targets| targets.get("targetInfos"))
-            .and_then(Value::as_array)
+        let context_id = context_id.to_owned();
+        // Request authorization above is a known rejection. Once an exact owned context is
+        // Disposing, any failed absence proof leaves its resources and effect uncertain.
+        async {
+        let snapshot = self
+            .worker_disposals
+            .get(&context_id)
+            .cloned()
             .ok_or(OwnerActorError::OutcomeUncertain)?;
-        if !target_infos.is_empty() {
-            return Err(OwnerActorError::OutcomeUncertain);
+        let deadline = self
+            .lifecycle_deadline(requested_deadline)
+            .min(Instant::now() + Duration::from_secs(3));
+        loop {
+            self.validate_disposal_snapshot(&context_id, &snapshot)?;
+            let targets = self
+                .command_event_first(
+                    "Target.getTargets",
+                    json!({}),
+                    None,
+                    None,
+                    None,
+                    Some(deadline),
+                )
+                .await?;
+            self.validate_disposal_snapshot(&context_id, &snapshot)?;
+            let infos = targets
+                .get("targetInfos")
+                .and_then(Value::as_array)
+                .ok_or(OwnerActorError::OutcomeUncertain)?;
+            if !self.disposal_targets_present(&context_id, &snapshot, infos)? {
+                break;
+            }
+            let wake = (Instant::now() + Duration::from_millis(25)).min(deadline);
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
+                control = self.control_requests.recv() => {
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                incoming = self.events.recv() => {
+                    self.handle_incoming(incoming.ok_or(OwnerActorError::OutcomeUncertain)?, None)?;
+                }
+                () = tokio::time::sleep_until(wake.into()) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
         }
         let contexts = self
             .command_event_first(
@@ -2189,36 +3893,105 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 None,
                 None,
                 None,
-                None,
+                Some(deadline),
             )
             .await?;
-        let context_ids = contexts
-            .as_object()
-            .and_then(|contexts| contexts.get("browserContextIds"))
+        self.validate_disposal_snapshot(&context_id, &snapshot)?;
+        let ids = contexts
+            .get("browserContextIds")
             .and_then(Value::as_array)
             .ok_or(OwnerActorError::OutcomeUncertain)?;
+        self.validate_sibling_contexts(&context_id, ids)?;
+        for (target, saved) in &snapshot.targets {
+            if let Some(route) = self.routes.get(target).cloned() {
+                self.frames.retire_target(target)?;
+                self.downloads.retire_target(target);
+                confirm_target_retirement(
+                    &mut self.target_admissions,
+                    &mut self.pending_policy_rejections,
+                    saved,
+                    &snapshot.ownership,
+                )?;
+                if self.retired_targets.len() >= MAX_RETIRED_TARGETS
+                    || self
+                        .retired_targets
+                        .insert(target.clone(), saved.flattened_session_id.clone())
+                        .is_some()
+                {
+                    return Err(OwnerActorError::StateOverflow);
+                }
+                self.routes.remove(target);
+                self.remember_retired_owner(saved.clone(), snapshot.ownership.clone())?;
+                if let Some(page) = route.page_id {
+                    self.downloads.retire_page(&page);
+                    let context = self
+                        .contexts
+                        .get_mut(&context_id)
+                        .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    if context.pages.remove(&page).as_deref() != Some(target.as_str())
+                        || self.closed_page_tombstones.len() >= MAX_CLOSED_PAGE_TOMBSTONES
+                        || self
+                            .closed_page_tombstones
+                            .insert(page.clone(), session_id.clone())
+                            .is_some()
+                    {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
+                    context.closing_pages.remove(&page);
+                }
+                self.ingress
+                    .try_send(TargetManagerEvent::Detached {
+                        target_id: target.clone(),
+                    })
+                    .map_err(|_| OwnerActorError::StateOverflow)?;
+            }
+        }
+        for (target, page) in &snapshot.pending_pages {
+            if self.pending_pages.remove(target).is_some()
+                && (self.closed_page_tombstones.len() >= MAX_CLOSED_PAGE_TOMBSTONES
+                    || self
+                        .closed_page_tombstones
+                        .insert(page.clone(), session_id.clone())
+                        .is_some())
+            {
+                return Err(OwnerActorError::StateOverflow);
+            }
+        }
         let context = self
             .contexts
             .get(&context_id)
             .ok_or(OwnerActorError::OutcomeUncertain)?;
-        if &context.ownership.tenant_id != tenant_id
-            || &context.ownership.session_id != session_id
-            || &context.ownership.fence != fence
-            || context.lifecycle != ContextLifecycle::Disposing
-            || !context_ids.is_empty()
-            || !self.routes.is_empty()
-            || !self.pending_pages.is_empty()
-            || !context.pages.is_empty()
+        if !context.pages.is_empty()
             || !context.closing_pages.is_empty()
+            || self
+                .routes
+                .values()
+                .any(|route| route.route.browser_context_id() == context_id)
+            || self
+                .pending_pages
+                .values()
+                .any(|pending| pending.context_id == context_id)
         {
             return Err(OwnerActorError::OutcomeUncertain);
         }
-        if self.context_by_session.get(session_id) != Some(&context_id) {
-            return Err(OwnerActorError::OutcomeUncertain);
-        }
+        self.downloads.forget_context(&context_id)?;
+        self.uploads.forget_context(&context_id)?;
+        self.frames.retire_context(&context_id);
+        self.target_admissions
+            .confirmed_context_disposal(&context_id, &snapshot.ownership)
+            .map_err(map_admission_error)?;
+        self.context_egress.disposed(&snapshot.ownership)?;
+        self.worker_disposals.remove(&context_id);
         self.contexts.remove(&context_id);
         self.context_by_session.remove(session_id);
-        Ok(())
+        Ok(snapshot
+            .targets
+            .into_keys()
+            .chain(snapshot.pending_pages.into_keys())
+            .collect())
+        }
+        .await
+        .map_err(|_: OwnerActorError| OwnerActorError::OutcomeUncertain)
     }
 
     async fn create_page(
@@ -2238,6 +4011,11 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
         if page_count >= MAX_PAGES_PER_CONTEXT {
             return Err(OwnerActorError::StateOverflow);
+        }
+        if page_count != 0
+            && let Some(context) = self.contexts.get_mut(&context_id)
+        {
+            context.checkpoint_restore_available = false;
         }
         let response = self
             .command_event_first(
@@ -2350,6 +4128,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         {
             return Err(OwnerActorError::Rejected);
         }
+        if self.downloads.enabled() {
+            self.contexts
+                .get_mut(&context_id)
+                .ok_or(OwnerActorError::OutcomeUncertain)?
+                .closing_pages
+                .insert(page_id.clone());
+            self.close_downloads(&context_id, Some(page_id)).await?;
+        }
         let response = self
             .command_event_first(
                 "Target.closeTarget",
@@ -2369,6 +4155,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .ok_or(OwnerActorError::OutcomeUncertain)?
             .closing_pages
             .insert(page_id.clone())
+            && !self.downloads.enabled()
         {
             return Err(OwnerActorError::OutcomeUncertain);
         }
@@ -2401,13 +4188,62 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         execution_fence: Option<PageExecutionFence>,
         deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
-        let (_, target_id, route) = self.owned_page_route(session_id, page_id)?;
+        self.active_frame_guard = None;
+        self.frame_action_active = true;
+        let read_only_document_query = matches!(
+            &command,
+            PageCommand::QueryAll { .. }
+                | PageCommand::GetText { .. }
+                | PageCommand::GetHtml { .. }
+                | PageCommand::GetAttribute { .. }
+                | PageCommand::GetProperties { .. }
+                | PageCommand::GetComputedStyle { .. }
+                | PageCommand::ExtractTable { .. }
+        );
+        let mut result = self
+            .execute_page_command_inner(session_id, page_id, command, execution_fence, deadline)
+            .await;
+        if read_only_document_query
+            && matches!(
+                result,
+                Err(OwnerActorError::OutcomeUncertain | OwnerActorError::Rejected)
+            )
+            && self
+                .active_frame_guard
+                .as_ref()
+                .is_some_and(|guard| self.observed_document_change(guard))
+        {
+            // These commands return no usable observation for the old epoch.
+            // Mutations, arbitrary scripts and uncertain ownership never enter this branch.
+            result = Err(OwnerActorError::DocumentChanged);
+        }
+        self.active_frame_guard = None;
+        self.frame_action_active = false;
+        result
+    }
+
+    async fn execute_page_command_inner(
+        &mut self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        command: PageCommand,
+        execution_fence: Option<PageExecutionFence>,
+        deadline: Option<Instant>,
+    ) -> Result<Value, OwnerActorError> {
+        let (context_id, target_id, route) = self.owned_page_route(session_id, page_id)?;
+        if let Some(context) = self.contexts.get_mut(&context_id) {
+            context.checkpoint_restore_available = false;
+        }
         let cdp_session_id = route.session_id().to_owned();
         let guarded = execution_fence.map(|fence| GuardedPageExecution {
+            viewer_transform: None,
             target_id: target_id.clone(),
             fence,
         });
         match command {
+            PageCommand::SetFiles { node_ref, files } => {
+                self.execute_set_files(&target_id, cdp_session_id, &node_ref, files, deadline).await
+            }
             PageCommand::Navigate { url, wait_until } => {
                 let result = self
                     .command_event_first(
@@ -2464,8 +4300,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .await?;
                 Ok(result)
             }
-            PageCommand::QueryAll { selector } => {
-                self.execute_query_all(&target_id, cdp_session_id, guarded, &selector, deadline)
+            PageCommand::QueryAll { selector, frame_path } => {
+                self.execute_frame_query(&target_id, guarded, &selector, &frame_path, deadline)
                     .await
             }
             PageCommand::GetText { node_ref } => {
@@ -2597,22 +4433,24 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     guarded,
                     deadline,
                 )
-                .await
+                .await.map_err(|error| if error == OwnerActorError::DeadlineBeforeDispatch { error } else { OwnerActorError::OutcomeUncertain })
             }
             PageCommand::Focus { node_ref } => {
-                let backend_node_id = self.resolve_node_backend_id(&target_id, &node_ref)?;
-                self.command_event_first(
-                    "DOM.focus",
-                    json!({ "backendNodeId": backend_node_id }),
-                    Some(cdp_session_id),
-                    None,
+                self.apply_node_mutation(
+                    &target_id,
+                    cdp_session_id,
                     guarded,
+                    &node_ref,
+                    NodeFunctionCall {
+                        declaration: NODE_FOCUS_FUNCTION,
+                        arguments: json!([]),
+                    },
                     deadline,
                 )
                 .await
             }
             PageCommand::Blur { node_ref } => {
-                self.call_function_on_node(
+                self.apply_node_mutation(
                     &target_id,
                     cdp_session_id,
                     guarded,
@@ -2681,24 +4519,41 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 )
                 .await
             }
-            PageCommand::Evaluate { expression } => {
+            PageCommand::Evaluate { expression, guard } => {
+                let mut params = json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                });
+                if let Some(guard) = guard {
+                    if guard.frame.scope.page_id != *page_id
+                        || guard.frame.scope.owner.session_id != *session_id
+                    {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
+                    self.validate_frame_guard(&guard.frame)
+                        .map_err(|_| OwnerActorError::OutcomeUncertain)?;
+                    params["uniqueContextId"] = json!(guard.frame.realm.unique_id);
+                    self.active_frame_guard = Some(guard.frame);
+                }
                 let response = self
                     .command_event_first(
                         "Runtime.evaluate",
-                        json!({
-                            "expression": expression,
-                            "returnByValue": true,
-                            "awaitPromise": true,
-                        }),
+                        params,
                         Some(cdp_session_id),
                         None,
                         guarded,
                         deadline,
                     )
-                    .await?;
-                // A thrown expression is a caller error, not an ownership fault.
+                    .await
+                    .map_err(|error| match error {
+                        OwnerActorError::DeadlineBeforeDispatch => error,
+                        _ => OwnerActorError::OutcomeUncertain,
+                    })?;
+                // JavaScript may have changed the page before throwing. Preserve observation
+                // capability without claiming known failure or exposing exception contents.
                 if response.get("exceptionDetails").is_some() {
-                    return Err(OwnerActorError::Rejected);
+                    return Err(OwnerActorError::ScriptException);
                 }
                 let value = response
                     .get("result")
@@ -2829,6 +4684,113 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn observe_evaluate_page(
+        &mut self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        session_incarnation: u64,
+        page_id: &PageId,
+        expected_fence: Option<&OwnershipFence>,
+        deadline: Option<Instant>,
+    ) -> Result<ObservedEvaluatePage, OwnerActorError> {
+        let (context_id, target_id, route) = self.owned_page_route(session_id, page_id)?;
+        if route.tenant_id() != tenant_id
+            || route.ownership_fence().session_incarnation() != session_incarnation
+            || expected_fence.is_some_and(|expected| route.ownership_fence() != expected)
+        {
+            return Err(OwnerActorError::UnknownOwnership);
+        }
+        if expected_fence.is_some()
+            && self
+                .contexts
+                .get(&context_id)
+                .and_then(|context| context.options.as_ref())
+                .is_none_or(|options| options.feature_profile != "privileged")
+        {
+            return Err(OwnerActorError::Rejected);
+        }
+        let before = self
+            .routes
+            .get(&target_id)
+            .cloned()
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let main = self.main_frame_guard(&target_id)?;
+        let response = self
+            .command_event_first(
+                "Page.getFrameTree",
+                json!({}),
+                Some(route.session_id().to_owned()),
+                None,
+                Some(GuardedPageExecution {
+                    viewer_transform: None,
+                    target_id: target_id.clone(),
+                    fence: PageExecutionFence {
+                        target_incarnation: before.target_incarnation,
+                        frame_document_epoch: before.frame_document_epoch,
+                        url_revision: before.url_revision,
+                    },
+                }),
+                deadline,
+            )
+            .await?;
+        self.validate_frame_guard(&main)
+            .map_err(|_| OwnerActorError::Rejected)?;
+        let (_, current_target, current_route) = self.owned_page_route(session_id, page_id)?;
+        let current = self
+            .routes
+            .get(&target_id)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        if current_target != target_id
+            || current_route != route
+            || current.target_incarnation != before.target_incarnation
+            || current.frame_document_epoch != before.frame_document_epoch
+            || current.url_revision != before.url_revision
+        {
+            return Err(OwnerActorError::Rejected);
+        }
+        let frame = response
+            .get("frameTree")
+            .and_then(|tree| tree.get("frame"))
+            .ok_or(OwnerActorError::Rejected)?;
+        if frame.get("id").and_then(Value::as_str) != Some(main.scope.frame_id.as_str())
+            || frame.get("parentId").is_some()
+        {
+            return Err(OwnerActorError::Rejected);
+        }
+        let raw_origin = frame
+            .get("securityOrigin")
+            .and_then(Value::as_str)
+            .filter(|origin| origin.len() <= 8_192)
+            .ok_or(OwnerActorError::Rejected)?;
+        let origin =
+            browserd_policy::Origin::parse(raw_origin).map_err(|_| OwnerActorError::Rejected)?;
+        if origin.as_str() != raw_origin {
+            return Err(OwnerActorError::Rejected);
+        }
+        let page = ObservedPage {
+            tenant_id: route.tenant_id().clone(),
+            session_id: session_id.clone(),
+            session_incarnation,
+            target_incarnation: before.target_incarnation,
+            frame_document_epoch: main.epoch,
+            url_revision: before.url_revision,
+            origin: raw_origin.to_owned(),
+            node_valid: true,
+        };
+        Ok(ObservedEvaluatePage {
+            page,
+            guard: EvaluateExecutionGuard {
+                frame: main,
+                page: PageExecutionFence {
+                    target_incarnation: before.target_incarnation,
+                    frame_document_epoch: before.frame_document_epoch,
+                    url_revision: before.url_revision,
+                },
+            },
+        })
+    }
+
     async fn observe_page(
         &mut self,
         tenant_id: &TenantId,
@@ -2907,6 +4869,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         {
             return Err(OwnerActorError::UnknownOwnership);
         }
+        self.context_egress
+            .check_active(&context.ownership, Instant::now())?;
         Ok((context_id, context))
     }
 
@@ -2952,12 +4916,37 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     /// expiry rather than racing it.
     fn lifecycle_deadline(&self, deadline: Option<Instant>) -> Instant {
         let capped = Instant::now() + self.command_timeout;
-        deadline.map_or(capped, |deadline| {
+        let bounded = deadline.map_or(capped, |deadline| {
             deadline
                 .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
                 .unwrap_or(deadline)
                 .min(capped)
-        })
+        });
+        self.context_command_deadline(bounded)
+    }
+
+    fn context_command_deadline(&self, deadline: Instant) -> Instant {
+        self.context_egress
+            .next_expiry()
+            .map_or(deadline, |lease| deadline.min(lease))
+    }
+
+    fn ensure_context_wait_lease(&self) -> Result<(), OwnerActorError> {
+        if self
+            .context_egress
+            .next_expiry()
+            .is_some_and(|lease| lease <= Instant::now())
+        {
+            Err(OwnerActorError::OutcomeUncertain)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn context_wait_timeout(&self) -> OwnerActorError {
+        self.ensure_context_wait_lease()
+            .err()
+            .unwrap_or(OwnerActorError::NavigationTimeout)
     }
 
     /// Waits until the main-frame document committed for `loader_id` reaches `wait_until`.
@@ -2980,6 +4969,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         tokio::pin!(expires);
         let mut committed = false;
         loop {
+            self.ensure_context_wait_lease()?;
+            self.service_downloads().await?;
             let route = self
                 .routes
                 .get(target_id)
@@ -3002,7 +4993,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
             tokio::select! {
                 biased;
-                () = &mut expires => return Err(OwnerActorError::NavigationTimeout),
+                () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
+                control = self.control_requests.recv() => {
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}
+                () = &mut expires => return Err(self.context_wait_timeout()),
+                bootstrap = self.bootstrap_requests.recv(), if !self.bootstrap_in_progress => {
+                    let bootstrap = bootstrap.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_bootstrap_request(bootstrap, Some(expires_at)).await?;
+                }
                 incoming = self.events.recv() => {
                     let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
                     self.handle_incoming(incoming, None)?;
@@ -3028,6 +5031,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         let expires = tokio::time::sleep_until(expires_at.into());
         tokio::pin!(expires);
         loop {
+            self.ensure_context_wait_lease()?;
+            self.service_downloads().await?;
             let route = self
                 .routes
                 .get(target_id)
@@ -3043,7 +5048,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
             tokio::select! {
                 biased;
-                () = &mut expires => return Err(OwnerActorError::NavigationTimeout),
+                () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
+                control = self.control_requests.recv() => {
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}
+                () = &mut expires => return Err(self.context_wait_timeout()),
+                bootstrap = self.bootstrap_requests.recv(), if !self.bootstrap_in_progress => {
+                    let bootstrap = bootstrap.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_bootstrap_request(bootstrap, Some(expires_at)).await?;
+                }
                 incoming = self.events.recv() => {
                     let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
                     self.handle_incoming(incoming, None)?;
@@ -3080,11 +5097,13 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         guarded: Option<GuardedPageExecution>,
         deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
+        let main_frame = self.main_frame_guard(target_id)?;
+        self.active_frame_guard = Some(main_frame.clone());
         let before = self.node_document_state(target_id)?;
-        let ax_tree = self
+        let mut ax_tree = self
             .command_event_first(
                 "Accessibility.getFullAXTree",
-                json!({}),
+                json!({"frameId": main_frame.scope.frame_id.as_str()}),
                 Some(cdp_session_id.clone()),
                 None,
                 guarded.clone(),
@@ -3122,6 +5141,41 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             "changed_during_capture"
         };
 
+        self.validate_frame_guard(&main_frame)?;
+        let strings = dom_snapshot
+            .get("strings")
+            .and_then(Value::as_array)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let documents = dom_snapshot
+            .get("documents")
+            .and_then(Value::as_array)
+            .ok_or(OwnerActorError::OutcomeUncertain)?;
+        let mut main_backends = BTreeSet::new();
+        for document in documents {
+            let frame_id = document
+                .get("frameId")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| strings.get(index))
+                .and_then(Value::as_str);
+            if frame_id == Some(main_frame.scope.frame_id.as_str()) {
+                for backend in document
+                    .pointer("/nodes/backendNodeId")
+                    .and_then(Value::as_array)
+                    .ok_or(OwnerActorError::OutcomeUncertain)?
+                {
+                    main_backends
+                        .insert(backend.as_u64().ok_or(OwnerActorError::OutcomeUncertain)?);
+                }
+            }
+        }
+        if let Some(nodes) = ax_tree.get_mut("nodes").and_then(Value::as_array_mut) {
+            nodes.retain(|node| {
+                node.get("backendDOMNodeId")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|backend| main_backends.contains(&backend))
+            });
+        }
         let bounds_by_id = snapshot_bounds_by_backend_id(&dom_snapshot);
         let (snapshot_nodes, total_nodes) = normalize_snapshot_nodes(&ax_tree, &bounds_by_id);
 
@@ -3136,9 +5190,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         let mut nodes = Vec::with_capacity(snapshot_nodes.len());
         for node in &snapshot_nodes {
             let binding = NodeBinding {
+                frame_scope: main_frame.scope.clone(),
                 session_incarnation: after.session_incarnation,
                 target_incarnation: after.target_incarnation,
-                frame_document_epoch: after.frame_document_epoch,
+                frame_document_epoch: DocumentEpoch::new(main_frame.epoch),
                 backend_node_id: BackendNodeId::new(node.backend_node_id),
                 snapshot_id,
                 url_revision: UrlRevision::new(after.url_revision),
@@ -3154,7 +5209,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             "page_id": page_id,
             "session_incarnation": after.session_incarnation.get(),
             "target_incarnation": after.target_incarnation.get(),
-            "document_epoch": after.frame_document_epoch.get(),
+            "document_epoch": main_frame.epoch,
             "url_revision": after.url_revision,
             "consistency": consistency,
             "viewport": snapshot_viewport(&layout_metrics),
@@ -3163,100 +5218,6 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             "returned_nodes": returned_nodes,
             "truncated": total_nodes > returned_nodes,
             "nodes": nodes,
-        }))
-    }
-
-    /// Resolves a selector against the live document and mints an opaque handle per match.
-    ///
-    /// Each match's stable `backendNodeId` is bound to the document state observed here, so a
-    /// later navigation invalidates the handle. An invalid selector is a caller rejection, not
-    /// an ownership fault.
-    async fn execute_query_all(
-        &mut self,
-        target_id: &str,
-        cdp_session_id: String,
-        guarded: Option<GuardedPageExecution>,
-        selector: &str,
-        deadline: Option<Instant>,
-    ) -> Result<Value, OwnerActorError> {
-        let document = self
-            .command_event_first(
-                "DOM.getDocument",
-                json!({ "depth": 0 }),
-                Some(cdp_session_id.clone()),
-                None,
-                guarded.clone(),
-                deadline,
-            )
-            .await?;
-        let root_node_id = document
-            .get("root")
-            .and_then(|root| root.get("nodeId"))
-            .and_then(Value::as_i64)
-            .ok_or(OwnerActorError::OutcomeUncertain)?;
-        let matches = self
-            .command_event_first(
-                "DOM.querySelectorAll",
-                json!({ "nodeId": root_node_id, "selector": selector }),
-                Some(cdp_session_id.clone()),
-                None,
-                guarded.clone(),
-                deadline,
-            )
-            .await?;
-        let node_ids = matches
-            .get("nodeIds")
-            .and_then(Value::as_array)
-            .ok_or(OwnerActorError::OutcomeUncertain)?;
-        // Preserve the total match count before bounding so the caller can tell a complete result
-        // from one this owner truncated to `MAX_QUERY_ALL_MATCHES` (BRD-026).
-        let total_matches = node_ids.len();
-        let truncated = total_matches > MAX_QUERY_ALL_MATCHES;
-        let mut backend_ids = Vec::new();
-        for node_id in node_ids.iter().take(MAX_QUERY_ALL_MATCHES) {
-            let node_id = node_id.as_i64().ok_or(OwnerActorError::OutcomeUncertain)?;
-            let described = self
-                .command_event_first(
-                    "DOM.describeNode",
-                    json!({ "nodeId": node_id }),
-                    Some(cdp_session_id.clone()),
-                    None,
-                    guarded.clone(),
-                    deadline,
-                )
-                .await?;
-            let backend_node_id = described
-                .get("node")
-                .and_then(|node| node.get("backendNodeId"))
-                .and_then(Value::as_u64)
-                .ok_or(OwnerActorError::OutcomeUncertain)?;
-            backend_ids.push(backend_node_id);
-        }
-        let document_state = self.node_document_state(target_id)?;
-        let now = node_store_now();
-        let mut node_refs = Vec::with_capacity(backend_ids.len());
-        for backend_node_id in backend_ids {
-            let binding = NodeBinding {
-                session_incarnation: document_state.session_incarnation,
-                target_incarnation: document_state.target_incarnation,
-                frame_document_epoch: document_state.frame_document_epoch,
-                backend_node_id: BackendNodeId::new(backend_node_id),
-                snapshot_id: SnapshotId::new(0),
-                url_revision: UrlRevision::new(document_state.url_revision),
-            };
-            let handle = self.node_store.insert(binding, now);
-            node_refs.push(handle.as_token().to_owned());
-        }
-        // Surface the truncation state and document provenance so the caller can detect a partial
-        // result and reason about which document version these handles were minted against
-        // (BRD-026). `snapshot_id` provenance is deferred to the normalized snapshot work.
-        Ok(json!({
-            "node_refs": node_refs,
-            "returned_count": node_refs.len(),
-            "limit": MAX_QUERY_ALL_MATCHES,
-            "truncated": truncated,
-            "document_epoch": document_state.frame_document_epoch.get(),
-            "url_revision": document_state.url_revision,
         }))
     }
 
@@ -3270,24 +5231,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         target_id: &str,
         node_ref: &str,
     ) -> Result<u64, OwnerActorError> {
-        let document_state = self.node_document_state(target_id)?;
-        let context = NodeResolutionContext {
-            session_incarnation: document_state.session_incarnation,
-            target_incarnation: document_state.target_incarnation,
-            frame_document_epoch: document_state.frame_document_epoch,
-            required_snapshot_id: None,
-            current_url_revision: UrlRevision::new(document_state.url_revision),
-            attached: true,
-            visible: true,
-            obscured: false,
-            disabled: false,
-        };
-        let handle = NodeHandle::from_token(node_ref);
-        let resolved = self
-            .node_store
-            .resolve(&handle, &context, node_store_now())
-            .map_err(|_| OwnerActorError::Rejected)?;
-        Ok(resolved.backend_node_id().get())
+        self.node_frame_guard(target_id, node_ref, true)
+            .map(|(_, backend)| backend)
     }
 
     /// Runs a node-mutating helper (`fill`/`check`/`select`) that applies only to a supported,
@@ -3321,17 +5266,22 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     async fn call_function_on_node(
         &mut self,
         target_id: &str,
-        cdp_session_id: String,
+        _cdp_session_id: String,
         guarded: Option<GuardedPageExecution>,
         node_ref: &str,
         call: NodeFunctionCall<'_>,
         deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
-        let backend_node_id = self.resolve_node_backend_id(target_id, node_ref)?;
+        let mutates = call.mutates();
+        let (frame, backend_node_id) = self.node_frame_guard(target_id, node_ref, false)?;
+        if self.frame_action_active {
+            self.active_frame_guard = Some(frame.clone());
+        }
+        let cdp_session_id = frame.scope.cdp_session_id.as_str().to_owned();
         let resolved = self
             .command_event_first(
                 "DOM.resolveNode",
-                json!({ "backendNodeId": backend_node_id }),
+                json!({ "backendNodeId": backend_node_id, "executionContextId": frame.realm.id }),
                 Some(cdp_session_id.clone()),
                 None,
                 guarded.clone(),
@@ -3344,19 +5294,62 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .and_then(Value::as_str)
             .ok_or(OwnerActorError::OutcomeUncertain)?
             .to_owned();
-        let mut params = json!({
-            "objectId": object_id,
-            "functionDeclaration": call.declaration,
-            "returnByValue": true,
-            "awaitPromise": false,
-        });
-        if call
-            .arguments
-            .as_array()
-            .is_some_and(|arguments| !arguments.is_empty())
-        {
-            params["arguments"] = call.arguments;
+        if mutates {
+            // A backend node can survive adoption into another document without a frame
+            // navigation. Reject that stale binding before submitting any mutating helper;
+            // the helper repeats this guard to cover changes after this observation.
+            let preflight = self
+                .command_event_first(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "uniqueContextId": frame.realm.unique_id,
+                        "functionDeclaration": "function (node) { return node.isConnected && node.ownerDocument === document; }",
+                        "arguments": [{"objectId": object_id}],
+                        "returnByValue": true,
+                        "awaitPromise": false,
+                        "throwOnSideEffect": true,
+                    }),
+                    Some(cdp_session_id.clone()),
+                    None,
+                    guarded.clone(),
+                    deadline,
+                )
+                .await?;
+            if preflight.get("exceptionDetails").is_some()
+                || preflight
+                    .get("result")
+                    .and_then(|result| result.get("value"))
+                    != Some(&Value::Bool(true))
+            {
+                let _ = self
+                    .command_event_first(
+                        "Runtime.releaseObject",
+                        json!({ "objectId": object_id }),
+                        Some(cdp_session_id),
+                        None,
+                        guarded,
+                        deadline,
+                    )
+                    .await;
+                return Err(OwnerActorError::Rejected);
+            }
         }
+        let mut params = json!({
+            "uniqueContextId": frame.realm.unique_id,
+            "functionDeclaration": format!("function (node, ...args) {{ if (!node.isConnected || node.ownerDocument !== document) {{ throw new Error('stale node'); }} return ({}).apply(node, args); }}", call.declaration),
+            "returnByValue": true,
+            "awaitPromise": call.declaration == NODE_ACTIONABLE_POINT_FUNCTION,
+        });
+        let mut arguments = vec![json!({"objectId": object_id})];
+        arguments.extend(
+            call.arguments
+                .as_array()
+                .ok_or(OwnerActorError::Rejected)?
+                .iter()
+                .cloned(),
+        );
+        params["arguments"] = json!(arguments);
+        self.validate_frame_guard(&frame)?;
         let evaluated = self
             .command_event_first(
                 "Runtime.callFunctionOn",
@@ -3384,7 +5377,28 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 )
                 .await;
         }
-        evaluated?
+        self.validate_frame_guard(&frame).map_err(|error| {
+            if mutates {
+                OwnerActorError::OutcomeUncertain
+            } else {
+                error
+            }
+        })?;
+        let evaluated = evaluated.map_err(|error| {
+            if mutates && error != OwnerActorError::DeadlineBeforeDispatch {
+                OwnerActorError::OutcomeUncertain
+            } else {
+                error
+            }
+        })?;
+        if evaluated.get("exceptionDetails").is_some() {
+            return Err(if mutates {
+                OwnerActorError::OutcomeUncertain
+            } else {
+                OwnerActorError::Rejected
+            });
+        }
+        evaluated
             .get("result")
             .and_then(|result| result.get("value"))
             .cloned()
@@ -3393,10 +5407,9 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
 
     /// Resolves a node handle to an actionable viewport pointer coordinate.
     ///
-    /// The element is scrolled into view, then rejected before any pointer input if it has no
-    /// layout box, its center falls outside the viewport, or another element occludes its center
-    /// (BRD-012) — on top of the node store's staleness checks. Validating the real geometry needs
-    /// a live browser; the helper's behavior is covered by the review's extracted-JS diagnostics.
+    /// The helper checks current document binding, bounded animation stability, and a final
+    /// hit-test in addition to the handle's epoch checks. Actual Chromium owner tests cover the
+    /// dispatch path; child coordinates are transformed through owned ancestor content quads.
     async fn node_pointer_target(
         &mut self,
         target_id: &str,
@@ -3405,15 +5418,26 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         node_ref: &str,
         deadline: Option<Instant>,
     ) -> Result<(f64, f64), OwnerActorError> {
+        self.scroll_frame_ancestors(target_id, node_ref, guarded.clone(), deadline)
+            .await?;
+        let stability_budget_ms = deadline.map_or(250, |deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(250)
+        });
+        if stability_budget_ms == 0 {
+            return Err(OwnerActorError::DeadlineBeforeDispatch);
+        }
         let actionable = self
             .call_function_on_node(
                 target_id,
                 cdp_session_id.to_owned(),
-                guarded,
+                guarded.clone(),
                 node_ref,
                 NodeFunctionCall {
                     declaration: NODE_ACTIONABLE_POINT_FUNCTION,
-                    arguments: json!([]),
+                    arguments: json!([{ "value": stability_budget_ms as u64 }]),
                 },
                 deadline,
             )
@@ -3431,7 +5455,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             .get("y")
             .and_then(Value::as_f64)
             .ok_or(OwnerActorError::OutcomeUncertain)?;
-        Ok((x, y))
+        self.frame_pointer_to_root(target_id, node_ref, (x, y), guarded, deadline)
+            .await
     }
 
     /// Dispatches a left mouse press/release pair at a point with the given click count.
@@ -3460,7 +5485,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             guarded.clone(),
             deadline,
         )
-        .await?;
+        .await.map_err(|error| if error == OwnerActorError::DeadlineBeforeDispatch { error } else { OwnerActorError::OutcomeUncertain })?;
         self.command_event_first(
             "Input.dispatchMouseEvent",
             json!({"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": click_count}),
@@ -3646,6 +5671,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         let expires = tokio::time::sleep_until(expires_at.into());
         tokio::pin!(expires);
         loop {
+            self.ensure_context_wait_lease()?;
+            self.service_downloads().await?;
             let route = self
                 .routes
                 .get(target_id)
@@ -3662,7 +5689,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
             tokio::select! {
                 biased;
-                () = &mut expires => return Err(OwnerActorError::NavigationTimeout),
+                () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
+                control = self.control_requests.recv() => {
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}
+                () = &mut expires => return Err(self.context_wait_timeout()),
+                bootstrap = self.bootstrap_requests.recv(), if !self.bootstrap_in_progress => {
+                    let bootstrap = bootstrap.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_bootstrap_request(bootstrap, Some(expires_at)).await?;
+                }
                 incoming = self.events.recv() => {
                     let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
                     self.handle_incoming(incoming, None)?;
@@ -3680,13 +5719,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
         let poll_interval = Duration::from_millis(100);
-        let expires_at = match deadline {
+        let expires_at = self.context_command_deadline(match deadline {
             Some(deadline) => deadline
                 .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
                 .unwrap_or(deadline),
             None => Instant::now() + self.command_timeout,
-        };
+        });
         loop {
+            self.ensure_context_wait_lease()?;
             let response = self
                 .command_event_first(
                     "Runtime.evaluate",
@@ -3710,9 +5750,10 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 return Ok(json!({ "ok": true }));
             }
             if Instant::now() + poll_interval >= expires_at {
-                return Err(OwnerActorError::NavigationTimeout);
+                return Err(self.context_wait_timeout());
             }
-            tokio::time::sleep(poll_interval).await;
+            self.control_interval((Instant::now() + poll_interval).min(expires_at))
+                .await?;
         }
     }
 
@@ -3732,13 +5773,15 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
     ) -> Result<Value, OwnerActorError> {
         let quiet = Duration::from_millis(quiet_ms);
         let started = Instant::now();
-        let expires_at = match deadline {
+        let expires_at = self.context_command_deadline(match deadline {
             Some(deadline) => deadline
                 .checked_sub(LIFECYCLE_DEADLINE_RESPONSE_MARGIN)
                 .unwrap_or(deadline),
             None => started + self.command_timeout,
-        };
+        });
         loop {
+            self.ensure_context_wait_lease()?;
+            self.service_downloads().await?;
             let route = self
                 .routes
                 .get(target_id)
@@ -3755,7 +5798,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 return Ok(json!({ "ok": true }));
             }
             if now >= expires_at {
-                return Err(OwnerActorError::NavigationTimeout);
+                return Err(self.context_wait_timeout());
             }
             // Wake when the quiet window would elapse (if currently idle) or at the deadline,
             // whichever is sooner; an incoming event wakes us earlier to re-evaluate the ledger.
@@ -3765,7 +5808,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 .map_or(expires_at, |ready| ready.min(expires_at));
             tokio::select! {
                 biased;
+                () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
+                control = self.control_requests.recv() => {
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}
                 () = tokio::time::sleep_until(wake.into()) => {}
+                bootstrap = self.bootstrap_requests.recv(), if !self.bootstrap_in_progress => {
+                    let bootstrap = bootstrap.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_bootstrap_request(bootstrap, Some(expires_at)).await?;
+                }
                 incoming = self.events.recv() => {
                     let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
                     self.handle_incoming(incoming, None)?;
@@ -3783,6 +5838,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         guarded: Option<GuardedPageExecution>,
         deadline: Option<Instant>,
     ) -> Result<Value, OwnerActorError> {
+        if self.event_failed_closed {
+            return Err(OwnerActorError::UnknownOwnership);
+        }
+        let deadline = match (deadline, self.context_egress.next_expiry()) {
+            (Some(action), Some(lease)) => Some(action.min(lease)),
+            (None, lease) => lease,
+            (action, None) => action,
+        };
         let client = self.client.clone();
         let command_timeout_cap = self.command_timeout;
         let command_deadline = deadline;
@@ -3814,6 +5877,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
         tokio::pin!(command);
         tokio::pin!(expires);
         loop {
+            self.service_downloads().await?;
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 return Err(if submitted.load(Ordering::Acquire) {
                     OwnerActorError::OutcomeUncertain
@@ -3821,7 +5885,47 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     OwnerActorError::DeadlineBeforeDispatch
                 });
             }
+            if submitted.load(Ordering::Acquire)
+                && matches!(
+                    method,
+                    "Page.navigate" | "Page.reload" | "Page.navigateToHistoryEntry"
+                )
+                && let Some(active) = self.active_approval.as_mut()
+            {
+                active.document_change_started = true;
+                self.active_frame_guard = None;
+            }
+            self.validate_active_approval().map_err(|_| {
+                if submitted.load(Ordering::Acquire) {
+                    OwnerActorError::OutcomeUncertain
+                } else {
+                    OwnerActorError::Rejected
+                }
+            })?;
+            if let Some(frame) = self.active_frame_guard.as_ref()
+                && self.validate_frame_guard(frame).is_err()
+            {
+                return Err(if submitted.load(Ordering::Acquire) {
+                    OwnerActorError::OutcomeUncertain
+                } else {
+                    OwnerActorError::Rejected
+                });
+            }
             if let Some(guarded) = guarded.as_ref() {
+                if let Some((page, epoch)) = &guarded.viewer_transform
+                    && self
+                        .viewer
+                        .streams
+                        .get(page)
+                        .and_then(|stream| stream.latest.as_ref())
+                        .is_none_or(|frame| frame.frame_transform_id != *epoch)
+                {
+                    return Err(if submitted.load(Ordering::Acquire) {
+                        OwnerActorError::OutcomeUncertain
+                    } else {
+                        OwnerActorError::Rejected
+                    });
+                }
                 let route = self
                     .routes
                     .get(&guarded.target_id)
@@ -3835,6 +5939,14 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             }
             tokio::select! {
                 biased;
+                () = self.shutdown.cancelled() => return Err(OwnerActorError::OutcomeUncertain),
+                control = self.control_requests.recv() => {
+                    self.start_control(control.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                completed = self.control_tasks.next(), if !self.control_tasks.is_empty() => {
+                    self.finish_control(completed.ok_or(OwnerActorError::OutcomeUncertain)?)?;
+                }
+                () = tokio::time::sleep(downloads::DOWNLOAD_TICK), if self.downloads.enabled() => {}
                 () = &mut expires => {
                     return Err(if submitted.load(Ordering::Acquire) {
                         OwnerActorError::OutcomeUncertain
@@ -3846,8 +5958,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     let incoming = incoming.ok_or(OwnerActorError::OutcomeUncertain)?;
                     self.handle_incoming(incoming, catch_up.as_deref_mut())?;
                 }
+                bootstrap = self.bootstrap_requests.recv(), if !self.bootstrap_in_progress => {
+                    let bootstrap = bootstrap.ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.handle_bootstrap_request(bootstrap, deadline).await?;
+                }
                 response = &mut command => {
+                    if matches!(method, "Page.navigate" | "Page.reload" | "Page.navigateToHistoryEntry")
+                        && let Some(active) = self.active_approval.as_mut()
+                    {
+                        active.document_change_started = true;
+                        self.active_frame_guard = None;
+                    }
                     let response = response?;
+                    self.validate_active_approval()?;
                     if !response.is_object() {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
@@ -3871,6 +5994,40 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
             return Err(OwnerActorError::OutcomeUncertain);
         };
         match method.as_str() {
+            "Page.javascriptDialogOpening" => {
+                self.dialog_opened(event_session_id.as_deref(), &params)?
+            }
+            // Only the bounded checkpoint command loop may acknowledge these events.
+            // A late or unrelated interception must never be continued upstream.
+            "Fetch.requestPaused" | "Fetch.authRequired" => {
+                return Err(OwnerActorError::OutcomeUncertain);
+            }
+            "Browser.downloadWillBegin" | "Browser.downloadProgress"
+                if self.egress_proxy_binding.is_some() =>
+            {
+                if let Err(error) = self.download_event(&method, &params) {
+                    self.event_failed_closed = true;
+                    if let Some(mailbox) = self.mailbox.upgrade() {
+                        mailbox.mark_terminal();
+                        mailbox.fail_closed();
+                    }
+                    self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                    return Err(error);
+                }
+            }
+            "Runtime.executionContextCreated"
+            | "Runtime.executionContextDestroyed"
+            | "Runtime.executionContextsCleared" => {
+                self.frame_event(&method, event_session_id.as_deref(), &params)?;
+            }
+            "Page.frameAttached" | "Page.frameDetached" => {
+                self.frame_event(&method, event_session_id.as_deref(), &params)?;
+                self.download_frame_event(&method, event_session_id.as_deref(), &params)?
+            }
+            "Page.screencastFrame" => {
+                self.viewer_frame_event(event_session_id.as_deref(), &params)?;
+            }
+
             "Target.attachedToTarget" => {
                 let params = params
                     .as_object()
@@ -3886,10 +6043,18 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 if self.retired_targets.contains_key(target.target_id()) {
                     return Err(OwnerActorError::OutcomeUncertain);
                 }
-                let context = self
-                    .contexts
-                    .get(&browser_context_id)
-                    .ok_or(OwnerActorError::UnknownOwnership)?;
+                let Some(context) = self.contexts.get(&browser_context_id) else {
+                    // Close admission before replying to an active action. UnknownOwnership
+                    // remains its known rejection, but no queued owner request or bootstrap
+                    // stage may continue on this compromised connection afterward.
+                    self.event_failed_closed = true;
+                    if let Some(mailbox) = self.mailbox.upgrade() {
+                        mailbox.mark_terminal();
+                        mailbox.fail_closed();
+                    }
+                    self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                    return Err(OwnerActorError::UnknownOwnership);
+                };
                 match context.lifecycle {
                     ContextLifecycle::Active => {}
                     ContextLifecycle::DisposeRequested | ContextLifecycle::Disposing => {
@@ -3897,6 +6062,146 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     }
                 }
                 let ownership = context.ownership.clone();
+                self.context_egress
+                    .check_active(&ownership, Instant::now())?;
+                // A recursively attached worker may outlive the page which created it, but
+                // an event delivered through a parent route must still name this exact context.
+                if matches!(
+                    target.kind(),
+                    TargetKind::DedicatedWorker
+                        | TargetKind::SharedWorker
+                        | TargetKind::ServiceWorker
+                ) && let Some(parent_session) = event_session_id.as_deref()
+                {
+                    let parent_matches = self
+                        .routes
+                        .values()
+                        .find(|route| route.route.session_id == parent_session)
+                        .is_some_and(|parent| {
+                            parent.route.browser_context_id == browser_context_id
+                                && parent.ownership() == ownership
+                        });
+                    if !parent_matches {
+                        // An event may interrupt an ordinary command whose known rejection
+                        // does not terminate the actor. Revoke admission before replying.
+                        self.event_failed_closed = true;
+                        if let Some(mailbox) = self.mailbox.upgrade() {
+                            mailbox.mark_terminal();
+                            mailbox.fail_closed();
+                        }
+                        self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                        return Err(OwnerActorError::UnknownOwnership);
+                    }
+                }
+                let existing = self.routes.get(target.target_id());
+                let target_incarnation = existing.map_or(self.next_target_incarnation, |route| {
+                    route.target_incarnation
+                });
+                if let Some(existing) = existing {
+                    if existing.route.session_id != session_id
+                        || existing.route.browser_context_id != browser_context_id
+                        || existing.ownership() != ownership
+                        || existing.kind != *target.kind()
+                    {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
+                } else if self.routes.len() >= 4_096
+                    || self
+                        .routes
+                        .values()
+                        .any(|route| route.route.session_id == session_id)
+                {
+                    return Err(OwnerActorError::StateOverflow);
+                }
+                let admission_target = OwnerAdmissionTarget {
+                    context_id: browser_context_id.clone(),
+                    target_id: target.target_id().to_owned(),
+                    flattened_session_id: session_id.clone(),
+                    kind: target.kind().clone(),
+                    target_incarnation,
+                };
+                let now = TargetTime::new(
+                    u64::try_from(self.admission_clock.elapsed().as_millis())
+                        .map_err(|_| OwnerActorError::StateOverflow)?,
+                );
+                if let Some(rejected) = self.pending_policy_rejections.get(target.target_id()) {
+                    return if rejected.matches(&admission_target, &ownership) {
+                        Ok(())
+                    } else {
+                        Err(OwnerActorError::OutcomeUncertain)
+                    };
+                }
+                let admission = match &self.runtime_safety {
+                    Some(cache) => cache
+                        .with_fresh_snapshot(|snapshot| {
+                            if snapshot.chromium_build_disabled(
+                                &self.artifact_identity.binary_digest.to_string(),
+                            ) {
+                                return Err(OwnerActorError::Rejected);
+                            }
+                            Ok(self.target_admissions.admit_with_ceiling(
+                                &admission_target,
+                                &ownership,
+                                now,
+                                u32::from(snapshot.max_targets_per_session()),
+                            ))
+                        })
+                        .map_err(|_| OwnerActorError::Rejected)??,
+                    None => self
+                        .target_admissions
+                        .admit(&admission_target, &ownership, now),
+                };
+                let admitted = match admission {
+                    Ok(receipt) => Some(receipt),
+                    Err(error) if known_policy_rejection(target.kind(), &error) => {
+                        if self.pending_policy_rejections.len() >= 4_096
+                            || self
+                                .routes
+                                .values()
+                                .filter(|route| {
+                                    route.route.browser_context_id == browser_context_id
+                                })
+                                .count()
+                                >= browserd_core::SessionLimits::default().max_targets_per_session
+                                    as usize
+                        {
+                            return Err(OwnerActorError::StateOverflow);
+                        }
+                        self.pending_policy_rejections.insert(
+                            target.target_id().to_owned(),
+                            PendingPolicyRejection {
+                                target: admission_target,
+                                ownership: ownership.clone(),
+                            },
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        // The target is still paused. Closing the owner and draining the exact
+                        // shard is the fallback when admission cannot register a cleanup route.
+                        self.event_failed_closed = true;
+                        if let Some(mailbox) = self.mailbox.upgrade() {
+                            mailbox.mark_terminal();
+                            mailbox.fail_closed();
+                        }
+                        self.ingress.fail_closed(TargetManagerEvent::TransportLost);
+                        return Err(map_admission_error(error));
+                    }
+                };
+                if let Some(admitted) = admitted {
+                    if admitted.target_incarnation != target_incarnation
+                        || admitted.creation_sequence == 0
+                    {
+                        return Err(OwnerActorError::OutcomeUncertain);
+                    }
+                    if !admitted.newly_admitted {
+                        return Ok(());
+                    }
+                }
+                self.next_target_incarnation = self
+                    .next_target_incarnation
+                    .checked_add(1)
+                    .ok_or(OwnerActorError::StateOverflow)?;
                 let page_id = if matches!(target.kind(), TargetKind::Page) {
                     let page_id = match self.pending_pages.remove(target.target_id()) {
                         Some(pending) if pending.context_id == browser_context_id => {
@@ -3921,11 +6226,6 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 } else {
                     None
                 };
-                let target_incarnation = self.next_target_incarnation;
-                self.next_target_incarnation = self
-                    .next_target_incarnation
-                    .checked_add(1)
-                    .ok_or(OwnerActorError::StateOverflow)?;
                 let entry = TargetRouteEntry {
                     route: ChromiumTargetRoute {
                         session_id,
@@ -3942,23 +6242,6 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     document: DocumentLoadState::default(),
                     network: NetworkActivity::quiet_at(Instant::now()),
                 };
-                if let Some(existing) = self.routes.get(target.target_id()) {
-                    if existing.route != entry.route
-                        || existing.kind != entry.kind
-                        || existing.page_id != entry.page_id
-                    {
-                        return Err(OwnerActorError::OutcomeUncertain);
-                    }
-                    return Ok(());
-                }
-                if self.routes.len() >= 4_096
-                    || self
-                        .routes
-                        .values()
-                        .any(|existing| existing.route.session_id == entry.route.session_id)
-                {
-                    return Err(OwnerActorError::StateOverflow);
-                }
                 if self
                     .routes
                     .insert(target.target_id().to_owned(), entry)
@@ -4004,10 +6287,22 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
+                    self.frames.retire_target(&target_id)?;
+                    self.downloads.retire_target(&target_id);
+                    confirm_target_retirement(
+                        &mut self.target_admissions,
+                        &mut self.pending_policy_rejections,
+                        &route.admission_target(&target_id),
+                        &route.ownership(),
+                    )?;
                     let route = self
                         .routes
                         .remove(&target_id)
                         .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.remember_retired_owner(
+                        route.admission_target(&target_id),
+                        route.ownership(),
+                    )?;
                     if self.retired_targets.len() >= MAX_RETIRED_TARGETS
                         || self
                             .retired_targets
@@ -4017,6 +6312,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
                     if let Some(page_id) = route.page_id {
+                        self.downloads.retire_page(&page_id);
                         let context = self
                             .contexts
                             .get_mut(&route.route.browser_context_id)
@@ -4064,10 +6360,22 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
+                    self.frames.retire_target(&target_id)?;
+                    self.downloads.retire_target(&target_id);
+                    confirm_target_retirement(
+                        &mut self.target_admissions,
+                        &mut self.pending_policy_rejections,
+                        &route.admission_target(&target_id),
+                        &route.ownership(),
+                    )?;
                     let route = self
                         .routes
                         .remove(&target_id)
                         .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    self.remember_retired_owner(
+                        route.admission_target(&target_id),
+                        route.ownership(),
+                    )?;
                     if self.retired_targets.len() >= MAX_RETIRED_TARGETS
                         || self
                             .retired_targets
@@ -4077,6 +6385,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         return Err(OwnerActorError::OutcomeUncertain);
                     }
                     if let Some(page_id) = route.page_id {
+                        self.downloads.retire_page(&page_id);
                         let context = self
                             .contexts
                             .get_mut(&route.route.browser_context_id)
@@ -4120,10 +6429,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                 {
                     return Err(OwnerActorError::OutcomeUncertain);
                 }
+                self.frames.retire_target(&target_id)?;
+                self.downloads.retire_target(&target_id);
+                confirm_target_retirement(
+                    &mut self.target_admissions,
+                    &mut self.pending_policy_rejections,
+                    &route.admission_target(&target_id),
+                    &route.ownership(),
+                )?;
                 let route = self
                     .routes
                     .remove(&target_id)
                     .ok_or(OwnerActorError::OutcomeUncertain)?;
+                self.remember_retired_owner(route.admission_target(&target_id), route.ownership())?;
                 if self.retired_targets.len() >= MAX_RETIRED_TARGETS
                     || self
                         .retired_targets
@@ -4133,6 +6451,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     return Err(OwnerActorError::OutcomeUncertain);
                 }
                 if let Some(page_id) = route.page_id {
+                    self.downloads.retire_page(&page_id);
                     let context = self
                         .contexts
                         .get_mut(&route.route.browser_context_id)
@@ -4155,6 +6474,8 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .map_err(|_| OwnerActorError::StateOverflow)?;
             }
             "Page.frameNavigated" => {
+                self.frame_event(&method, event_session_id.as_deref(), &params)?;
+                self.download_frame_event(&method, event_session_id.as_deref(), &params)?;
                 let session_id = event_session_id
                     .as_deref()
                     .filter(|session_id| valid_identifier(session_id))
@@ -4175,6 +6496,12 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         .values_mut()
                         .find(|route| route.route.session_id == session_id)
                         .ok_or(OwnerActorError::UnknownOwnership)?;
+                    if frame.get("url").and_then(Value::as_str) != Some("about:blank")
+                        && let Some(context) =
+                            self.contexts.get_mut(route.route.browser_context_id())
+                    {
+                        context.checkpoint_restore_available = false;
+                    }
                     route.frame_document_epoch = route
                         .frame_document_epoch
                         .checked_add(1)
@@ -4183,14 +6510,21 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                         .url_revision
                         .checked_add(1)
                         .ok_or(OwnerActorError::StateOverflow)?;
+                    let frame_id = frame
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| valid_identifier(id))
+                        .ok_or(OwnerActorError::OutcomeUncertain)?;
+                    route.network.document_committed(
+                        frame_id,
+                        loader_id.as_deref(),
+                        Instant::now(),
+                    );
                     route.document = DocumentLoadState {
                         loader_id,
                         dom_content_loaded: false,
                         loaded: false,
                     };
-                    // A new document abandons any requests the prior document left in flight (they
-                    // never emit a terminal event), so the quiescence ledger restarts from here.
-                    route.network = NetworkActivity::quiet_at(Instant::now());
                 }
             }
             "Page.domContentEventFired" | "Page.loadEventFired" => {
@@ -4243,7 +6577,7 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .as_object()
                     .and_then(|params| params.get("requestId"))
                     .and_then(Value::as_str)
-                    .filter(|request_id| !request_id.is_empty())
+                    .filter(|request_id| valid_identifier(request_id))
                 else {
                     return Ok(());
                 };
@@ -4253,7 +6587,18 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
                     .find(|route| route.route.session_id == session_id)
                 {
                     if method == "Network.requestWillBeSent" {
-                        route.network.record_request(request_id.to_owned());
+                        let identifier = |field| {
+                            params
+                                .get(field)
+                                .and_then(Value::as_str)
+                                .filter(|value| valid_identifier(value))
+                                .map(str::to_owned)
+                        };
+                        route.network.record_request(
+                            request_id.to_owned(),
+                            identifier("loaderId"),
+                            identifier("frameId"),
+                        )?;
                     } else {
                         route.network.settle_request(request_id, Instant::now());
                     }
@@ -4269,6 +6614,19 @@ impl<D: TargetManagerDrain> ChromiumOwnerActor<D> {
 struct NodeFunctionCall<'a> {
     declaration: &'a str,
     arguments: Value,
+}
+
+impl NodeFunctionCall<'_> {
+    fn mutates(&self) -> bool {
+        [
+            NODE_FILL_FUNCTION,
+            NODE_SET_CHECKED_FUNCTION,
+            NODE_SELECT_FUNCTION,
+            NODE_FOCUS_FUNCTION,
+            NODE_BLUR_FUNCTION,
+        ]
+        .contains(&self.declaration)
+    }
 }
 
 /// The document identity a node handle is bound to and resolved against.
@@ -4626,6 +6984,16 @@ fn valid_identifier(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn snapshot_context_matches(info: &Map<String, Value>, context: &str, kind: &TargetKind) -> bool {
+    match info.get("browserContextId") {
+        Some(value) => value.as_str() == Some(context),
+        None => matches!(
+            kind,
+            TargetKind::DedicatedWorker | TargetKind::SharedWorker | TargetKind::ServiceWorker
+        ),
+    }
+}
+
 fn allowed_target_kind(kind: &TargetKind) -> bool {
     matches!(
         kind,
@@ -4683,7 +7051,9 @@ fn target_kind(kind: &str) -> TargetKind {
 
 fn map_command_error(error: CdpCommandError) -> OwnerActorError {
     match error {
-        CdpCommandError::Protocol(_) => OwnerActorError::Rejected,
+        CdpCommandError::Protocol(_)
+        | CdpCommandError::SensitivePayloadRejected
+        | CdpCommandError::SensitiveProtocol { .. } => OwnerActorError::Rejected,
         CdpCommandError::CommandQueueFull | CdpCommandError::PendingLimitExceeded => {
             OwnerActorError::StateOverflow
         }
@@ -4694,13 +7064,79 @@ fn map_command_error(error: CdpCommandError) -> OwnerActorError {
     }
 }
 
+fn known_policy_rejection(kind: &TargetKind, error: &OwnerAdmissionError) -> bool {
+    matches!(
+        (kind, error),
+        (
+            TargetKind::Prerender,
+            OwnerAdmissionError::Admission(
+                browserd_targets::TargetAdmissionError::PrerenderDisabled
+            )
+        ) | (
+            TargetKind::Extension,
+            OwnerAdmissionError::Admission(
+                browserd_targets::TargetAdmissionError::ExtensionForbiddenInSharedContext
+            )
+        ) | (
+            TargetKind::Devtools,
+            OwnerAdmissionError::Admission(
+                browserd_targets::TargetAdmissionError::DevtoolsForbidden
+            )
+        )
+    )
+}
+
+fn confirm_target_retirement(
+    admissions: &mut OwnerTargetAdmissions,
+    pending: &mut BTreeMap<String, PendingPolicyRejection>,
+    target: &OwnerAdmissionTarget,
+    ownership: &ContextOwnership,
+) -> Result<(), OwnerActorError> {
+    if let Some(rejected) = pending.get(&target.target_id) {
+        if !rejected.matches(target, ownership) {
+            return Err(OwnerActorError::OutcomeUncertain);
+        }
+        // This exact known-policy target never consumed an admission permit.
+        pending.remove(&target.target_id);
+        Ok(())
+    } else if admissions
+        .confirmed_retirement(target, ownership)
+        .map_err(map_admission_error)?
+    {
+        Ok(())
+    } else {
+        Err(OwnerActorError::OutcomeUncertain)
+    }
+}
+
+fn map_admission_error(error: OwnerAdmissionError) -> OwnerActorError {
+    match error {
+        OwnerAdmissionError::UnknownContext | OwnerAdmissionError::OwnershipMismatch => {
+            OwnerActorError::UnknownOwnership
+        }
+        OwnerAdmissionError::StateOverflow
+        | OwnerAdmissionError::Admission(
+            browserd_targets::TargetAdmissionError::ClockMovedBackwards
+            | browserd_targets::TargetAdmissionError::CounterOverflow
+            | browserd_targets::TargetAdmissionError::InvalidLimits,
+        ) => OwnerActorError::StateOverflow,
+        OwnerAdmissionError::Admission(_) => OwnerActorError::Rejected,
+        OwnerAdmissionError::InvalidIdentity
+        | OwnerAdmissionError::BindingMismatch
+        | OwnerAdmissionError::ContextClosing
+        | OwnerAdmissionError::TargetClosing => OwnerActorError::OutcomeUncertain,
+    }
+}
+
 fn map_actor_stage_error(error: OwnerActorError) -> BootstrapStageFailure {
     match error {
         OwnerActorError::UnknownOwnership => BootstrapStageFailure::UnknownOwnership,
         OwnerActorError::Rejected
+        | OwnerActorError::DocumentChanged
         | OwnerActorError::NavigationInterrupted
         | OwnerActorError::NavigationTimeout => BootstrapStageFailure::Rejected,
         OwnerActorError::DeadlineBeforeDispatch
+        | OwnerActorError::ScriptException
         | OwnerActorError::StateOverflow
         | OwnerActorError::Unavailable
         | OwnerActorError::OutcomeUncertain => BootstrapStageFailure::StateOverflow,
@@ -4710,15 +7146,16 @@ fn map_actor_stage_error(error: OwnerActorError) -> BootstrapStageFailure {
 fn map_actor_runtime_error(error: OwnerActorError) -> ShardRuntimeError {
     match error {
         OwnerActorError::Rejected
+        | OwnerActorError::DocumentChanged
         | OwnerActorError::UnknownOwnership
         | OwnerActorError::NavigationInterrupted
         | OwnerActorError::NavigationTimeout => ShardRuntimeError::Rejected,
         OwnerActorError::StateOverflow | OwnerActorError::Unavailable => {
             ShardRuntimeError::Unavailable
         }
-        OwnerActorError::DeadlineBeforeDispatch | OwnerActorError::OutcomeUncertain => {
-            ShardRuntimeError::OutcomeUncertain
-        }
+        OwnerActorError::DeadlineBeforeDispatch
+        | OwnerActorError::OutcomeUncertain
+        | OwnerActorError::ScriptException => ShardRuntimeError::OutcomeUncertain,
     }
 }
 
@@ -4929,13 +7366,17 @@ mod tests {
         assert!(ledger.quiet_for(quiet, floor + quiet, floor));
 
         // An in-flight request suspends quiescence and leaves no idle deadline to schedule.
-        ledger.record_request("req-1".to_owned());
+        ledger
+            .record_request("req-1".to_owned(), None, None)
+            .expect("request admitted");
         assert!(!ledger.quiet_for(quiet, floor + quiet * 10, floor));
         assert_eq!(ledger.quiet_deadline(quiet, floor), None);
 
         // A redirect re-uses the request id without double-counting it, so one terminal event
         // settles it and restarts the quiet clock at that instant.
-        ledger.record_request("req-1".to_owned());
+        ledger
+            .record_request("req-1".to_owned(), None, None)
+            .expect("request admitted");
         let settled = floor + Duration::from_millis(50);
         ledger.settle_request("req-1", settled);
         assert!(!ledger.quiet_for(quiet, settled, floor));
@@ -4947,7 +7388,9 @@ mod tests {
         assert!(ledger.quiet_for(quiet, settled + quiet, floor));
 
         // A new document resets the ledger, discarding a request the prior document left pending.
-        ledger.record_request("req-2".to_owned());
+        ledger
+            .record_request("req-2".to_owned(), None, None)
+            .expect("request admitted");
         assert!(!ledger.quiet_for(quiet, settled + quiet * 3, floor));
         ledger = NetworkActivity::quiet_at(settled + quiet * 3);
         assert!(ledger.quiet_for(quiet, settled + quiet * 4, floor));

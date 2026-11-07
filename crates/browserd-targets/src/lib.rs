@@ -13,16 +13,17 @@ pub use admission::{
     TargetPolicy,
 };
 pub use bootstrap::{
-    BootstrapBackend, BootstrapError, BootstrapStage, BootstrapStageFailure, PausedTarget,
-    ReadyTarget, ShardTaintReason, TargetBootstrapBarrier,
+    BootstrapBackend, BootstrapDisposition, BootstrapError, BootstrapStage, BootstrapStageFailure,
+    PausedTarget, ReadyTarget, ShardTaintReason, TargetBootstrapBarrier,
 };
 pub use browserd_core::PageId;
 pub use nodes::{
-    BackendNodeId, NodeBinding, NodeHandle, NodeHandleStore, NodeResolutionContext,
-    NodeResolutionError, ResolvedNode, SnapshotId, classify_selector_match_count,
+    BackendNodeId, FrameEpochFence, NodeBinding, NodeFrameScope, NodeHandle, NodeHandleStore,
+    NodeOwnerBinding, NodeResolutionContext, NodeResolutionError, ResolvedNode, SnapshotId,
+    classify_selector_match_count,
 };
 pub use page::{FrameState, PageEpochError, PageEpochTracker};
 pub use types::{
-    DocumentEpoch, FrameId, SessionIncarnation, TargetIncarnation, TargetKind, TargetTime,
-    UrlRevision,
+    DocumentEpoch, FlattenedSessionId, FrameId, SessionIncarnation, TargetIncarnation, TargetKind,
+    TargetTime, UrlRevision,
 };

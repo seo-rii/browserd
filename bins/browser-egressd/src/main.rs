@@ -16,7 +16,11 @@ use browser_egressd::{
     DaemonControlError, DaemonLimits, EgressDaemon, PreparedRouteRequest, RenewRouteRequest,
     allocate_daemon_epoch,
 };
-use browserd_core::{EgressFence, TenantId, WorkerId};
+use browserd_coordination::{
+    RedisSafetyAuthority, RedisSafetyAuthorityConfig, SafetyAuthority, SafetyAuthorityConfig,
+    SafetyObserver,
+};
+use browserd_core::{EgressFence, RuntimeSafetyCache, TenantId, WorkerId};
 use browserd_egress::{AttachmentState, DataPlaneLimits, QuotaLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +35,7 @@ const MAX_INSTALL_TASKS: usize = 1024;
 struct AppState {
     daemon: Arc<EgressDaemon>,
     credentials: Arc<ControlCredentials>,
+    safety_cache: Arc<RuntimeSafetyCache>,
 }
 
 #[derive(Clone)]
@@ -112,6 +117,22 @@ impl ControlCredentials {
         }
         self.authorize_worker(headers, fence)
     }
+
+    fn authorize_prepare(
+        &self,
+        headers: &HeaderMap,
+        fence: &EgressFence,
+        shared_context: bool,
+    ) -> Result<(), ApiError> {
+        if shared_context {
+            return if self.supervisor.authorizes(headers) {
+                Ok(())
+            } else {
+                Err(ApiError::unauthorized())
+            };
+        }
+        self.authorize_worker(headers, fence)
+    }
 }
 
 struct Config {
@@ -156,8 +177,22 @@ impl Config {
                 "BROWSER_EGRESS_IDLE_TIMEOUT_MILLIS",
             )?),
         };
-        let limits = DaemonLimits::new(max_lease, max_plans, quotas)
+        let mut limits = DaemonLimits::new(max_lease, max_plans, quotas)
             .map_err(|error| anyhow::anyhow!(error))?;
+        match std::env::var("BROWSER_EGRESS_MAX_PLAN_HISTORY") {
+            Ok(value) => {
+                let capacity = value
+                    .parse()
+                    .context("BROWSER_EGRESS_MAX_PLAN_HISTORY must be a positive capacity")?;
+                limits = limits
+                    .with_plan_history_capacity(capacity)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => {
+                return Err(error).context("BROWSER_EGRESS_MAX_PLAN_HISTORY must be Unicode");
+            }
+        }
         let worker_id = WorkerId::new(env_value("BROWSER_EGRESS_WORKER_ID")?)
             .context("BROWSER_EGRESS_WORKER_ID is invalid")?;
         let worker_epoch = parse_env("BROWSER_EGRESS_WORKER_EPOCH")?;
@@ -234,6 +269,8 @@ struct PrepareApiRequest {
     binding_digest_hex: String,
     profile: String,
     lease_ttl_millis: u64,
+    #[serde(default)]
+    shared_context: bool,
 }
 
 #[derive(Serialize)]
@@ -314,7 +351,9 @@ async fn health() -> StatusCode {
 }
 
 async fn readiness(State(state): State<AppState>) -> StatusCode {
-    if state.daemon.daemon_epoch().get() == 0 {
+    if state.daemon.daemon_epoch().get() == 0
+        || state.safety_cache.with_fresh_snapshot(|_| ()).is_err()
+    {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::NO_CONTENT
@@ -328,7 +367,7 @@ async fn prepare_route(
 ) -> Result<(StatusCode, Json<PrepareApiResponse>), ApiError> {
     state
         .credentials
-        .authorize_worker(&headers, &request.egress_fence)?;
+        .authorize_prepare(&headers, &request.egress_fence, request.shared_context)?;
     let digest = parse_digest(&request.binding_digest_hex)?;
     let prepared = PreparedRouteRequest::new(
         request.daemon_epoch,
@@ -339,6 +378,11 @@ async fn prepare_route(
         Duration::from_millis(request.lease_ttl_millis),
     )
     .map_err(ApiError::from)?;
+    let prepared = if request.shared_context {
+        prepared.with_shared_context()
+    } else {
+        prepared
+    };
     let response = state.daemon.prepare(prepared).map_err(ApiError::from)?;
     Ok((
         StatusCode::CREATED,
@@ -364,6 +408,28 @@ async fn route_status(
         .status(request.daemon_epoch, &request.egress_fence)
         .map_err(ApiError::from)?;
     Ok(Json(status_response(status)))
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ShardRetireRequest {
+    daemon_epoch: u64,
+    shard_fence: browserd_core::ShardFence,
+}
+
+async fn retire_shard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ShardRetireRequest>,
+) -> Result<Json<ShardRetireRequest>, ApiError> {
+    if !state.credentials.supervisor.authorizes(&headers) {
+        return Err(ApiError::unauthorized());
+    }
+    state
+        .daemon
+        .retire_shard(request.daemon_epoch, &request.shard_fence)
+        .map_err(ApiError::from)?;
+    Ok(Json(request))
 }
 
 async fn revoke_route(
@@ -472,6 +538,10 @@ impl From<DaemonControlError> for ApiError {
             DaemonControlError::PlanCapacityExceeded => {
                 (StatusCode::TOO_MANY_REQUESTS, "route_capacity_exceeded")
             }
+            DaemonControlError::PlanHistoryCapacityExceeded => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "route_history_capacity_exceeded",
+            ),
             DaemonControlError::PlanNotFound => (StatusCode::NOT_FOUND, "route_not_found"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "egress_internal_error"),
         };
@@ -536,15 +606,65 @@ async fn shutdown_signal() -> io::Result<()> {
     tokio::signal::ctrl_c().await
 }
 
+async fn run_safety_observer(observer: Arc<SafetyObserver>, shutdown: CancellationToken) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            result = observer.refresh() => {
+                if result.is_err() {
+                    eprintln!("runtime safety observer refresh unavailable");
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
+    let safety_cache = Arc::new(RuntimeSafetyCache::new());
+    let safety_config = RedisSafetyAuthorityConfig::new(
+        env_value("BROWSERD_REDIS_URL")?,
+        env_value("BROWSERD_REDIS_PREFIX")?,
+        SafetyAuthorityConfig::default(),
+        4,
+        Duration::from_secs(5),
+    )
+    .context("runtime safety Redis configuration is invalid")?;
+    let safety_authority: Arc<dyn SafetyAuthority> = Arc::new(
+        RedisSafetyAuthority::connect(safety_config)
+            .await
+            .context("runtime safety authority connection unavailable")?,
+    );
+    let safety_path = std::env::var_os("BROWSERD_SAFETY_STATE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.epoch_state.with_extension("safety-state"));
+    let safety_observer = Arc::new(
+        SafetyObserver::open(
+            safety_path,
+            safety_authority,
+            Arc::clone(&safety_cache),
+            Duration::from_secs(30),
+        )
+        .context("runtime safety observer durability unavailable")?,
+    );
+    // An uninitialized authority leaves readiness unavailable while authenticated control works.
+    let _initial_safety = safety_observer.refresh().await;
     let daemon_epoch = allocate_daemon_epoch(&config.epoch_state)
         .context("durable daemon epoch allocation failed")?;
-    let daemon = Arc::new(EgressDaemon::new(
+    let daemon = Arc::new(EgressDaemon::with_runtime_safety(
         daemon_epoch,
         config.limits,
         DataPlaneLimits::default(),
+        Arc::clone(&safety_cache),
     )?);
     let control_listener = TcpListener::bind(config.control_bind)
         .await
@@ -552,6 +672,7 @@ async fn main() -> anyhow::Result<()> {
     let install_listener = UnixListener::bind(&config.install_socket)
         .context("listener installation socket bind failed")?;
     let shutdown = CancellationToken::new();
+    let safety_task = tokio::spawn(run_safety_observer(safety_observer, shutdown.clone()));
     let install_task = tokio::spawn(run_install_server(
         install_listener,
         Arc::clone(&daemon),
@@ -566,18 +687,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/routes/renew", post(renew_route))
         .route("/v1/routes/status", post(route_status))
         .route("/v1/routes/revoke", post(revoke_route))
+        .route("/v1/shards/retire", post(retire_shard))
         .with_state(AppState {
             daemon: Arc::clone(&daemon),
             credentials: Arc::new(config.credentials),
+            safety_cache,
         });
-    axum::serve(control_listener, app)
+    let control_result = axum::serve(control_listener, app)
         .with_graceful_shutdown(async {
             let _ = shutdown_signal().await;
         })
-        .await
-        .context("control server failed")?;
+        .await;
     shutdown.cancel();
+    let _ = safety_task.await;
     let _ = install_task.await;
+    control_result.context("control server failed")?;
     daemon.shutdown().await?;
     remove_owned_socket(&config.install_socket)?;
     Ok(())
@@ -597,8 +721,266 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use std::collections::HashSet;
+    use std::os::unix::fs::DirBuilderExt;
+
+    use browserd_coordination::{
+        MemorySafetyAuthority, SafetyActorIdentity, SafetyAuthorityError, SafetyInitializeRequest,
+    };
+    use browserd_core::{
+        LaunchGeneration, OwnerFence, RouteGeneration, SafetySwitchSnapshot, SessionId,
+        SessionIncarnation, ShardFence, ShardId, WorkerEpoch,
+    };
+    use browserd_egress::DaemonEpoch;
 
     use super::*;
+
+    struct PrivateDirectory(PathBuf);
+    impl PrivateDirectory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("egress-safety-{}", SessionId::new()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&path)
+                .expect("private observer directory");
+            Self(path)
+        }
+    }
+    impl Drop for PrivateDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn runtime_state(cache: Arc<RuntimeSafetyCache>) -> AppState {
+        let limits = DaemonLimits::new(
+            Duration::from_secs(30),
+            8,
+            QuotaLimits {
+                max_concurrent_connections: 8,
+                max_connection_starts_per_window: 32,
+                max_dns_queries_per_window: 32,
+                max_egress_bytes_per_window: 1024 * 1024,
+                max_total_egress_bytes: 8 * 1024 * 1024,
+                max_response_bytes: Some(1024 * 1024),
+                accounting_window: Duration::from_secs(60),
+                idle_connection_timeout: Duration::from_secs(15),
+            },
+        )
+        .expect("limits");
+        AppState {
+            daemon: Arc::new(
+                EgressDaemon::with_runtime_safety(
+                    DaemonEpoch::new(41).expect("epoch"),
+                    limits,
+                    DataPlaneLimits::default(),
+                    cache.clone(),
+                )
+                .expect("daemon"),
+            ),
+            credentials: Arc::new(
+                ControlCredentials::new(
+                    &"s".repeat(32),
+                    &"w".repeat(32),
+                    WorkerId::new("runtime-worker").expect("worker"),
+                    7,
+                )
+                .expect("credentials"),
+            ),
+            safety_cache: cache,
+        }
+    }
+
+    fn runtime_fence() -> EgressFence {
+        EgressFence::new(
+            ShardFence::new(
+                OwnerFence::new(
+                    WorkerId::new("runtime-worker").expect("worker"),
+                    WorkerEpoch::new(7).expect("worker epoch"),
+                ),
+                ShardId::new(),
+                LaunchGeneration::new(1).expect("launch"),
+            ),
+            RouteGeneration::new(1).expect("route"),
+            SessionId::new(),
+            SessionIncarnation::new(1).expect("incarnation"),
+        )
+    }
+
+    fn worker_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", "w".repeat(32))
+                .parse()
+                .expect("header"),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn readiness_requires_fresh_safety_but_health_remains_available() {
+        let cache = Arc::new(RuntimeSafetyCache::new());
+        let state = runtime_state(cache.clone());
+        let namespace = *SessionId::new().as_uuid();
+        assert_eq!(health().await, StatusCode::NO_CONTENT);
+        assert_eq!(
+            readiness(State(state.clone())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        cache
+            .install(
+                namespace,
+                SafetySwitchSnapshot::default(),
+                Duration::from_secs(30),
+            )
+            .expect("observed initial authority");
+        assert_eq!(
+            readiness(State(state.clone())).await,
+            StatusCode::NO_CONTENT
+        );
+        cache.invalidate().expect("invalidate");
+        assert_eq!(
+            readiness(State(state.clone())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        cache
+            .install(
+                namespace,
+                SafetySwitchSnapshot::default(),
+                Duration::from_millis(1),
+            )
+            .expect("short fresh observation");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            readiness(State(state)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(health().await, StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn stale_safety_keeps_authenticated_route_cleanup_operational() {
+        let cache = Arc::new(RuntimeSafetyCache::new());
+        cache
+            .install(
+                *SessionId::new().as_uuid(),
+                SafetySwitchSnapshot::default(),
+                Duration::from_secs(30),
+            )
+            .expect("initialize");
+        let state = runtime_state(cache.clone());
+        let fence = runtime_fence();
+        assert!(
+            prepare_route(
+                State(state.clone()),
+                worker_headers(),
+                Json(PrepareApiRequest {
+                    daemon_epoch: 41,
+                    tenant_id: TenantId::new(),
+                    egress_fence: fence.clone(),
+                    binding_digest_hex: "ab".repeat(32),
+                    profile: "public-web".to_owned(),
+                    lease_ttl_millis: 10_000,
+                    shared_context: false,
+                }),
+            )
+            .await
+            .is_ok()
+        );
+        cache.invalidate().expect("authority unavailable");
+        assert_eq!(
+            readiness(State(state.clone())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let request = || FenceApiRequest {
+            daemon_epoch: 41,
+            egress_fence: fence.clone(),
+        };
+        assert!(matches!(
+            revoke_route(State(state.clone()), HeaderMap::new(), Json(request())).await,
+            Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                ..
+            })
+        ));
+        let revoked = revoke_route(State(state.clone()), worker_headers(), Json(request())).await;
+        assert!(matches!(
+            revoked,
+            Ok(Json(StatusApiResponse {
+                state: "released",
+                ..
+            }))
+        ));
+        let status = route_status(State(state), worker_headers(), Json(request())).await;
+        assert!(matches!(
+            status,
+            Ok(Json(StatusApiResponse {
+                state: "released",
+                ..
+            }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn independent_observer_polls_after_initialization_and_joins_on_shutdown() {
+        let directory = PrivateDirectory::new();
+        let authority = Arc::new(MemorySafetyAuthority::default());
+        let cache = Arc::new(RuntimeSafetyCache::new());
+        let pin = directory.0.join("safety-state");
+        let observer = Arc::new(
+            SafetyObserver::open(
+                pin.clone(),
+                authority.clone(),
+                cache.clone(),
+                Duration::from_secs(30),
+            )
+            .expect("open durable observer"),
+        );
+        assert_eq!(
+            observer.refresh().await,
+            Err(SafetyAuthorityError::MissingAuthority)
+        );
+        let state = runtime_state(cache.clone());
+        assert_eq!(
+            readiness(State(state.clone())).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run_safety_observer(observer.clone(), shutdown.clone()));
+        authority
+            .initialize(
+                SafetyInitializeRequest::new(
+                    SafetyActorIdentity::new(TenantId::new(), "operator").expect("actor"),
+                    *SessionId::new().as_uuid(),
+                    "bootstrap runtime safety",
+                )
+                .expect("initialize command"),
+            )
+            .await
+            .expect("explicit initialization");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while cache.generation().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("observer independently sees initialization");
+        assert_eq!(readiness(State(state)).await, StatusCode::NO_CONTENT);
+        assert!(pin.is_file());
+        assert_eq!(
+            observer
+                .last_accepted()
+                .expect("pin")
+                .expect("accepted")
+                .version(),
+            0
+        );
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("observer shutdown is prompt")
+            .expect("observer task joins");
+    }
 
     #[test]
     fn static_data_listener_configuration_is_not_part_of_the_daemon_contract() {
@@ -671,5 +1053,128 @@ mod tests {
         let source = include_str!("main.rs");
         assert!(source.contains(".route(\"/v1/routes/renew\", post(renew_route))"));
         assert!(source.contains("authorize_worker(&headers, &request.egress_fence)"));
+    }
+    #[test]
+    fn history_exhaustion_is_distinct_from_active_admission_exhaustion() {
+        let active = ApiError::from(DaemonControlError::PlanCapacityExceeded);
+        let history = ApiError::from(DaemonControlError::PlanHistoryCapacityExceeded);
+        assert_eq!(active.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(history.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(active.body.code, "route_capacity_exceeded");
+        assert_eq!(history.body.code, "route_history_capacity_exceeded");
+    }
+
+    #[test]
+    fn coordinated_owner_credentials_reject_old_prepare_specs_and_old_supervisor_tokens() {
+        let fence = runtime_fence();
+        let owner = fence.shard().owner();
+        let original = ControlCredentials::new(
+            &"s".repeat(32),
+            &"w".repeat(32),
+            owner.worker_id().clone(),
+            owner.worker_epoch().get(),
+        )
+        .expect("old authority");
+        let worker = worker_headers();
+        let mut supervisor = HeaderMap::new();
+        supervisor.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", "s".repeat(32))
+                .parse()
+                .expect("old supervisor header"),
+        );
+        assert!(original.authorize_prepare(&worker, &fence, false).is_ok());
+        assert!(
+            original
+                .authorize_prepare(&supervisor, &fence, true)
+                .is_ok()
+        );
+        let coordinated = ControlCredentials::new(
+            &"n".repeat(32),
+            &"m".repeat(32),
+            owner.worker_id().clone(),
+            owner.worker_epoch().get() + 1,
+        )
+        .expect("new authority");
+        assert!(
+            coordinated
+                .authorize_prepare(&worker, &fence, false)
+                .is_err()
+        );
+        assert!(
+            coordinated
+                .authorize_prepare(&supervisor, &fence, true)
+                .is_err()
+        );
+        let mut fresh_worker = HeaderMap::new();
+        fresh_worker.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", "m".repeat(32))
+                .parse()
+                .expect("new worker header"),
+        );
+        assert!(
+            coordinated
+                .authorize_prepare(&fresh_worker, &fence, false)
+                .is_err(),
+            "a current worker credential cannot replay its retired ownership fence"
+        );
+        // Supervisor preparation trusts that authority's complete inventory.
+        // The coordinated drain must retire its old specs as well as credentials.
+    }
+
+    #[test]
+    fn shared_route_preparation_requires_supervisor_capability_and_legacy_remains_worker_fenced() {
+        use browserd_core::{
+            LaunchGeneration, OwnerFence, RouteGeneration, SessionId, SessionIncarnation,
+            ShardFence, ShardId, WorkerEpoch,
+        };
+        let worker = WorkerId::new("shared-auth").expect("worker");
+        let credentials =
+            ControlCredentials::new(&"s".repeat(32), &"w".repeat(32), worker.clone(), 7)
+                .expect("credentials");
+        let fence = EgressFence::new(
+            ShardFence::new(
+                OwnerFence::new(worker, WorkerEpoch::new(7).expect("epoch")),
+                ShardId::new(),
+                LaunchGeneration::new(1).expect("launch"),
+            ),
+            RouteGeneration::new(1).expect("route"),
+            SessionId::new(),
+            SessionIncarnation::new(1).expect("incarnation"),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", "w".repeat(32))
+                .parse()
+                .expect("header"),
+        );
+        assert!(
+            credentials
+                .authorize_prepare(&headers, &fence, false)
+                .is_ok()
+        );
+        assert!(
+            credentials
+                .authorize_prepare(&headers, &fence, true)
+                .is_err()
+        );
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", "s".repeat(32))
+                .parse()
+                .expect("header"),
+        );
+        assert!(
+            credentials
+                .authorize_prepare(&headers, &fence, true)
+                .is_ok()
+        );
+        assert!(
+            credentials
+                .authorize_prepare(&headers, &fence, false)
+                .is_err()
+        );
     }
 }

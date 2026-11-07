@@ -1,3 +1,6 @@
+use crate::{
+    ContextEgressBinding, ContextEgressReleaseReceipt, ContextEgressRequest, ContextRoutePolicy,
+};
 use std::io::IoSlice;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
@@ -19,9 +22,10 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec,
-    InspectResources, KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxError,
-    SandboxSupervisor, WorkerOwnership,
+    ChromiumBinaryDigest, ChromiumCdpPipes, ChromiumProcessProfile, CleanupReason,
+    CreateShardOutcome, DedicatedEgressProxyBinding, DedicatedEgressSpec, InspectResources,
+    KillShardOutcome, LaunchSpec, RenewLeaseError, SandboxBackend, SandboxError, SandboxScratch,
+    SandboxSupervisor, ScratchMetadata, WorkerOwnership,
 };
 
 const CLIENT_DESCRIPTOR_READY: u8 = 0x51;
@@ -172,6 +176,7 @@ pub enum RpcFailureCode {
     LaunchFenceMismatch,
     LaunchBindingMismatch,
     ChromiumBinaryDigestMismatch,
+    InvalidChromiumProcessProfile,
     MissingCapability,
     AdmissionClosed,
     OwnershipMismatch,
@@ -204,6 +209,9 @@ impl From<SandboxError> for RpcFailure {
             SandboxError::LaunchBindingMismatch => RpcFailureCode::LaunchBindingMismatch,
             SandboxError::ChromiumBinaryDigestMismatch => {
                 RpcFailureCode::ChromiumBinaryDigestMismatch
+            }
+            SandboxError::InvalidChromiumProcessProfile => {
+                RpcFailureCode::InvalidChromiumProcessProfile
             }
             SandboxError::MissingCapability { .. } => RpcFailureCode::MissingCapability,
             SandboxError::AdmissionClosed => RpcFailureCode::AdmissionClosed,
@@ -255,8 +263,24 @@ enum RpcRequest {
         worker_epoch: u64,
         tenant_id: TenantId,
         chromium_binary_digest: ChromiumBinaryDigest,
+        process_profile: ChromiumProcessProfile,
         dedicated_egress: DedicatedEgressSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_route_policy: Option<ContextRoutePolicy>,
         lease_ttl_ms: u64,
+    },
+    AttachContextEgress {
+        sandboxd_epoch: u64,
+        request: ContextEgressRequest,
+    },
+    RenewContextEgress {
+        sandboxd_epoch: u64,
+        binding: Box<ContextEgressBinding>,
+        lease_ttl_ms: u64,
+    },
+    ReleaseContextEgress {
+        sandboxd_epoch: u64,
+        request: ContextEgressRequest,
     },
     CancelOrKillShard {
         sandboxd_epoch: u64,
@@ -295,7 +319,10 @@ enum RpcRequest {
 impl RpcRequest {
     const fn sandboxd_epoch(&self) -> u64 {
         match self {
-            Self::ProbeDaemonEpoch { sandboxd_epoch, .. }
+            Self::AttachContextEgress { sandboxd_epoch, .. }
+            | Self::RenewContextEgress { sandboxd_epoch, .. }
+            | Self::ReleaseContextEgress { sandboxd_epoch, .. }
+            | Self::ProbeDaemonEpoch { sandboxd_epoch, .. }
             | Self::CreateShard { sandboxd_epoch, .. }
             | Self::CancelOrKillShard { sandboxd_epoch, .. }
             | Self::RenewOwnerLease { sandboxd_epoch, .. }
@@ -307,6 +334,20 @@ impl RpcRequest {
 
     fn is_authorized_for(&self, binding: &SandboxRpcPeerBinding) -> bool {
         match self {
+            Self::AttachContextEgress { request, .. }
+            | Self::ReleaseContextEgress { request, .. } => {
+                let owner = request.egress().egress_fence().shard().owner();
+                owner.worker_id() == &binding.worker_id
+                    && owner.worker_epoch().get() == binding.worker_epoch
+            }
+            Self::RenewContextEgress {
+                binding: receipt, ..
+            } => {
+                let owner = receipt.request().egress().egress_fence().shard().owner();
+                owner.worker_id() == &binding.worker_id
+                    && owner.worker_epoch().get() == binding.worker_epoch
+            }
+
             Self::ProbeDaemonEpoch {
                 worker_id,
                 worker_epoch,
@@ -340,6 +381,8 @@ enum RpcSuccess {
         daemon_epoch: u64,
         request_nonce: LeaseId,
     },
+    ContextEgressAttached(Box<ContextEgressBinding>),
+    ContextEgressReleased(Box<ContextEgressReleaseReceipt>),
     CreateShard(CreateShardOutcome),
     CancelOrKillShard(KillShardOutcome),
     Renewed,
@@ -347,6 +390,10 @@ enum RpcSuccess {
     InspectResources(InspectResources),
     CdpPipesReady {
         transfer_id: LeaseId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress_proxy_binding: Option<Box<DedicatedEgressProxyBinding>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scratch: Option<Box<ScratchMetadata>>,
     },
 }
 
@@ -364,6 +411,7 @@ pub struct SandboxRpcClient {
     request_timeout: Duration,
     expected_server_uid: u32,
     expected_daemon_epoch: u64,
+    expected_server_identity: Option<crate::ChildIdentity>,
 }
 
 impl SandboxRpcClient {
@@ -388,7 +436,15 @@ impl SandboxRpcClient {
             request_timeout,
             expected_server_uid,
             expected_daemon_epoch,
+            expected_server_identity: None,
         })
+    }
+
+    /// Optionally pins the actual peer process on every connection before any request bytes.
+    #[must_use]
+    pub fn with_expected_server_identity(mut self, identity: crate::ChildIdentity) -> Self {
+        self.expected_server_identity = Some(identity);
+        self
     }
 
     async fn connect(&self) -> Result<UnixStream, SandboxRpcError> {
@@ -403,6 +459,24 @@ impl SandboxRpcClient {
                 expected: self.expected_server_uid,
                 received: peer.uid(),
             });
+        }
+        if let Some(expected) = self.expected_server_identity {
+            let pid = peer
+                .pid()
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid != 0)
+                .ok_or(SandboxRpcError::PeerProcessMismatch)?;
+            let proc_stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map_err(|_| SandboxRpcError::PeerProcessMismatch)?;
+            let start = proc_stat
+                .rsplit_once(") ")
+                .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|start| *start != 0)
+                .ok_or(SandboxRpcError::PeerProcessMismatch)?;
+            if crate::ChildIdentity::new(pid, start) != expected {
+                return Err(SandboxRpcError::PeerProcessMismatch);
+            }
         }
         Ok(stream)
     }
@@ -435,6 +509,74 @@ impl SandboxRpcClient {
         }
     }
 
+    pub async fn attach_context_egress(
+        &self,
+        request: &ContextEgressRequest,
+    ) -> Result<ContextEgressBinding, SandboxRpcError> {
+        request.validate().map_err(|_| SandboxRpcError::Protocol)?;
+        match self
+            .exchange(RpcRequest::AttachContextEgress {
+                sandboxd_epoch: self.expected_daemon_epoch,
+                request: request.clone(),
+            })
+            .await?
+        {
+            RpcSuccess::ContextEgressAttached(binding)
+                if binding.request() == request
+                    && binding.sandboxd_epoch() == self.expected_daemon_epoch
+                    && binding.validate().is_ok() =>
+            {
+                Ok(*binding)
+            }
+            _ => Err(SandboxRpcError::Protocol),
+        }
+    }
+    pub async fn renew_context_egress(
+        &self,
+        binding: &ContextEgressBinding,
+        ttl: Duration,
+    ) -> Result<(), SandboxRpcError> {
+        binding.validate().map_err(|_| SandboxRpcError::Protocol)?;
+        if binding.sandboxd_epoch() != self.expected_daemon_epoch {
+            return Err(SandboxRpcError::Protocol);
+        }
+        let lease_ttl_ms =
+            u64::try_from(ttl.as_millis()).map_err(|_| SandboxRpcError::InvalidLease)?;
+        match self
+            .exchange(RpcRequest::RenewContextEgress {
+                sandboxd_epoch: self.expected_daemon_epoch,
+                binding: Box::new(binding.clone()),
+                lease_ttl_ms,
+            })
+            .await?
+        {
+            RpcSuccess::Renewed => Ok(()),
+            _ => Err(SandboxRpcError::Protocol),
+        }
+    }
+    pub async fn release_context_egress(
+        &self,
+        request: &ContextEgressRequest,
+    ) -> Result<ContextEgressReleaseReceipt, SandboxRpcError> {
+        request.validate().map_err(|_| SandboxRpcError::Protocol)?;
+        match self
+            .exchange(RpcRequest::ReleaseContextEgress {
+                sandboxd_epoch: self.expected_daemon_epoch,
+                request: request.clone(),
+            })
+            .await?
+        {
+            RpcSuccess::ContextEgressReleased(receipt)
+                if receipt
+                    .validate_for(request, self.expected_daemon_epoch)
+                    .is_ok() =>
+            {
+                Ok(*receipt)
+            }
+            _ => Err(SandboxRpcError::Protocol),
+        }
+    }
+
     pub async fn create_shard(
         &self,
         spec: LaunchSpec,
@@ -453,7 +595,9 @@ impl SandboxRpcClient {
                 worker_epoch: spec.worker_epoch(),
                 tenant_id: spec.tenant_id().clone(),
                 chromium_binary_digest: spec.chromium_binary_digest(),
+                process_profile: spec.process_profile().clone(),
                 dedicated_egress: spec.dedicated_egress().clone(),
+                context_route_policy: spec.context_route_policy().cloned(),
                 lease_ttl_ms,
             })
             .await?;
@@ -517,17 +661,26 @@ impl SandboxRpcClient {
         spec: &LaunchSpec,
         reason: CleanupReason,
     ) -> Result<KillShardOutcome, SandboxRpcError> {
-        let response = self
-            .exchange(RpcRequest::CancelOrKillShard {
-                sandboxd_epoch: self.expected_daemon_epoch,
-                spec: spec.clone(),
-                reason,
-            })
-            .await?;
-        match response {
-            RpcSuccess::CancelOrKillShard(outcome) => Ok(outcome),
-            _ => Err(SandboxRpcError::Protocol),
-        }
+        let deadline = Instant::now() + self.request_timeout;
+        let request = RpcRequest::CancelOrKillShard {
+            sandboxd_epoch: self.expected_daemon_epoch,
+            spec: spec.clone(),
+            reason,
+        };
+        // Cleanup may commit before its acknowledgement is lost. The same immutable launch
+        // can confirm that state once more, with fresh peer checks and the original deadline.
+        tokio::time::timeout_at(deadline, async {
+            let response = match self.exchange(request.clone()).await {
+                Err(SandboxRpcError::ConnectionClosed) => self.exchange(request).await?,
+                result => result?,
+            };
+            match response {
+                RpcSuccess::CancelOrKillShard(outcome) => Ok(outcome),
+                _ => Err(SandboxRpcError::Protocol),
+            }
+        })
+        .await
+        .map_err(|_| SandboxRpcError::TimedOut)?
     }
 
     pub async fn inspect_resources(
@@ -583,18 +736,23 @@ impl SandboxRpcClient {
                 .await
                 .ok_or(SandboxRpcError::ConnectionClosed)?
                 .map_err(|error| SandboxRpcError::Io(error.to_string()))?;
-            let transfer_id = match serde_json::from_slice::<RpcResponse>(&response)
-                .map_err(|error| SandboxRpcError::Serialization(error.to_string()))?
-            {
-                RpcResponse::Success(RpcSuccess::CdpPipesReady { transfer_id }) => transfer_id,
-                RpcResponse::Success(_) => return Err(SandboxRpcError::Protocol),
-                RpcResponse::Failure(failure) => {
-                    return Err(SandboxRpcError::Remote {
-                        code: failure.code,
-                        message: failure.message,
-                    });
-                }
-            };
+            let (transfer_id, egress_proxy_binding, scratch_metadata) =
+                match serde_json::from_slice::<RpcResponse>(&response)
+                    .map_err(|error| SandboxRpcError::Serialization(error.to_string()))?
+                {
+                    RpcResponse::Success(RpcSuccess::CdpPipesReady {
+                        transfer_id,
+                        egress_proxy_binding,
+                        scratch,
+                    }) => (transfer_id, egress_proxy_binding, scratch),
+                    RpcResponse::Success(_) => return Err(SandboxRpcError::Protocol),
+                    RpcResponse::Failure(failure) => {
+                        return Err(SandboxRpcError::Remote {
+                            code: failure.code,
+                            message: failure.message,
+                        });
+                    }
+                };
             let cleanup_client = self.clone();
             let cleanup_shard_id = shard_id.clone();
             let cleanup_window = self
@@ -638,6 +796,22 @@ impl SandboxRpcClient {
                     }
                 }
             });
+            if egress_proxy_binding.as_ref().is_some_and(|binding| {
+                let shard = binding.egress_fence().shard();
+                shard.shard_id() != shard_id
+                    || shard.owner().worker_id() != worker_id
+                    || shard.owner().worker_epoch().get() != worker_epoch
+                    || shard.launch_generation() != launch_generation
+            }) {
+                return Err(SandboxRpcError::Protocol);
+            }
+            if scratch_metadata.as_ref().is_some_and(|metadata| {
+                !metadata.valid()
+                    || metadata.owner_uid() != self.expected_server_uid
+                    || egress_proxy_binding.as_deref() != Some(metadata.binding())
+            }) {
+                return Err(SandboxRpcError::Protocol);
+            }
             let parts = framed.into_parts();
             if !parts.read_buf.is_empty() || !parts.write_buf.is_empty() {
                 return Err(SandboxRpcError::Protocol);
@@ -786,7 +960,7 @@ impl SandboxRpcClient {
                 || rights_messages != 1
                 || unexpected_control
                 || invalid_control
-                || descriptors.len() != 2
+                || descriptors.len() != if scratch_metadata.is_some() { 3 } else { 2 }
             {
                 return Err(SandboxRpcError::Protocol);
             }
@@ -795,6 +969,23 @@ impl SandboxRpcClient {
             let event_reader = descriptors.next().ok_or(SandboxRpcError::Protocol)?;
             let pipes = ChromiumCdpPipes::from_owned_fds(command_writer, event_reader)
                 .map_err(|error| SandboxRpcError::InvalidCapabilities(error.to_string()))?;
+            let pipes = match egress_proxy_binding {
+                Some(binding) => pipes
+                    .with_egress_proxy_binding(*binding)
+                    .map_err(|error| SandboxRpcError::InvalidCapabilities(error.to_string()))?,
+                None => pipes,
+            };
+            let pipes = match scratch_metadata {
+                Some(metadata) => {
+                    let directory = descriptors.next().ok_or(SandboxRpcError::Protocol)?;
+                    let scratch = SandboxScratch::from_owned_fd(directory, *metadata)
+                        .map_err(|error| SandboxRpcError::InvalidCapabilities(error.to_string()))?;
+                    pipes
+                        .with_scratch(scratch)
+                        .map_err(|error| SandboxRpcError::InvalidCapabilities(error.to_string()))?
+                }
+                None => pipes,
+            };
 
             let mut offer_challenge = [0_u8; 16];
             stream
@@ -1028,6 +1219,8 @@ where
                                     let response = RpcResponse::Success(
                                         RpcSuccess::CdpPipesReady {
                                             transfer_id: transfer_id.clone(),
+                                            egress_proxy_binding: pending.pipes().egress_proxy_binding().cloned().map(Box::new),
+                                            scratch: pending.pipes().scratch().map(|scratch| Box::new(scratch.metadata().clone())),
                                         },
                                     );
                                     let response = serde_json::to_vec(&response).map_err(|error| {
@@ -1060,10 +1253,13 @@ where
                                         return Err(SandboxRpcError::Protocol);
                                     }
 
-                                    let descriptors = [
+                                    let mut descriptors = vec![
                                         pending.pipes().command_writer().as_raw_fd(),
                                         pending.pipes().event_reader().as_raw_fd(),
                                     ];
+                                    if let Some(scratch) = pending.pipes().scratch() {
+                                        descriptors.push(scratch.directory().as_raw_fd());
+                                    }
                                     let marker = [DESCRIPTOR_OFFER];
                                     let bytes_sent = stream
                                         .async_io(Interest::WRITABLE, || {
@@ -1164,6 +1360,12 @@ where
                                     daemon_epoch: config.daemon_epoch,
                                     request_nonce,
                                 }),
+                                RpcRequest::AttachContextEgress { request, .. } => match supervisor.attach_context_egress(request, config.daemon_epoch).await { Ok(binding) => RpcResponse::Success(RpcSuccess::ContextEgressAttached(Box::new(binding))), Err(error) => RpcResponse::Failure(error.into()) },
+                                RpcRequest::RenewContextEgress { binding, lease_ttl_ms, .. } => {
+                                    if binding.sandboxd_epoch() != config.daemon_epoch { RpcResponse::Failure(RpcFailure::from(SandboxError::LaunchFenceMismatch)) }
+                                    else { match supervisor.renew_context_egress(*binding, Duration::from_millis(lease_ttl_ms)).await { Ok(()) => RpcResponse::Success(RpcSuccess::Renewed), Err(error) => RpcResponse::Failure(error.into()) } }
+                                },
+                                RpcRequest::ReleaseContextEgress { request, .. } => match supervisor.release_context_egress(request, config.daemon_epoch).await { Ok(receipt) => RpcResponse::Success(RpcSuccess::ContextEgressReleased(Box::new(receipt))), Err(error) => RpcResponse::Failure(error.into()) },
                                 RpcRequest::CreateShard {
                                     sandboxd_epoch: _,
                                     shard_id,
@@ -1171,7 +1373,9 @@ where
                                     worker_epoch,
                                     tenant_id,
                                     chromium_binary_digest,
+                                    process_profile,
                                     dedicated_egress,
+                                    context_route_policy,
                                     lease_ttl_ms,
                                 } => {
                                     let lease_ttl = Duration::from_millis(lease_ttl_ms);
@@ -1190,8 +1394,9 @@ where
                                             worker_id.clone(),
                                             worker_epoch,
                                             chromium_binary_digest,
+                                            process_profile,
                                             dedicated_egress,
-                                        ) {
+                                        ).and_then(|spec| match context_route_policy { Some(policy) => spec.with_context_route_policy(policy), None => Ok(spec) }) {
                                             Ok(spec) => match supervisor
                                                 .create_shard(
                                                     spec,
@@ -1334,6 +1539,8 @@ pub enum SandboxRpcError {
     Protocol,
     #[error("sandbox RPC server UID mismatch: expected {expected}, received {received}")]
     PeerUidMismatch { expected: u32, received: u32 },
+    #[error("sandbox RPC server process identity mismatch")]
+    PeerProcessMismatch,
     #[error("sandbox RPC returned invalid CDP capabilities: {0}")]
     InvalidCapabilities(String),
     #[error("sandbox RPC serialization failed: {0}")]
@@ -1349,4 +1556,94 @@ pub enum SandboxRpcError {
     ConnectionTaskFailed,
     #[error("sandbox shutdown left {pending_shards} shard(s) requiring restart reconciliation")]
     ShutdownIncomplete { pending_shards: usize },
+}
+
+#[cfg(test)]
+mod server_identity_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn mismatched_peer_pid_or_start_rejects_before_request_bytes() {
+        let directory = tempfile::tempdir().expect("private socket directory");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", std::process::id()))
+            .expect("self stat");
+        let ticks = stat
+            .rsplit_once(") ")
+            .expect("stat fields")
+            .1
+            .split_whitespace()
+            .nth(19)
+            .expect("start ticks")
+            .parse::<u64>()
+            .expect("ticks");
+        for (index, expected) in [
+            crate::ChildIdentity::new(std::process::id() + 1, ticks),
+            crate::ChildIdentity::new(std::process::id(), ticks + 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = directory.path().join(format!("identity-{index}.sock"));
+            let listener = UnixListener::bind(&path).expect("listener");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("connection");
+                let mut bytes = [0; 16];
+                stream.read(&mut bytes).await.expect("EOF after rejection")
+            });
+            let client = SandboxRpcClient::new(
+                &path,
+                4096,
+                Duration::from_secs(1),
+                nix::unistd::Uid::effective().as_raw(),
+                1,
+            )
+            .expect("client")
+            .with_expected_server_identity(expected);
+            assert!(matches!(
+                client
+                    .probe_daemon_epoch(&WorkerId::new("identity-test").expect("worker"), 1)
+                    .await,
+                Err(SandboxRpcError::PeerProcessMismatch)
+            ));
+            assert_eq!(server.await.expect("server task"), 0);
+        }
+    }
+    #[tokio::test]
+    async fn exact_peer_pin_and_legacy_unpinned_connect_remain_usable() {
+        let directory = tempfile::tempdir().expect("socket directory");
+        let path = directory.path().join("matching.sock");
+        let listener = UnixListener::bind(&path).expect("listener");
+        let stat =
+            std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).expect("stat");
+        let ticks = stat
+            .rsplit_once(") ")
+            .expect("fields")
+            .1
+            .split_whitespace()
+            .nth(19)
+            .expect("ticks")
+            .parse::<u64>()
+            .expect("start");
+        let client = SandboxRpcClient::new(
+            &path,
+            4096,
+            Duration::from_secs(1),
+            nix::unistd::Uid::effective().as_raw(),
+            1,
+        )
+        .expect("client");
+        for client in [
+            client.clone(),
+            client.with_expected_server_identity(crate::ChildIdentity::new(
+                std::process::id(),
+                ticks,
+            )),
+        ] {
+            let stream = client.connect().await.expect("authenticated connection");
+            let (server, _) = listener.accept().await.expect("accepted");
+            drop(stream);
+            drop(server);
+        }
+    }
 }

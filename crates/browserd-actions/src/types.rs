@@ -71,11 +71,41 @@ pub enum ActionKind {
     Mutating,
 }
 
+/// A finite result allowance chosen from the validated action, never a client byte budget.
+/// Older accepted journal/coordination records retain the standard allowance.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionResultBudget {
+    #[default]
+    Standard,
+    Snapshot,
+}
+
+impl ActionResultBudget {
+    #[must_use]
+    pub const fn max_bytes(self) -> usize {
+        match self {
+            Self::Standard => MAX_ACTION_RESULT_CONTENT_BYTES,
+            Self::Snapshot => MAX_SNAPSHOT_RESULT_CONTENT_BYTES,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_valid_for(self, kind: ActionKind) -> bool {
+        matches!(self, Self::Standard) || matches!(kind, ActionKind::ReadOnly)
+    }
+
+    pub(crate) fn is_standard(&self) -> bool {
+        *self == Self::Standard
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionRequest {
     idempotency_key: IdempotencyKey,
     canonical_request_hash: CanonicalRequestHash,
     kind: ActionKind,
+    result_budget: ActionResultBudget,
 }
 
 impl ActionRequest {
@@ -89,6 +119,7 @@ impl ActionRequest {
             idempotency_key,
             canonical_request_hash,
             kind,
+            result_budget: ActionResultBudget::Standard,
         }
     }
 
@@ -105,6 +136,18 @@ impl ActionRequest {
     #[must_use]
     pub const fn kind(&self) -> ActionKind {
         self.kind
+    }
+
+    /// The caller must derive this finite profile from its normalized, validated command.
+    #[must_use]
+    pub const fn with_result_budget(mut self, result_budget: ActionResultBudget) -> Self {
+        self.result_budget = result_budget;
+        self
+    }
+
+    #[must_use]
+    pub const fn result_budget(&self) -> ActionResultBudget {
+        self.result_budget
     }
 }
 
@@ -189,6 +232,8 @@ pub enum KnownFailureReason {
     ApprovalDenied,
     ApprovalTimedOut,
     ExecutionTimedOut,
+    SnapshotTooLarge,
+    DocumentChanged,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -328,8 +373,10 @@ pub struct ActionSnapshotFacts {
     pub result_content: Option<Vec<u8>>,
 }
 
-/// Maximum size of surfaced action result content, matching the worker's result cap.
+/// Default result-content cap for standard actions and legacy accepted records.
 pub const MAX_ACTION_RESULT_CONTENT_BYTES: usize = 64 * 1024;
+/// Result-content cap selected only for a normalized read-only snapshot action.
+pub const MAX_SNAPSHOT_RESULT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ActionSnapshotReconstructionError;
@@ -360,8 +407,17 @@ impl ActionSnapshot {
     pub fn from_facts(
         facts: ActionSnapshotFacts,
     ) -> Result<Self, ActionSnapshotReconstructionError> {
+        Self::from_facts_with_result_budget(facts, ActionResultBudget::Standard)
+    }
+
+    /// Reconstruct using the trusted accepted action profile, never one inferred from a body.
+    pub fn from_facts_with_result_budget(
+        facts: ActionSnapshotFacts,
+        result_budget: ActionResultBudget,
+    ) -> Result<Self, ActionSnapshotReconstructionError> {
         let idempotency_key = facts.idempotency_key.as_str();
-        if facts.action_sequence.get() == 0
+        if !result_budget.is_valid_for(facts.kind)
+            || facts.action_sequence.get() == 0
             || idempotency_key.is_empty()
             || idempotency_key.len() > 255
             || idempotency_key.trim() != idempotency_key
@@ -411,7 +467,7 @@ impl ActionSnapshot {
                 ))
             || facts.result_content.as_ref().is_some_and(|content| {
                 content.is_empty()
-                    || content.len() > MAX_ACTION_RESULT_CONTENT_BYTES
+                    || content.len() > result_budget.max_bytes()
                     || !matches!(facts.terminal_detail, Some(TerminalDetail::Succeeded(_)))
             })
         {
@@ -424,7 +480,8 @@ impl ActionSnapshot {
                 facts.idempotency_key,
                 facts.canonical_request_hash,
                 facts.kind,
-            ),
+            )
+            .with_result_budget(result_budget),
             state: facts.state,
             dispatch_permit: None,
             dispatch_acknowledged: facts.dispatch_acknowledged,
@@ -621,6 +678,12 @@ pub struct JournalEntry {
     pub(crate) action_id: ActionId,
     pub(crate) action_sequence: ActionSequence,
     pub(crate) kind: JournalEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approval_id: Option<browserd_core::ApprovalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) notifications: Option<browserd_core::NotificationCommit>,
+    #[serde(default, skip_serializing_if = "ActionResultBudget::is_standard")]
+    pub(crate) result_budget: ActionResultBudget,
 }
 
 impl JournalEntry {
@@ -637,6 +700,9 @@ impl JournalEntry {
             action_id,
             action_sequence,
             kind,
+            approval_id: None,
+            notifications: None,
+            result_budget: ActionResultBudget::Standard,
         }
     }
 
@@ -669,6 +735,21 @@ impl JournalEntry {
     pub const fn kind(&self) -> &JournalEntryKind {
         &self.kind
     }
+
+    #[must_use]
+    pub const fn approval_id(&self) -> Option<&browserd_core::ApprovalId> {
+        self.approval_id.as_ref()
+    }
+
+    #[must_use]
+    pub const fn notifications(&self) -> Option<&browserd_core::NotificationCommit> {
+        self.notifications.as_ref()
+    }
+
+    #[must_use]
+    pub const fn result_budget(&self) -> ActionResultBudget {
+        self.result_budget
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -696,6 +777,10 @@ impl std::error::Error for JournalError {}
 pub trait DurableActionJournal: Send + Sync {
     /// Returns only after the entry is durably committed.
     fn append(&self, entry: &JournalEntry) -> Result<(), JournalError>;
+
+    fn notification_source(&self) -> Option<browserd_core::NotificationSourceScope> {
+        None
+    }
 }
 
 pub trait ReplayableActionJournal: DurableActionJournal {
@@ -708,6 +793,7 @@ pub enum ActionLedgerError {
     JournalUnavailable(JournalError),
     RecoveryInvalid(JournalError),
     StateUnavailable,
+    InvalidResultBudget,
     StaleFence {
         expected: PlacementFence,
         received: PlacementFence,

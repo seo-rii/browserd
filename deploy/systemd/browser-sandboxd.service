@@ -1,0 +1,25 @@
+[Unit]
+Description=browserd sandbox supervisor (single host)
+Requires=browser-egressd.service
+BindsTo=browser-egressd.service
+After=browser-egressd.service
+
+[Service]
+Type=exec
+User=browserd
+Group=browserd
+EnvironmentFile=/etc/browserd/browserd.env
+ExecStart=/bin/sh ${BROWSERD_RELEASE_ROOT}/deploy/run-sandbox.sh
+ExecStartPost=/usr/bin/python3 ${BROWSERD_RELEASE_ROOT}/deploy/wait_ready.py sandbox
+StateDirectory=browserd/sandbox browserd/sandbox/journal browserd/sandboxes
+StateDirectoryMode=0700
+Delegate=yes
+TasksMax=4096
+UMask=0077
+Restart=no
+TimeoutStartSec=120
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

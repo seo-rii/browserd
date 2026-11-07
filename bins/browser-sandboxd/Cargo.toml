@@ -10,6 +10,7 @@ publish.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 browser-egressd = { path = "../browser-egressd" }
+browserd-chromium = { path = "../../crates/browserd-chromium" }
 browserd-core = { path = "../../crates/browserd-core" }
 browserd-egress-control = { path = "../../crates/browserd-egress-control" }
 browserd-sandbox = { path = "../../crates/browserd-sandbox" }

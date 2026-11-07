@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use browserd_core::{SessionId, ShardFence, TenantId};
 use browserd_session::OwnershipFence;
 use browserd_targets::{
-    BootstrapBackend, BootstrapStageFailure, PausedTarget, TargetBootstrapBarrier,
+    BootstrapBackend, BootstrapDisposition, BootstrapStageFailure, PausedTarget,
+    TargetBootstrapBarrier,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -97,6 +98,7 @@ struct ManagerState {
     tainted: AtomicBool,
     drain_started: AtomicBool,
     ready_targets: Mutex<BTreeSet<String>>,
+    closing_targets: Mutex<BTreeSet<String>>,
     target_changed: Condvar,
 }
 
@@ -117,6 +119,43 @@ pub(crate) struct TargetReadiness {
 }
 
 impl TargetReadiness {
+    pub(crate) fn wait_until_targets_absent(
+        &self,
+        targets: &[String],
+        timeout: Duration,
+    ) -> Result<(), ShardRuntimeError> {
+        if targets.len() > MAX_BOOTSTRAP_TARGETS {
+            return Err(ShardRuntimeError::Rejected);
+        }
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or(ShardRuntimeError::Rejected)?;
+        let mut ready = self
+            .state
+            .ready_targets
+            .lock()
+            .map_err(|_| ShardRuntimeError::Unavailable)?;
+        loop {
+            if self.state.tainted.load(Ordering::Acquire) {
+                return Err(ShardRuntimeError::OutcomeUncertain);
+            }
+            if targets.iter().all(|target| !ready.contains(target)) {
+                return Ok(());
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(ShardRuntimeError::OutcomeUncertain)?;
+            let (guard, result) = self
+                .state
+                .target_changed
+                .wait_timeout(ready, remaining)
+                .map_err(|_| ShardRuntimeError::Unavailable)?;
+            ready = guard;
+            if result.timed_out() && targets.iter().any(|target| ready.contains(target)) {
+                return Err(ShardRuntimeError::OutcomeUncertain);
+            }
+        }
+    }
     pub(crate) fn wait_until_ready(
         &self,
         target_id: &str,
@@ -352,6 +391,7 @@ where
                 tainted: AtomicBool::new(false),
                 drain_started: AtomicBool::new(false),
                 ready_targets: Mutex::new(BTreeSet::new()),
+                closing_targets: Mutex::new(BTreeSet::new()),
                 target_changed: Condvar::new(),
             }),
             pump: EventPumpControl {
@@ -414,19 +454,30 @@ where
     async fn bootstrap_target(&self, target: PausedTarget) -> Result<(), BootstrapStageFailure> {
         let target_id = target.target_id().to_owned();
         let backend = self.backend.clone();
-        tokio::task::spawn_blocking(move || {
+        let disposition = tokio::task::spawn_blocking(move || {
             let mut backend = backend
                 .lock()
                 .map_err(|_| BootstrapStageFailure::StateOverflow)?;
             TargetBootstrapBarrier::new()
-                .bootstrap(&target, &mut *backend)
-                .map(|_| ())
+                .bootstrap_with_disposition(&target, &mut *backend)
                 .map_err(|error| match error {
                     browserd_targets::BootstrapError::StageFailed { cause, .. } => cause,
                 })
         })
         .await
         .map_err(|_| BootstrapStageFailure::StateOverflow)??;
+        if disposition != BootstrapDisposition::Completed {
+            let mut closing = self
+                .state
+                .closing_targets
+                .lock()
+                .map_err(|_| BootstrapStageFailure::StateOverflow)?;
+            if closing.len() >= MAX_BOOTSTRAP_TARGETS || !closing.insert(target_id) {
+                return Err(BootstrapStageFailure::StateOverflow);
+            }
+            self.state.target_changed.notify_all();
+            return Ok(());
+        }
         let mut ready_targets = self
             .state
             .ready_targets
@@ -467,7 +518,7 @@ where
                                 .map_err(|_| ())
                                 .and_then(|mut backend| {
                                     TargetBootstrapBarrier::new()
-                                        .bootstrap(&target, &mut *backend)
+                                        .bootstrap_with_disposition(&target, &mut *backend)
                                         .map_err(|_| ())
                                 })
                         });
@@ -481,7 +532,24 @@ where
                                 result.map_err(|_| ()).and_then(|result| result)
                             }
                         };
-                        if result.is_ok() {
+                        if matches!(
+                            result,
+                            Ok(BootstrapDisposition::OwnedClosing
+                                | BootstrapDisposition::OwnedRetired)
+                        ) {
+                            let inserted = state
+                                .closing_targets
+                                .lock()
+                                .map(|mut closing| {
+                                    closing.len() < MAX_BOOTSTRAP_TARGETS
+                                        && closing.insert(target_id)
+                                })
+                                .unwrap_or(false);
+                            if inserted {
+                                state.target_changed.notify_all();
+                                continue;
+                            }
+                        } else if result == Ok(BootstrapDisposition::Completed) {
                             let inserted = state
                                 .ready_targets
                                 .lock()
@@ -499,7 +567,12 @@ where
                             .lock()
                             .map(|mut ready_targets| ready_targets.remove(&target_id))
                             .unwrap_or(false);
-                        if removed {
+                        let closing_removed = state
+                            .closing_targets
+                            .lock()
+                            .map(|mut closing| closing.remove(&target_id))
+                            .unwrap_or(false);
+                        if removed || closing_removed {
                             state.target_changed.notify_all();
                             continue;
                         }
@@ -597,5 +670,189 @@ fn taint_and_drain<D: TargetManagerDrain>(state: &ManagerState, drain: &D) {
     state.target_changed.notify_all();
     if !state.drain_started.swap(true, Ordering::AcqRel) {
         drain.begin_drain();
+    }
+}
+
+#[cfg(test)]
+mod context_retirement_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use browserd_core::{LaunchGeneration, OwnerFence, ShardId, WorkerEpoch, WorkerId};
+    use browserd_targets::{BootstrapStage, ShardTaintReason, TargetKind};
+    use std::sync::atomic::AtomicUsize;
+
+    struct Drain(AtomicUsize);
+    impl TargetManagerDrain for Drain {
+        fn begin_drain(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct Backend {
+        stages: Arc<Mutex<Vec<(String, BootstrapStage)>>>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl BootstrapBackend for Backend {
+        fn run_stage(
+            &mut self,
+            target: &PausedTarget,
+            stage: BootstrapStage,
+        ) -> Result<(), BootstrapStageFailure> {
+            self.stages
+                .lock()
+                .expect("stages")
+                .push((target.target_id().to_owned(), stage));
+            Ok(())
+        }
+        fn run_stage_with_disposition(
+            &mut self,
+            target: &PausedTarget,
+            stage: BootstrapStage,
+        ) -> Result<BootstrapDisposition, BootstrapStageFailure> {
+            self.run_stage(target, stage)?;
+            if target.target_id() == "unowned" {
+                return Err(BootstrapStageFailure::UnknownOwnership);
+            }
+            if target.target_id() == "closing-worker" && stage == BootstrapStage::ApplyEmulation {
+                let (lock, changed) = &*self.gate;
+                let open = lock.lock().expect("gate");
+                let (open, result) = changed
+                    .wait_timeout_while(open, Duration::from_secs(2), |open| !*open)
+                    .expect("gate wait");
+                if result.timed_out() || !*open {
+                    return Err(BootstrapStageFailure::StateOverflow);
+                }
+                return Ok(BootstrapDisposition::OwnedClosing);
+            }
+            Ok(BootstrapDisposition::Completed)
+        }
+        fn close_paused_target(&mut self, _target: &PausedTarget) {}
+        fn taint_shard(&mut self, _reason: ShardTaintReason) {}
+    }
+    impl TargetManagerBackend for Backend {
+        fn enable_auto_attach_and_snapshot(
+            &mut self,
+        ) -> Result<TargetBootstrapSnapshot, ShardRuntimeError> {
+            TargetBootstrapSnapshot::new(
+                vec![PausedTarget::new("sibling", TargetKind::Page)],
+                vec![],
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_paused_worker_never_becomes_ready_and_sibling_remains_live() {
+        let drain = Arc::new(Drain(AtomicUsize::new(0)));
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let fence = ShardFence::new(
+            OwnerFence::new(
+                WorkerId::new("retirement-test").expect("worker"),
+                WorkerEpoch::new(1).expect("epoch"),
+            ),
+            ShardId::new(),
+            LaunchGeneration::new(1).expect("launch"),
+        );
+        let (manager, ingress) = ProductionTargetManager::new_bounded(
+            fence,
+            Backend {
+                stages: stages.clone(),
+                gate: gate.clone(),
+            },
+            8,
+            drain.clone(),
+        )
+        .expect("manager");
+        manager.bootstrap().await.expect("sibling bootstrap");
+        ingress
+            .try_send(TargetManagerEvent::Attached(PausedTarget::new(
+                "closing-worker",
+                TargetKind::SharedWorker,
+            )))
+            .expect("paused attach");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !stages
+                .lock()
+                .expect("stages")
+                .iter()
+                .any(|(target, stage)| {
+                    target == "closing-worker" && *stage == BootstrapStage::ApplyEmulation
+                })
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker paused at deterministic stage");
+        ingress
+            .try_send(TargetManagerEvent::Detached {
+                target_id: "closing-worker".to_owned(),
+            })
+            .expect("exact retirement");
+        let (open, changed) = &*gate;
+        *open.lock().expect("gate") = true;
+        changed.notify_all();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager
+                .state
+                .closing_targets
+                .lock()
+                .expect("closing")
+                .contains("closing-worker")
+                || stages
+                    .lock()
+                    .expect("stages")
+                    .iter()
+                    .filter(|(target, _)| target == "closing-worker")
+                    .count()
+                    < 8
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement processed");
+        assert!(manager.has_ready_target("sibling"));
+        assert!(!manager.has_ready_target("closing-worker"));
+        assert!(
+            !stages
+                .lock()
+                .expect("stages")
+                .contains(&("closing-worker".to_owned(), BootstrapStage::Resume))
+        );
+        assert!(!manager.is_tainted());
+        assert_eq!(drain.0.load(Ordering::SeqCst), 0);
+        manager
+            .readiness()
+            .wait_until_targets_absent(&["closing-worker".to_owned()], Duration::from_millis(20))
+            .expect("sibling excluded from close barrier");
+        ingress
+            .try_send(TargetManagerEvent::Attached(PausedTarget::new(
+                "unowned",
+                TargetKind::Iframe,
+            )))
+            .expect("unowned attach");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !manager.is_tainted() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unowned still fails closed");
+        assert_eq!(drain.0.load(Ordering::SeqCst), 1);
+        assert!(
+            stages
+                .lock()
+                .expect("stages")
+                .contains(&("unowned".to_owned(), BootstrapStage::AttributeOwnership)),
+            "closing retirement must not taint before the separate unowned target"
+        );
+        assert_eq!(
+            manager.readiness().wait_until_targets_absent(
+                &["closing-worker".to_owned()],
+                Duration::from_millis(20)
+            ),
+            Err(ShardRuntimeError::OutcomeUncertain)
+        );
+        manager.shutdown().await.expect("shutdown");
     }
 }

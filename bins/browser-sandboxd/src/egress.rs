@@ -14,7 +14,7 @@ use browserd_egress_control::{
 use browserd_sandbox::{
     EgressRouteBackend, NetworkNamespaceIdentity, PinnedNetworkNamespace, SandboxError,
     ShardEgressReservation, ShardIngressLease, ShardIngressReceipt,
-    create_dedicated_egress_listener,
+    create_native_dedicated_egress_listener,
 };
 use futures::{FutureExt, StreamExt};
 use reqwest::{Client, StatusCode};
@@ -149,6 +149,16 @@ pub struct PreparedRouteReceipt {
 }
 
 impl PreparedRouteReceipt {
+    #[cfg(test)]
+    pub(crate) fn fixture(request: PrepareRouteRequest) -> Self {
+        Self {
+            daemon_epoch: request.daemon_epoch,
+            egress_fence: request.egress_fence,
+            binding_digest: request.binding_digest,
+            prepare_revision: 1,
+        }
+    }
+
     #[must_use]
     pub const fn daemon_epoch(&self) -> u64 {
         self.daemon_epoch
@@ -294,6 +304,16 @@ impl RenewedRouteLeaseReceipt {
 }
 
 impl RouteStatusReceipt {
+    #[cfg(test)]
+    pub(crate) fn released_fixture(daemon_epoch: u64, egress_fence: EgressFence) -> Self {
+        Self {
+            daemon_epoch,
+            egress_fence,
+            state: RouteStatusState::Released,
+            active: None,
+        }
+    }
+
     #[must_use]
     pub const fn daemon_epoch(&self) -> u64 {
         self.daemon_epoch
@@ -339,11 +359,22 @@ pub struct PrepareRouteRequest {
     pub binding_digest: [u8; 32],
     pub profile: String,
     pub lease_ttl: Duration,
+    pub shared_context: bool,
 }
 
 #[async_trait]
 pub trait EgressControlPlane: Send + Sync + 'static {
     async fn current_daemon_epoch(&self) -> Result<u64, EgressControlError>;
+
+    async fn retire_shard(
+        &self,
+        _daemon_epoch: u64,
+        _fence: &browserd_core::ShardFence,
+    ) -> Result<(), EgressControlError> {
+        Err(EgressControlError::Protocol(
+            "shard retirement unsupported".into(),
+        ))
+    }
 
     async fn prepare(
         &self,
@@ -376,6 +407,71 @@ pub trait EgressControlPlane: Send + Sync + 'static {
         daemon_epoch: u64,
         fence: &EgressFence,
     ) -> Result<Option<RouteStatusReceipt>, EgressControlError>;
+}
+
+/// Establishes an exact daemon tombstone before acknowledging an uninstalled cancellation.
+/// A known active route disappearing within the same daemon epoch is never positive cleanup.
+pub(crate) async fn release_context_route_positive<C: EgressControlPlane + ?Sized>(
+    control: &C,
+    epoch: u64,
+    tenant: &TenantId,
+    egress: &browserd_sandbox::DedicatedEgressSpec,
+    known_active: bool,
+) -> Result<(), EgressControlError> {
+    let fence = egress.egress_fence();
+    let status = control.revoke(epoch, fence).await?;
+    if let Some(status) = &status {
+        if status.daemon_epoch != epoch || &status.egress_fence != fence {
+            return Err(EgressControlError::Protocol(
+                "context release identity mismatch".into(),
+            ));
+        }
+        if status.state == RouteStatusState::Released {
+            return Ok(());
+        }
+        if status.state != RouteStatusState::Absent {
+            return Err(EgressControlError::Protocol(
+                "context route is not positively released".into(),
+            ));
+        }
+    }
+    if known_active {
+        return Err(EgressControlError::Protocol(
+            "active context route disappeared without release proof".into(),
+        ));
+    }
+    let prepared = control
+        .prepare(PrepareRouteRequest {
+            daemon_epoch: epoch,
+            tenant_id: tenant.clone(),
+            egress_fence: fence.clone(),
+            binding_digest: *egress.policy_binding().snapshot_digest(),
+            profile: egress.policy_binding().profile().to_owned(),
+            lease_ttl: egress.initial_lease_ttl(),
+            shared_context: true,
+        })
+        .await?;
+    if prepared.daemon_epoch != epoch
+        || &prepared.egress_fence != fence
+        || prepared.binding_digest != *egress.policy_binding().snapshot_digest()
+        || prepared.prepare_revision == 0
+    {
+        return Err(EgressControlError::Protocol(
+            "context cancellation preparation mismatch".into(),
+        ));
+    }
+    match control.revoke(epoch, fence).await? {
+        Some(status)
+            if status.daemon_epoch == epoch
+                && &status.egress_fence == fence
+                && status.state == RouteStatusState::Released =>
+        {
+            Ok(())
+        }
+        _ => Err(EgressControlError::Protocol(
+            "context cancellation lacks release receipt".into(),
+        )),
+    }
 }
 
 #[derive(Clone)]
@@ -496,6 +592,7 @@ struct PrepareApiRequest<'a> {
     binding_digest_hex: String,
     profile: &'a str,
     lease_ttl_millis: u64,
+    shared_context: bool,
 }
 
 #[derive(Deserialize)]
@@ -549,6 +646,39 @@ impl EgressControlPlane for HttpEgressControl {
         self.authenticated_current_daemon_epoch().await
     }
 
+    async fn retire_shard(
+        &self,
+        daemon_epoch: u64,
+        fence: &browserd_core::ShardFence,
+    ) -> Result<(), EgressControlError> {
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            daemon_epoch: u64,
+            shard_fence: browserd_core::ShardFence,
+        }
+        let response: Option<Request> = self
+            .post(
+                "/v1/shards/retire",
+                &self.config.supervisor_token,
+                &Request {
+                    daemon_epoch,
+                    shard_fence: fence.clone(),
+                },
+            )
+            .await?;
+        match response {
+            Some(response)
+                if response.daemon_epoch == daemon_epoch && response.shard_fence == *fence =>
+            {
+                Ok(())
+            }
+            _ => Err(EgressControlError::Protocol(
+                "shard retirement receipt mismatch".into(),
+            )),
+        }
+    }
+
     async fn prepare(
         &self,
         request: PrepareRouteRequest,
@@ -558,7 +688,11 @@ impl EgressControlPlane for HttpEgressControl {
         let response: PrepareApiResponse = self
             .post(
                 "/v1/routes/prepare",
-                &self.config.worker_token,
+                if request.shared_context {
+                    &self.config.supervisor_token
+                } else {
+                    &self.config.worker_token
+                },
                 &PrepareApiRequest {
                     daemon_epoch: request.daemon_epoch,
                     tenant_id: &request.tenant_id,
@@ -566,6 +700,7 @@ impl EgressControlPlane for HttpEgressControl {
                     binding_digest_hex: hex::encode(request.binding_digest),
                     profile: &request.profile,
                     lease_ttl_millis,
+                    shared_context: request.shared_context,
                 },
             )
             .await?
@@ -713,7 +848,7 @@ impl EgressListenerFactory for ExactListenerFactory {
         &self,
         namespace: &PinnedNetworkNamespace,
     ) -> Result<ListenerCapability, SandboxError> {
-        let listener = create_dedicated_egress_listener(namespace)
+        let listener = create_native_dedicated_egress_listener(namespace)
             .map_err(|error| SandboxError::Backend(error.to_string()))?;
         let (descriptor, receipt) = listener.into_parts();
         Ok(ListenerCapability {
@@ -750,6 +885,7 @@ enum LocalRouteState {
 
 struct LocalRoute {
     reservation: ShardEgressReservation,
+    known_active: bool,
     state: LocalRouteState,
     renewal_operation: Arc<Mutex<()>>,
 }
@@ -914,7 +1050,7 @@ impl EgressRouteAdapter {
             .ok_or_else(|| SandboxError::Backend("missing exact egress fence".into()))?
             .clone();
         let generation = reservation.generation().clone();
-        {
+        let known_active = {
             let mut routes = self.routes.lock().await;
             match routes.get_mut(&generation) {
                 Some(route) if route.reservation == *reservation => {
@@ -926,13 +1062,15 @@ impl EgressRouteAdapter {
                         generation.clone(),
                         LocalRoute {
                             reservation: reservation.clone(),
+                            known_active: false,
                             state: LocalRouteState::Terminal,
                             renewal_operation: Arc::new(Mutex::new(())),
                         },
                     );
                 }
             }
-        }
+            routes.get(&generation).is_some_and(|row| row.known_active)
+        };
         let control = Arc::clone(&self.control);
         let routes = Arc::clone(&self.routes);
         let daemon_epoch = self.daemon_epoch;
@@ -948,22 +1086,43 @@ impl EgressRouteAdapter {
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
             let _revoke_permit = revoke_permit;
-            let result = control
-                .revoke(daemon_epoch, &fence)
-                .await
-                .and_then(|status| {
-                    if status.as_ref().is_none_or(|receipt| {
-                        receipt.daemon_epoch == daemon_epoch
-                            && receipt.egress_fence == fence
-                            && receipt.state.is_terminal()
-                    }) {
-                        Ok(())
-                    } else {
-                        Err(EgressControlError::Protocol(
-                            "revoke did not reach an exact terminal receipt".into(),
-                        ))
+            let result = if expected_reservation.is_shared() {
+                match (
+                    expected_reservation.tenant_id(),
+                    expected_reservation.dedicated_egress(),
+                ) {
+                    (Some(tenant), Some(egress)) => {
+                        release_context_route_positive(
+                            control.as_ref(),
+                            daemon_epoch,
+                            tenant,
+                            egress,
+                            known_active,
+                        )
+                        .await
                     }
-                });
+                    _ => Err(EgressControlError::Protocol(
+                        "missing context release identity".into(),
+                    )),
+                }
+            } else {
+                control
+                    .revoke(daemon_epoch, &fence)
+                    .await
+                    .and_then(|status| {
+                        if status.as_ref().is_none_or(|receipt| {
+                            receipt.daemon_epoch == daemon_epoch
+                                && receipt.egress_fence == fence
+                                && receipt.state.is_terminal()
+                        }) {
+                            Ok(())
+                        } else {
+                            Err(EgressControlError::Protocol(
+                                "revoke did not reach an exact terminal receipt".into(),
+                            ))
+                        }
+                    })
+            };
             if result.is_ok()
                 && let Some(route) = routes.lock().await.get_mut(&generation)
                 && route.reservation == expected_reservation
@@ -981,6 +1140,13 @@ impl EgressRouteAdapter {
 
 #[async_trait]
 impl EgressRouteBackend for EgressRouteAdapter {
+    async fn retire_shard(&self, fence: &browserd_core::ShardFence) -> Result<(), SandboxError> {
+        self.control
+            .retire_shard(self.daemon_epoch, fence)
+            .await
+            .map_err(|_| SandboxError::Backend("egress shard retirement failed".into()))
+    }
+
     async fn prepare(&self, reservation: &ShardEgressReservation) -> Result<(), SandboxError> {
         let tenant_id = reservation
             .tenant_id()
@@ -1018,6 +1184,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
                         generation.clone(),
                         LocalRoute {
                             reservation: reservation.clone(),
+                            known_active: false,
                             state: LocalRouteState::Preparing,
                             renewal_operation: Arc::new(Mutex::new(())),
                         },
@@ -1033,7 +1200,10 @@ impl EgressRouteBackend for EgressRouteAdapter {
                 egress_fence: dedicated.egress_fence().clone(),
                 binding_digest: *dedicated.policy_binding().snapshot_digest(),
                 profile: dedicated.policy_binding().profile().to_owned(),
-                lease_ttl: dedicated.initial_lease_ttl(),
+                lease_ttl: reservation
+                    .initial_lease_ttl()
+                    .ok_or(SandboxError::InvalidEgressLease)?,
+                shared_context: reservation.is_shared(),
             })
             .await
             .map_err(|error| SandboxError::Backend(error.to_string()))?;
@@ -1096,7 +1266,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
                         request,
                         address: listener.address,
                         namespace: listener.namespace,
-                        receipt: ShardIngressReceipt::new(),
+                        receipt: ShardIngressReceipt::with_proxy_address(listener.address)?,
                     };
                     route.state = LocalRouteState::Installing(pending.clone());
                     AttachPlan::Install(pending, listener)
@@ -1179,6 +1349,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
                                                         == pending_for_task.request.transfer_id()
                                             ) =>
                                     {
+                                        route.known_active = true;
                                         route.state = LocalRouteState::Active(ActiveRoute {
                                             pending: pending_for_task.clone(),
                                             active,
@@ -1227,6 +1398,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
                 "egress generation is terminal".into(),
             ));
         }
+        route.known_active = true;
         route.state = LocalRouteState::Active(ActiveRoute {
             pending: pending.clone(),
             active,
@@ -1246,7 +1418,17 @@ impl EgressRouteBackend for EgressRouteAdapter {
         &self,
         reservation: &ShardEgressReservation,
     ) -> Result<(), SandboxError> {
-        self.revoke_generation(reservation).await
+        self.revoke_generation(reservation).await?;
+        if !reservation.is_shared() {
+            self.retire_shard(
+                reservation
+                    .egress_fence()
+                    .ok_or(SandboxError::LaunchFenceMismatch)?
+                    .shard(),
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn renew(
@@ -1380,7 +1562,7 @@ impl EgressRouteBackend for EgressRouteAdapter {
     }
 
     async fn release(&self, lease: &ShardIngressLease) -> Result<(), SandboxError> {
-        self.revoke_generation(lease.reservation()).await
+        self.release_reservation(lease.reservation()).await
     }
 
     async fn is_active(&self, lease: &ShardIngressLease) -> Result<bool, SandboxError> {
@@ -1616,6 +1798,7 @@ mod tests {
         install_entered: Arc<Notify>,
         install_release: Arc<Notify>,
         block_install: bool,
+        install_wait_registration: Option<Arc<Semaphore>>,
         revoke_entered: Arc<Notify>,
         revoke_release: Arc<Notify>,
         block_revoke: bool,
@@ -1642,6 +1825,7 @@ mod tests {
                 install_entered: Arc::new(Notify::new()),
                 install_release: Arc::new(Notify::new()),
                 block_install: false,
+                install_wait_registration: None,
                 revoke_entered: Arc::new(Notify::new()),
                 revoke_release: Arc::new(Notify::new()),
                 block_revoke: false,
@@ -1675,6 +1859,13 @@ mod tests {
             Ok(DAEMON_EPOCH)
         }
 
+        async fn retire_shard(
+            &self,
+            _daemon_epoch: u64,
+            _fence: &browserd_core::ShardFence,
+        ) -> Result<(), EgressControlError> {
+            Ok(())
+        }
         async fn prepare(
             &self,
             request: PrepareRouteRequest,
@@ -1699,6 +1890,12 @@ mod tests {
         ) -> Result<ActiveInstallResponse, EgressControlError> {
             self.install_entered.notify_one();
             if self.block_install {
+                if let Some(registration) = &self.install_wait_registration {
+                    let _permit = registration
+                        .acquire()
+                        .await
+                        .expect("install waiter registration gate should remain open");
+                }
                 self.install_release.notified().await;
             }
             assert!(!self.install_panics, "injected install owner panic");
@@ -1808,6 +2005,136 @@ mod tests {
         }
     }
 
+    struct ContextCancelControl {
+        absent_status: bool,
+        prepared: AtomicBool,
+        prepares: AtomicUsize,
+        revokes: AtomicUsize,
+    }
+    #[async_trait]
+    impl EgressControlPlane for ContextCancelControl {
+        async fn current_daemon_epoch(&self) -> Result<u64, EgressControlError> {
+            Ok(DAEMON_EPOCH)
+        }
+        async fn prepare(
+            &self,
+            request: PrepareRouteRequest,
+        ) -> Result<PreparedRouteReceipt, EgressControlError> {
+            self.prepares.fetch_add(1, Ordering::SeqCst);
+            self.prepared.store(true, Ordering::SeqCst);
+            Ok(PreparedRouteReceipt {
+                daemon_epoch: request.daemon_epoch,
+                egress_fence: request.egress_fence,
+                binding_digest: request.binding_digest,
+                prepare_revision: 1,
+            })
+        }
+        #[allow(clippy::panic)]
+        async fn install(
+            &self,
+            _request: InstallRequest,
+            _listener: OwnedFd,
+        ) -> Result<ActiveInstallResponse, EgressControlError> {
+            panic!("cancellation must never allocate or install a listener")
+        }
+        async fn status(
+            &self,
+            epoch: u64,
+            fence: &EgressFence,
+        ) -> Result<Option<RouteStatusReceipt>, EgressControlError> {
+            Ok(
+                if self.prepared.load(Ordering::SeqCst) || self.absent_status {
+                    Some(RouteStatusReceipt {
+                        daemon_epoch: epoch,
+                        egress_fence: fence.clone(),
+                        state: if self.prepared.load(Ordering::SeqCst) {
+                            RouteStatusState::Released
+                        } else {
+                            RouteStatusState::Absent
+                        },
+                        active: None,
+                    })
+                } else {
+                    None
+                },
+            )
+        }
+        async fn revoke(
+            &self,
+            epoch: u64,
+            fence: &EgressFence,
+        ) -> Result<Option<RouteStatusReceipt>, EgressControlError> {
+            self.revokes.fetch_add(1, Ordering::SeqCst);
+            self.status(epoch, fence).await
+        }
+    }
+    #[tokio::test]
+    async fn shared_active_route_requires_positive_release_not_absence_in_same_epoch() {
+        let spec = launch_spec();
+        for absent_status in [false, true] {
+            let control = ContextCancelControl {
+                absent_status,
+                prepared: AtomicBool::new(false),
+                prepares: AtomicUsize::new(0),
+                revokes: AtomicUsize::new(0),
+            };
+            assert!(
+                release_context_route_positive(
+                    &control,
+                    DAEMON_EPOCH,
+                    spec.tenant_id(),
+                    spec.dedicated_egress(),
+                    true
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                control.prepares.load(Ordering::SeqCst),
+                0,
+                "known-active disappearance cannot invent a new route"
+            );
+            assert_eq!(control.revokes.load(Ordering::SeqCst), 1);
+        }
+    }
+    #[tokio::test]
+    async fn shared_cancel_before_prepare_obtains_durable_terminal_receipt_before_success() {
+        let spec = launch_spec();
+        for absent_status in [false, true] {
+            let control = ContextCancelControl {
+                absent_status,
+                prepared: AtomicBool::new(false),
+                prepares: AtomicUsize::new(0),
+                revokes: AtomicUsize::new(0),
+            };
+            release_context_route_positive(
+                &control,
+                DAEMON_EPOCH,
+                spec.tenant_id(),
+                spec.dedicated_egress(),
+                false,
+            )
+            .await
+            .expect("exact prepare+cancel proof");
+            assert_eq!(control.prepares.load(Ordering::SeqCst), 1);
+            assert_eq!(control.revokes.load(Ordering::SeqCst), 2);
+            release_context_route_positive(
+                &control,
+                DAEMON_EPOCH,
+                spec.tenant_id(),
+                spec.dedicated_egress(),
+                false,
+            )
+            .await
+            .expect("lost-response replay");
+            assert_eq!(
+                control.prepares.load(Ordering::SeqCst),
+                1,
+                "terminal proof is replayed without new preparation"
+            );
+        }
+    }
+
     fn adapter(control: FakeControl) -> EgressRouteAdapter {
         EgressRouteAdapter::with_components(
             Arc::new(control.clone()),
@@ -1838,6 +2165,7 @@ mod tests {
             .attach(&reservation, &namespace)
             .await
             .expect("Active receipt should commit the exact listener");
+        assert_eq!(receipt.proxy_address(), Some(address));
         let lease =
             ShardIngressLease::from_attachment(reservation.clone(), namespace.identity(), receipt);
         assert!(adapter.is_active(&lease).await.expect("status should work"));
@@ -2035,6 +2363,8 @@ mod tests {
         let address = "127.0.0.1:43122".parse().expect("address should parse");
         let mut control = FakeControl::new(address);
         control.block_install = true;
+        let registration = Arc::new(Semaphore::new(0));
+        control.install_wait_registration = Some(Arc::clone(&registration));
         let adapter = Arc::new(adapter(control.clone()));
         let reservation = ShardEgressReservation::from_launch_spec(&launch_spec());
         adapter
@@ -2050,7 +2380,10 @@ mod tests {
         control.install_entered.notified().await;
         owner.abort();
         owner.await.expect_err("owner should be cancelled");
-        control.install_release.notify_waiters();
+        // Force release before the detached install has registered its waiter,
+        // as can happen when another runtime worker handles cancellation first.
+        control.install_release.notify_one();
+        registration.add_permits(1);
 
         let receipt = tokio::time::timeout(
             Duration::from_secs(1),

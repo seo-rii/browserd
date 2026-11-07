@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
+use browserd_core::SafetySwitchSnapshot;
+
 use crate::ip_policy::{IpDenyReason, IpPolicy};
 use crate::scheme::{NavigationScope, SchemeDecision, SchemePolicy};
 use crate::url::{CanonicalUrl, CanonicalUrlError, canonicalize_host};
@@ -168,6 +170,8 @@ impl ConnectPlan {
 /// A fail-closed connection-planning failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlanError {
+    EmergencyDomainDenied,
+    EmergencyIpDenied,
     SchemeDenied {
         scheme: String,
     },
@@ -214,7 +218,17 @@ impl ConnectionPlanner {
         url: &CanonicalUrl,
         resolution: DnsResolution,
     ) -> Result<ConnectPlan, PlanError> {
+        self.plan_with_safety(url, resolution, None)
+    }
+
+    pub(crate) fn plan_with_safety(
+        &self,
+        url: &CanonicalUrl,
+        resolution: DnsResolution,
+        safety: Option<&SafetySwitchSnapshot>,
+    ) -> Result<ConnectPlan, PlanError> {
         self.authorize(url)?;
+        Self::authorize_safety(url, safety)?;
         if resolution.canonical_host.as_deref() != Some(url.host()) {
             return Err(PlanError::DnsHostMismatch {
                 declared: url.host().to_owned(),
@@ -245,6 +259,9 @@ impl ConnectionPlanner {
                     reason,
                 }
             })?;
+            if safety.is_some_and(|snapshot| snapshot.ip_denied(canonical)) {
+                return Err(PlanError::EmergencyIpDenied);
+            }
             if checked_literal.is_some_and(|literal| literal != canonical) {
                 return Err(PlanError::LiteralAddressMismatch {
                     declared: checked_literal,
@@ -299,6 +316,23 @@ impl ConnectionPlanner {
                 host: url.host().to_owned(),
                 port: url.port(),
             });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_safety(
+        url: &CanonicalUrl,
+        safety: Option<&SafetySwitchSnapshot>,
+    ) -> Result<(), PlanError> {
+        if safety.is_some_and(|snapshot| snapshot.domain_denied(url.host())) {
+            return Err(PlanError::EmergencyDomainDenied);
+        }
+        if url
+            .host()
+            .parse::<IpAddr>()
+            .is_ok_and(|address| safety.is_some_and(|snapshot| snapshot.ip_denied(address)))
+        {
+            return Err(PlanError::EmergencyIpDenied);
         }
         Ok(())
     }

@@ -65,6 +65,26 @@ impl<D> ChromiumDriverShardRuntime<D> {
         }
     }
 
+    fn validate_typed_owner(
+        &self,
+        tenant: &TenantId,
+        session: &SessionId,
+        fence: &OwnershipFence,
+    ) -> Result<(), ApprovedActionError> {
+        let contexts = self
+            .contexts
+            .lock()
+            .map_err(|_| ApprovedActionError::Unavailable)?;
+        match contexts.get(session) {
+            Some(context)
+                if context.tenant_id.as_ref() == Some(tenant) && context.fence == *fence =>
+            {
+                Ok(())
+            }
+            _ => Err(ApprovedActionError::DispatchRevoked),
+        }
+    }
+
     fn create_context_for(
         &self,
         tenant_id: Option<&TenantId>,
@@ -311,6 +331,358 @@ impl<D: ChromiumDriver> ActorChromiumDriver<D> {
 }
 
 impl<D: ChromiumDriver> ChromiumDriver for ActorChromiumDriver<D> {
+    fn effective_isolation(&self) -> crate::WorkerIsolationProfile {
+        self.runtime.driver.effective_isolation()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_typed_approval_until(
+        &self,
+        tenant: &TenantId,
+        session: &SessionId,
+        page: Option<&PageId>,
+        fence: &OwnershipFence,
+        action: &crate::WorkerActionCommand,
+        deadline: Instant,
+    ) -> Result<crate::TypedApprovalObservation, ApprovedActionError> {
+        self.runtime.validate_typed_owner(tenant, session, fence)?;
+        let driver = &self.runtime.driver;
+        // The pinned route forwards the original deadline; its owner validates the optional page.
+        driver.inspect_typed_approval_until(tenant, session, page, fence, action, deadline)
+    }
+
+    fn execute_typed_browser_until(
+        &self,
+        expected: &crate::TypedApprovalObservation,
+        payload: &[u8],
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &crate::TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        self.runtime.validate_typed_owner(
+            &expected.tenant_id,
+            &expected.session_id,
+            &expected.fence,
+        )?;
+        let driver = &self.runtime.driver;
+        driver.execute_typed_browser_until(expected, payload, deadline, authorize_and_commit)
+    }
+
+    fn execute_typed_secret_until(
+        &self,
+        expected: &crate::TypedApprovalObservation,
+        secret: crate::ResolvedSecret,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &crate::TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        self.runtime.validate_typed_owner(
+            &expected.tenant_id,
+            &expected.session_id,
+            &expected.fence,
+        )?;
+        let driver = &self.runtime.driver;
+        driver.execute_typed_secret_until(expected, secret, deadline, authorize_and_commit)
+    }
+
+    fn execute_typed_files_until(
+        &self,
+        expected: &crate::TypedApprovalObservation,
+        files: Vec<crate::BrowserFileAttachment>,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &crate::TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        self.runtime.validate_typed_owner(
+            &expected.tenant_id,
+            &expected.session_id,
+            &expected.fence,
+        )?;
+        let driver = &self.runtime.driver;
+        driver.execute_typed_files_until(expected, files, deadline, authorize_and_commit)
+    }
+
+    fn capture_typed_checkpoint_until(
+        &self,
+        expected: &crate::TypedApprovalObservation,
+        origins: &[String],
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &crate::TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<crate::CheckpointSnapshot, ApprovedActionError> {
+        self.runtime.validate_typed_owner(
+            &expected.tenant_id,
+            &expected.session_id,
+            &expected.fence,
+        )?;
+        let driver = &self.runtime.driver;
+        driver.capture_typed_checkpoint_until(expected, origins, deadline, authorize_and_commit)
+    }
+
+    fn execute_typed_capture_until(
+        &self,
+        expected: &crate::TypedApprovalObservation,
+        command: browserd_features::CaptureCommand,
+        request: crate::GeneratedArtifactRequest,
+        store: Arc<dyn crate::SandboxClient>,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &crate::TypedApprovalObservation,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<crate::GeneratedCaptureResult, ApprovedActionError> {
+        self.runtime.validate_typed_owner(
+            &expected.tenant_id,
+            &expected.session_id,
+            &expected.fence,
+        )?;
+        let driver = &self.runtime.driver;
+        driver.execute_typed_capture_until(
+            expected,
+            command,
+            request,
+            store,
+            deadline,
+            authorize_and_commit,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_privileged_evaluate_until(
+        &self,
+        tenant_id: &browserd_core::TenantId,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+        payload: &[u8],
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        self.runtime
+            .primary_page(session_id, fence)
+            .map_err(|_| ApprovedActionError::DispatchRevoked)?;
+        self.runtime.driver.execute_privileged_evaluate_until(
+            tenant_id,
+            session_id,
+            page_id,
+            fence,
+            payload,
+            deadline,
+            authorize_and_commit,
+        )
+    }
+
+    fn capture_checkpoint_until(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        origins: &[String],
+        deadline: Instant,
+    ) -> Result<crate::CheckpointSnapshot, crate::CheckpointError> {
+        self.runtime
+            .primary_page(session_id, fence)
+            .map_err(|_| crate::CheckpointError::Rejected)?;
+        self.runtime
+            .driver
+            .capture_checkpoint_until(tenant_id, session_id, fence, origins, deadline)
+    }
+
+    fn restore_checkpoint_until(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        primary_page: &PageId,
+        fence: &OwnershipFence,
+        snapshot: crate::CheckpointSnapshot,
+        deadline: Instant,
+    ) -> Result<(), crate::CheckpointError> {
+        let expected = self
+            .runtime
+            .primary_page(session_id, fence)
+            .map_err(|_| crate::CheckpointError::Rejected)?;
+        if &expected != primary_page {
+            return Err(crate::CheckpointError::Rejected);
+        }
+        self.runtime.driver.restore_checkpoint_until(
+            tenant_id,
+            session_id,
+            primary_page,
+            fence,
+            snapshot,
+            deadline,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn inspect_secret_fill_target_until(
+        &self,
+        tenant_id: &browserd_core::TenantId,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+        node_ref: &str,
+        deadline: Instant,
+    ) -> Result<crate::SecretFillTarget, crate::SecretFillError> {
+        self.runtime
+            .primary_page(session_id, fence)
+            .map_err(|_| crate::SecretFillError::Rejected)?;
+        self.runtime.driver.inspect_secret_fill_target_until(
+            tenant_id, session_id, page_id, fence, node_ref, deadline,
+        )
+    }
+
+    fn execute_secret_fill_until(
+        &self,
+        target: &crate::SecretFillTarget,
+        secret: crate::ResolvedSecret,
+        deadline: Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &crate::SecretFillTarget,
+        ) -> Result<(), crate::SecretFillError>,
+    ) -> Result<ActionExecutionResult, crate::SecretFillError> {
+        self.runtime
+            .primary_page(&target.session_id, &target.fence)
+            .map_err(|_| crate::SecretFillError::Rejected)?;
+        self.runtime.driver.execute_secret_fill_until(
+            target,
+            secret,
+            deadline,
+            authorize_and_commit,
+        )
+    }
+
+    fn execute_file_attachment_until(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+        node_ref: &str,
+        files: Vec<crate::BrowserFileAttachment>,
+        deadline: Instant,
+    ) -> ActionExecutionResult {
+        if self.runtime.primary_page(session_id, fence).is_err() {
+            return ActionExecutionResult::FailedKnown("files_rejected".to_owned());
+        }
+        self.runtime
+            .driver
+            .execute_file_attachment_until(session_id, page_id, fence, node_ref, files, deadline)
+    }
+
+    fn pending_browser_downloads(
+        &self,
+        session_id: &SessionId,
+        fence: &OwnershipFence,
+        limit: usize,
+    ) -> Result<Vec<crate::BrowserDownloadCompletion>, DependencyError> {
+        self.runtime.primary_page(session_id, fence)?;
+        self.runtime
+            .driver
+            .pending_browser_downloads(session_id, fence, limit)
+    }
+
+    fn open_browser_download(
+        &self,
+        completion: &crate::BrowserDownloadCompletion,
+    ) -> Result<crate::BrowserDownloadFile, DependencyError> {
+        self.runtime
+            .primary_page(&completion.session_id, &completion.fence)?;
+        self.runtime.driver.open_browser_download(completion)
+    }
+
+    fn ack_browser_download(
+        &self,
+        completion: &crate::BrowserDownloadCompletion,
+    ) -> Result<(), DependencyError> {
+        self.runtime
+            .primary_page(&completion.session_id, &completion.fence)?;
+        self.runtime.driver.ack_browser_download(completion)
+    }
+
+    fn reject_browser_download(
+        &self,
+        completion: &crate::BrowserDownloadCompletion,
+    ) -> Result<(), DependencyError> {
+        self.runtime
+            .primary_page(&completion.session_id, &completion.fence)?;
+        self.runtime.driver.reject_browser_download(completion)
+    }
+
+    fn viewer_rebind(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+    ) -> Result<u64, DependencyError> {
+        self.runtime
+            .driver
+            .viewer_rebind(session_id, page_id, fence)
+    }
+    fn viewer_start(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        self.runtime.driver.viewer_start(session_id, page_id, fence)
+    }
+    fn viewer_stop(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        self.runtime.driver.viewer_stop(session_id, page_id, fence)
+    }
+    fn viewer_frame(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+    ) -> Result<Option<crate::WorkerViewerFrame>, DependencyError> {
+        self.runtime.driver.viewer_frame(session_id, page_id, fence)
+    }
+    fn viewer_input(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+        transform_epoch: u64,
+        message: &crate::ViewerClientMessage,
+    ) -> Result<(), DependencyError> {
+        self.runtime
+            .driver
+            .viewer_input(session_id, page_id, fence, transform_epoch, message)
+    }
+    fn viewer_cleanup(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        fence: &OwnershipFence,
+        cleanup: &browserd_viewer::InputCleanup,
+    ) -> Result<(), DependencyError> {
+        self.runtime
+            .driver
+            .viewer_cleanup(session_id, page_id, fence, cleanup)
+    }
+    fn execute_capture_until(
+        &self,
+        session_id: &SessionId,
+        page_id: &PageId,
+        command: browserd_features::CaptureCommand,
+        request: crate::GeneratedArtifactRequest,
+        store: Arc<dyn crate::SandboxClient>,
+        deadline: Instant,
+    ) -> Result<crate::GeneratedCaptureResult, DependencyError> {
+        self.runtime
+            .driver
+            .execute_capture_until(session_id, page_id, command, request, store, deadline)
+    }
     fn qualify(&self) -> Result<(), DependencyError> {
         self.runtime.driver.qualify()
     }

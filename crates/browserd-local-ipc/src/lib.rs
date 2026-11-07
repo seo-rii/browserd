@@ -10,7 +10,7 @@
 
 use std::io::IoSlice;
 use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 use browserd_core::LeaseId;
 use nix::fcntl::{FcntlArg, fcntl};
@@ -18,6 +18,33 @@ use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use thiserror::Error;
 use tokio::io::Interest;
 use tokio::net::UnixStream;
+
+/// Reads the kernel-assigned namespace identity of a socket without trusting peer metadata.
+pub fn socket_network_namespace_cookie(descriptor: BorrowedFd<'_>) -> std::io::Result<u64> {
+    let mut cookie = 0_u64;
+    let mut length = std::mem::size_of::<u64>() as nix::libc::socklen_t;
+    // SAFETY: the borrowed descriptor stays open and both output pointers reference initialized,
+    // correctly sized storage for the entire getsockopt call; the kernel cannot outlive it.
+    let result = unsafe {
+        nix::libc::getsockopt(
+            descriptor.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_NETNS_COOKIE,
+            std::ptr::addr_of_mut!(cookie).cast(),
+            std::ptr::addr_of_mut!(length),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if length as usize != std::mem::size_of::<u64>() || cookie == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid socket namespace cookie",
+        ));
+    }
+    Ok(cookie)
+}
 
 const RECEIVER_READY: u8 = 0x51;
 const DESCRIPTOR_OFFER: u8 = 0x52;

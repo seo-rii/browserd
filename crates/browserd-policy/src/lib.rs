@@ -1,11 +1,23 @@
 #![forbid(unsafe_code)]
 
+mod action_approval;
+mod runtime_safety;
+pub use action_approval::{
+    ActionApprovalDecision, ActionApprovalGrant, ActionApprovalOutcome, ActionApprovalPolicy,
+    ActionApprovalPolicyError, ApprovalActionKind, ApprovalArtifactBinding, ApprovalContextScope,
+    ApprovalNodeBinding, ApprovalWorkerFence, MAX_ACTION_APPROVAL_GRANTS,
+    MAX_ACTION_APPROVAL_POLICY_BYTES, MAX_TYPED_ACTION_BINDING_BYTES, TypedActionPayload,
+    TypedActionProposalBinding,
+};
+
 use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use browserd_core::{IsolationProfile, PageId, PrincipalId, SessionId, TenantId};
+use browserd_core::{
+    IsolationProfile, PageId, PrincipalId, RuntimeSafetyCache, SessionId, TenantId,
+};
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
@@ -94,6 +106,14 @@ impl PolicySnapshot {
 pub struct Origin {
     serialized: String,
     host: String,
+    kind: OriginScopeKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum OriginScopeKind {
+    Http,
+    BrowserContext,
+    OpaqueDocument,
 }
 
 impl Origin {
@@ -109,7 +129,38 @@ impl Origin {
         Ok(Self {
             serialized: parsed.origin().ascii_serialization(),
             host,
+            kind: OriginScopeKind::Http,
         })
+    }
+
+    /// Explicit non-HTTP authority for checkpoint context capture; never accepted by `parse`.
+    #[must_use]
+    pub fn browser_context_scope() -> Self {
+        Self {
+            serialized: "browserd:context".to_owned(),
+            host: String::new(),
+            kind: OriginScopeKind::BrowserContext,
+        }
+    }
+
+    /// An inspected opaque document has no HTTP origin authority.
+    #[must_use]
+    pub fn opaque_document_scope() -> Self {
+        Self {
+            serialized: "null".to_owned(),
+            host: String::new(),
+            kind: OriginScopeKind::OpaqueDocument,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_browser_context_scope(&self) -> bool {
+        matches!(self.kind, OriginScopeKind::BrowserContext)
+    }
+
+    #[must_use]
+    pub const fn is_opaque_document_scope(&self) -> bool {
+        matches!(self.kind, OriginScopeKind::OpaqueDocument)
     }
 
     #[must_use]
@@ -274,6 +325,7 @@ pub struct CanonicalActionProposal {
     node_ref: Option<NodeReference>,
     credential_refs_hash: CredentialRefsHash,
     expires_at_unix_ms: u64,
+    typed_binding: Option<Box<TypedActionProposalBinding>>,
 }
 
 impl CanonicalActionProposal {
@@ -310,6 +362,7 @@ impl CanonicalActionProposal {
             node_ref,
             credential_refs_hash,
             expires_at_unix_ms,
+            typed_binding: None,
         }
     }
 
@@ -359,7 +412,35 @@ impl CanonicalActionProposal {
         }
         hasher.update(self.credential_refs_hash.0);
         hasher.update(self.expires_at_unix_ms.to_be_bytes());
-        ProposalHash(hasher.finalize().into())
+        let legacy_hash: [u8; 32] = hasher.finalize().into();
+        if let Some(binding) = &self.typed_binding {
+            let mut v2 = Sha256::new();
+            v2.update(b"browserd-canonical-action-proposal-v2\0");
+            v2.update(legacy_hash);
+            binding.hash_into(&mut v2);
+            ProposalHash(v2.finalize().into())
+        } else {
+            ProposalHash(legacy_hash)
+        }
+    }
+
+    pub fn with_typed_binding(
+        mut self,
+        binding: TypedActionProposalBinding,
+    ) -> Result<Self, ActionApprovalPolicyError> {
+        binding.validate_for(&self)?;
+        self.typed_binding = Some(Box::new(binding));
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn typed_binding(&self) -> Option<&TypedActionProposalBinding> {
+        self.typed_binding.as_deref()
+    }
+
+    #[must_use]
+    pub const fn schema_version(&self) -> u8 {
+        if self.typed_binding.is_some() { 2 } else { 1 }
     }
 
     #[must_use]
@@ -537,6 +618,52 @@ struct EmergencyPolicyState {
     killed_features: HashSet<String>,
     killed_chromium_builds: HashSet<String>,
     force_dedicated_tenants: HashSet<TenantId>,
+    runtime_safety: Option<Arc<RuntimeSafetyCache>>,
+    runtime_chromium_digest: Option<String>,
+}
+
+impl EmergencyPolicyState {
+    fn context_denial(&self, context: &ExecutionContext) -> Option<EmergencyDenyReason> {
+        if self.disabled_tenants.contains(&context.tenant_id) {
+            Some(EmergencyDenyReason::TenantDisabled)
+        } else if self.disabled_sessions.contains(&context.session_id) {
+            Some(EmergencyDenyReason::SessionDisabled)
+        } else if self.denied_domains.iter().any(|domain| {
+            context.current_origin.host() == domain
+                || context
+                    .current_origin
+                    .host()
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }) {
+            Some(EmergencyDenyReason::DomainDenied)
+        } else if context
+            .resolved_ips
+            .iter()
+            .any(|ip| self.denied_ips.contains(ip))
+        {
+            Some(EmergencyDenyReason::IpDenied)
+        } else if context
+            .credential_refs
+            .iter()
+            .any(|secret_ref| self.revoked_secrets.contains(secret_ref))
+        {
+            Some(EmergencyDenyReason::SecretRevoked)
+        } else if self.killed_features.contains(&context.feature) {
+            Some(EmergencyDenyReason::FeatureKillSwitch)
+        } else if self
+            .killed_chromium_builds
+            .contains(&context.chromium_build)
+        {
+            Some(EmergencyDenyReason::ChromiumBuildKillSwitch)
+        } else if self.force_dedicated_tenants.contains(&context.tenant_id)
+            && context.effective_isolation < IsolationProfile::DedicatedProcess
+        {
+            Some(EmergencyDenyReason::ForceDedicatedProcess)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -549,6 +676,12 @@ pub enum EmergencyPolicyError {
     CoordinationUnavailable,
     RevisionExhausted,
     InvalidDomain,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecretDispatchAdmissionError {
+    Unavailable,
+    Denied(EmergencyDenyReason),
 }
 
 impl fmt::Display for EmergencyPolicyError {
@@ -564,6 +697,71 @@ impl fmt::Display for EmergencyPolicyError {
 impl std::error::Error for EmergencyPolicyError {}
 
 impl EmergencyPolicy {
+    /// Linearizes an explicitly authorized feature's dispatch with emergency policy changes.
+    ///
+    /// The caller supplies trusted, current execution metadata, including the fixed feature name,
+    /// and checks ownership, grants, deadline, and durable audit before entering this method.
+    /// `commit` must be short, synchronous, non-blocking, and non-reentrant; browser I/O starts
+    /// after the policy lock is released. A denial completed before this admission prevents the
+    /// effect, while a later change does not retroactively cancel an admitted effect.
+    pub fn authorize_feature_dispatch<T>(
+        &self,
+        context: &ExecutionContext,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, SecretDispatchAdmissionError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SecretDispatchAdmissionError::Unavailable)?;
+        if let Some(reason) = state.context_denial(context) {
+            return Err(SecretDispatchAdmissionError::Denied(reason));
+        }
+        runtime_safety::admit_context(&state, context, commit)
+    }
+
+    /// Linearizes credential admission with emergency denial/revocation changes.
+    ///
+    /// `commit` must be short, synchronous, non-blocking, and non-reentrant. It only commits the
+    /// caller's dispatch marker; browser I/O starts after this method has released the policy lock.
+    /// A revoke completed before this point prevents dispatch. Later changes do not retroactively
+    /// cancel an already admitted effect, matching approval dispatch admission semantics.
+    pub fn authorize_secret_dispatch<T>(
+        &self,
+        tenant_id: &TenantId,
+        session_id: &SessionId,
+        secret_ref: &str,
+        origin: &Origin,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, SecretDispatchAdmissionError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| SecretDispatchAdmissionError::Unavailable)?;
+        let reason = if state.disabled_tenants.contains(tenant_id) {
+            Some(EmergencyDenyReason::TenantDisabled)
+        } else if state.disabled_sessions.contains(session_id) {
+            Some(EmergencyDenyReason::SessionDisabled)
+        } else if state.denied_domains.iter().any(|domain| {
+            origin.host() == domain
+                || origin
+                    .host()
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }) {
+            Some(EmergencyDenyReason::DomainDenied)
+        } else if state.revoked_secrets.contains(secret_ref) {
+            Some(EmergencyDenyReason::SecretRevoked)
+        } else if state.killed_features.contains("browser:fill_secret") {
+            Some(EmergencyDenyReason::FeatureKillSwitch)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(SecretDispatchAdmissionError::Denied(reason));
+        }
+        runtime_safety::admit_secret(&state, origin, commit)
+    }
+
     pub fn revision(&self) -> Result<u64, EmergencyPolicyError> {
         Ok(self
             .state
@@ -983,141 +1181,186 @@ impl ApprovalRequest {
         trusted_now: impl FnOnce() -> Result<u64, E>,
         dispatch: impl FnOnce(),
     ) -> Result<(), ApprovalAuthorizationError<E>> {
+        self.authorize_dispatch_internal(emergency, context, None, trusted_now, dispatch)
+    }
+
+    /// V2 admission checks the freshly observed typed binding and immutable operator policy.
+    /// The caller must independently enforce scopes, privileged-evaluate permission, secret
+    /// grants and artifact attachment checks; an approval cannot grant any of those authorities.
+    pub fn authorize_typed_and_dispatch_with_clock<E>(
+        &self,
+        emergency: &EmergencyPolicy,
+        context: &ExecutionContext,
+        current_binding: &TypedActionProposalBinding,
+        policy: &ActionApprovalPolicy,
+        trusted_now: impl FnOnce() -> Result<u64, E>,
+        dispatch: impl FnOnce(),
+    ) -> Result<(), ApprovalAuthorizationError<E>> {
+        self.authorize_dispatch_internal(
+            emergency,
+            context,
+            Some((current_binding, policy)),
+            trusted_now,
+            dispatch,
+        )
+    }
+
+    fn authorize_dispatch_internal<E>(
+        &self,
+        emergency: &EmergencyPolicy,
+        context: &ExecutionContext,
+        typed: Option<(&TypedActionProposalBinding, &ActionApprovalPolicy)>,
+        trusted_now: impl FnOnce() -> Result<u64, E>,
+        dispatch: impl FnOnce(),
+    ) -> Result<(), ApprovalAuthorizationError<E>> {
         {
-            let emergency = emergency.state.lock().map_err(|_| {
+            let state = emergency.state.lock().map_err(|_| {
                 ApprovalAuthorizationError::Approval(ApprovalError::CoordinationUnavailable)
             })?;
-            let mut inner = self.inner.lock().map_err(|_| {
-                ApprovalAuthorizationError::Approval(ApprovalError::CoordinationUnavailable)
-            })?;
-            let now_unix_ms = trusted_now().map_err(ApprovalAuthorizationError::Clock)?;
-
-            macro_rules! stale {
-                ($reason:expr) => {{
-                    inner.token_consumed = true;
-                    return Err(ApprovalAuthorizationError::Approval(
-                        ApprovalError::ApprovalStale($reason),
-                    ));
-                }};
-            }
-
-            match inner.state {
-                ApprovalState::Pending => {
-                    return Err(ApprovalAuthorizationError::Approval(
-                        ApprovalError::ApprovalPending,
-                    ));
+            match &state.runtime_safety {
+                Some(cache) => cache
+                    .with_fresh_snapshot(|snapshot| {
+                        self.authorize_dispatch_locked(
+                            &state,
+                            context,
+                            typed,
+                            trusted_now,
+                            Some(snapshot),
+                        )
+                    })
+                    .map_err(|_| {
+                        ApprovalAuthorizationError::Approval(ApprovalError::CoordinationUnavailable)
+                    })??,
+                None => {
+                    self.authorize_dispatch_locked(&state, context, typed, trusted_now, None)?
                 }
-                ApprovalState::Denied { .. } | ApprovalState::Expired => {
-                    return Err(ApprovalAuthorizationError::Approval(
-                        ApprovalError::ApprovalDenied,
-                    ));
-                }
-                ApprovalState::Approved { .. } => {}
             }
-            if inner.token_consumed {
-                stale!(StaleApprovalReason::TokenConsumed);
-            }
-            if now_unix_ms >= self.proposal.expires_at_unix_ms() {
-                stale!(StaleApprovalReason::Expired);
-            }
-            if context.tenant_id != self.proposal.tenant_id {
-                stale!(StaleApprovalReason::ActionBinding);
-            }
-            if context.requester_principal_id != self.proposal.requester_principal_id {
-                stale!(StaleApprovalReason::RequesterPrincipal);
-            }
-            if context.session_id != self.proposal.session_id
-                || context.session_incarnation != self.proposal.session_incarnation
-            {
-                stale!(StaleApprovalReason::SessionIncarnation);
-            }
-            if !context.placement_owned {
-                stale!(StaleApprovalReason::PlacementOwnership);
-            }
-            if context.page_id != self.proposal.page_id {
-                stale!(StaleApprovalReason::Page);
-            }
-            if context.target_incarnation != self.proposal.target_incarnation {
-                stale!(StaleApprovalReason::TargetIncarnation);
-            }
-            if context.frame_document_epoch != self.proposal.frame_document_epoch {
-                stale!(StaleApprovalReason::DocumentEpoch);
-            }
-            if context.current_origin != self.proposal.current_origin {
-                stale!(StaleApprovalReason::Origin);
-            }
-            if context.url_revision != self.proposal.url_revision {
-                stale!(StaleApprovalReason::UrlRevision);
-            }
-            if !context.node_valid || context.node_ref != self.proposal.node_ref {
-                stale!(StaleApprovalReason::Node);
-            }
-            if CredentialRefsHash::digest(context.credential_refs.iter().map(String::as_str))
-                != self.proposal.credential_refs_hash
-            {
-                stale!(StaleApprovalReason::CredentialRefs);
-            }
-            let expected_feature = match &self.proposal.action_type {
-                ActionType::Click => "browser:click",
-                ActionType::Fill => "browser:fill",
-                ActionType::Navigate => "browser:navigate",
-                ActionType::Evaluate => "browser:evaluate",
-                ActionType::Upload => "browser:upload",
-                ActionType::Download => "browser:download",
-                ActionType::Custom(feature) => feature,
-            };
-            if context.feature != expected_feature {
-                stale!(StaleApprovalReason::ActionBinding);
-            }
-
-            let emergency_reason = if emergency.disabled_tenants.contains(&context.tenant_id) {
-                Some(EmergencyDenyReason::TenantDisabled)
-            } else if emergency.disabled_sessions.contains(&context.session_id) {
-                Some(EmergencyDenyReason::SessionDisabled)
-            } else if emergency.denied_domains.iter().any(|domain| {
-                context.current_origin.host() == domain
-                    || context
-                        .current_origin
-                        .host()
-                        .strip_suffix(domain)
-                        .is_some_and(|prefix| prefix.ends_with('.'))
-            }) {
-                Some(EmergencyDenyReason::DomainDenied)
-            } else if context
-                .resolved_ips
-                .iter()
-                .any(|ip| emergency.denied_ips.contains(ip))
-            {
-                Some(EmergencyDenyReason::IpDenied)
-            } else if context
-                .credential_refs
-                .iter()
-                .any(|secret_ref| emergency.revoked_secrets.contains(secret_ref))
-            {
-                Some(EmergencyDenyReason::SecretRevoked)
-            } else if emergency.killed_features.contains(expected_feature) {
-                Some(EmergencyDenyReason::FeatureKillSwitch)
-            } else if emergency
-                .killed_chromium_builds
-                .contains(&context.chromium_build)
-            {
-                Some(EmergencyDenyReason::ChromiumBuildKillSwitch)
-            } else if emergency
-                .force_dedicated_tenants
-                .contains(&context.tenant_id)
-                && context.effective_isolation < IsolationProfile::DedicatedProcess
-            {
-                Some(EmergencyDenyReason::ForceDedicatedProcess)
-            } else {
-                None
-            };
-            if let Some(reason) = emergency_reason {
-                stale!(StaleApprovalReason::EmergencyDenied(reason));
-            }
-
-            inner.token_consumed = true;
         }
         dispatch();
+        Ok(())
+    }
+
+    fn authorize_dispatch_locked<E>(
+        &self,
+        emergency: &EmergencyPolicyState,
+        context: &ExecutionContext,
+        typed: Option<(&TypedActionProposalBinding, &ActionApprovalPolicy)>,
+        trusted_now: impl FnOnce() -> Result<u64, E>,
+        runtime: Option<&browserd_core::SafetySwitchSnapshot>,
+    ) -> Result<(), ApprovalAuthorizationError<E>> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            ApprovalAuthorizationError::Approval(ApprovalError::CoordinationUnavailable)
+        })?;
+        let now_unix_ms = trusted_now().map_err(ApprovalAuthorizationError::Clock)?;
+
+        macro_rules! stale {
+            ($reason:expr) => {{
+                inner.token_consumed = true;
+                return Err(ApprovalAuthorizationError::Approval(
+                    ApprovalError::ApprovalStale($reason),
+                ));
+            }};
+        }
+
+        match inner.state {
+            ApprovalState::Pending => {
+                return Err(ApprovalAuthorizationError::Approval(
+                    ApprovalError::ApprovalPending,
+                ));
+            }
+            ApprovalState::Denied { .. } | ApprovalState::Expired => {
+                return Err(ApprovalAuthorizationError::Approval(
+                    ApprovalError::ApprovalDenied,
+                ));
+            }
+            ApprovalState::Approved { .. } => {}
+        }
+        if inner.token_consumed {
+            stale!(StaleApprovalReason::TokenConsumed);
+        }
+        if now_unix_ms >= self.proposal.expires_at_unix_ms() {
+            stale!(StaleApprovalReason::Expired);
+        }
+        match (self.proposal.typed_binding(), typed) {
+            (None, None) => {}
+            (Some(expected), Some((observed, policy))) => {
+                if expected != observed || observed.validate_for(&self.proposal).is_err() {
+                    stale!(StaleApprovalReason::ActionBinding);
+                }
+                let decision = match policy.evaluate_proposal(&self.proposal) {
+                    Ok(decision) => decision,
+                    Err(_) => stale!(StaleApprovalReason::ActionBinding),
+                };
+                if decision.outcome == ActionApprovalOutcome::Deny
+                    || decision.require_four_eyes && !self.require_four_eyes
+                {
+                    stale!(StaleApprovalReason::ActionBinding);
+                }
+            }
+            _ => stale!(StaleApprovalReason::ActionBinding),
+        }
+        if context.tenant_id != self.proposal.tenant_id {
+            stale!(StaleApprovalReason::ActionBinding);
+        }
+        if context.requester_principal_id != self.proposal.requester_principal_id {
+            stale!(StaleApprovalReason::RequesterPrincipal);
+        }
+        if context.session_id != self.proposal.session_id
+            || context.session_incarnation != self.proposal.session_incarnation
+        {
+            stale!(StaleApprovalReason::SessionIncarnation);
+        }
+        if !context.placement_owned {
+            stale!(StaleApprovalReason::PlacementOwnership);
+        }
+        if context.page_id != self.proposal.page_id {
+            stale!(StaleApprovalReason::Page);
+        }
+        if context.target_incarnation != self.proposal.target_incarnation {
+            stale!(StaleApprovalReason::TargetIncarnation);
+        }
+        if context.frame_document_epoch != self.proposal.frame_document_epoch {
+            stale!(StaleApprovalReason::DocumentEpoch);
+        }
+        if context.current_origin != self.proposal.current_origin {
+            stale!(StaleApprovalReason::Origin);
+        }
+        if context.url_revision != self.proposal.url_revision {
+            stale!(StaleApprovalReason::UrlRevision);
+        }
+        if !context.node_valid || context.node_ref != self.proposal.node_ref {
+            stale!(StaleApprovalReason::Node);
+        }
+        if CredentialRefsHash::digest(context.credential_refs.iter().map(String::as_str))
+            != self.proposal.credential_refs_hash
+        {
+            stale!(StaleApprovalReason::CredentialRefs);
+        }
+        let expected_feature = match &self.proposal.action_type {
+            ActionType::Click => "browser:click",
+            ActionType::Fill => "browser:fill",
+            ActionType::Navigate => "browser:navigate",
+            ActionType::Evaluate => "browser:evaluate",
+            ActionType::Upload => "browser:upload",
+            ActionType::Download => "browser:download",
+            ActionType::Custom(feature) => feature,
+        };
+        if context.feature != expected_feature {
+            stale!(StaleApprovalReason::ActionBinding);
+        }
+
+        if let Some(snapshot) = runtime
+            && let Some(reason) = runtime_safety::build_denial(emergency, snapshot)
+                .or_else(|| runtime_safety::context_denial(snapshot, context))
+        {
+            stale!(StaleApprovalReason::EmergencyDenied(reason));
+        }
+        let emergency_reason = emergency.context_denial(context);
+        if let Some(reason) = emergency_reason {
+            stale!(StaleApprovalReason::EmergencyDenied(reason));
+        }
+
+        inner.token_consumed = true;
         Ok(())
     }
 }

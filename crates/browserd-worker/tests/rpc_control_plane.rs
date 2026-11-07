@@ -3,9 +3,12 @@ use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use browserd_actions::{ActionJournalLimits, ActionKind, ActionSequence};
+use browserd_actions::{
+    ActionJournalLimits, ActionKind, ActionSequence, JournalSessionScope,
+    TerminalCustodyRequirement,
+};
 use browserd_core::{
     ActionId, IsolationProfile, OperationId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
 };
@@ -13,16 +16,19 @@ use browserd_policy::{CanonicalActionProposal, Origin};
 use browserd_sandbox::CleanupReason;
 use browserd_session::{LeasePolicy, OwnershipFence, SessionTime, SessionTimeoutPolicy};
 use browserd_worker::{
-    ActionExecutionResult, ActionJournalConfig, ApprovedActionError, ArtifactStoreReceipt,
-    ArtifactStoreRequest, AuthenticatedPeer, ChromiumDriver, DependencyError, InternalEndpoint,
-    LiveApprovalContext, SandboxClient, SessionOptionSupport, UnavailableChromiumDriver,
-    UnavailableSandboxClient, WORKER_SESSION_OPTIONS_VERSION, WorkerActionApprovalRequirement,
-    WorkerActionCommand, WorkerActionExecutionTimeout, WorkerActionStatus,
-    WorkerApprovalActionType, WorkerClock, WorkerConfig, WorkerControlPlane,
-    WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest, WorkerError, WorkerIsolationProfile,
-    WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
+    ActionExecutionResult, ActionJournalConfig, ActionJournalPool, ActionJournalPoolConfig,
+    ApprovedActionError, ArtifactStoreReceipt, ArtifactStoreRequest, AuthenticatedPeer,
+    ChromiumDriver, DependencyError, InternalEndpoint, LiveApprovalContext, SandboxClient,
+    SessionOptionSupport, UnavailableChromiumDriver, UnavailableSandboxClient,
+    WORKER_SESSION_OPTIONS_VERSION, WorkerActionApprovalRequirement, WorkerActionCommand,
+    WorkerActionExecutionTimeout, WorkerActionStatus, WorkerApprovalActionType, WorkerClock,
+    WorkerConfig, WorkerControlPlane, WorkerControlPlaneRpcHandler, WorkerCreateSessionRequest,
+    WorkerError, WorkerIsolationProfile, WorkerRpcFailureCode, WorkerRpcHandler, WorkerRpcRequest,
+    WorkerRpcResponse, WorkerSessionFence, WorkerSessionOptionsV1, WorkerViewport,
 };
+
+#[path = "support/fleet_worker_admission.rs"]
+mod fleet_worker_admission;
 
 fn session_options() -> WorkerSessionOptionsV1 {
     WorkerSessionOptionsV1 {
@@ -185,6 +191,8 @@ struct OptionsRecordingDriver {
     calls: AtomicUsize,
     observed: Mutex<Option<WorkerSessionOptionsV1>>,
     page_id: PageId,
+    placement: Option<WorkerIsolationProfile>,
+    closed: AtomicUsize,
 }
 
 impl OptionsRecordingDriver {
@@ -193,11 +201,33 @@ impl OptionsRecordingDriver {
             calls: AtomicUsize::new(0),
             observed: Mutex::new(None),
             page_id,
+            placement: None,
+            closed: AtomicUsize::new(0),
         }
     }
 }
 
 impl ChromiumDriver for OptionsRecordingDriver {
+    fn supports_requested_isolation(&self, requested: WorkerIsolationProfile) -> bool {
+        self.placement.is_some() || requested.satisfied_by(self.effective_isolation())
+    }
+
+    fn create_context_owned_with_placement(
+        &self,
+        tenant: &TenantId,
+        session: &SessionId,
+        fence: &OwnershipFence,
+        options: Option<&WorkerSessionOptionsV1>,
+        _requested: WorkerIsolationProfile,
+    ) -> Result<browserd_worker::CreatedSessionContext, DependencyError> {
+        let options = options.ok_or(DependencyError::Rejected)?;
+        Ok(browserd_worker::CreatedSessionContext {
+            primary_page_id: self
+                .create_context_owned_with_options(tenant, session, fence, options)?,
+            effective_isolation: self.placement.unwrap_or(self.effective_isolation()),
+        })
+    }
+
     fn qualify(&self) -> Result<(), DependencyError> {
         Ok(())
     }
@@ -223,6 +253,7 @@ impl ChromiumDriver for OptionsRecordingDriver {
     }
 
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
+        self.closed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -498,6 +529,51 @@ impl ChromiumDriver for DedicatedProcessDriver {
 
 struct ReadySandbox;
 
+#[tokio::test]
+async fn named_upload_rpc_rejects_unsafe_filenames_before_storage() -> Result<(), Box<dyn Error>> {
+    let fixture = action_rpc_fixture(Arc::new(ReadyDriver), Arc::new(ReadySandbox), 19082).await?;
+    for display_filename in [
+        "".to_owned(),
+        ".".to_owned(),
+        "..".to_owned(),
+        "/tmp/file".to_owned(),
+        "a\\b".to_owned(),
+        "a\nb".to_owned(),
+        "a".repeat(256),
+        "한".repeat(86),
+    ] {
+        let response = fixture
+            .handler
+            .handle(WorkerRpcRequest::UploadNamedArtifact {
+                fence: fixture.fence.clone(),
+                bytes: b"hello".to_vec(),
+                content_type: "text/plain".to_owned(),
+                display_filename,
+                now_unix_millis: 2,
+            })
+            .await;
+        assert!(
+            matches!(response, WorkerRpcResponse::Failure(failure) if failure.code == WorkerRpcFailureCode::InvalidRequest)
+        );
+    }
+    // The valid Unicode basename crosses validation and reaches this fixture's unavailable
+    // storage adapter. A filename validation failure would instead be InvalidRequest.
+    let response = fixture
+        .handler
+        .handle(WorkerRpcRequest::UploadNamedArtifact {
+            fence: fixture.fence.clone(),
+            bytes: b"hello".to_vec(),
+            content_type: "text/plain".to_owned(),
+            display_filename: "첨부 문서.txt".to_owned(),
+            now_unix_millis: 2,
+        })
+        .await;
+    assert!(
+        matches!(response, WorkerRpcResponse::Failure(failure) if failure.code == WorkerRpcFailureCode::Dependency)
+    );
+    Ok(())
+}
+
 impl SandboxClient for ReadySandbox {
     fn qualify(&self) -> Result<(), DependencyError> {
         Ok(())
@@ -541,24 +617,22 @@ struct ActionRpcFixture<D, S> {
     primary_page_id: PageId,
 }
 
-async fn action_rpc_fixture<D: ChromiumDriver, S: SandboxClient>(
-    driver: Arc<D>,
-    sandbox: Arc<S>,
+fn action_rpc_config(
+    directory: &std::path::Path,
+    worker_id: &WorkerId,
+    epoch: u64,
+    peer: &AuthenticatedPeer,
     endpoint_port: u16,
-) -> Result<ActionRpcFixture<D, S>, Box<dyn Error>> {
-    let directory = tempfile::tempdir()?;
-    let worker_id = WorkerId::new(format!("worker-rpc-action-{endpoint_port}"))?;
-    let peer = AuthenticatedPeer::new(format!("gateway-rpc-action-{endpoint_port}"))
-        .map_err(|error| std::io::Error::other(format!("invalid action peer: {error:?}")))?;
+) -> Result<WorkerConfig, Box<dyn Error>> {
     let lease = LeasePolicy::new(Duration::from_secs(15), Duration::from_secs(3))
         .map_err(|error| std::io::Error::other(format!("invalid lease policy: {error:?}")))?;
     let timeout = SessionTimeoutPolicy::new(Duration::from_secs(60), Duration::from_secs(30))
         .map_err(|error| std::io::Error::other(format!("invalid timeout policy: {error:?}")))?;
-    let journal = ActionJournalConfig::new(directory.path(), ActionJournalLimits::default())
+    let journal = ActionJournalConfig::new(directory, ActionJournalLimits::default())
         .map_err(|error| std::io::Error::other(format!("invalid action journal: {error:?}")))?;
-    let config = WorkerConfig::new(
+    Ok(WorkerConfig::new(
         worker_id.clone(),
-        7,
+        epoch,
         InternalEndpoint::Loopback(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             endpoint_port,
@@ -572,14 +646,42 @@ async fn action_rpc_fixture<D: ChromiumDriver, S: SandboxClient>(
         journal,
     )
     .map_err(|error| std::io::Error::other(format!("invalid worker config: {error:?}")))?
-    .with_session_option_support(SessionOptionSupport::single_host_default());
+    .with_session_option_support(SessionOptionSupport::single_host_default()))
+}
+
+async fn action_rpc_fixture<D: ChromiumDriver, S: SandboxClient>(
+    driver: Arc<D>,
+    sandbox: Arc<S>,
+    endpoint_port: u16,
+) -> Result<ActionRpcFixture<D, S>, Box<dyn Error>> {
+    action_rpc_fixture_with_pool(driver, sandbox, endpoint_port, false).await
+}
+
+async fn action_rpc_fixture_with_pool<D: ChromiumDriver, S: SandboxClient>(
+    driver: Arc<D>,
+    sandbox: Arc<S>,
+    endpoint_port: u16,
+    pooled: bool,
+) -> Result<ActionRpcFixture<D, S>, Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let worker_id = WorkerId::new(format!("worker-rpc-action-{endpoint_port}"))?;
+    let peer = AuthenticatedPeer::new(format!("gateway-rpc-action-{endpoint_port}"))
+        .map_err(|error| std::io::Error::other(format!("invalid action peer: {error:?}")))?;
+    let config = action_rpc_config(directory.path(), &worker_id, 7, &peer, endpoint_port)?;
     let tenant_id = TenantId::new();
-    let worker = Arc::new(WorkerControlPlane::new_with_clock(
-        config,
-        driver,
-        sandbox,
-        Arc::new(FrozenClock),
-    ));
+    let mut worker =
+        WorkerControlPlane::new_with_clock(config, driver, sandbox, Arc::new(FrozenClock));
+    if pooled {
+        let pool = ActionJournalPool::open(
+            ActionJournalPoolConfig::new(
+                directory.path().to_path_buf(),
+                ActionJournalLimits::default(),
+            )?,
+            worker_id.clone(),
+        )?;
+        worker = worker.with_action_journal_pool(pool);
+    }
+    let worker = Arc::new(worker);
     let handler = Arc::new(WorkerControlPlaneRpcHandler::new(
         Arc::clone(&worker),
         peer.clone(),
@@ -711,6 +813,610 @@ fn submit_action_request(
         approval: None,
         now_unix_millis: action_sequence.saturating_add(1),
     }
+}
+
+#[tokio::test]
+async fn transient_terminal_projection_preserves_known_result_and_historical_rpc_recovers_after_restart()
+-> Result<(), Box<dyn Error>> {
+    let driver = Arc::new(BlockingActionDriver::new(
+        Arc::new(Barrier::new(1)),
+        Arc::new(Barrier::new(1)),
+    ));
+    let fixture =
+        action_rpc_fixture_with_pool(Arc::clone(&driver), Arc::new(ReadySandbox), 19117, true)
+            .await?;
+    let action_id = ActionId::new();
+    let WorkerRpcResponse::Action(original) = fixture
+        .handler
+        .handle(submit_action_request(
+            &fixture.fence,
+            &fixture.primary_page_id,
+            &action_id,
+            1,
+            "projection-recovery",
+            93,
+        ))
+        .await
+    else {
+        return Err(std::io::Error::other("projection action was not accepted").into());
+    };
+    original.to_action_snapshot()?;
+    assert_eq!(original.status, WorkerActionStatus::Succeeded);
+    assert_eq!(
+        original.custody_requirement,
+        Some(TerminalCustodyRequirement::Required)
+    );
+    let custody = original
+        .custody
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("original custody missing"))?
+        .clone();
+    let wal = fixture
+        ._directory
+        .path()
+        .join(format!("{}.wal", fixture.fence.session_id));
+    let durable_bytes = std::fs::read(&wal)?;
+    let mut unreadable = durable_bytes.clone();
+    let last = unreadable
+        .last_mut()
+        .ok_or_else(|| std::io::Error::other("empty action WAL"))?;
+    *last ^= 1;
+    // Fail the optional projection's real replay read while the durable terminal result is
+    // already in the live action ledger. Restore the same inode before reopening the pool.
+    std::fs::write(&wal, unreadable)?;
+    let observed = fixture
+        .handler
+        .handle(WorkerRpcRequest::GetAction {
+            fence: fixture.fence.clone(),
+            action_id: action_id.clone(),
+        })
+        .await;
+    std::fs::write(&wal, durable_bytes)?;
+    let WorkerRpcResponse::Action(observed) = observed else {
+        return Err(std::io::Error::other("known result was lost on projection failure").into());
+    };
+    observed.to_action_snapshot()?;
+    assert_eq!(observed.status, original.status);
+    assert_eq!(observed.terminal_detail, original.terminal_detail);
+    assert_eq!(observed.result, original.result);
+    assert_eq!(
+        observed.custody_requirement,
+        Some(TerminalCustodyRequirement::Required)
+    );
+    assert!(observed.custody.is_none());
+    assert!(matches!(
+        fixture
+            .handler
+            .handle(WorkerRpcRequest::CloseSession {
+                fence: fixture.fence.clone(),
+                now_unix_millis: 3,
+            })
+            .await,
+        WorkerRpcResponse::SessionClosed(_)
+    ));
+    let worker_id = fixture.ownership.worker_id().clone();
+    let scope = custody.scope().clone();
+    let ActionRpcFixture {
+        _directory: directory,
+        worker,
+        handler,
+        peer,
+        ..
+    } = fixture;
+    drop(handler);
+    drop(worker);
+    let pool = ActionJournalPool::open(
+        ActionJournalPoolConfig::new(
+            directory.path().to_path_buf(),
+            ActionJournalLimits::default(),
+        )?,
+        worker_id.clone(),
+    )?;
+    let worker = Arc::new(
+        WorkerControlPlane::new_with_clock(
+            action_rpc_config(directory.path(), &worker_id, 8, &peer, 19117)?,
+            Arc::new(UnavailableChromiumDriver),
+            Arc::new(UnavailableSandboxClient),
+            Arc::new(FrozenClock),
+        )
+        .with_action_journal_pool(pool),
+    );
+    let handler = WorkerControlPlaneRpcHandler::new(Arc::clone(&worker), peer.clone());
+    assert!(
+        matches!(handler.handle(WorkerRpcRequest::Probe { expected_worker_epoch: 8 }).await,
+        WorkerRpcResponse::Failure(f) if f.code == WorkerRpcFailureCode::NotReady)
+    );
+    let query = WorkerRpcRequest::GetTerminalCustody {
+        expected_serving_worker_id: worker_id.clone(),
+        expected_serving_worker_epoch: 8,
+        scope: scope.clone(),
+        action_id: action_id.clone(),
+        action_sequence: original.action_sequence,
+        kind: original.kind,
+    };
+    for _ in 0..2 {
+        let WorkerRpcResponse::TerminalCustody(proof) = handler.handle(query.clone()).await else {
+            return Err(std::io::Error::other("historical custody could not be recovered").into());
+        };
+        proof.validate_for(
+            &worker_id,
+            8,
+            &scope,
+            &action_id,
+            original.action_sequence,
+            original.kind,
+        )?;
+        assert_eq!(*proof.receipt, *custody);
+    }
+    let invalid_scopes = [
+        JournalSessionScope::new(
+            TenantId::new(),
+            scope.session_id().clone(),
+            worker_id.clone(),
+            scope.fence(),
+        )?,
+        JournalSessionScope::new(
+            scope.tenant_id().clone(),
+            SessionId::new(),
+            worker_id.clone(),
+            scope.fence(),
+        )?,
+        JournalSessionScope::new(
+            scope.tenant_id().clone(),
+            scope.session_id().clone(),
+            worker_id.clone(),
+            browserd_core::PlacementFence::new(
+                scope.fence().worker_epoch,
+                scope.fence().placement_version + 1,
+                scope.fence().session_incarnation,
+            ),
+        )?,
+    ];
+    for wrong_scope in invalid_scopes {
+        assert!(matches!(
+            handler
+                .handle(WorkerRpcRequest::GetTerminalCustody {
+                    expected_serving_worker_id: worker_id.clone(),
+                    expected_serving_worker_epoch: 8,
+                    scope: wrong_scope,
+                    action_id: action_id.clone(),
+                    action_sequence: original.action_sequence,
+                    kind: original.kind,
+                })
+                .await,
+            WorkerRpcResponse::Failure(_)
+        ));
+    }
+    for (epoch, sequence, kind) in [
+        (7, original.action_sequence, original.kind),
+        (8, ActionSequence::new(2), original.kind),
+        (8, original.action_sequence, ActionKind::ReadOnly),
+    ] {
+        assert!(matches!(
+            handler
+                .handle(WorkerRpcRequest::GetTerminalCustody {
+                    expected_serving_worker_id: worker_id.clone(),
+                    expected_serving_worker_epoch: epoch,
+                    scope: scope.clone(),
+                    action_id: action_id.clone(),
+                    action_sequence: sequence,
+                    kind,
+                })
+                .await,
+            WorkerRpcResponse::Failure(_)
+        ));
+    }
+    let foreign = WorkerControlPlaneRpcHandler::new(
+        worker,
+        AuthenticatedPeer::new("foreign-custody-peer")
+            .map_err(|_| std::io::Error::other("invalid test peer"))?,
+    );
+    assert!(matches!(
+        foreign.handle(query).await,
+        WorkerRpcResponse::Failure(_)
+    ));
+    assert_eq!(driver.execution_count.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unmanaged_origin_is_explicit_but_historical_pool_absence_is_unavailable()
+-> Result<(), Box<dyn Error>> {
+    let driver = Arc::new(BlockingActionDriver::new(
+        Arc::new(Barrier::new(1)),
+        Arc::new(Barrier::new(1)),
+    ));
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19118).await?;
+    let action_id = ActionId::new();
+    let WorkerRpcResponse::Action(receipt) = fixture
+        .handler
+        .handle(submit_action_request(
+            &fixture.fence,
+            &fixture.primary_page_id,
+            &action_id,
+            1,
+            "unmanaged-origin",
+            94,
+        ))
+        .await
+    else {
+        return Err(std::io::Error::other("unmanaged action was not accepted").into());
+    };
+    receipt.to_action_snapshot()?;
+    assert_eq!(receipt.status, WorkerActionStatus::Succeeded);
+    assert_eq!(
+        receipt.custody_requirement,
+        Some(TerminalCustodyRequirement::Unsupported)
+    );
+    assert!(receipt.custody.is_none());
+    let scope = JournalSessionScope::new(
+        fixture.fence.tenant_id.clone(),
+        fixture.fence.session_id.clone(),
+        fixture.ownership.worker_id().clone(),
+        fixture.ownership.as_placement_fence(),
+    )?;
+    assert!(
+        matches!(fixture.handler.handle(WorkerRpcRequest::GetTerminalCustody {
+        expected_serving_worker_id: fixture.ownership.worker_id().clone(), expected_serving_worker_epoch: 7,
+        scope, action_id, action_sequence: receipt.action_sequence, kind: receipt.kind,
+    }).await, WorkerRpcResponse::Failure(f) if f.code == WorkerRpcFailureCode::Durability)
+    );
+    assert_eq!(driver.execution_count.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_custody_survives_lost_ack_restart_and_unready_release()
+-> Result<(), Box<dyn Error>> {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let driver = Arc::new(BlockingActionDriver::new(
+        Arc::new(Barrier::new(1)),
+        Arc::new(Barrier::new(1)),
+    ));
+    let fixture =
+        action_rpc_fixture_with_pool(Arc::clone(&driver), Arc::new(ReadySandbox), 19115, true)
+            .await?;
+    let action_id = ActionId::new();
+    let submitted = fixture
+        .handler
+        .handle(submit_action_request(
+            &fixture.fence,
+            &fixture.primary_page_id,
+            &action_id,
+            1,
+            "custody-once",
+            91,
+        ))
+        .await;
+    let WorkerRpcResponse::Action(submitted) = submitted else {
+        return Err(std::io::Error::other("custody action was not accepted").into());
+    };
+    assert_eq!(submitted.status, WorkerActionStatus::Succeeded);
+    submitted.to_action_snapshot()?;
+    let custody = submitted
+        .custody
+        .ok_or_else(|| std::io::Error::other("terminal custody missing"))?;
+    assert_ne!(custody.request_hash().as_bytes(), &[91; 32]);
+    assert_eq!(custody.action_id(), &action_id);
+    let worker_id = fixture.ownership.worker_id().clone();
+    let ack_request = WorkerRpcRequest::AckTerminalCustody {
+        expected_serving_worker_id: worker_id.clone(),
+        expected_serving_worker_epoch: 7,
+        receipt: custody.clone(),
+    };
+    // The caller loses this successful response before persisting its positive ACK.
+    assert!(matches!(
+        fixture.handler.handle(ack_request).await,
+        WorkerRpcResponse::TerminalCustodyAck(_)
+    ));
+    assert!(matches!(
+        fixture
+            .handler
+            .handle(WorkerRpcRequest::CloseSession {
+                fence: fixture.fence.clone(),
+                now_unix_millis: 3,
+            })
+            .await,
+        WorkerRpcResponse::SessionClosed(_)
+    ));
+    assert_eq!(driver.execution_count.load(Ordering::Acquire), 1);
+    let ActionRpcFixture {
+        _directory: directory,
+        worker,
+        handler,
+        peer,
+        fence,
+        ..
+    } = fixture;
+    drop(handler);
+    drop(worker);
+    let pool = ActionJournalPool::open(
+        ActionJournalPoolConfig::new(
+            directory.path().to_path_buf(),
+            ActionJournalLimits::default(),
+        )?,
+        worker_id.clone(),
+    )?;
+    // An ACK alone never allows deletion, even after its retention horizon.
+    assert_eq!(
+        pool.maintain(30 * DAY, 32, Instant::now() + Duration::from_secs(2))?,
+        0
+    );
+    let config = action_rpc_config(directory.path(), &worker_id, 8, &peer, 19115)?;
+    let worker = Arc::new(
+        WorkerControlPlane::new_with_clock(
+            config,
+            Arc::new(UnavailableChromiumDriver),
+            Arc::new(UnavailableSandboxClient),
+            Arc::new(FrozenClock),
+        )
+        .with_action_journal_pool(Arc::clone(&pool)),
+    );
+    let handler = WorkerControlPlaneRpcHandler::new(Arc::clone(&worker), peer.clone());
+    assert!(
+        matches!(handler.handle(WorkerRpcRequest::Probe { expected_worker_epoch: 8 }).await,
+        WorkerRpcResponse::Failure(f) if f.code == WorkerRpcFailureCode::NotReady)
+    );
+    assert!(
+        matches!(handler.handle(WorkerRpcRequest::AckTerminalCustody {
+        expected_serving_worker_id: worker_id.clone(), expected_serving_worker_epoch: 7, receipt: custody.clone(),
+    }).await, WorkerRpcResponse::Failure(f) if f.code == WorkerRpcFailureCode::FenceMismatch)
+    );
+    for _ in 0..2 {
+        let response = handler
+            .handle(WorkerRpcRequest::AckTerminalCustody {
+                expected_serving_worker_id: worker_id.clone(),
+                expected_serving_worker_epoch: 8,
+                receipt: custody.clone(),
+            })
+            .await;
+        assert!(
+            matches!(response, WorkerRpcResponse::TerminalCustodyAck(ack)
+            if ack.worker_id == worker_id && ack.worker_epoch == 8 && ack.receipt_sha256 == custody.digest())
+        );
+    }
+    assert!(
+        matches!(handler.handle(WorkerRpcRequest::GetSession { fence }).await,
+        WorkerRpcResponse::Failure(f) if matches!(f.code, WorkerRpcFailureCode::NotFound | WorkerRpcFailureCode::FenceMismatch))
+    );
+    assert_eq!(
+        pool.maintain(30 * DAY, 32, Instant::now() + Duration::from_secs(2))?,
+        0
+    );
+    let release = WorkerRpcRequest::ReleaseTerminalCustody {
+        expected_serving_worker_id: worker_id.clone(),
+        expected_serving_worker_epoch: 8,
+        receipt: custody.clone(),
+    };
+    assert!(matches!(
+        handler.handle(release.clone()).await,
+        WorkerRpcResponse::TerminalCustodyRelease(_)
+    ));
+    assert_eq!(
+        pool.maintain(30 * DAY, 32, Instant::now() + Duration::from_secs(2))?,
+        1
+    );
+    // A lost release response converges after physical deletion; it cannot fabricate a copy ACK.
+    assert!(
+        matches!(handler.handle(release).await, WorkerRpcResponse::TerminalCustodyRelease(ack)
+        if ack.receipt_sha256 == custody.digest())
+    );
+    assert!(matches!(
+        handler
+            .handle(WorkerRpcRequest::AckTerminalCustody {
+                expected_serving_worker_id: worker_id,
+                expected_serving_worker_epoch: 8,
+                receipt: custody,
+            })
+            .await,
+        WorkerRpcResponse::Failure(_)
+    ));
+    assert_eq!(driver.execution_count.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_custody_remains_queryable_after_closed_session_memory_is_reclaimed()
+-> Result<(), Box<dyn Error>> {
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+    let driver = Arc::new(BlockingActionDriver::new(
+        Arc::new(Barrier::new(1)),
+        Arc::new(Barrier::new(1)),
+    ));
+    let fixture =
+        action_rpc_fixture_with_pool(Arc::clone(&driver), Arc::new(ReadySandbox), 19116, true)
+            .await?;
+    let action_id = ActionId::new();
+    let WorkerRpcResponse::Action(receipt) = fixture
+        .handler
+        .handle(submit_action_request(
+            &fixture.fence,
+            &fixture.primary_page_id,
+            &action_id,
+            1,
+            "custody-retired",
+            92,
+        ))
+        .await
+    else {
+        return Err(std::io::Error::other("retained action missing").into());
+    };
+    let custody = receipt
+        .custody
+        .ok_or_else(|| std::io::Error::other("retained custody missing"))?;
+    fixture
+        .worker
+        .close_session(
+            &fixture.peer,
+            &fixture.fence.session_id,
+            &fixture.ownership,
+            SessionTime::new(3),
+        )
+        .map_err(|error| std::io::Error::other(format!("close failed: {error:?}")))?;
+    assert_eq!(
+        fixture
+            .worker
+            .reclaim_retired_sessions(&fixture.peer, SessionTime::new(4))
+            .map_err(|error| std::io::Error::other(format!("reclamation failed: {error:?}")))?,
+        0
+    );
+    assert_eq!(
+        fixture
+            .worker
+            .reclaim_retired_sessions(&fixture.peer, SessionTime::new(DAY + 4))
+            .map_err(|error| std::io::Error::other(format!("reclamation failed: {error:?}")))?,
+        1
+    );
+    assert_eq!(
+        fixture
+            .worker
+            .terminal_custody_receipt(
+                &fixture.peer,
+                &fixture.fence.tenant_id,
+                &fixture.fence.session_id,
+                &action_id,
+                &fixture.ownership,
+            )
+            .map_err(|error| std::io::Error::other(format!("custody read failed: {error:?}")))?,
+        Some(*custody.clone())
+    );
+    let foreign = AuthenticatedPeer::new("untrusted-custody-peer")
+        .map_err(|error| std::io::Error::other(format!("peer failed: {error:?}")))?;
+    assert_eq!(
+        fixture
+            .worker
+            .ack_terminal_custody(&foreign, fixture.ownership.worker_id(), 7, &custody),
+        Err(WorkerError::UnauthorizedPeer)
+    );
+    let mut wrong_scope = fixture.fence.clone();
+    wrong_scope.tenant_id = TenantId::new();
+    assert!(
+        fixture
+            .worker
+            .terminal_custody_receipt(
+                &fixture.peer,
+                &wrong_scope.tenant_id,
+                &wrong_scope.session_id,
+                &action_id,
+                &fixture.ownership,
+            )
+            .is_err()
+    );
+    let scope = JournalSessionScope::new(
+        fixture.fence.tenant_id,
+        fixture.fence.session_id,
+        fixture.ownership.worker_id().clone(),
+        fixture.ownership.as_placement_fence(),
+    )?;
+    assert_eq!(custody.scope(), &scope);
+    assert_eq!(driver.execution_count.load(Ordering::Acquire), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_checkpoint_origins_are_rejected_before_action_registration()
+-> Result<(), Box<dyn Error>> {
+    let fixture = action_rpc_fixture(Arc::new(ReadyDriver), Arc::new(ReadySandbox), 19084).await?;
+    for origins in [
+        vec!["https://example.test/path".to_owned()],
+        vec!["https://example.test".to_owned(); 2],
+        (0..17)
+            .map(|i| format!("https://origin-{i}.test"))
+            .collect(),
+    ] {
+        let id = ActionId::new();
+        let mut request = submit_action_request(
+            &fixture.fence,
+            &fixture.primary_page_id,
+            &id,
+            1,
+            "invalid-checkpoint",
+            3,
+        );
+        if let WorkerRpcRequest::SubmitAction { action, kind, .. } = &mut request {
+            *action = WorkerActionCommand::Checkpoint { origins };
+            *kind = ActionKind::ReadOnly;
+        }
+        assert!(
+            matches!(fixture.handler.handle(request).await,WorkerRpcResponse::Failure(failure) if failure.code==WorkerRpcFailureCode::InvalidRequest)
+        );
+        assert!(
+            matches!(fixture.handler.handle(WorkerRpcRequest::GetAction { fence:fixture.fence.clone(),action_id:id }).await,WorkerRpcResponse::Failure(failure) if failure.code==WorkerRpcFailureCode::NotFound)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_restore_rejects_unbound_or_unsupported_reference_before_context_allocation()
+-> Result<(), Box<dyn Error>> {
+    let driver = Arc::new(OptionsRecordingDriver::new(PageId::new()));
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19085).await?;
+    let calls = driver.calls.load(Ordering::Acquire);
+    for bind_reference in [false, true] {
+        let options = WorkerSessionOptionsV1 {
+            checkpoint_ref: Some("opaque-checkpoint".to_owned()),
+            ..session_options()
+        };
+        let hash = if bind_reference {
+            options.canonical_request_hash(WorkerIsolationProfile::SharedContext)
+        } else {
+            session_options().canonical_request_hash(WorkerIsolationProfile::SharedContext)
+        };
+        let response = fixture
+            .handler
+            .handle(WorkerRpcRequest::CreateSession(
+                WorkerCreateSessionRequest {
+                    operation_id: OperationId::new(),
+                    tenant_id: fixture.fence.tenant_id.clone(),
+                    idempotency_key: format!("checkpoint-restore-{bind_reference}"),
+                    canonical_request_hash: hash,
+                    expected_worker_epoch: fixture.fence.worker_epoch,
+                    placement_version: 1,
+                    session_incarnation: 1,
+                    requested_isolation: WorkerIsolationProfile::SharedContext,
+                    options_version: WORKER_SESSION_OPTIONS_VERSION,
+                    options,
+                    now_unix_millis: 2,
+                },
+            ))
+            .await;
+        assert!(
+            matches!(response,WorkerRpcResponse::Failure(failure) if failure.code==WorkerRpcFailureCode::InvalidRequest)
+        );
+        assert_eq!(driver.calls.load(Ordering::Acquire), calls);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_secret_reference_is_rejected_before_action_registration()
+-> Result<(), Box<dyn Error>> {
+    let fixture = action_rpc_fixture(Arc::new(ReadyDriver), Arc::new(ReadySandbox), 19083).await?;
+    for secret_ref in ["", " reference", "reference ", "ref\nerence"] {
+        let id = ActionId::new();
+        let mut request = submit_action_request(
+            &fixture.fence,
+            &fixture.primary_page_id,
+            &id,
+            1,
+            "invalid-secret",
+            3,
+        );
+        if let WorkerRpcRequest::SubmitAction { action, .. } = &mut request {
+            *action = WorkerActionCommand::FillSecret {
+                node_ref: "0000000000000001".to_owned(),
+                secret_ref: secret_ref.to_owned(),
+            };
+        }
+        assert!(
+            matches!(fixture.handler.handle(request).await, WorkerRpcResponse::Failure(failure) if failure.code == WorkerRpcFailureCode::InvalidRequest)
+        );
+        assert!(
+            matches!(fixture.handler.handle(WorkerRpcRequest::GetAction { fence:fixture.fence.clone(), action_id:id }).await, WorkerRpcResponse::Failure(failure) if failure.code == WorkerRpcFailureCode::NotFound)
+        );
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1410,6 +2116,113 @@ async fn create_session_rpc_negotiates_isolation_against_worker_capability()
         WorkerRpcResponse::Failure(failure)
             if failure.code == WorkerRpcFailureCode::InvalidRequest
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_receipt_uses_per_session_placement_and_exact_retry_preserves_it()
+-> Result<(), Box<dyn Error>> {
+    let mut driver = OptionsRecordingDriver::new(PageId::new());
+    driver.placement = Some(WorkerIsolationProfile::TenantDedicatedShard);
+    let driver = Arc::new(driver);
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19074).await?;
+    assert_eq!(
+        fixture
+            .worker
+            .session_effective_isolation(
+                &fixture.peer,
+                &fixture.fence.session_id,
+                &fixture.ownership,
+            )
+            .map_err(|_| "effective session isolation lookup failed")?,
+        WorkerIsolationProfile::TenantDedicatedShard
+    );
+    let options = session_options();
+    let request = WorkerCreateSessionRequest {
+        operation_id: OperationId::new(),
+        tenant_id: fixture.fence.tenant_id.clone(),
+        idempotency_key: "session-placement-retry".to_owned(),
+        canonical_request_hash: options
+            .canonical_request_hash(WorkerIsolationProfile::SharedContext),
+        expected_worker_epoch: 7,
+        placement_version: 2,
+        session_incarnation: 1,
+        requested_isolation: WorkerIsolationProfile::SharedContext,
+        options_version: WORKER_SESSION_OPTIONS_VERSION,
+        options,
+        now_unix_millis: 2,
+    };
+    let first = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(request.clone()))
+        .await;
+    let second = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(request))
+        .await;
+    let (WorkerRpcResponse::SessionCreated(first), WorkerRpcResponse::SessionCreated(second)) =
+        (first, second)
+    else {
+        return Err("per-session placement must be returned".into());
+    };
+    assert_eq!(first.session_id, second.session_id);
+    assert_eq!(
+        first.effective_isolation,
+        WorkerIsolationProfile::TenantDedicatedShard
+    );
+    assert_eq!(first.effective_isolation, second.effective_isolation);
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+    let foreign = OwnershipFence::new(fixture.ownership.worker_id().clone(), 7, 99, 1);
+    assert!(
+        fixture
+            .worker
+            .session_effective_isolation(&fixture.peer, &fixture.fence.session_id, &foreign)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn weaker_actual_placement_is_cleaned_before_ready_and_never_reported()
+-> Result<(), Box<dyn Error>> {
+    let mut driver = OptionsRecordingDriver::new(PageId::new());
+    driver.placement = Some(WorkerIsolationProfile::SharedContext);
+    let driver = Arc::new(driver);
+    let fixture = action_rpc_fixture(Arc::clone(&driver), Arc::new(ReadySandbox), 19075).await?;
+    let options = session_options();
+    let response = fixture
+        .handler
+        .handle(WorkerRpcRequest::CreateSession(
+            WorkerCreateSessionRequest {
+                operation_id: OperationId::new(),
+                tenant_id: fixture.fence.tenant_id.clone(),
+                idempotency_key: "weaker-placement".to_owned(),
+                canonical_request_hash: options
+                    .canonical_request_hash(WorkerIsolationProfile::DedicatedProcess),
+                expected_worker_epoch: 7,
+                placement_version: 2,
+                session_incarnation: 1,
+                requested_isolation: WorkerIsolationProfile::DedicatedProcess,
+                options_version: WORKER_SESSION_OPTIONS_VERSION,
+                options,
+                now_unix_millis: 2,
+            },
+        ))
+        .await;
+    assert!(matches!(response, WorkerRpcResponse::Failure(_)));
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(driver.closed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .worker
+            .session_effective_isolation(
+                &fixture.peer,
+                &fixture.fence.session_id,
+                &fixture.ownership
+            )
+            .map_err(|_| "effective session isolation lookup failed")?,
+        WorkerIsolationProfile::SharedContext
+    );
     Ok(())
 }
 

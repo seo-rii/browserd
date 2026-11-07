@@ -1,6 +1,9 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::collections::{BTreeMap, BTreeSet};
+#[path = "support/singlehost_safety.rs"]
+mod singlehost_safety;
+
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -18,17 +21,18 @@ use browserd_actions::{
 use browserd_api::{
     ActionGetRequest, ActionPayload, ActionResolveBody, ActionResolveRequest, ActionSubmitCommand,
     ActionSubmitRequest, ApiRequest, ApiResponse, ApiRouter, ApiService, ApprovalDecisionBody,
-    ApprovalDecisionRequest, ApprovalListQuery, ArtifactRequest, PageActivateRequest,
-    PageCreateBody, PageCreateRequest, PageDeleteRequest, PageListRequest, ResolutionRequestKind,
-    WaitCondition, WaitUntil, decode_session_create,
+    ApprovalDecisionRequest, ApprovalListQuery, ArtifactRequest, ArtifactUploadBody,
+    ArtifactUploadRequest, PageActivateRequest, PageCreateBody, PageCreateRequest,
+    PageDeleteRequest, PageListRequest, ResolutionRequestKind, WaitCondition, WaitUntil,
+    decode_session_create,
 };
 use browserd_auth::{
     AuthConfig, AuthenticatedPrincipal, RevocationRegistry, ServiceClaims, ServiceTokenSigner,
     ServiceTokenVerifier, VerificationKeySet,
 };
 use browserd_core::{
-    ActionId, ActionState, ApprovalId, ArtifactId, CreateOperationState, PageId, PrincipalId,
-    SessionId, TenantId, WorkerId,
+    ActionId, ActionState, ApprovalId, ArtifactId, CreateOperationState, ErrorCode, PageId,
+    PrincipalId, SessionId, TenantId, WorkerId,
 };
 use browserd_worker::{
     WorkerActionCommand, WorkerActionReceipt, WorkerActionStatus, WorkerApprovalActionType,
@@ -37,8 +41,8 @@ use browserd_worker::{
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
     WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerRpcCompletionError, WorkerRpcEnqueueError,
     WorkerRpcError, WorkerRpcFailure, WorkerRpcFailureCode, WorkerRpcRequest, WorkerRpcResponse,
-    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1, WorkerSessionReceipt,
-    WorkerViewport, WorkerWaitCondition,
+    WorkerSessionFence, WorkerSessionLifecycle, WorkerSessionOptionsV1,
+    WorkerSessionOwnershipReceipt, WorkerSessionReceipt, WorkerViewport, WorkerWaitCondition,
 };
 use jsonwebtoken::Algorithm;
 use uuid::Uuid;
@@ -81,6 +85,7 @@ struct RecordingWorker {
     request: Mutex<Option<WorkerCreateSessionRequest>>,
     session_id: SessionId,
     corrupt_epoch: bool,
+    closed: AtomicBool,
 }
 
 impl GatewayWorkerClient for RecordingWorker {
@@ -106,16 +111,39 @@ impl GatewayWorkerClient for RecordingWorker {
             },
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
     fn request(&self, request: WorkerRpcRequest) -> Result<WorkerRpcResponse, WorkerRpcError> {
         let recorded = self.request.lock().map_err(|_| WorkerRpcError::Runtime)?;
         let created = recorded.as_ref().ok_or(WorkerRpcError::Protocol)?;
-        let (fence, lifecycle, closed) = match request {
-            WorkerRpcRequest::GetSession { fence } => (fence, WorkerSessionLifecycle::Ready, false),
+        let (fence, lifecycle, closed, inspected_worker) = match request {
+            WorkerRpcRequest::GetSession { fence } => (
+                fence,
+                if self.closed.load(Ordering::Acquire) {
+                    WorkerSessionLifecycle::Closed
+                } else {
+                    WorkerSessionLifecycle::Ready
+                },
+                false,
+                None,
+            ),
+            WorkerRpcRequest::InspectSession {
+                expected_worker_id,
+                fence,
+            } => (
+                fence,
+                if self.closed.load(Ordering::Acquire) {
+                    WorkerSessionLifecycle::Closed
+                } else {
+                    WorkerSessionLifecycle::Ready
+                },
+                false,
+                Some(expected_worker_id),
+            ),
             WorkerRpcRequest::CloseSession { fence, .. } => {
-                (fence, WorkerSessionLifecycle::Closed, true)
+                (fence, WorkerSessionLifecycle::Closed, true, None)
             }
             _ => return Err(WorkerRpcError::InvalidRequest),
         };
@@ -127,12 +155,20 @@ impl GatewayWorkerClient for RecordingWorker {
         {
             return Err(WorkerRpcError::Protocol);
         }
+        if closed {
+            self.closed.store(true, Ordering::Release);
+        }
         let receipt = WorkerSessionReceipt {
             fence,
             lifecycle,
             primary_page_id: PageId::new(),
         };
-        Ok(if closed {
+        Ok(if let Some(worker_id) = inspected_worker {
+            WorkerRpcResponse::SessionOwnership(WorkerSessionOwnershipReceipt {
+                worker_id,
+                session: receipt,
+            })
+        } else if closed {
             WorkerRpcResponse::SessionClosed(receipt)
         } else {
             WorkerRpcResponse::Session(receipt)
@@ -147,10 +183,40 @@ impl GatewayWorkerClient for RecordingWorker {
     }
 }
 
+struct CheckpointWorker {
+    inner: RecordingWorker,
+    restored_checkpoint: Option<browserd_worker::WorkerCheckpointRestoreReceipt>,
+}
+
+impl GatewayWorkerClient for CheckpointWorker {
+    type PendingAction = ImmediatePending;
+
+    fn create_session(
+        &self,
+        request: WorkerCreateSessionRequest,
+    ) -> Result<WorkerCreateSessionReceipt, WorkerRpcError> {
+        let mut receipt = self.inner.create_session(request)?;
+        receipt.restored_checkpoint = self.restored_checkpoint.clone();
+        Ok(receipt)
+    }
+
+    fn request(&self, request: WorkerRpcRequest) -> Result<WorkerRpcResponse, WorkerRpcError> {
+        self.inner.request(request)
+    }
+
+    fn enqueue_action(
+        &self,
+        request: WorkerRpcRequest,
+    ) -> Result<Self::PendingAction, WorkerRpcEnqueueError> {
+        self.inner.enqueue_action(request)
+    }
+}
+
 struct RacingWorker {
     create: Mutex<Option<WorkerCreateSessionRequest>>,
     session_id: SessionId,
     block_first_get: AtomicBool,
+    closed: AtomicBool,
     get_entered: mpsc::Sender<()>,
     get_release: Mutex<mpsc::Receiver<()>>,
 }
@@ -184,6 +250,7 @@ impl GatewayWorkerClient for PageWorker {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
@@ -254,6 +321,8 @@ struct ResourceWorker {
     page_id: PageId,
     approval_action_id: ActionId,
     artifact_id: ArtifactId,
+    artifact_list_ids: Vec<ArtifactId>,
+    artifact_list_fault: AtomicUsize,
     approval_id: ApprovalId,
     requester_principal_id: PrincipalId,
     create_count: AtomicUsize,
@@ -287,6 +356,7 @@ impl GatewayWorkerClient for ResourceWorker {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
@@ -331,6 +401,8 @@ impl GatewayWorkerClient for ResourceWorker {
                 terminal_detail,
                 result: None,
                 resolution,
+                custody: None,
+                custody_requirement: None,
             })
         };
         let approval_receipt = |fence: WorkerSessionFence,
@@ -351,6 +423,7 @@ impl GatewayWorkerClient for ResourceWorker {
                 node_ref: Some("node-opaque".to_owned()),
                 credential_refs_hash: [3; 32],
                 expires_at_unix_millis: 10_000,
+                typed_binding: None,
             };
             let proposal_hash = *proposal.to_canonical()?.hash().as_bytes();
             Ok(WorkerApprovalReceipt {
@@ -464,6 +537,24 @@ impl GatewayWorkerClient for ResourceWorker {
                 )
                 .map(WorkerRpcResponse::Action)
             }
+            WorkerRpcRequest::UploadNamedArtifact {
+                fence,
+                bytes,
+                content_type,
+                display_filename,
+                ..
+            } => Ok(WorkerRpcResponse::ArtifactStored(WorkerArtifactReceipt {
+                fence,
+                artifact_id: self.artifact_id.clone(),
+                state: WorkerArtifactState::Available,
+                size_bytes: bytes.len() as u64,
+                checksum_sha256: [8; 32],
+                content_type,
+                source: WorkerArtifactSource::ClientUpload,
+                display_filename: Some(display_filename.clone()),
+                origin: display_filename,
+                object_generation: [9; 32],
+            })),
             WorkerRpcRequest::GetArtifact { fence, artifact_id }
                 if artifact_id == self.artifact_id =>
             {
@@ -475,9 +566,56 @@ impl GatewayWorkerClient for ResourceWorker {
                     checksum_sha256: [8; 32],
                     content_type: "application/octet-stream".to_owned(),
                     source: WorkerArtifactSource::ClientUpload,
+                    display_filename: None,
                     origin: "gateway-test-upload".to_owned(),
                     object_generation: [9; 32],
                 }))
+            }
+            WorkerRpcRequest::ListArtifacts {
+                fence,
+                after,
+                limit,
+            } => {
+                let mut receipts = self
+                    .artifact_list_ids
+                    .iter()
+                    .filter(|id| after.as_ref().is_none_or(|after| *id > after))
+                    .take(limit)
+                    .map(|id| WorkerArtifactReceipt {
+                        fence: fence.clone(),
+                        artifact_id: id.clone(),
+                        state: WorkerArtifactState::Available,
+                        size_bytes: 4,
+                        checksum_sha256: [8; 32],
+                        content_type: "application/octet-stream".to_owned(),
+                        source: WorkerArtifactSource::BrowserDownload,
+                        display_filename: None,
+                        origin: "browserd-worker-download".to_owned(),
+                        object_generation: [9; 32],
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(last) = receipts.last_mut() {
+                    match self.artifact_list_fault.load(Ordering::Acquire) {
+                        1 => last.fence.tenant_id = TenantId::new(),
+                        2 => last.fence.session_id = SessionId::new(),
+                        3 => last.fence.worker_epoch += 1,
+                        4 => last.artifact_id = self.artifact_list_ids[0].clone(),
+                        6 => {
+                            last.artifact_id =
+                                after.unwrap_or_else(|| self.artifact_list_ids[0].clone())
+                        }
+                        7 => last.content_type = "invalid\ncontent-type".to_owned(),
+                        8 => last.object_generation = [0; 32],
+                        _ => {}
+                    }
+                }
+                if self.artifact_list_fault.load(Ordering::Acquire) == 5 {
+                    receipts.reverse();
+                }
+                if self.artifact_list_fault.load(Ordering::Acquire) == 9 {
+                    receipts.extend(receipts.clone());
+                }
+                Ok(WorkerRpcResponse::Artifacts(receipts))
             }
             WorkerRpcRequest::ListApprovals { fence } => {
                 approval_receipt(fence, WorkerApprovalState::Pending)
@@ -536,6 +674,7 @@ impl GatewayWorkerClient for RacingWorker {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
@@ -550,7 +689,7 @@ impl GatewayWorkerClient for RacingWorker {
                 created.session_incarnation,
             )
         };
-        let (fence, lifecycle, closed) = match request {
+        let (fence, lifecycle, closed, inspected_worker) = match request {
             WorkerRpcRequest::GetSession { fence } => {
                 if self.block_first_get.swap(false, Ordering::AcqRel) {
                     self.get_entered
@@ -562,10 +701,23 @@ impl GatewayWorkerClient for RacingWorker {
                         .recv()
                         .map_err(|_| WorkerRpcError::Runtime)?;
                 }
-                (fence, WorkerSessionLifecycle::Ready, false)
+                (fence, WorkerSessionLifecycle::Ready, false, None)
             }
+            WorkerRpcRequest::InspectSession {
+                expected_worker_id,
+                fence,
+            } => (
+                fence,
+                if self.closed.load(Ordering::Acquire) {
+                    WorkerSessionLifecycle::Closed
+                } else {
+                    WorkerSessionLifecycle::Ready
+                },
+                false,
+                Some(expected_worker_id),
+            ),
             WorkerRpcRequest::CloseSession { fence, .. } => {
-                (fence, WorkerSessionLifecycle::Closed, true)
+                (fence, WorkerSessionLifecycle::Closed, true, None)
             }
             _ => return Err(WorkerRpcError::InvalidRequest),
         };
@@ -577,12 +729,20 @@ impl GatewayWorkerClient for RacingWorker {
         {
             return Err(WorkerRpcError::Protocol);
         }
+        if closed {
+            self.closed.store(true, Ordering::Release);
+        }
         let receipt = WorkerSessionReceipt {
             fence,
             lifecycle,
             primary_page_id: PageId::new(),
         };
-        Ok(if closed {
+        Ok(if let Some(worker_id) = inspected_worker {
+            WorkerRpcResponse::SessionOwnership(WorkerSessionOwnershipReceipt {
+                worker_id,
+                session: receipt,
+            })
+        } else if closed {
             WorkerRpcResponse::SessionClosed(receipt)
         } else {
             WorkerRpcResponse::Session(receipt)
@@ -598,6 +758,26 @@ impl GatewayWorkerClient for RacingWorker {
 }
 
 fn authenticated_principal(tenant_id: TenantId) -> Result<AuthenticatedPrincipal, Box<dyn Error>> {
+    authenticated_principal_with_scopes(
+        tenant_id,
+        &[
+            "session:create",
+            "session:read",
+            "session:close",
+            "browser:act",
+            "browser:evaluate",
+            "artifact:read",
+            "artifact:upload",
+            "approval:read",
+            "approval:decide",
+        ],
+    )
+}
+
+fn authenticated_principal_with_scopes(
+    tenant_id: TenantId,
+    scopes: &[&str],
+) -> Result<AuthenticatedPrincipal, Box<dyn Error>> {
     let secret = [9_u8; 32];
     let mut keys = VerificationKeySet::new();
     keys.insert_hmac("gateway-worker-test", Algorithm::HS256, &secret)?;
@@ -612,16 +792,7 @@ fn authenticated_principal(tenant_id: TenantId) -> Result<AuthenticatedPrincipal
         "audience",
         PrincipalId::new(),
         tenant_id,
-        BTreeSet::from([
-            "session:create".to_owned(),
-            "session:read".to_owned(),
-            "session:close".to_owned(),
-            "browser:act".to_owned(),
-            "browser:evaluate".to_owned(),
-            "artifact:read".to_owned(),
-            "approval:read".to_owned(),
-            "approval:decide".to_owned(),
-        ]),
+        scopes.iter().map(|scope| (*scope).to_owned()).collect(),
         "gateway-worker-runtime",
         1,
         100,
@@ -648,6 +819,15 @@ fn resource_worker(
         page_id: PageId::new(),
         approval_action_id: ActionId::new(),
         artifact_id: ArtifactId::new(),
+        artifact_list_ids: [
+            "01900000-0000-7000-8000-000000000001",
+            "01900000-0000-7000-8000-000000000002",
+            "01900000-0000-7000-8000-000000000003",
+        ]
+        .into_iter()
+        .map(|id| id.parse().expect("typed artifact ID"))
+        .collect(),
+        artifact_list_fault: AtomicUsize::new(0),
         approval_id: ApprovalId::new(),
         requester_principal_id,
         create_count: AtomicUsize::new(0),
@@ -694,6 +874,7 @@ fn create_dispatch_preserves_idempotency_and_exact_worker_fences() -> Result<(),
         request: Mutex::new(None),
         session_id: SessionId::new(),
         corrupt_epoch: false,
+        closed: AtomicBool::new(false),
     });
     let placement = gateway_placement()?;
     let runtime = Arc::new(GatewayWorkerRuntime::new(Arc::clone(&worker), placement)?);
@@ -755,6 +936,7 @@ fn create_dispatch_forwards_every_v1_session_option_to_the_worker() -> Result<()
         request: Mutex::new(None),
         session_id: SessionId::new(),
         corrupt_epoch: false,
+        closed: AtomicBool::new(false),
     });
     let runtime = Arc::new(GatewayWorkerRuntime::new(
         Arc::clone(&worker),
@@ -816,6 +998,199 @@ fn create_dispatch_forwards_every_v1_session_option_to_the_worker() -> Result<()
 }
 
 #[test]
+fn checkpoint_restore_requires_scope_and_preserves_the_reference_into_a_new_session()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::new();
+    let source_session = SessionId::new();
+    let destination = SessionId::new();
+    let checkpoint_ref = "opaque-checkpoint";
+    let worker = Arc::new(CheckpointWorker {
+        inner: RecordingWorker {
+            request: Mutex::new(None),
+            session_id: destination.clone(),
+            corrupt_epoch: false,
+            closed: AtomicBool::new(false),
+        },
+        restored_checkpoint: Some(browserd_worker::WorkerCheckpointRestoreReceipt {
+            checkpoint_ref: checkpoint_ref.to_owned(),
+            source_session_id: source_session.clone(),
+        }),
+    });
+    let runtime = Arc::new(GatewayWorkerRuntime::new(
+        Arc::clone(&worker),
+        gateway_placement()?,
+    )?);
+    let router = ApiRouter::new(runtime);
+    let key = Uuid::new_v4().to_string();
+    let mut body = decode_session_create(CREATE_JSON)?;
+    body.checkpoint_ref = Some(checkpoint_ref.to_owned());
+    body.metadata.insert(
+        "restored_from_checkpoint".to_owned(),
+        "spoofed-ref".to_owned(),
+    );
+    body.metadata.insert(
+        "recovered_from_session".to_owned(),
+        "spoofed-session".to_owned(),
+    );
+    let request = || ApiRequest::CreateSession {
+        body: body.clone(),
+        idempotency_key: key.clone(),
+        received_at: Instant::now(),
+    };
+    for scopes in [&["session:create"][..], &["checkpoint:read"][..]] {
+        assert!(
+            router
+                .execute(
+                    &authenticated_principal_with_scopes(tenant.clone(), scopes)?,
+                    request()
+                )
+                .is_err()
+        );
+    }
+    assert!(worker.inner.request.lock().unwrap().is_none());
+    let principal = authenticated_principal_with_scopes(
+        tenant.clone(),
+        &["session:create", "checkpoint:read", "session:read"],
+    )?;
+    let ApiResponse::SessionCreate(created) = router.execute(&principal, request())? else {
+        return Err("unexpected restore response".into());
+    };
+    assert_eq!(
+        created.data().operation().state(),
+        CreateOperationState::Succeeded
+    );
+    let session = created
+        .data()
+        .operation()
+        .session()
+        .ok_or("restored session missing")?;
+    assert_eq!(session.id, destination);
+    assert_ne!(session.id, source_session);
+    assert_eq!(session.incarnation, 1);
+    assert_eq!(
+        session
+            .metadata
+            .get("restored_from_checkpoint")
+            .map(String::as_str),
+        Some(checkpoint_ref)
+    );
+    assert_eq!(
+        session.metadata.get("recovered_from_session"),
+        Some(&source_session.to_string())
+    );
+    assert_eq!(
+        session.metadata.get("agent_run_id").map(String::as_str),
+        Some("run_123")
+    );
+    let recorded = worker
+        .inner
+        .request
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("worker create missing")?;
+    assert_eq!(recorded.tenant_id, tenant);
+    assert_eq!(
+        recorded.options.checkpoint_ref.as_deref(),
+        Some(checkpoint_ref)
+    );
+    assert_eq!(
+        recorded.canonical_request_hash,
+        recorded
+            .options
+            .canonical_request_hash(recorded.requested_isolation)
+    );
+    let ApiResponse::Session(fetched) =
+        router.execute(&principal, ApiRequest::GetSession(destination))?
+    else {
+        return Err("unexpected restored session".into());
+    };
+    assert_eq!(fetched.data().metadata, session.metadata);
+    assert!(
+        router
+            .execute(&principal, ApiRequest::GetSession(source_session))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_checkpoint_restore_receipts_never_register_a_session_route_or_catalog_entry()
+-> Result<(), Box<dyn Error>> {
+    let destination = SessionId::new();
+    let restored = browserd_worker::WorkerCheckpointRestoreReceipt {
+        checkpoint_ref: "opaque-checkpoint".to_owned(),
+        source_session_id: SessionId::new(),
+    };
+    for (requested, receipt) in [
+        (Some("opaque-checkpoint"), None),
+        (
+            Some("opaque-checkpoint"),
+            Some(browserd_worker::WorkerCheckpointRestoreReceipt {
+                checkpoint_ref: "different-checkpoint".to_owned(),
+                ..restored.clone()
+            }),
+        ),
+        (
+            Some("opaque-checkpoint"),
+            Some(browserd_worker::WorkerCheckpointRestoreReceipt {
+                source_session_id: destination.clone(),
+                ..restored.clone()
+            }),
+        ),
+        (None, Some(restored)),
+    ] {
+        let principal = authenticated_principal_with_scopes(
+            TenantId::new(),
+            &["session:create", "checkpoint:read", "session:read"],
+        )?;
+        let worker = Arc::new(CheckpointWorker {
+            inner: RecordingWorker {
+                request: Mutex::new(None),
+                session_id: destination.clone(),
+                corrupt_epoch: false,
+                closed: AtomicBool::new(false),
+            },
+            restored_checkpoint: receipt,
+        });
+        let runtime = Arc::new(GatewayWorkerRuntime::new(worker, gateway_placement()?)?);
+        let router = ApiRouter::new(runtime);
+        let mut body = decode_session_create(CREATE_JSON)?;
+        body.checkpoint_ref = requested.map(str::to_owned);
+        let ApiResponse::SessionCreate(created) = router.execute(
+            &principal,
+            ApiRequest::CreateSession {
+                body,
+                idempotency_key: Uuid::new_v4().to_string(),
+                received_at: Instant::now(),
+            },
+        )?
+        else {
+            return Err("unexpected restore response".into());
+        };
+        assert_eq!(
+            created.data().operation().state(),
+            CreateOperationState::Failed
+        );
+        assert!(created.data().operation().session().is_none());
+        assert!(
+            router
+                .execute(&principal, ApiRequest::GetSession(destination.clone()))
+                .is_err()
+        );
+        let ApiResponse::Sessions(sessions) = router.execute(
+            &principal,
+            ApiRequest::ListSessions(browserd_api::SessionListQuery::default()),
+        )?
+        else {
+            return Err("unexpected session catalog response".into());
+        };
+        assert!(sessions.data().items().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn a_mismatched_worker_receipt_cannot_complete_the_create_operation() -> Result<(), Box<dyn Error>>
 {
     let tenant_id = TenantId::new();
@@ -824,6 +1199,7 @@ fn a_mismatched_worker_receipt_cannot_complete_the_create_operation() -> Result<
         request: Mutex::new(None),
         session_id: SessionId::new(),
         corrupt_epoch: true,
+        closed: AtomicBool::new(false),
     });
     let placement = gateway_placement()?;
     let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement)?);
@@ -857,15 +1233,25 @@ fn created_sessions_are_read_and_closed_through_the_same_exact_worker_fence()
         request: Mutex::new(None),
         session_id: SessionId::new(),
         corrupt_epoch: false,
+        closed: AtomicBool::new(false),
     });
     let placement = gateway_placement()?;
     let runtime = Arc::new(GatewayWorkerRuntime::new(worker, placement)?);
     let router = ApiRouter::new(runtime);
+    let mut body = decode_session_create(CREATE_JSON)?;
+    body.metadata.insert(
+        "restored_from_checkpoint".to_owned(),
+        "spoofed-ref".to_owned(),
+    );
+    body.metadata.insert(
+        "recovered_from_session".to_owned(),
+        "spoofed-session".to_owned(),
+    );
 
     let created = router.execute(
         &principal,
         ApiRequest::CreateSession {
-            body: decode_session_create(CREATE_JSON)?,
+            body,
             idempotency_key: Uuid::new_v4().to_string(),
             received_at: Instant::now(),
         },
@@ -884,6 +1270,9 @@ fn created_sessions_are_read_and_closed_through_the_same_exact_worker_fence()
     assert!(matches!(
         fetched,
         ApiResponse::Session(response) if response.data().id == session_id
+            && !response.data().metadata.contains_key("restored_from_checkpoint")
+            && !response.data().metadata.contains_key("recovered_from_session")
+            && response.data().metadata.get("agent_run_id").map(String::as_str)==Some("run_123")
     ));
     let closed = router.execute(&principal, ApiRequest::DeleteSession(session_id.clone()))?;
     assert!(matches!(
@@ -905,6 +1294,7 @@ fn a_delayed_read_cannot_regress_a_concurrently_closed_session() -> Result<(), B
         create: Mutex::new(None),
         session_id: SessionId::new(),
         block_first_get: AtomicBool::new(true),
+        closed: AtomicBool::new(false),
         get_entered: get_entered_tx,
         get_release: Mutex::new(get_release_rx),
     });
@@ -1364,7 +1754,7 @@ fn unsupported_public_actions_are_rejected_before_durable_claim_or_worker_enqueu
                 page_id: worker.page_id.clone(),
                 if_session_incarnation: 1,
                 execution_timeout_ms: 1_000,
-                action: ActionPayload::Screenshot,
+                action: ActionPayload::NewPage { url: None },
             },
         }),
     );
@@ -1544,45 +1934,88 @@ fn raw_input_actions_reach_the_worker_as_typed_mutations() -> Result<(), Box<dyn
 
 #[test]
 fn query_all_reaches_the_worker_as_a_read_only_selector() -> Result<(), Box<dyn Error>> {
-    let (principal, worker, router, session_id) = resource_fixture()?;
-    let submitted = router.execute(
-        &principal,
-        ApiRequest::SubmitAction(ActionSubmitCommand {
-            session_id: session_id.clone(),
-            idempotency_key: Uuid::new_v4(),
-            body: ActionSubmitRequest {
-                page_id: worker.page_id.clone(),
-                if_session_incarnation: 1,
-                execution_timeout_ms: 30_000,
-                action: ActionPayload::QueryAll {
-                    selector: "a.link".to_owned(),
-                },
+    for frame_path in [
+        vec![],
+        vec!["iframe#outer".to_owned(), "iframe#inner".to_owned()],
+    ] {
+        let (principal, worker, router, session_id) = resource_fixture()?;
+        let idempotency_key = Uuid::new_v4();
+        let body = ActionSubmitRequest {
+            page_id: worker.page_id.clone(),
+            if_session_incarnation: 1,
+            execution_timeout_ms: 30_000,
+            action: ActionPayload::QueryAll {
+                selector: "a.link".to_owned(),
+                frame_path: frame_path.clone(),
             },
-        }),
-    )?;
-    let ApiResponse::Action(submitted) = submitted else {
-        return Err("unexpected query_all submit response".into());
-    };
-    assert_eq!(submitted.data().request().kind(), ActionKind::ReadOnly);
-
-    let requests = worker
-        .requests
-        .lock()
-        .map_err(|_| "request lock poisoned")?;
-    let action = requests
-        .iter()
-        .find_map(|request| match request {
-            WorkerRpcRequest::SubmitAction { action, kind, .. } => Some((action, kind)),
-            _ => None,
-        })
-        .ok_or("query_all submit RPC not recorded")?;
-    assert_eq!(*action.1, ActionKind::ReadOnly);
-    assert_eq!(
-        action.0,
-        &WorkerActionCommand::QueryAll {
-            selector: "a.link".to_owned(),
+        };
+        let expected_hash =
+            *browserd_operations::CanonicalRequestHash::from_json(&serde_json::to_value(&body)?)
+                .as_bytes();
+        let request = |body| {
+            ApiRequest::SubmitAction(ActionSubmitCommand {
+                session_id: session_id.clone(),
+                idempotency_key,
+                body,
+            })
+        };
+        let ApiResponse::Action(submitted) = router.execute(&principal, request(body.clone()))?
+        else {
+            return Err("unexpected query_all submit response".into());
+        };
+        assert_eq!(submitted.data().request().kind(), ActionKind::ReadOnly);
+        {
+            let requests = worker
+                .requests
+                .lock()
+                .map_err(|_| "request lock poisoned")?;
+            let (action, kind, hash) = requests
+                .iter()
+                .rev()
+                .find_map(|request| match request {
+                    WorkerRpcRequest::SubmitAction {
+                        action,
+                        kind,
+                        canonical_request_hash,
+                        ..
+                    } => Some((action, kind, canonical_request_hash)),
+                    _ => None,
+                })
+                .ok_or("query_all submit RPC not recorded")?;
+            assert_eq!(*kind, ActionKind::ReadOnly);
+            assert_eq!(*hash, expected_hash);
+            assert_eq!(
+                action,
+                &WorkerActionCommand::QueryAll {
+                    selector: "a.link".to_owned(),
+                    frame_path: frame_path.clone(),
+                }
+            );
         }
-    );
+        let before = worker
+            .requests
+            .lock()
+            .map_err(|_| "request lock poisoned")?
+            .len();
+        let mut different = body;
+        different.action = ActionPayload::QueryAll {
+            selector: "a.link".to_owned(),
+            frame_path: vec!["iframe#different".to_owned()],
+        };
+        let error = router
+            .execute(&principal, request(different))
+            .err()
+            .ok_or("changed frame path must conflict with the original idempotency key")?;
+        assert_eq!(error.code(), ErrorCode::IdempotencyConflict);
+        assert_eq!(
+            worker
+                .requests
+                .lock()
+                .map_err(|_| "request lock poisoned")?
+                .len(),
+            before
+        );
+    }
     Ok(())
 }
 
@@ -2004,6 +2437,215 @@ fn pointer_mutations_reach_the_worker_as_typed_node_references() -> Result<(), B
 }
 
 #[test]
+fn set_files_reaches_worker_with_exact_ids_and_rejects_duplicates_before_dispatch()
+-> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let ids = vec![ArtifactId::new(), ArtifactId::new()];
+    let command = |ids| {
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key: Uuid::new_v4(),
+            body: ActionSubmitRequest {
+                page_id: worker.page_id.clone(),
+                if_session_incarnation: 1,
+                execution_timeout_ms: 30_000,
+                action: ActionPayload::SetFiles {
+                    node_ref: "0000000000000001".to_owned(),
+                    artifact_ids: ids,
+                },
+            },
+        })
+    };
+    assert!(
+        router
+            .execute(&principal, command(vec![ids[0].clone(), ids[0].clone()]))
+            .is_err()
+    );
+    assert!(
+        !worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request, WorkerRpcRequest::SubmitAction { .. }))
+    );
+    assert!(matches!(
+        router.execute(&principal, command(ids.clone()))?,
+        ApiResponse::Action(_)
+    ));
+    assert!(worker.requests.lock().unwrap().iter().any(|request| matches!(request,
+        WorkerRpcRequest::SubmitAction { action:WorkerActionCommand::SetFiles { node_ref, artifact_ids }, kind:ActionKind::Mutating, page_id, .. }
+        if node_ref == "0000000000000001" && artifact_ids == &ids && page_id.as_ref() == Some(&worker.page_id))));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_actions_preserve_origins_and_require_create_scope_before_worker_dispatch()
+-> Result<(), Box<dyn Error>> {
+    for origins in [
+        vec![],
+        vec![
+            "https://example.test".to_owned(),
+            "http://example.test:8080".to_owned(),
+        ],
+    ] {
+        let (base, worker, router, session_id) = resource_fixture()?;
+        let checkpoint_only =
+            authenticated_principal_with_scopes(base.tenant_id().clone(), &["checkpoint:create"])?;
+        let authorized = authenticated_principal_with_scopes(
+            base.tenant_id().clone(),
+            &["browser:act", "checkpoint:create"],
+        )?;
+        let key = Uuid::new_v4();
+        let body = ActionSubmitRequest {
+            page_id: worker.page_id.clone(),
+            if_session_incarnation: 1,
+            execution_timeout_ms: 30000,
+            action: ActionPayload::Checkpoint {
+                origins: origins.clone(),
+            },
+        };
+        let request = |body| {
+            ApiRequest::SubmitAction(ActionSubmitCommand {
+                session_id: session_id.clone(),
+                idempotency_key: key,
+                body,
+            })
+        };
+        let before = worker.requests.lock().unwrap().len();
+        for denied in [&base, &checkpoint_only] {
+            assert!(router.execute(denied, request(body.clone())).is_err());
+        }
+        let mut invalid = body.clone();
+        invalid.action = ActionPayload::Checkpoint {
+            origins: vec!["https://example.test/path".to_owned()],
+        };
+        assert!(router.execute(&authorized, request(invalid)).is_err());
+        assert_eq!(worker.requests.lock().unwrap().len(), before);
+        let expected_hash =
+            *browserd_operations::CanonicalRequestHash::from_json(&serde_json::to_value(&body)?)
+                .as_bytes();
+        let ApiResponse::Action(submitted) = router.execute(&authorized, request(body))? else {
+            return Err("unexpected checkpoint action response".into());
+        };
+        assert_eq!(submitted.data().request().kind(), ActionKind::ReadOnly);
+        assert!(worker.requests.lock().unwrap().iter().any(|request|matches!(request,
+            WorkerRpcRequest::SubmitAction { action:WorkerActionCommand::Checkpoint { origins:actual },kind:ActionKind::ReadOnly,canonical_request_hash,.. }
+                if actual==&origins && *canonical_request_hash==expected_hash)));
+    }
+    Ok(())
+}
+
+#[test]
+fn fill_secret_requires_both_scopes_and_dispatches_only_the_reference() -> Result<(), Box<dyn Error>>
+{
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let secret_only =
+        authenticated_principal_with_scopes(principal.tenant_id().clone(), &["secret:use"])?;
+    let authorized = authenticated_principal_with_scopes(
+        principal.tenant_id().clone(),
+        &["browser:act", "secret:use"],
+    )?;
+    let idempotency_key = Uuid::new_v4();
+    let body = ActionSubmitRequest {
+        page_id: worker.page_id.clone(),
+        if_session_incarnation: 1,
+        execution_timeout_ms: 30_000,
+        action: ActionPayload::FillSecret {
+            node_ref: "0000000000000001".to_owned(),
+            secret_ref: "credential.login".to_owned(),
+        },
+    };
+    let request = |body| {
+        ApiRequest::SubmitAction(ActionSubmitCommand {
+            session_id: session_id.clone(),
+            idempotency_key,
+            body,
+        })
+    };
+    let before = worker.requests.lock().unwrap().len();
+    for denied in [&principal, &secret_only] {
+        assert!(router.execute(denied, request(body.clone())).is_err());
+    }
+    let mut invalid = body.clone();
+    invalid.action = ActionPayload::FillSecret {
+        node_ref: "0000000000000001".to_owned(),
+        secret_ref: " invalid ".to_owned(),
+    };
+    assert!(router.execute(&authorized, request(invalid)).is_err());
+    assert_eq!(worker.requests.lock().unwrap().len(), before);
+    let expected_hash =
+        *browserd_operations::CanonicalRequestHash::from_json(&serde_json::to_value(&body)?)
+            .as_bytes();
+    assert!(matches!(
+        router.execute(&authorized, request(body))?,
+        ApiResponse::Action(_)
+    ));
+    let requests = worker.requests.lock().unwrap();
+    let sent = requests
+        .iter()
+        .find_map(|request| match request {
+            WorkerRpcRequest::SubmitAction {
+                action,
+                kind,
+                canonical_request_hash,
+                requester_principal_id,
+                ..
+            } => Some((action, kind, canonical_request_hash, requester_principal_id)),
+            _ => None,
+        })
+        .ok_or("secret reference dispatch missing")?;
+    assert_eq!(*sent.1, ActionKind::Mutating);
+    assert_eq!(*sent.2, expected_hash);
+    assert_eq!(sent.3, authorized.principal_id());
+    assert_eq!(
+        serde_json::to_value(sent.0)?,
+        serde_json::json!({"type":"fill_secret","node_ref":"0000000000000001","secret_ref":"credential.login"})
+    );
+    Ok(())
+}
+
+#[test]
+fn upload_preserves_safe_filename_and_rejects_paths_before_worker_dispatch()
+-> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let command = |display_filename: &str| {
+        ApiRequest::UploadArtifact(ArtifactUploadRequest {
+            session_id: session_id.clone(),
+            body: ArtifactUploadBody {
+                display_filename: display_filename.to_owned(),
+                declared_content_type: Some("text/plain".to_owned()),
+                expected_size_bytes: 5,
+                data_base64: Some("aGVsbG8=".to_owned()),
+            },
+        })
+    };
+    for name in ["../file", "/file", "a\\b", ".", "..", "a\nb"] {
+        assert!(router.execute(&principal, command(name)).is_err());
+    }
+    assert!(
+        !worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| matches!(
+                request,
+                WorkerRpcRequest::StoreArtifact { .. }
+                    | WorkerRpcRequest::UploadNamedArtifact { .. }
+            ))
+    );
+    assert!(matches!(
+        router.execute(&principal, command("첨부 문서.txt"))?,
+        ApiResponse::ArtifactUpload(_)
+    ));
+    assert!(worker.requests.lock().unwrap().iter().any(|request| matches!(request,
+        WorkerRpcRequest::UploadNamedArtifact { fence, bytes, content_type, display_filename, .. }
+        if fence.session_id == session_id && bytes == b"hello" && content_type == "text/plain" && display_filename == "첨부 문서.txt")));
+    Ok(())
+}
+
+#[test]
 fn action_lookup_treats_worker_identity_drift_as_ambiguous_after_dispatch()
 -> Result<(), Box<dyn Error>> {
     let (principal, worker, router, session_id) = resource_fixture()?;
@@ -2067,6 +2709,183 @@ fn artifact_metadata_is_read_through_the_exact_worker_fence() -> Result<(), Box<
                 && response.data().checksum_sha256 == Some([8; 32])
                 && response.data().size_bytes == Some(4)
     ));
+    Ok(())
+}
+
+#[test]
+fn artifact_discovery_paginates_typed_ids_and_requests_one_extra_result()
+-> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    let first = router.execute(
+        &principal,
+        ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+            session_id: session_id.clone(),
+            after: None,
+            limit: 2,
+        }),
+    )?;
+    let ApiResponse::Artifacts(first) = first else {
+        return Err("expected artifact list".into());
+    };
+    assert_eq!(
+        first
+            .data()
+            .items
+            .iter()
+            .map(|item| item.key.artifact_id().clone())
+            .collect::<Vec<_>>(),
+        worker.artifact_list_ids[..2]
+    );
+    assert_eq!(
+        first.data().next_cursor.as_ref(),
+        Some(&worker.artifact_list_ids[1])
+    );
+    assert!(
+        first
+            .data()
+            .items
+            .iter()
+            .all(|item| item.key.tenant_id() == principal.tenant_id()
+                && item.key.session_id() == &session_id)
+    );
+    let second = router.execute(
+        &principal,
+        ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+            session_id: session_id.clone(),
+            after: first.data().next_cursor.clone(),
+            limit: 2,
+        }),
+    )?;
+    let ApiResponse::Artifacts(second) = second else {
+        return Err("expected artifact list".into());
+    };
+    assert_eq!(second.data().items.len(), 1);
+    assert_eq!(
+        second.data().items[0].key.artifact_id(),
+        &worker.artifact_list_ids[2]
+    );
+    assert_eq!(second.data().next_cursor, None);
+    let requests = worker.requests.lock().unwrap();
+    let lists = requests
+        .iter()
+        .filter_map(|request| match request {
+            WorkerRpcRequest::ListArtifacts {
+                fence,
+                after,
+                limit,
+            } => Some((fence, after, limit)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lists.len(), 2);
+    assert_eq!(lists[0].0.tenant_id, *principal.tenant_id());
+    assert_eq!(lists[0].0.session_id, session_id);
+    assert_eq!(lists[0].1, &None);
+    assert_eq!(*lists[0].2, 3);
+    assert_eq!(lists[1].1.as_ref(), Some(&worker.artifact_list_ids[1]));
+    Ok(())
+}
+
+#[test]
+fn artifact_discovery_checks_cross_fence_and_metadata_on_hidden_extra_item()
+-> Result<(), Box<dyn Error>> {
+    for fault in [1, 2, 3, 7, 8] {
+        let (principal, worker, router, session_id) = resource_fixture()?;
+        worker.artifact_list_fault.store(fault, Ordering::Release);
+        assert!(
+            router
+                .execute(
+                    &principal,
+                    ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+                        session_id,
+                        after: None,
+                        limit: 2,
+                    })
+                )
+                .is_err(),
+            "fault {fault} on extra item must fail the whole page"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn artifact_discovery_rejects_duplicate_unsorted_and_unbounded_worker_lists()
+-> Result<(), Box<dyn Error>> {
+    for fault in [4, 5, 9] {
+        let (principal, worker, router, session_id) = resource_fixture()?;
+        worker.artifact_list_fault.store(fault, Ordering::Release);
+        assert!(
+            router
+                .execute(
+                    &principal,
+                    ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+                        session_id,
+                        after: None,
+                        limit: 2,
+                    })
+                )
+                .is_err(),
+            "fault {fault} must fail closed"
+        );
+    }
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    worker.artifact_list_fault.store(6, Ordering::Release);
+    assert!(
+        router
+            .execute(
+                &principal,
+                ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+                    session_id,
+                    after: Some(worker.artifact_list_ids[0].clone()),
+                    limit: 2,
+                })
+            )
+            .is_err(),
+        "worker cannot return a cursor or earlier artifact"
+    );
+    Ok(())
+}
+
+#[test]
+fn artifact_discovery_rejects_invalid_limits_and_another_tenants_session_before_dispatch()
+-> Result<(), Box<dyn Error>> {
+    let (principal, worker, router, session_id) = resource_fixture()?;
+    for limit in [0, 101, usize::MAX] {
+        assert!(
+            router
+                .execute(
+                    &principal,
+                    ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+                        session_id: session_id.clone(),
+                        after: None,
+                        limit,
+                    })
+                )
+                .is_err()
+        );
+    }
+    let stranger = authenticated_principal(TenantId::new())?;
+    assert!(
+        router
+            .execute(
+                &stranger,
+                ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+                    session_id,
+                    after: None,
+                    limit: 2,
+                })
+            )
+            .is_err()
+    );
+    assert!(
+        !worker
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| matches!(request, WorkerRpcRequest::ListArtifacts { .. }))
+    );
     Ok(())
 }
 

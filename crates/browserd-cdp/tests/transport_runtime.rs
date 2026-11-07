@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use browserd_cdp::{CdpCommandError, CdpTransport, CdpTransportConfig, CdpTransportError};
 use serde_json::{Value, json};
@@ -41,6 +41,157 @@ fn config() -> CdpTransportConfig {
         write_timeout: Duration::from_secs(1),
         default_command_timeout: Duration::from_secs(1),
     }
+}
+
+#[tokio::test]
+async fn sensitive_arguments_use_the_same_writer_and_redact_remote_errors() {
+    #[derive(serde::Serialize)]
+    struct Arguments<'a> {
+        value: &'a str,
+    }
+    let (client_io, mut chromium_io) = tokio::io::duplex(16 * 1024);
+    let (client, _events, driver) = CdpTransport::spawn(client_io, config());
+    let secret = "fixture-only-한글-password";
+    let calls = async {
+        assert!(
+            client
+                .command("Page.enable", json!({}), None, None)
+                .await
+                .is_ok()
+        );
+        let result = client
+            .command_sensitive(
+                "Runtime.callFunctionOn",
+                &Arguments { value: secret },
+                Some("flat-session".to_owned()),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(
+            &result,
+            Err(CdpCommandError::SensitiveProtocol { code: -32000 })
+        ));
+        if let Err(error) = result {
+            assert!(!error.to_string().contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        assert!(
+            client
+                .command("Page.disable", json!({}), None, None)
+                .await
+                .is_ok()
+        );
+    };
+    let peer = async {
+        let before = read_command(&mut chromium_io).await;
+        assert_eq!(before["method"], "Page.enable");
+        write_message(&mut chromium_io, json!({"id":before["id"],"result":{}})).await;
+        let sensitive = read_command(&mut chromium_io).await;
+        assert_eq!(sensitive["method"], "Runtime.callFunctionOn");
+        assert_eq!(sensitive["sessionId"], "flat-session");
+        assert!(sensitive["params"]["value"].as_str() == Some(secret));
+        write_message(
+            &mut chromium_io,
+            json!({"id":sensitive["id"],"error":{
+                "code":-32000,"message":secret,"data":{"echo":secret}
+            }}),
+        )
+        .await;
+        let after = read_command(&mut chromium_io).await;
+        assert_eq!(after["method"], "Page.disable");
+        assert!(before["id"].as_u64() < sensitive["id"].as_u64());
+        assert!(sensitive["id"].as_u64() < after["id"].as_u64());
+        write_message(&mut chromium_io, json!({"id":after["id"],"result":{}})).await;
+    };
+    tokio::join!(calls, peer);
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_sensitive_params_and_envelopes_never_dispatch() {
+    #[derive(serde::Serialize)]
+    struct Arguments<'a> {
+        value: &'a str,
+    }
+    let (client_io, mut chromium_io) = tokio::io::duplex(4096);
+    let mut constrained = config();
+    constrained.max_frame_bytes = 128;
+    let (client, _events, driver) = CdpTransport::spawn(client_io, constrained);
+    for value in ["x".repeat(129), "y".repeat(95)] {
+        assert_eq!(
+            client
+                .command_sensitive(
+                    "Runtime.callFunctionOn",
+                    &Arguments { value: &value },
+                    Some("flat-session".to_owned()),
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .await,
+            Err(CdpCommandError::SensitivePayloadRejected)
+        );
+    }
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), chromium_io.read(&mut byte))
+            .await
+            .is_err()
+    );
+    assert!(!client.is_closed());
+    driver.shutdown().await;
+}
+
+#[tokio::test]
+async fn sensitive_partial_write_is_unknown_and_closes_the_transport() {
+    #[derive(serde::Serialize)]
+    struct Arguments<'a> {
+        value: &'a str,
+    }
+    let (client_io, _unread_chromium_io) = tokio::io::duplex(8);
+    let mut constrained = config();
+    constrained.write_timeout = Duration::from_millis(20);
+    let (client, _events, driver) = CdpTransport::spawn(client_io, constrained);
+    assert_eq!(
+        client
+            .command_sensitive(
+                "Runtime.callFunctionOn",
+                &Arguments { value: "dummy" },
+                None,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .await,
+        Err(CdpCommandError::WriteUncertain)
+    );
+    assert_eq!(driver.wait().await, Err(CdpTransportError::WriteUncertain));
+    assert!(client.is_closed());
+}
+
+#[tokio::test]
+async fn sensitive_absolute_deadline_bounds_a_blocked_write() {
+    #[derive(serde::Serialize)]
+    struct Arguments<'a> {
+        value: &'a str,
+    }
+    let (client_io, _unread_chromium_io) = tokio::io::duplex(8);
+    let (client, _events, driver) = CdpTransport::spawn(client_io, config());
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        client.command_sensitive(
+            "Runtime.callFunctionOn",
+            &Arguments { value: "dummy" },
+            None,
+            Instant::now() + Duration::from_millis(20),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Ok(Err(
+            CdpCommandError::TimedOut | CdpCommandError::WriteUncertain
+        ))
+    ));
+    let terminated = tokio::time::timeout(Duration::from_millis(200), driver.wait()).await;
+    assert_eq!(terminated, Ok(Err(CdpTransportError::WriteUncertain)));
+    assert!(client.is_closed());
 }
 
 #[tokio::test]

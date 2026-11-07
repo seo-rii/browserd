@@ -11,11 +11,11 @@ use browserd_core::{
     SessionIncarnation, ShardFence, ShardId, TenantId, WorkerEpoch, WorkerId,
 };
 use browserd_sandbox::{
-    ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CreateShardOutcome, DedicatedEgressSpec,
-    EgressPolicyBinding, InspectResources, KillShardOutcome, LaunchSpec, RpcFailureCode,
-    SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle, SandboxRpcClient,
-    SandboxRpcConfig, SandboxRpcError, SandboxRpcPeerBinding, SandboxRpcServer, SandboxSupervisor,
-    SupervisorConfig, WorkerOwnership,
+    ChildIdentity, ChromiumBinaryDigest, ChromiumCdpPipes, CleanupReason, CreateShardOutcome,
+    DedicatedEgressSpec, EgressPolicyBinding, InspectResources, KillShardOutcome, LaunchSpec,
+    RpcFailureCode, SandboxBackend, SandboxCapabilities, SandboxError, SandboxHandle,
+    SandboxRpcClient, SandboxRpcConfig, SandboxRpcError, SandboxRpcPeerBinding, SandboxRpcServer,
+    SandboxSupervisor, SupervisorConfig, WorkerOwnership,
 };
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
 use serde_json::json;
@@ -27,6 +27,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 const SANDBOXD_EPOCH: u64 = 73;
+
+#[path = "rpc_contract/cleanup_confirmation.rs"]
+mod cleanup_confirmation;
 
 #[derive(Clone, Default)]
 struct RecordingBackend {
@@ -493,6 +496,384 @@ async fn authenticated_epoch_probe_succeeds_without_creating_a_shard() {
     assert!(matches!(task.await, Ok(Ok(()))));
 }
 
+mod egress_binding_handoff {
+    use super::*;
+    use browserd_sandbox::{
+        DedicatedEgressProxyBinding, PinnedNetworkNamespace, ShardEgressReservation,
+        ShardIngressLease, ShardIngressReceipt,
+    };
+
+    fn binding_for(spec: &LaunchSpec) -> (DedicatedEgressProxyBinding, PinnedNetworkNamespace) {
+        let namespace = PinnedNetworkNamespace::from_owned_fd(
+            std::fs::File::open("/proc/thread-self/ns/net")
+                .expect("current namespace descriptor")
+                .into(),
+        )
+        .expect("pinned network namespace");
+        let lease = ShardIngressLease::from_attachment(
+            ShardEgressReservation::from_launch_spec(spec),
+            namespace.identity(),
+            ShardIngressReceipt::with_proxy_address("127.0.0.1:20124".parse().unwrap())
+                .expect("nonzero loopback proxy endpoint"),
+        );
+        (
+            DedicatedEgressProxyBinding::from_lease(&lease).expect("full egress binding"),
+            namespace,
+        )
+    }
+
+    #[tokio::test]
+    async fn egress_proxy_binding_round_trips_with_the_exact_cdp_pipe_pair() {
+        let temporary = tempdir().unwrap();
+        let socket = temporary.path().join("binding-roundtrip.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let shutdown = CancellationToken::new();
+        let shard = ShardId::new();
+        let spec = launch_spec(shard.clone(), worker(), 21);
+        let (binding, _namespace) = binding_for(&spec);
+        let (backend, mut command_reader, mut event_writer) = ClaimingBackend::new();
+        {
+            let mut slot = backend.pipes.lock().unwrap();
+            let pipes = slot.take().unwrap();
+            *slot = Some(pipes.with_egress_proxy_binding(binding.clone()).unwrap());
+        }
+        let backend_view = backend.clone();
+        let supervisor = Arc::new(SandboxSupervisor::new(
+            SupervisorConfig::new(Duration::from_secs(1), Duration::from_secs(2)).unwrap(),
+            backend,
+        ));
+        let server = SandboxRpcServer::new(supervisor, rpc_config());
+        let server_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+        let client = SandboxRpcClient::new(
+            socket,
+            rpc_config().max_frame_bytes(),
+            Duration::from_millis(500),
+            nix::unistd::Uid::effective().as_raw(),
+            SANDBOXD_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(
+            client.create_shard(spec, Duration::from_millis(900)).await,
+            Ok(CreateShardOutcome::Created)
+        );
+        assert_eq!(backend_view.inner.events(), ["provision"]);
+
+        let pipes = client
+            .claim_cdp_pipes(&shard, &worker(), 21, launch_generation())
+            .await
+            .expect("the full metadata and pipe pair must share one completed handshake");
+        assert_eq!(
+            pipes.egress_proxy_binding(),
+            Some(&binding),
+            "tenant, policy, fence, reservation, namespace and receipt metadata must survive exactly"
+        );
+        assert_eq!(backend_view.inner.events(), ["provision", "activate"]);
+        let (command_writer, event_reader) = pipes.into_owned_fds();
+        let mut command_writer = Sender::from_owned_fd(command_writer).unwrap();
+        let mut event_reader = Receiver::from_owned_fd(event_reader).unwrap();
+        command_writer.write_all(b"bound-command").await.unwrap();
+        let mut command = [0; 13];
+        command_reader.read_exact(&mut command).await.unwrap();
+        assert_eq!(&command, b"bound-command");
+        event_writer.write_all(b"bound-event").await.unwrap();
+        let mut event = [0; 11];
+        event_reader.read_exact(&mut event).await.unwrap();
+        assert_eq!(&event, b"bound-event");
+
+        drop(command_writer);
+        drop(event_reader);
+        let mut byte = [0; 1];
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(200), command_reader.read(&mut byte)).await,
+            Ok(Ok(0))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                event_writer.write_all(b"closed")
+            )
+            .await,
+            Ok(Err(_))
+        ));
+        shutdown.cancel();
+        assert!(matches!(task.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn oversized_bound_ready_response_cleans_the_exact_claim_without_activation() {
+        let temporary = tempdir().unwrap();
+        let socket = temporary.path().join("oversized-binding.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let shutdown = CancellationToken::new();
+        let shard = ShardId::new();
+        let spec = launch_spec(shard.clone(), worker(), 24);
+        let (binding, _namespace) = binding_for(&spec);
+        let transfer_id = LeaseId::new();
+        let claim_bytes = serde_json::to_vec(&json!({
+            "operation":"claim_cdp_pipes",
+            "sandboxd_epoch":SANDBOXD_EPOCH,
+            "shard_id":shard,
+            "worker_id":worker(),
+            "worker_epoch":24,
+            "launch_generation":launch_generation(),
+        }))
+        .unwrap();
+        let legacy_ready_bytes = serde_json::to_vec(&json!({
+            "status":"success",
+            "value":{
+                "result":"cdp_pipes_ready",
+                "value":{"transfer_id":transfer_id},
+            }
+        }))
+        .unwrap();
+        let bound_ready_bytes = serde_json::to_vec(&json!({
+            "status":"success",
+            "value":{
+                "result":"cdp_pipes_ready",
+                "value":{
+                    "transfer_id":transfer_id,
+                    "egress_proxy_binding":binding,
+                }
+            }
+        }))
+        .unwrap();
+        let max_frame_bytes = claim_bytes.len().max(legacy_ready_bytes.len()) + 1;
+        assert!(claim_bytes.len() <= max_frame_bytes);
+        assert!(legacy_ready_bytes.len() <= max_frame_bytes);
+        assert!(bound_ready_bytes.len() > max_frame_bytes);
+
+        let (backend, mut command_reader, mut event_writer) = ClaimingBackend::new();
+        {
+            let mut slot = backend.pipes.lock().unwrap();
+            let pipes = slot.take().unwrap();
+            *slot = Some(pipes.with_egress_proxy_binding(binding).unwrap());
+        }
+        let backend_view = backend.clone();
+        let supervisor = Arc::new(SandboxSupervisor::new(
+            SupervisorConfig::new(Duration::from_secs(5), Duration::from_secs(10)).unwrap(),
+            backend,
+        ));
+        // Provision directly: the small RPC limit is specifically for the claim response.
+        assert_eq!(
+            supervisor
+                .create_shard(
+                    spec,
+                    WorkerOwnership::new(
+                        worker(),
+                        24,
+                        tokio::time::Instant::now() + Duration::from_secs(5),
+                    ),
+                )
+                .await,
+            Ok(CreateShardOutcome::Created)
+        );
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let server_config = SandboxRpcConfig::new(
+            max_frame_bytes,
+            4,
+            Duration::from_millis(500),
+            Duration::from_millis(5),
+            Some(uid),
+        )
+        .unwrap()
+        .with_daemon_epoch(SANDBOXD_EPOCH)
+        .unwrap()
+        .with_peer_binding(SandboxRpcPeerBinding::new(uid, worker(), 24).unwrap())
+        .unwrap();
+        let server = SandboxRpcServer::new(supervisor.clone(), server_config);
+        let server_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { server.serve(listener, server_shutdown).await });
+        let client = SandboxRpcClient::new(
+            socket,
+            // A client limit cannot mask failure to enforce the server's smaller limit.
+            bound_ready_bytes.len() + 1,
+            Duration::from_millis(500),
+            uid,
+            SANDBOXD_EPOCH,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client
+                .claim_cdp_pipes(&shard, &worker(), 24, launch_generation())
+                .await,
+            Err(SandboxRpcError::ConnectionClosed)
+        ));
+        assert!(
+            backend_view.pipes.lock().unwrap().is_none(),
+            "the request must fit and reach the one-shot backend claim"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if backend_view.inner.events().last().map(String::as_str) == Some("cleanup") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("metadata frame rejection must finish cleanup without a caller READY byte");
+        assert_eq!(
+            backend_view.inner.events(),
+            ["provision", "revoke", "kill", "cleanup"],
+            "frame rejection must clean the claim before activating the process"
+        );
+        assert_eq!(
+            supervisor
+                .inspect_resources(&shard, 24, launch_generation())
+                .await,
+            Err(SandboxError::ShardNotFound)
+        );
+        let mut byte = [0; 1];
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(200), command_reader.read(&mut byte)).await,
+            Ok(Ok(0))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                event_writer.write_all(b"must-be-closed"),
+            )
+            .await,
+            Ok(Err(_))
+        ));
+        shutdown.cancel();
+        assert!(matches!(task.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn mismatched_response_binding_rejects_before_ready_and_cleans_the_requested_launch() {
+        for mismatch in ["shard", "worker", "worker_epoch", "launch_generation"] {
+            let temporary = tempdir().unwrap();
+            let socket = temporary.path().join("mismatched-binding.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let requested = launch_spec(ShardId::new(), worker(), 22);
+            let original = requested.dedicated_egress().egress_fence();
+            let response_shard = ShardFence::new(
+                OwnerFence::new(
+                    if mismatch == "worker" {
+                        WorkerId::new("different-response-worker").unwrap()
+                    } else {
+                        requested.worker_id().clone()
+                    },
+                    WorkerEpoch::new(if mismatch == "worker_epoch" { 23 } else { 22 }).unwrap(),
+                ),
+                if mismatch == "shard" {
+                    ShardId::new()
+                } else {
+                    requested.shard_id().clone()
+                },
+                if mismatch == "launch_generation" {
+                    LaunchGeneration::new(2).unwrap()
+                } else {
+                    requested.launch_generation()
+                },
+            );
+            let response_spec = LaunchSpec::production(
+                requested.tenant_id().clone(),
+                DedicatedEgressSpec::new(
+                    EgressFence::new(
+                        response_shard,
+                        original.route_generation(),
+                        original.session_id().clone(),
+                        original.session_incarnation(),
+                    ),
+                    requested.dedicated_egress().policy_binding().clone(),
+                    requested.dedicated_egress().initial_lease_ttl(),
+                )
+                .unwrap(),
+                requested.chromium_binary_digest(),
+            );
+            let (binding, _namespace) = binding_for(&response_spec);
+            let fake_server = tokio::spawn(async move {
+                let (mut stream, request) = accept_probe_request(&listener).await;
+                assert_eq!(request["operation"], "claim_cdp_pipes");
+                let response = serde_json::to_vec(&json!({
+                    "status":"success",
+                    "value":{
+                        "result":"cdp_pipes_ready",
+                        "value":{
+                            "transfer_id":LeaseId::new(),
+                            "egress_proxy_binding":binding,
+                        }
+                    }
+                }))
+                .unwrap();
+                stream
+                    .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&response).await.unwrap();
+                let mut ready = [0; 17];
+                let handoff_closed_before_ready = matches!(
+                    tokio::time::timeout(Duration::from_millis(300), stream.read(&mut ready)).await,
+                    Ok(Ok(0))
+                );
+                // Closing also bounds a broken client that sent READY despite the mismatch.
+                drop(stream);
+                let cleanup =
+                    tokio::time::timeout(Duration::from_secs(1), accept_probe_request(&listener))
+                        .await;
+                let Ok((mut cleanup_stream, cleanup_request)) = cleanup else {
+                    return (request, handoff_closed_before_ready, None);
+                };
+                let response = serde_json::to_vec(&json!({
+                    "status":"failure",
+                    "value":{
+                        "code":"shard_not_found",
+                        "message":"the fake supervisor confirms exact cleanup",
+                    }
+                }))
+                .unwrap();
+                cleanup_stream
+                    .write_all(&u32::try_from(response.len()).unwrap().to_be_bytes())
+                    .await
+                    .unwrap();
+                cleanup_stream.write_all(&response).await.unwrap();
+                (request, handoff_closed_before_ready, Some(cleanup_request))
+            });
+            let client = SandboxRpcClient::new(
+                socket,
+                rpc_config().max_frame_bytes(),
+                Duration::from_millis(500),
+                nix::unistd::Uid::effective().as_raw(),
+                SANDBOXD_EPOCH,
+            )
+            .unwrap();
+            let result = client
+                .claim_cdp_pipes(
+                    requested.shard_id(),
+                    requested.worker_id(),
+                    requested.worker_epoch(),
+                    requested.launch_generation(),
+                )
+                .await;
+            let (claim, closed_before_ready, cleanup) = fake_server.await.unwrap();
+            assert!(
+                result.is_err(),
+                "{mismatch} mismatch must reject the handoff"
+            );
+            assert!(
+                closed_before_ready,
+                "{mismatch} response metadata must be checked before the client READY byte"
+            );
+            assert_eq!(claim["worker_id"], json!(requested.worker_id()));
+            let cleanup =
+                cleanup.expect("success response must arm cleanup before binding validation");
+            assert_eq!(cleanup["operation"], "kill_shard");
+            assert_eq!(cleanup["sandboxd_epoch"], SANDBOXD_EPOCH);
+            assert_eq!(cleanup["shard_id"], json!(requested.shard_id()));
+            assert_eq!(cleanup["worker_epoch"], requested.worker_epoch());
+            assert_eq!(
+                cleanup["launch_generation"],
+                json!(requested.launch_generation())
+            );
+            assert_eq!(cleanup["reason"], "browser_failure");
+        }
+    }
+}
+
 #[tokio::test]
 async fn epoch_probe_rejects_stale_daemon_or_wrong_worker_binding() {
     let temporary = tempdir().expect("temporary directory is available");
@@ -712,6 +1093,113 @@ async fn rpc_client_rejects_an_unexpected_supervisor_uid_before_sending_a_reques
 
     shutdown.cancel();
     assert!(matches!(task.await, Ok(Ok(()))));
+}
+
+fn current_process_start_time() -> u64 {
+    let stat = std::fs::read_to_string("/proc/self/stat")
+        .expect("the test process identity must be readable");
+    stat.rsplit_once(") ")
+        .expect("proc stat must delimit its process name")
+        .1
+        .split_whitespace()
+        .nth(19)
+        .expect("proc stat must include the process start time")
+        .parse()
+        .expect("the process start time must be numeric")
+}
+
+async fn assert_rejected_server_identity_sends_no_request_bytes(identity: ChildIdentity) {
+    let temporary = tempdir().expect("temporary directory is available");
+    let socket = temporary.path().join("pinned-sandboxd.sock");
+    let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+    let observed = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("peer connection must arrive");
+        let mut first_request_byte = [0_u8; 1];
+        tokio::time::timeout(Duration::from_secs(1), stream.read(&mut first_request_byte))
+            .await
+            .expect("rejected connection must close promptly")
+            .expect("request byte observation must succeed")
+    });
+    let client = SandboxRpcClient::new(
+        socket,
+        4 * 1024,
+        Duration::from_secs(1),
+        nix::unistd::Uid::effective().as_raw(),
+        SANDBOXD_EPOCH,
+    )
+    .expect("client config is valid")
+    .with_expected_server_identity(identity);
+
+    assert_eq!(
+        client
+            .inspect_resources(&ShardId::new(), 9, launch_generation())
+            .await,
+        Err(SandboxRpcError::PeerProcessMismatch)
+    );
+    assert_eq!(
+        observed.await.expect("byte observer must finish"),
+        0,
+        "an unexpected process must not receive any request or backend effect bytes"
+    );
+}
+
+#[tokio::test]
+async fn rpc_client_rejects_an_unexpected_supervisor_pid_before_sending_any_request_bytes() {
+    assert_rejected_server_identity_sends_no_request_bytes(ChildIdentity::new(
+        std::process::id()
+            .checked_add(1)
+            .expect("a different PID must be representable"),
+        current_process_start_time(),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn rpc_client_rejects_a_reused_supervisor_pid_before_sending_any_request_bytes() {
+    assert_rejected_server_identity_sends_no_request_bytes(ChildIdentity::new(
+        std::process::id(),
+        current_process_start_time()
+            .checked_add(1)
+            .expect("a different process start time must be representable"),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn rpc_client_accepts_the_exact_supervisor_identity_and_preserves_unpinned_clients() {
+    for pin_identity in [false, true] {
+        let temporary = tempdir().expect("temporary directory is available");
+        let socket = temporary.path().join("sandboxd.sock");
+        let listener = UnixListener::bind(&socket).expect("Unix socket binds");
+        let response = tokio::spawn(respond_to_probe(listener, SANDBOXD_EPOCH, true));
+        let client = SandboxRpcClient::new(
+            socket,
+            4 * 1024,
+            Duration::from_secs(1),
+            nix::unistd::Uid::effective().as_raw(),
+            SANDBOXD_EPOCH,
+        )
+        .expect("client config is valid");
+        let client = if pin_identity {
+            client.with_expected_server_identity(ChildIdentity::new(
+                std::process::id(),
+                current_process_start_time(),
+            ))
+        } else {
+            client
+        };
+        assert_eq!(
+            client.probe_daemon_epoch(&worker(), 9).await,
+            Ok(SANDBOXD_EPOCH)
+        );
+        assert_eq!(
+            response.await.expect("probe server must finish")["operation"],
+            "probe_daemon_epoch"
+        );
+    }
 }
 
 #[tokio::test]

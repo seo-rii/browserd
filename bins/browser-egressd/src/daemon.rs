@@ -9,7 +9,7 @@ use browserd_egress::{
     AcceptedIngressHandler, AttachmentManager, AttachmentManagerError, AttachmentState,
     AttachmentStatus, BindingDigest, DaemonEpoch, DataPlane, DataPlaneLimits, EgressPolicy,
     MonotonicMillis, PreparedAttachmentReceipt, QuotaLimits, RouteBinding, RouteRegistry,
-    TcpConnector, TokioResolver,
+    RouteRegistryLimits, TcpConnector, TokioResolver,
 };
 use browserd_egress_control::{
     ActiveInstallResponse, ControlRequest, EpochProbeError, PendingInstall, ReceiveInstallError,
@@ -22,6 +22,7 @@ use tokio::net::UnixStream;
 pub struct DaemonLimits {
     max_lease: Duration,
     max_plans: usize,
+    max_plan_history: usize,
     quotas: QuotaLimits,
 }
 
@@ -49,8 +50,24 @@ impl DaemonLimits {
         Ok(Self {
             max_lease,
             max_plans,
+            max_plan_history: max_plans.max(RouteRegistryLimits::default().max_tracked_shards()),
             quotas,
         })
+    }
+
+    /// Bounds immutable anti-replay records independently of active admission.
+    /// Terminal receipts are retained, never evicted to make an old fence reusable.
+    /// Exhaustion requires a coordinated ownership/credential drain and a new
+    /// daemon incarnation; changing only the egress epoch cannot retire old specs.
+    pub fn with_plan_history_capacity(
+        mut self,
+        capacity: usize,
+    ) -> Result<Self, DaemonControlError> {
+        if capacity < self.max_plans || capacity == 0 {
+            return Err(DaemonControlError::InvalidLimits);
+        }
+        self.max_plan_history = capacity;
+        Ok(self)
     }
 }
 
@@ -64,6 +81,7 @@ pub struct PreparedRouteRequest {
     binding_digest: [u8; 32],
     profile: String,
     lease_ttl: Duration,
+    shared_context: bool,
 }
 
 impl PreparedRouteRequest {
@@ -91,7 +109,14 @@ impl PreparedRouteRequest {
             binding_digest,
             profile,
             lease_ttl,
+            shared_context: false,
         })
+    }
+
+    #[must_use]
+    pub fn with_shared_context(mut self) -> Self {
+        self.shared_context = true;
+        self
     }
 }
 
@@ -255,6 +280,7 @@ struct PreparedPlan {
     binding: Option<RouteBinding>,
     active: Option<ActiveInstallResponse>,
     last_renewal: Option<CommittedRenewal>,
+    admission_released: bool,
 }
 
 #[derive(Clone)]
@@ -269,7 +295,36 @@ impl EgressDaemon {
         limits: DaemonLimits,
         data_plane_limits: DataPlaneLimits,
     ) -> Result<Self, DaemonControlError> {
-        let routes = RouteRegistry::new(limits.max_lease);
+        let routes = RouteRegistry::with_limits(
+            limits.max_lease,
+            RouteRegistryLimits::new(limits.max_plan_history, limits.max_plan_history),
+        );
+        let data_plane = DataPlane::new(
+            routes.clone(),
+            TokioResolver,
+            TcpConnector,
+            data_plane_limits,
+        )
+        .map_err(|_| DaemonControlError::InvalidLimits)?;
+        Ok(Self::with_registry_and_handler(
+            daemon_epoch,
+            limits,
+            routes,
+            Arc::new(data_plane),
+        ))
+    }
+
+    pub fn with_runtime_safety(
+        daemon_epoch: DaemonEpoch,
+        limits: DaemonLimits,
+        data_plane_limits: DataPlaneLimits,
+        cache: Arc<browserd_core::RuntimeSafetyCache>,
+    ) -> Result<Self, DaemonControlError> {
+        let routes = RouteRegistry::with_limits(
+            limits.max_lease,
+            RouteRegistryLimits::new(limits.max_plan_history, limits.max_plan_history),
+        )
+        .with_runtime_safety(cache);
         let data_plane = DataPlane::new(
             routes.clone(),
             TokioResolver,
@@ -290,7 +345,10 @@ impl EgressDaemon {
         limits: DaemonLimits,
         handler: Arc<dyn AcceptedIngressHandler>,
     ) -> Result<Self, DaemonControlError> {
-        let routes = RouteRegistry::new(limits.max_lease);
+        let routes = RouteRegistry::with_limits(
+            limits.max_lease,
+            RouteRegistryLimits::new(limits.max_plan_history, limits.max_plan_history),
+        );
         Ok(Self::with_registry_and_handler(
             daemon_epoch,
             limits,
@@ -334,16 +392,40 @@ impl EgressDaemon {
             }
             return Ok(prepared_response(&existing.prepared));
         }
-        if plans.len() >= self.limits.max_plans {
+        if plans.len() >= self.limits.max_plan_history {
+            return Err(DaemonControlError::PlanHistoryCapacityExceeded);
+        }
+        let mut active_plans = 0;
+        for plan in plans.values_mut() {
+            if !plan.admission_released {
+                let status = self
+                    .manager
+                    .status(self.daemon_epoch, &plan.request.egress_fence)
+                    .map_err(DaemonControlError::Manager)?;
+                match status.state() {
+                    AttachmentState::Released | AttachmentState::Cancelled => {
+                        plan.admission_released = true;
+                    }
+                    AttachmentState::Absent => return Err(DaemonControlError::InconsistentReceipt),
+                    _ => active_plans += 1,
+                }
+            }
+        }
+        if active_plans >= self.limits.max_plans {
             return Err(DaemonControlError::PlanCapacityExceeded);
         }
-        let prepared = self
-            .manager
-            .prepare(
+        let prepared = if request.shared_context {
+            self.manager.prepare_context_route(
                 request.egress_fence.clone(),
                 BindingDigest::new(request.binding_digest),
             )
-            .map_err(DaemonControlError::Manager)?;
+        } else {
+            self.manager.prepare(
+                request.egress_fence.clone(),
+                BindingDigest::new(request.binding_digest),
+            )
+        }
+        .map_err(DaemonControlError::Manager)?;
         let response = prepared_response(&prepared);
         plans.insert(
             request.egress_fence.clone(),
@@ -353,6 +435,7 @@ impl EgressDaemon {
                 binding: None,
                 active: None,
                 last_renewal: None,
+                admission_released: false,
             },
         );
         Ok(response)
@@ -483,6 +566,17 @@ impl EgressDaemon {
                 Err(DaemonControlError::Commit(error))
             }
         }
+    }
+
+    pub fn retire_shard(
+        &self,
+        daemon_epoch: u64,
+        fence: &browserd_core::ShardFence,
+    ) -> Result<(), DaemonControlError> {
+        self.ensure_epoch(daemon_epoch)?;
+        self.manager
+            .retire_shard(fence)
+            .map_err(DaemonControlError::Manager)
     }
 
     pub async fn revoke(
@@ -722,6 +816,7 @@ pub enum DaemonControlError {
     DaemonEpochMismatch { expected: u64, received: u64 },
     PlanConflict,
     PlanCapacityExceeded,
+    PlanHistoryCapacityExceeded,
     PlanNotFound,
     InstallMetadataMismatch,
     RenewalConflict,
@@ -747,6 +842,9 @@ impl fmt::Display for DaemonControlError {
             ),
             Self::PlanConflict => formatter.write_str("prepared route conflicts with its fence"),
             Self::PlanCapacityExceeded => formatter.write_str("prepared route capacity exceeded"),
+            Self::PlanHistoryCapacityExceeded => formatter.write_str(
+                "route anti-replay history capacity exceeded; coordinated ownership drain required",
+            ),
             Self::PlanNotFound => formatter.write_str("prepared route does not exist"),
             Self::InstallMetadataMismatch => {
                 formatter.write_str("install metadata does not match the prepared route")

@@ -7,6 +7,10 @@ mod memory;
 mod memory_ephemeral;
 mod postgres;
 mod redis;
+mod safety_authority;
+mod session_admission;
+mod session_directory;
+mod webhooks;
 
 use std::fmt;
 use std::time::Duration;
@@ -30,21 +34,66 @@ pub use ephemeral::{
     WorkerReservationRequest, WorkerReservationSnapshot, WorkerReservationStore,
 };
 pub use event_outbox::{
-    EventCursor, EventOutbox, EventOutboxBlockingClient, EventOutboxError, MAX_EVENT_PAGE_LIMIT,
-    MINIMUM_EVENT_RETENTION, MemoryEventOutbox, OutboxAggregate, OutboxAppend, OutboxEvent,
-    OutboxEventKind, OutboxPage, PostgresEventOutbox, RedisEventOutbox, RedisEventOutboxConfig,
+    EventActionResolution, EventActionState, EventApprovalDecision, EventArtifactState,
+    EventControlState, EventCursor, EventDownloadState, EventNotificationKind,
+    EventNotificationResource, EventOperationState, EventOutbox, EventOutboxBlockingClient,
+    EventOutboxError, EventSessionExecutionState, EventSessionLifecycleState, EventStateSummary,
+    MAX_ENCODED_OUTBOX_EVENT_BYTES, MAX_EVENT_PAGE_LIMIT, MINIMUM_EVENT_RETENTION,
+    MemoryEventOutbox, NOTIFICATION_IMPORT_RECEIPTS_PER_SOURCE, NotificationImportConfig,
+    OutboxAggregate, OutboxAppend, OutboxEvent, OutboxEventKind, OutboxEventWire, OutboxPage,
+    PostgresEventOutbox, RedisEventOutbox, RedisEventOutboxConfig, encode_outbox_event,
 };
 pub use gateway_action_actor::GatewayActionBlockingClient;
 pub use gateway_actions::{
-    ClaimGatewayAction, GatewayActionClaimOutcome, GatewayActionCoordination,
-    GatewayActionCoordinationError, GatewayActionPlacement, GatewayActionSnapshot,
-    MAX_DURABLE_RESULT_CONTENT_BYTES, MemoryGatewayActionStore, RedisGatewayActionConfig,
-    RedisGatewayActionStore, SessionLossClaim, SessionLossOutcome,
+    ClaimGatewayAction, EventProjectionSource, GatewayActionClaimOutcome,
+    GatewayActionCoordination, GatewayActionCoordinationError, GatewayActionPlacement,
+    GatewayActionRecoveryCursor, GatewayActionRecoveryPage, GatewayActionRetentionClock,
+    GatewayActionRetentionCursor, GatewayActionRetentionLimits, GatewayActionRetentionPage,
+    GatewayActionSnapshot, GatewayActionSubmissionLease, GatewayCustodyCursor, GatewayCustodyPage,
+    GatewayEventProjection, GatewayEventScanCursor, GatewayEventScanPage, GatewayEventSession,
+    GatewayPendingCustody, GatewayTerminalCustodyCatchupPage, MAX_DURABLE_RESULT_CONTENT_BYTES,
+    MAX_PENDING_ACTIONS_PER_NAMESPACE, MAX_PENDING_ACTIONS_PER_SESSION, MAX_RECOVERY_SCAN_LIMIT,
+    MemoryGatewayActionStore, RedisGatewayActionConfig, RedisGatewayActionMigrationProgress,
+    RedisGatewayActionStore, SessionLossClaim, SessionLossOutcome, SessionLossReceipt,
 };
 pub use memory::{MemoryCoordinationDatabase, MemoryCreateSessionStore};
 pub use memory_ephemeral::{ManualCoordinationClock, MemoryEphemeralCoordinationStore};
 pub use postgres::PostgresCreateSessionStore;
 pub use redis::{RedisEphemeralConfig, RedisEphemeralCoordinationStore};
+pub use safety_authority::{
+    MemorySafetyAuthority, RedisSafetyAuthority, RedisSafetyAuthorityConfig, SafetyActorIdentity,
+    SafetyAuditAck, SafetyAuditIntent, SafetyAuthority, SafetyAuthorityBlockingClient,
+    SafetyAuthorityClock, SafetyAuthorityConfig, SafetyAuthorityError, SafetyAuthoritySnapshot,
+    SafetyInitializeRequest, SafetyMutationReceipt, SafetyMutationRequest, SafetyObserver,
+    SafetyObserverWatermark, SystemSafetyAuthorityClock,
+};
+pub use session_admission::{
+    GatewayFleetAdmissionClock, GatewayFleetAdmissionConfig, GatewayFleetAdmissionLimits,
+    GatewayFleetExclusiveTenant, GatewayFleetProfile, GatewayFleetTenantPolicy,
+    GatewayFleetTenantRule, GatewayFleetWorker, GatewayFleetWorkerIdentity,
+    GatewayFleetWorkerObservation, GatewaySessionAdmissionCursor, GatewaySessionAdmissionKey,
+    GatewaySessionAdmissionPage, GatewaySessionAdmissionRequest, GatewaySessionAdmissionSnapshot,
+    GatewaySessionAdmissionState, GatewaySessionAuthorityRef, GatewaySessionCleanupProof,
+    GatewaySessionIsolation, GatewaySessionPlacementAuthority, GatewaySessionPlacementStatus,
+    GatewaySessionRenewalIntent, GatewaySessionReservation, GatewaySessionRestoredCheckpoint,
+    GatewaySessionWorkerReadyProof, GatewaySessionWorkerRenewalProof,
+    GatewaySessionWorkerReservationProof, GatewaySessionWorkload, MAX_FLEET_CONFIG_BYTES,
+    MAX_FLEET_WORKER_CANDIDATES, MAX_SESSION_ADMISSION_SCAN,
+};
+pub use session_directory::{
+    GatewayDirectoryLifecycle, GatewaySessionDirectoryPage, GatewaySessionDirectoryRecord,
+    MAX_SESSION_DIRECTORY_BYTES, MAX_SESSION_DIRECTORY_PAGE, MAX_SESSION_DIRECTORY_RECORDS,
+};
+pub use webhooks::{
+    MAX_WEBHOOK_BODY_BYTES, MAX_WEBHOOK_EXAMINED, MAX_WEBHOOK_IN_FLIGHT, MemoryWebhookStore,
+    PostgresWebhookStore, WEBHOOK_ACK_RETENTION, WebhookAttemptLease, WebhookAttemptOutcome,
+    WebhookAttemptPage, WebhookAttemptResult, WebhookBlockingClient, WebhookClock,
+    WebhookDeliveryCursor, WebhookEndpointRef, WebhookEndpointSnapshot, WebhookEndpointSpec,
+    WebhookEndpointStatus, WebhookEventBody, WebhookGapObservation, WebhookMaintenancePage,
+    WebhookMutationBinding, WebhookPutRequest, WebhookResumeMode, WebhookSigningKeyRef,
+    WebhookStore, WebhookStoreConfig, WebhookStoreError, WebhookSuspensionReason,
+    encode_webhook_event,
+};
 
 pub const MINIMUM_IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub const MINIMUM_DISPATCH_LEASE_TTL: Duration = Duration::from_millis(1);
@@ -566,6 +615,19 @@ impl OperationMutation {
         }
     }
 
+    /// Returns positively unexposed admission to the queue under the exact dispatch owner.
+    /// This must never be used after a worker creation has been armed or exposed.
+    #[must_use]
+    pub const fn defer_with_lease(token: DispatchLeaseToken) -> Self {
+        Self {
+            next_state: CreateOperationState::Queued,
+            result: None,
+            error: None,
+            required_dispatch_token: Some(token),
+            dispatch_lease: None,
+        }
+    }
+
     #[must_use]
     pub const fn succeed_with_lease(
         token: DispatchLeaseToken,
@@ -613,6 +675,8 @@ impl OperationMutation {
 
 #[derive(Debug, Error)]
 pub enum CoordinationError {
+    #[error("operation event outbox is unavailable: {0}")]
+    EventOutbox(#[from] EventOutboxError),
     #[error("idempotency retention must be at least 24 hours")]
     RetentionBelowMinimum,
     #[error("idempotency key must be 1-255 trimmed printable characters")]
@@ -794,6 +858,7 @@ fn validate_mutation(
                 CreateOperationState::TimedOut
             )
             | (CreateOperationState::Creating, CreateOperationState::Failed)
+            | (CreateOperationState::Creating, CreateOperationState::Queued)
     );
     if !valid_transition {
         return Err(CoordinationError::InvalidTransition {
@@ -810,7 +875,12 @@ fn validate_mutation(
             | CreateOperationState::Failed
             | CreateOperationState::TimedOut
     );
-    if terminal_completion && current.dispatch_lease.is_some() {
+    let deferred = current.state == CreateOperationState::Creating
+        && mutation.next_state == CreateOperationState::Queued;
+    if deferred && current.dispatch_lease.is_none() {
+        return Err(CoordinationError::DispatchLeaseMismatch);
+    }
+    if (terminal_completion || deferred) && current.dispatch_lease.is_some() {
         let required = mutation
             .required_dispatch_token
             .as_ref()

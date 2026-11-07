@@ -82,6 +82,7 @@ fn canonical_url_normalizes_authority_before_policy_checks() {
     assert_eq!(url.host(), "example.com");
     assert_eq!(url.port(), 80);
     assert_eq!(url.path_and_query(), "/resource?x=1");
+    assert_eq!(url.wire_path_and_query(), "/a/../resource?x=1");
 }
 
 #[test]

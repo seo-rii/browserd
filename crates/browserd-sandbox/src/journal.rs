@@ -1,3 +1,6 @@
+mod context_routes;
+use crate::ContextRoutePolicy;
+pub use context_routes::{ContextRouteJournalEntry, ContextRoutePhase};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
@@ -506,6 +509,8 @@ pub struct PreparedShardJournalRecord {
     events: Vec<PreparedShardJournalEvent>,
     cleanup: [PreparedShardCleanupProgress; 10],
     cleanup_writes: u64,
+    context_route_policy: Option<ContextRoutePolicy>,
+    context_routes: Vec<ContextRouteJournalEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -532,6 +537,10 @@ struct StoredPreparedShardJournalRecord {
     events: Vec<PreparedShardJournalEvent>,
     cleanup: [PreparedShardCleanupProgress; 10],
     cleanup_writes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_route_policy: Option<ContextRoutePolicy>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    context_routes: Vec<ContextRouteJournalEntry>,
 }
 
 impl From<&PreparedShardJournalRecord> for StoredPreparedShardJournalRecord {
@@ -544,6 +553,8 @@ impl From<&PreparedShardJournalRecord> for StoredPreparedShardJournalRecord {
             events: record.events.clone(),
             cleanup: record.cleanup,
             cleanup_writes: record.cleanup_writes,
+            context_route_policy: record.context_route_policy.clone(),
+            context_routes: record.context_routes.clone(),
         }
     }
 }
@@ -560,6 +571,8 @@ impl TryFrom<StoredPreparedShardJournalRecord> for PreparedShardJournalRecord {
             events: stored.events,
             cleanup: stored.cleanup,
             cleanup_writes: stored.cleanup_writes,
+            context_route_policy: stored.context_route_policy,
+            context_routes: stored.context_routes,
         };
         validate_record(&record)?;
         Ok(record)
@@ -634,6 +647,72 @@ pub struct FilePreparedShardJournal {
 }
 
 impl FilePreparedShardJournal {
+    /// Read one exact immutable replacement frame while a live daemon retains its writer lock.
+    /// This takes no lock, creates no files, and applies the same checksum/fence/root validation
+    /// as recovery. Reads never combine two replacement frames. If a concurrent replacement
+    /// unlinks the opened frame before its metadata check, inspection fails closed and may
+    /// be retried; it never relaxes the regular-file or single-link checks.
+    pub fn inspect_existing_record(
+        directory_path: &Path,
+        limits: PreparedShardJournalLimits,
+        recovery_roots: PreparedShardRecoveryRoots,
+        fence: &ShardFence,
+    ) -> Result<PreparedShardJournalRecord, PreparedShardJournalError> {
+        let relative = directory_path
+            .strip_prefix("/")
+            .map_err(|_| PreparedShardJournalError::UnsafeDirectory)?;
+        if relative.as_os_str().is_empty()
+            || directory_path
+                .components()
+                .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+        {
+            return Err(PreparedShardJournalError::UnsafeDirectory);
+        }
+        let root = nix::fcntl::open(
+            Path::new("/"),
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(PreparedShardJournalError::io)?;
+        let directory = File::from(
+            openat2(
+                &root,
+                relative,
+                OpenHow::new()
+                    .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC)
+                    .resolve(
+                        ResolveFlag::RESOLVE_BENEATH
+                            | ResolveFlag::RESOLVE_NO_MAGICLINKS
+                            | ResolveFlag::RESOLVE_NO_SYMLINKS,
+                    ),
+            )
+            .map_err(|_| PreparedShardJournalError::UnsafeDirectory)?,
+        );
+        let metadata = directory
+            .metadata()
+            .map_err(PreparedShardJournalError::io)?;
+        if !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != Uid::effective().as_raw())
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(PreparedShardJournalError::UnsafeDirectory);
+        }
+        let key = record_key(fence)?;
+        let (record, _) = read_record(
+            &directory,
+            &format!("{key}{RECORD_SUFFIX}"),
+            limits.max_record_bytes(),
+        )?;
+        if record.fence() != fence {
+            return Err(PreparedShardJournalError::Corrupt(
+                "record fence does not match exact requested key",
+            ));
+        }
+        validate_record(&record)?;
+        validate_locator_roots(record.locators(), &recovery_roots)?;
+        Ok(record)
+    }
+
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, PreparedShardJournalError> {
         Self::open_with_limits_and_roots(
             directory,
@@ -837,6 +916,8 @@ impl FilePreparedShardJournal {
             events: Vec::new(),
             cleanup: [PreparedShardCleanupProgress::NOT_STARTED; 10],
             cleanup_writes: 0,
+            context_route_policy: None,
+            context_routes: Vec::new(),
         };
         validate_record(&record)?;
         if !record_set_is_consistent(records.values().chain(std::iter::once(&record))) {
@@ -1848,6 +1929,7 @@ fn validate_record(
     if record.schema_version != SCHEMA_VERSION || record.events.len() > MAX_EVENTS {
         return Err(PreparedShardJournalError::InvalidHistory);
     }
+    context_routes::validate_context_routes(record)?;
     validate_recovery_binding(&record.fence, &record.locators)?;
     let mut lifecycle = PreparedShardLifecycle::new(record.fence.clone());
     let mut pending_effect: Option<PreparedShardEffect> = None;
@@ -2184,6 +2266,80 @@ mod tests {
             Err(PreparedShardJournalError::LimitExceeded)
         ));
         assert_eq!(growing_file.position(), 129);
+    }
+
+    #[test]
+    fn exact_read_only_inspection_works_under_live_writer_and_rejects_foreign_key_corruption() {
+        let directory = tempfile::tempdir().expect("journal directory");
+        let fence = ShardFence::new(
+            OwnerFence::new(
+                WorkerId::new("probe-inspection").expect("worker"),
+                WorkerEpoch::new(1).expect("epoch"),
+            ),
+            ShardId::new(),
+            LaunchGeneration::new(1).expect("generation"),
+        );
+        let journal =
+            FilePreparedShardJournal::open(directory.path()).expect("live exclusive writer");
+        let expected = journal
+            .reserve(
+                fence.clone(),
+                PreparedShardRecoveryLocators::new(
+                    "backend-probe-inspection",
+                    PathBuf::from("/sys/fs/cgroup/browserd/probe-inspection"),
+                    PathBuf::from("/run/browserd/shards/probe-inspection"),
+                )
+                .expect("locators"),
+            )
+            .expect("durable reserve");
+        let inspect = |wanted: &ShardFence| {
+            FilePreparedShardJournal::inspect_existing_record(
+                directory.path(),
+                super::PreparedShardJournalLimits::default(),
+                super::PreparedShardRecoveryRoots::production(),
+                wanted,
+            )
+        };
+        assert_eq!(inspect(&fence).expect("read under writer"), expected);
+        assert!(matches!(
+            FilePreparedShardJournal::open(directory.path()),
+            Err(PreparedShardJournalError::WriterAlreadyActive)
+        ));
+        let foreign = ShardFence::new(
+            fence.owner().clone(),
+            fence.shard_id().clone(),
+            LaunchGeneration::new(2).expect("other generation"),
+        );
+        assert!(inspect(&foreign).is_err());
+        let correct_name = format!(
+            "{}{}",
+            super::record_key(&fence).expect("key"),
+            super::RECORD_SUFFIX
+        );
+        let foreign_name = format!(
+            "{}{}",
+            super::record_key(&foreign).expect("other key"),
+            super::RECORD_SUFFIX
+        );
+        std::fs::copy(
+            directory.path().join(&correct_name),
+            directory.path().join(&foreign_name),
+        )
+        .expect("copied frame");
+        assert!(matches!(
+            inspect(&foreign),
+            Err(PreparedShardJournalError::Corrupt(_))
+        ));
+        let path = directory.path().join(correct_name);
+        let mut bytes = std::fs::read(&path).expect("frame bytes");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 1;
+        std::fs::write(path, bytes).expect("corruption");
+        assert!(inspect(&fence).is_err());
+        assert_eq!(
+            journal.records().expect("writer remains independent").len(),
+            1
+        );
     }
 
     #[test]

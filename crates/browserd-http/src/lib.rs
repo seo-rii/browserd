@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod action_wait;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
@@ -22,11 +24,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use browserd_api::{
     ActionGetRequest, ActionResolveRequest, ActionSubmitCommand, ApiError, ApiRequest, ApiResponse,
-    ApiService, ApprovalDecisionBody, ApprovalListQuery, ApprovalStateFilter, ArtifactRequest,
-    ArtifactUploadRequest, PageActivateRequest, PageCreateRequest, PageDeleteRequest,
-    PageListRequest, SessionListQuery, ViewerScopeRequest, ViewerTicketBody, decode_action_resolve,
-    decode_action_submit, decode_approval_decision, decode_artifact_upload, decode_page_create,
-    decode_session_create, validate_idempotency_key, validate_last_event_id,
+    ApiService, ApprovalDecisionBody, ApprovalListQuery, ApprovalStateFilter, ArtifactListRequest,
+    ArtifactRequest, ArtifactUploadRequest, PageActivateRequest, PageCreateRequest,
+    PageDeleteRequest, PageListRequest, SessionListQuery, ViewerScopeRequest, ViewerTicketBody,
+    decode_action_resolve, decode_action_submit, decode_approval_decision, decode_artifact_upload,
+    decode_page_create, decode_session_create, validate_idempotency_key, validate_last_event_id,
 };
 use browserd_artifacts::DownloadToken;
 use browserd_auth::AuthenticatedPrincipal;
@@ -43,11 +45,46 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use action_wait::{ActionWaitAdmission, same_action_receipt};
+
 const GLOBAL_BODY_LIMIT: usize = 262_144;
 const SESSION_BODY_LIMIT: usize = 65_536;
 const ACTION_BODY_LIMIT: usize = browserd_api::MAX_ACTION_BODY_BYTES;
 const SMALL_BODY_LIMIT: usize = 16_384;
 const VIEWER_PROTOCOL: &str = "browser-viewer.v1";
+
+#[async_trait]
+pub trait ArtifactBody: Send {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ApiError>;
+    fn abort(&mut self);
+}
+
+pub struct ArtifactDownloadBody {
+    pub size_bytes: u64,
+    pub stream: Box<dyn ArtifactBody>,
+}
+
+#[async_trait]
+pub trait ArtifactTransport: Send + Sync {
+    fn present_token(&self, token: &DownloadToken) -> Option<String>;
+    async fn consume(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        session_id: &SessionId,
+        artifact_id: &ArtifactId,
+        secret: &str,
+    ) -> Result<ArtifactDownloadBody, ApiError>;
+}
+
+struct DownloadBodyGuard {
+    stream: Box<dyn ArtifactBody>,
+    _admission: AdmissionGuard,
+}
+impl Drop for DownloadBodyGuard {
+    fn drop(&mut self) {
+        self.stream.abort();
+    }
+}
 
 /// Default global cap on authenticated mutating requests admitted for downstream service work at
 /// once. Bounds how many requests (and their decoded bodies) can queue in front of the blocking
@@ -386,6 +423,10 @@ pub struct HttpConfig {
     max_in_flight_reads: usize,
     max_in_flight_mutations: usize,
     max_in_flight_per_tenant: usize,
+    max_action_waiters: usize,
+    max_action_waiters_per_tenant: usize,
+    max_action_polls: usize,
+    max_action_polls_per_tenant: usize,
 }
 
 impl Default for HttpConfig {
@@ -396,6 +437,10 @@ impl Default for HttpConfig {
             max_in_flight_reads: DEFAULT_MAX_IN_FLIGHT_READS,
             max_in_flight_mutations: DEFAULT_MAX_IN_FLIGHT_MUTATIONS,
             max_in_flight_per_tenant: DEFAULT_MAX_IN_FLIGHT_PER_TENANT,
+            max_action_waiters: 256,
+            max_action_waiters_per_tenant: 32,
+            max_action_polls: 64,
+            max_action_polls_per_tenant: 8,
         }
     }
 }
@@ -435,6 +480,29 @@ impl HttpConfig {
         self.max_in_flight_per_tenant = max_in_flight_per_tenant.min(max_in_flight_mutations);
         Ok(self)
     }
+
+    /// Reduces the independent synchronous action-wait and background status-poll limits.
+    /// These lanes do not consume the reserved ingress capacity for ordinary GET requests.
+    pub fn with_action_wait_limits(
+        mut self,
+        max_waiters: usize,
+        max_waiters_per_tenant: usize,
+        max_polls: usize,
+        max_polls_per_tenant: usize,
+    ) -> Result<Self, ApiError> {
+        if !(1..=256).contains(&max_waiters)
+            || !(1..=32).contains(&max_waiters_per_tenant)
+            || !(1..=64).contains(&max_polls)
+            || !(1..=8).contains(&max_polls_per_tenant)
+        {
+            return Err(ApiError::invalid_request("invalid action wait limit"));
+        }
+        self.max_action_waiters = max_waiters;
+        self.max_action_waiters_per_tenant = max_waiters_per_tenant.min(max_waiters);
+        self.max_action_polls = max_polls;
+        self.max_action_polls_per_tenant = max_polls_per_tenant.min(max_polls);
+        Ok(self)
+    }
 }
 
 #[derive(Clone)]
@@ -442,10 +510,12 @@ struct HttpState {
     service: Arc<dyn ApiService>,
     authenticator: Arc<dyn Authenticator>,
     viewer: Arc<dyn ViewerTransport>,
+    artifacts: Option<Arc<dyn ArtifactTransport>>,
     readiness: Arc<dyn Readiness>,
     global_body_limit: usize,
     viewer_socket_limits: ViewerSocketLimits,
     admission: Arc<IngressAdmission>,
+    action_wait: Arc<ActionWaitAdmission>,
 }
 
 pub fn router(
@@ -454,6 +524,17 @@ pub fn router(
     authenticator: Arc<dyn Authenticator>,
     viewer: Arc<dyn ViewerTransport>,
     readiness: Arc<dyn Readiness>,
+) -> Router {
+    router_with_artifacts(config, service, authenticator, viewer, readiness, None)
+}
+
+pub fn router_with_artifacts(
+    config: HttpConfig,
+    service: Arc<dyn ApiService>,
+    authenticator: Arc<dyn Authenticator>,
+    viewer: Arc<dyn ViewerTransport>,
+    readiness: Arc<dyn Readiness>,
+    artifacts: Option<Arc<dyn ArtifactTransport>>,
 ) -> Router {
     Router::new()
         .route("/health/live", get(health_live))
@@ -464,6 +545,7 @@ pub fn router(
             service,
             authenticator,
             viewer,
+            artifacts,
             readiness,
             global_body_limit: config.global_body_limit,
             viewer_socket_limits: config.viewer_socket_limits,
@@ -471,6 +553,12 @@ pub fn router(
                 config.max_in_flight_reads,
                 config.max_in_flight_mutations,
                 config.max_in_flight_per_tenant,
+            )),
+            action_wait: Arc::new(ActionWaitAdmission::new(
+                config.max_action_waiters,
+                config.max_action_waiters_per_tenant,
+                config.max_action_polls,
+                config.max_action_polls_per_tenant,
             )),
         })
         .layer(axum::extract::DefaultBodyLimit::disable())
@@ -603,6 +691,19 @@ struct ViewerTicketHttpBody {
 }
 
 async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Response {
+    let path = request.uri().path();
+    let safety_route =
+        path == "/v1/admin/safety-switches" || path.starts_with("/v1/admin/safety-switches/");
+    let mut response = dispatch_inner(State(state), request).await;
+    if safety_route {
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+async fn dispatch_inner(State(state): State<HttpState>, request: Request<Body>) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     if path.contains("//") || (path.len() > 1 && path.ends_with('/')) {
@@ -981,11 +1082,22 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
         Ok(value) => value,
         Err(_) => return transport_error(StatusCode::UNAUTHORIZED, "unauthenticated"),
     };
+    // Global operator authority is checked before decoding even an invalid body.
+    if matches!(segments.as_slice(), ["v1", "admin", "safety-switches", ..]) {
+        let scope = if method == Method::GET {
+            "admin:safety:read"
+        } else {
+            "admin:safety:write"
+        };
+        if principal.require_scope(scope).is_err() {
+            return transport_error(StatusCode::FORBIDDEN, "permission_denied");
+        }
+    }
     // Admit the request into a bounded in-flight lane before decoding its body or handing it to
     // the blocking service path, so requests and their decoded payloads cannot pile up without
     // limit when the worker or database stalls. Read-only requests use a reserved lane; mutating
-    // requests are bounded globally and per tenant. The guard holds the slot until this handler
-    // returns (BRD-019).
+    // requests are bounded globally and per tenant. Service jobs retain the guard until their
+    // actual completion, including after this handler returns or disconnects (BRD-019).
     let _admission = if method == Method::GET {
         state.admission.admit_read()
     } else {
@@ -1014,6 +1126,7 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
     let query_allowed = matches!(
         (method.clone(), segments.as_slice()),
         (Method::GET, ["v1", "sessions"])
+            | (Method::GET, ["v1", "sessions", _, "artifacts"])
             | (Method::GET, ["v1", "events"])
             | (Method::GET, ["v1", "approvals"])
     );
@@ -1021,7 +1134,87 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
         return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     let headers = request.headers().clone();
+    if let (
+        Method::GET,
+        [
+            "v1",
+            "sessions",
+            session_id,
+            "artifacts",
+            artifact_id,
+            "content",
+        ],
+    ) = (method.clone(), segments.as_slice())
+    {
+        if principal.require_scope("artifact:read").is_err() {
+            return transport_error(StatusCode::FORBIDDEN, "permission_denied");
+        }
+        let (Ok(session_id), Ok(artifact_id)) = (
+            session_id.parse::<SessionId>(),
+            artifact_id.parse::<ArtifactId>(),
+        ) else {
+            return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+        };
+        let Some(artifacts) = state.artifacts.as_ref() else {
+            return transport_error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable");
+        };
+        let Some(secret) = headers
+            .get("x-browserd-download-token")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+        else {
+            return transport_error(StatusCode::UNAUTHORIZED, "unauthenticated");
+        };
+        if headers.get_all("x-browserd-download-token").iter().count() != 1 {
+            return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+        let download = match artifacts
+            .consume(&principal, &session_id, &artifact_id, secret)
+            .await
+        {
+            Ok(download) => download,
+            Err(_) => return transport_error(StatusCode::NOT_FOUND, "artifact_not_found"),
+        };
+        let stream = futures::stream::unfold(
+            Some(DownloadBodyGuard {
+                stream: download.stream,
+                _admission,
+            }),
+            |state| async move {
+                let mut guard = state?;
+                match guard.stream.next_chunk().await {
+                    Ok(Some(chunk)) => Some((Ok::<_, std::io::Error>(chunk), Some(guard))),
+                    Ok(None) => None,
+                    Err(_) => Some((
+                        Err(std::io::Error::other("artifact stream interrupted")),
+                        None,
+                    )),
+                }
+            },
+        );
+        let mut response = Response::new(Body::from_stream(stream));
+        let headers = response.headers_mut();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        headers.insert(
+            "content-disposition",
+            HeaderValue::from_static("attachment; filename=\"artifact.bin\""),
+        );
+        headers.insert("cache-control", HeaderValue::from_static("no-store"));
+        headers.insert(
+            "x-content-type-options",
+            HeaderValue::from_static("nosniff"),
+        );
+        if let Ok(length) = HeaderValue::from_str(&download.size_bytes.to_string()) {
+            headers.insert("content-length", length);
+        }
+        return response;
+    }
     let route_limit = match (method.clone(), segments.as_slice()) {
+        (Method::POST, ["v1", "admin", "safety-switches", "initialize" | "audit-ack"])
+        | (Method::PATCH, ["v1", "admin", "safety-switches"]) => SMALL_BODY_LIMIT,
         (Method::POST, ["v1", "sessions"]) => SESSION_BODY_LIMIT,
         (Method::POST, ["v1", "sessions", _, "actions"]) => ACTION_BODY_LIMIT,
         (
@@ -1033,9 +1226,11 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
                 "reconnect" | "transfer" | "pages" | "viewer-ticket",
             ],
         )
-        | (Method::POST, ["v1", "sessions", _, "artifacts", "uploads"])
         | (Method::POST, ["v1", "sessions", _, "actions", _, "resolve"])
         | (Method::POST, ["v1", "approvals", _, "decision"]) => SMALL_BODY_LIMIT,
+        (Method::PUT | Method::DELETE, ["v1", "webhook-endpoint"])
+        | (Method::POST, ["v1", "webhook-endpoint", "resume"]) => SMALL_BODY_LIMIT,
+        (Method::POST, ["v1", "sessions", _, "artifacts", "uploads"]) => 720_896,
         _ => 0,
     };
     let body = match to_bytes(request.into_body(), state.global_body_limit + 1).await {
@@ -1066,7 +1261,92 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
         Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
     };
 
+    let mut action_wait_millis = None;
     let api_request = match (method.clone(), segments.as_slice()) {
+        (Method::GET, ["v1", "admin", "safety-switches"]) => {
+            ApiRequest::Safety(browserd_api::SafetyRequest::Get)
+        }
+        (Method::GET, ["v1", "admin", "safety-switches", "audits"]) => {
+            ApiRequest::Safety(browserd_api::SafetyRequest::Audits)
+        }
+        (Method::POST, ["v1", "admin", "safety-switches", "audit-ack"]) => {
+            let ack = match serde_json::from_str(body_text) {
+                Ok(ack) => ack,
+                Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+            };
+            ApiRequest::Safety(browserd_api::SafetyRequest::AckAudit(ack))
+        }
+        (Method::POST, ["v1", "admin", "safety-switches", "initialize"])
+        | (Method::PATCH, ["v1", "admin", "safety-switches"]) => {
+            if headers.get_all("idempotency-key").iter().count() != 1 {
+                return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            let Some(idempotency_key) = headers
+                .get("idempotency-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| validate_idempotency_key(v).ok())
+            else {
+                return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+            };
+            let parsed = if method == Method::POST {
+                serde_json::from_str(body_text).map(|body| {
+                    browserd_api::SafetyRequest::Initialize {
+                        body,
+                        idempotency_key,
+                    }
+                })
+            } else {
+                serde_json::from_str(body_text).map(|body| browserd_api::SafetyRequest::Mutate {
+                    body,
+                    idempotency_key,
+                })
+            };
+            match parsed {
+                Ok(request) => ApiRequest::Safety(request),
+                Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+            }
+        }
+
+        (Method::GET, ["v1", "webhook-endpoint"]) => {
+            ApiRequest::Webhook(browserd_api::WebhookRequest::Get)
+        }
+        (Method::PUT | Method::DELETE, ["v1", "webhook-endpoint"])
+        | (Method::POST, ["v1", "webhook-endpoint", "resume"]) => {
+            if headers.get_all("idempotency-key").iter().count() != 1 {
+                return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            let Some(idempotency_key) = headers
+                .get("idempotency-key")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| validate_idempotency_key(v).ok())
+            else {
+                return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+            };
+            let parsed = match method {
+                Method::PUT => {
+                    serde_json::from_str(body_text).map(|body| browserd_api::WebhookRequest::Put {
+                        body,
+                        idempotency_key,
+                    })
+                }
+                Method::DELETE => serde_json::from_str(body_text).map(|body| {
+                    browserd_api::WebhookRequest::Delete {
+                        body,
+                        idempotency_key,
+                    }
+                }),
+                _ => serde_json::from_str(body_text).map(|body| {
+                    browserd_api::WebhookRequest::Resume {
+                        body,
+                        idempotency_key,
+                    }
+                }),
+            };
+            match parsed {
+                Ok(request) => ApiRequest::Webhook(request),
+                Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+            }
+        }
         (Method::POST, ["v1", "sessions"]) => {
             if !query.is_empty() {
                 return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
@@ -1286,13 +1566,18 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
                 Some(value) => value,
                 None => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
             };
-            if let Some(prefer) = headers.get("prefer").and_then(|value| value.to_str().ok()) {
-                let wait = prefer
-                    .strip_prefix("wait=")
-                    .and_then(|value| value.parse::<u64>().ok());
-                if wait.is_none_or(|wait| wait > 30_000) {
-                    return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
-                }
+            if let Some(prefer) = headers.get("prefer") {
+                let wait = prefer.to_str().ok().and_then(|value| {
+                    let digits = value.strip_prefix("wait=")?;
+                    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return None;
+                    }
+                    digits.parse::<u64>().ok().filter(|wait| *wait <= 30_000)
+                });
+                action_wait_millis = match wait {
+                    Some(wait) => Some(wait),
+                    None => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+                };
             }
             match decode_action_submit(body_text) {
                 Ok(body) => ApiRequest::SubmitAction(ActionSubmitCommand {
@@ -1410,6 +1695,42 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
                 Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
             }
         }
+        (Method::GET, ["v1", "sessions", session_id, "artifacts"]) => {
+            let session_id = match session_id.parse::<SessionId>() {
+                Ok(value) => value,
+                Err(_) => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+            };
+            let mut request = ArtifactListRequest {
+                session_id,
+                after: None,
+                limit: 50,
+            };
+            let mut seen = std::collections::HashSet::new();
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                if !seen.insert(key.to_string()) {
+                    return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+                }
+                match key.as_ref() {
+                    "after" => match value.parse::<ArtifactId>() {
+                        Ok(after) => request.after = Some(after),
+                        Err(_) => {
+                            return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+                        }
+                    },
+                    "limit" => match value.parse::<usize>() {
+                        Ok(limit) => request.limit = limit,
+                        Err(_) => {
+                            return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+                        }
+                    },
+                    _ => return transport_error(StatusCode::BAD_REQUEST, "invalid_request"),
+                }
+            }
+            if request.validate().is_err() {
+                return transport_error(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            ApiRequest::ListArtifacts(request)
+        }
         (Method::POST, ["v1", "sessions", session_id, "artifacts", "uploads"]) => {
             let session_id = match session_id.parse::<SessionId>() {
                 Ok(value) => value,
@@ -1504,13 +1825,20 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
         _ => return transport_error(StatusCode::NOT_FOUND, "not_found"),
     };
 
-    let service = Arc::clone(&state.service);
-    let result =
-        tokio::task::spawn_blocking(move || service.execute(&principal, api_request)).await;
-    let result = match result {
-        Ok(result) => result,
-        Err(_) => {
-            return transport_error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable");
+    let (result, preference_applied) = match (api_request, action_wait_millis) {
+        (ApiRequest::SubmitAction(command), Some(wait_ms))
+            if wait_ms == 0 || principal.require_scope("session:read").is_ok() =>
+        {
+            execute_action_with_wait(&state, principal, command, _admission, wait_ms).await
+        }
+        (api_request, _) => {
+            let service = Arc::clone(&state.service);
+            let result = tokio::task::spawn_blocking(move || {
+                let _admission = _admission;
+                service.execute(&principal, api_request)
+            })
+            .await;
+            (completed_service_result(result), None)
         }
     };
     let response = match result {
@@ -1528,7 +1856,7 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
             );
         }
     };
-    match response {
+    let mut response = match response {
         ApiResponse::ViewerTicket(envelope) => {
             let ticket = match state.viewer.present_viewer_ticket(envelope.data()) {
                 Some(ticket)
@@ -1562,7 +1890,12 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
             response
         }
         ApiResponse::ArtifactDownload(envelope) => {
-            let token = match state.viewer.present_download_token(envelope.data()) {
+            let token = match state
+                .artifacts
+                .as_ref()
+                .and_then(|transport| transport.present_token(envelope.data()))
+                .or_else(|| state.viewer.present_download_token(envelope.data()))
+            {
                 Some(token)
                     if !token.is_empty()
                         && token.len() <= 4_096
@@ -1574,17 +1907,213 @@ async fn dispatch(State(state): State<HttpState>, request: Request<Body>) -> Res
                     return transport_error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable");
                 }
             };
-            json_response(
+            let mut response = json_response(
                 StatusCode::OK,
                 json!({"data":{"download_token":token},"trace_id":envelope.trace_id()}),
-            )
+            );
+            response
+                .headers_mut()
+                .insert("cache-control", HeaderValue::from_static("no-store"));
+            response
         }
         response => render_api_response(response, method, &path),
+    };
+    if let Some(wait_ms) = preference_applied
+        && let Ok(value) = HeaderValue::from_str(&format!("wait={wait_ms}"))
+    {
+        response.headers_mut().insert("preference-applied", value);
+    }
+    response
+}
+
+type ServiceJob = tokio::task::JoinHandle<Result<ApiResponse, ApiError>>;
+
+fn completed_service_result(
+    result: Result<Result<ApiResponse, ApiError>, tokio::task::JoinError>,
+) -> Result<ApiResponse, ApiError> {
+    result.unwrap_or_else(|_| {
+        Err(ApiError::new(
+            browserd_core::ErrorCode::WorkerUnavailable,
+            "service job unavailable",
+        ))
+    })
+}
+
+async fn optional_service_job(
+    job: &mut Option<ServiceJob>,
+) -> Result<Result<ApiResponse, ApiError>, tokio::task::JoinError> {
+    match job {
+        Some(job) => job.await,
+        None => std::future::pending().await,
     }
 }
 
+/// The submission runs once and owns its ingress lease through completion. Receiving a durable
+/// receipt permits an early HTTP response; neither a timeout nor dropping this future cancels
+/// the submission or any already-started status lookup.
+async fn execute_action_with_wait(
+    state: &HttpState,
+    principal: AuthenticatedPrincipal,
+    command: ActionSubmitCommand,
+    admission: AdmissionGuard,
+    wait_ms: u64,
+) -> (Result<ApiResponse, ApiError>, Option<u64>) {
+    let session_id = command.session_id.clone();
+    let waiter = (wait_ms > 0)
+        .then(|| state.action_wait.try_waiter(principal.tenant_id()))
+        .flatten();
+    let mut applied = (wait_ms == 0 || waiter.is_some()).then_some(wait_ms);
+    let (sender, mut acceptance) = tokio::sync::oneshot::channel();
+    let service = Arc::clone(&state.service);
+    let submit_principal = principal.clone();
+    let submit_waiter = waiter.clone();
+    // Admission, coordination and enqueue delays consume the same absolute HTTP budget.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+    let mut submit = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let _waiter = submit_waiter;
+        let mut sender = Some(sender);
+        service.execute_with_action_acceptance(
+            &submit_principal,
+            ApiRequest::SubmitAction(command),
+            &mut |receipt| {
+                // The gateway invokes this under its session admission lease. Sending one
+                // receipt is nonblocking and cannot re-enter the gateway or dispatch again.
+                if let Some(sender) = sender.take() {
+                    let _sent = sender.send(receipt);
+                }
+            },
+        )
+    });
+
+    let (mut latest, submission_pending, observed_acceptance) = tokio::select! {
+        biased;
+        result = &mut submit => match completed_service_result(result) {
+            Ok(ApiResponse::Action(receipt)) => (receipt, false, acceptance.try_recv().is_ok()),
+            result => return (result, None),
+        },
+        receipt = &mut acceptance => match receipt {
+            Ok(receipt) => (receipt, true, true),
+            // No durable receipt means that inventing an action ID or a 202 would be unsafe.
+            Err(_) => match completed_service_result((&mut submit).await) {
+                Ok(ApiResponse::Action(receipt)) => (receipt, false, false),
+                result => return (result, None),
+            },
+        },
+    };
+    if !observed_acceptance {
+        // A legacy service may only return after finishing its ordinary submission. Do not
+        // claim early acceptance or a bounded wait that this adapter could not provide.
+        applied = None;
+    }
+    if latest.data().state().is_terminal()
+        || wait_ms == 0
+        || waiter.is_none()
+        || tokio::time::Instant::now() >= deadline
+    {
+        return (Ok(ApiResponse::Action(latest)), applied);
+    }
+
+    // A legacy nonterminal receipt can still use the remaining budget for bounded status
+    // observation. This is an applied positive wait even without an early callback.
+    applied = Some(wait_ms);
+
+    let mut submit = submission_pending.then_some(submit);
+    let mut poll = None;
+    let mut next_poll = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => break,
+            result = optional_service_job(&mut submit) => {
+                submit = None;
+                match completed_service_result(result) {
+                    Ok(ApiResponse::Action(receipt))
+                        if same_action_receipt(latest.data(), receipt.data()) =>
+                    {
+                        latest = receipt;
+                        if latest.data().state().is_terminal() {
+                            break;
+                        }
+                    }
+                    // Once accepted, preserve that receipt even if completion cannot be read.
+                    _ => break,
+                }
+            }
+            result = optional_service_job(&mut poll) => {
+                poll = None;
+                match completed_service_result(result) {
+                    Ok(ApiResponse::Action(receipt))
+                        if same_action_receipt(latest.data(), receipt.data()) =>
+                    {
+                        latest = receipt;
+                        if latest.data().state().is_terminal() {
+                            break;
+                        }
+                        next_poll = tokio::time::Instant::now() + Duration::from_millis(50);
+                    }
+                    _ => break,
+                }
+            }
+            _ = tokio::time::sleep_until(next_poll), if poll.is_none() => {
+                let Some(poll_guard) = state.action_wait.try_poll(principal.tenant_id()) else {
+                    applied = None;
+                    break;
+                };
+                let service = Arc::clone(&state.service);
+                let poll_principal = principal.clone();
+                let request = ActionGetRequest {
+                    session_id: session_id.clone(),
+                    action_id: latest.data().action_id().clone(),
+                };
+                let poll_waiter = waiter.clone();
+                poll = Some(tokio::task::spawn_blocking(move || {
+                    let _poll_guard = poll_guard;
+                    let _waiter = poll_waiter;
+                    service.execute(&poll_principal, ApiRequest::GetAction(request))
+                }));
+            }
+        }
+    }
+    (Ok(ApiResponse::Action(latest)), applied)
+}
+
 pub fn render_api_response(response: ApiResponse, method: Method, path: &str) -> Response {
+    let is_action = matches!(&response, ApiResponse::Action(_));
+    let is_webhook_endpoint = matches!(&response, ApiResponse::WebhookEndpoint(_));
+    let action_location = match &response {
+        ApiResponse::Action(envelope) if method == Method::POST && path.ends_with("/actions") => {
+            Some(format!("{path}/{}", envelope.data().action_id()))
+        }
+        _ => None,
+    };
     let (status, trace_id, data) = match response {
+        ApiResponse::Safety(envelope) => {
+            (StatusCode::OK, envelope.trace_id(), envelope.data().clone())
+        }
+        ApiResponse::WebhookEndpoint(envelope) => {
+            let endpoint = &envelope.data().endpoint;
+            let mut data = json!({
+                "id":endpoint.endpoint_ref().endpoint_id(),
+                "revision":endpoint.endpoint_ref().revision(),
+                "url":endpoint.spec().endpoint_url(),
+                "status":endpoint.status(),
+                "cursor":endpoint.cursor().position(),
+                "failure_count":endpoint.failure_count(),
+                "suspension_reason":endpoint.suspension_reason(),
+                "gap_observation":endpoint.gap_observation().map(|gap|json!({
+                    "pruned_through":gap.pruned_through(), "tail":gap.tail(),
+                })),
+                "signing_key_id":endpoint.spec().signing_key_ref().key_id(),
+                "created_at":endpoint.created_at(),"updated_at":endpoint.updated_at(),
+            });
+            if let Some(secret) = &envelope.data().signing_secret {
+                data["signing_secret"] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(secret.as_bytes())
+                    .into();
+            }
+            (StatusCode::OK, envelope.trace_id(), data)
+        }
         ApiResponse::SessionCreate(envelope) => {
             let operation = envelope.data().operation();
             let status = if operation.state() == CreateOperationState::Succeeded {
@@ -1595,7 +2124,7 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
             (
                 status,
                 envelope.trace_id(),
-                json!({"operation":{"id":operation.id().to_string(),"state":format!("{:?}",operation.state()).to_ascii_lowercase(),"poll_url":operation.poll_url()}}),
+                json!({"operation":operation.public_value()}),
             )
         }
         ApiResponse::Operation(envelope) => {
@@ -1615,13 +2144,13 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                     StatusCode::OK
                 },
                 envelope.trace_id(),
-                json!({"operation":{"id":operation.id().to_string(),"state":format!("{:?}",operation.state()).to_ascii_lowercase(),"poll_url":operation.poll_url()}}),
+                json!({"operation":operation.public_value()}),
             )
         }
         ApiResponse::Sessions(envelope) => (
             StatusCode::OK,
             envelope.trace_id(),
-            json!({"sessions":envelope.data().items().iter().map(|session| session.id.to_string()).collect::<Vec<_>>(),"next_page_token":envelope.data().next_page_token()}),
+            json!({"sessions":envelope.data().items().iter().map(browserd_api::SessionResource::public_value).collect::<Vec<_>>(),"next_page_token":envelope.data().next_page_token()}),
         ),
         ApiResponse::Session(envelope) | ApiResponse::SessionClosed(envelope) => {
             let session = envelope.data();
@@ -1634,7 +2163,7 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
             (
                 status,
                 envelope.trace_id(),
-                json!({"session":{"id":session.id.to_string(),"state":format!("{:?}",session.lifecycle).to_ascii_lowercase(),"incarnation":session.incarnation,"metadata":session.metadata}}),
+                json!({"session":session.public_value()}),
             )
         }
         ApiResponse::Reconnected(envelope) | ApiResponse::Transferred(envelope) => (
@@ -1645,7 +2174,7 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
         ApiResponse::Pages(envelope) => (
             StatusCode::OK,
             envelope.trace_id(),
-            json!({"pages":envelope.data().iter().map(|page| page.page_id.to_string()).collect::<Vec<_>>() }),
+            json!({"pages":envelope.data().iter().map(browserd_api::PageResource::public_value).collect::<Vec<_>>() }),
         ),
         ApiResponse::Page(envelope) => (
             if method == Method::POST && path.ends_with("/pages") {
@@ -1654,7 +2183,7 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                 StatusCode::OK
             },
             envelope.trace_id(),
-            json!({"page":{"id":envelope.data().page_id.to_string(),"active":envelope.data().active}}),
+            json!({"page":envelope.data().public_value()}),
         ),
         ApiResponse::PageDeleted(envelope) => (
             StatusCode::OK,
@@ -1706,6 +2235,10 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                         browserd_actions::KnownFailureReason::ExecutionTimedOut => {
                             "execution_timed_out"
                         }
+                        browserd_actions::KnownFailureReason::SnapshotTooLarge => {
+                            "snapshot_too_large"
+                        }
+                        browserd_actions::KnownFailureReason::DocumentChanged => "document_changed",
                     };
                     data.insert("reason".to_owned(), json!(reason));
                 }
@@ -1749,26 +2282,36 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
         ApiResponse::Events(envelope) => (
             StatusCode::OK,
             envelope.trace_id(),
-            json!({"events":envelope.data().events().iter().map(|event| {
-                let kind = match event.kind() {
-                    browserd_api::EventKind::OperationStateChanged => "operation.state_changed",
-                    browserd_api::EventKind::SessionLifecycleChanged => "session.lifecycle_changed",
-                    browserd_api::EventKind::SessionExecutionChanged => "session.execution_changed",
-                    browserd_api::EventKind::ActionStateChanged => "action.state_changed",
-                    browserd_api::EventKind::ActionApprovalRequired => "action.approval_required",
-                    browserd_api::EventKind::ApprovalDecided => "approval.decided",
-                    browserd_api::EventKind::BrowserControlChanged => "browser.control_changed",
-                    browserd_api::EventKind::DownloadCompleted => "download.completed",
-                    browserd_api::EventKind::ArtifactStateChanged => "artifact.state_changed",
-                };
-                json!({"event_id":event.event_id(),"kind":kind,"created_at":event.created_at()})
-            }).collect::<Vec<_>>(),"gap":envelope.data().gap(),"next_cursor":envelope.data().next_cursor()}),
+            json!({"events":envelope.data().events().iter().map(browserd_api::EventRecord::public_wire).collect::<Vec<_>>(),"gap":envelope.data().gap(),"next_cursor":envelope.data().next_cursor()}),
         ),
         ApiResponse::ViewerTicket(_) => {
             return transport_error(StatusCode::SERVICE_UNAVAILABLE, "worker_unavailable");
         }
+        ApiResponse::Artifacts(envelope) => {
+            if envelope
+                .data()
+                .items
+                .iter()
+                .any(|artifact| artifact.validate_display_filename().is_err())
+            {
+                return transport_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
+            (
+                StatusCode::OK,
+                envelope.trace_id(),
+                json!({"artifacts":envelope.data().items.iter().map(|artifact| {
+                    json!({"id":artifact.key.artifact_id().to_string(),
+                        "state":format!("{:?}",artifact.state).to_ascii_lowercase(),
+                        "size_bytes":artifact.size_bytes,"content_type":artifact.content_type,
+                        "display_filename":artifact.display_filename})
+                }).collect::<Vec<_>>(),"next_cursor":envelope.data().next_cursor.as_ref().map(ToString::to_string)}),
+            )
+        }
         ApiResponse::ArtifactUpload(envelope) | ApiResponse::Artifact(envelope) => {
             let artifact = envelope.data();
+            if artifact.validate_display_filename().is_err() {
+                return transport_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            }
             (
                 if path.ends_with("/uploads") {
                     StatusCode::CREATED
@@ -1776,7 +2319,7 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
                     StatusCode::OK
                 },
                 envelope.trace_id(),
-                json!({"artifact":{"id":artifact.key.artifact_id().to_string(),"state":format!("{:?}",artifact.state).to_ascii_lowercase(),"size_bytes":artifact.size_bytes,"content_type":artifact.content_type}}),
+                json!({"artifact":{"id":artifact.key.artifact_id().to_string(),"state":format!("{:?}",artifact.state).to_ascii_lowercase(),"size_bytes":artifact.size_bytes,"content_type":artifact.content_type,"display_filename":artifact.display_filename}}),
             )
         }
         ApiResponse::ArtifactDownload(_) => {
@@ -1785,15 +2328,41 @@ pub fn render_api_response(response: ApiResponse, method: Method, path: &str) ->
         ApiResponse::Approvals(envelope) => (
             StatusCode::OK,
             envelope.trace_id(),
-            json!({"approvals":envelope.data().items().iter().map(|approval| approval.approval_id).collect::<Vec<_>>(),"next_page_token":envelope.data().next_page_token()}),
+            json!({"approvals":envelope.data().items().iter().map(approval_json).collect::<Vec<_>>(),"next_page_token":envelope.data().next_page_token()}),
         ),
         ApiResponse::Approval(envelope) => (
             StatusCode::OK,
             envelope.trace_id(),
-            json!({"approval":{"id":envelope.data().approval_id,"session_id":envelope.data().session_id.to_string(),"action_id":envelope.data().action_id.to_string(),"state":match &envelope.data().state { browserd_policy::ApprovalState::Pending => "pending", browserd_policy::ApprovalState::Approved { .. } => "approved", browserd_policy::ApprovalState::Denied { .. } => "denied", browserd_policy::ApprovalState::Expired => "expired" }}}),
+            json!({"approval":approval_json(envelope.data())}),
         ),
     };
-    json_response(status, json!({"data":data,"trace_id":trace_id}))
+    let mut response = json_response(status, json!({"data":data,"trace_id":trace_id}));
+    if is_action || is_webhook_endpoint {
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+    }
+    if let Some(location) = action_location
+        && let Ok(value) = HeaderValue::from_str(&location)
+    {
+        response.headers_mut().insert("location", value);
+    }
+    response
+}
+
+fn approval_json(approval: &browserd_api::ApprovalResource) -> Value {
+    json!({
+        "id": approval.approval_id,
+        "session_id": approval.session_id,
+        "action_id": approval.action_id,
+        "state": match &approval.state {
+            browserd_policy::ApprovalState::Pending => "pending",
+            browserd_policy::ApprovalState::Approved { .. } => "approved",
+            browserd_policy::ApprovalState::Denied { .. } => "denied",
+            browserd_policy::ApprovalState::Expired => "expired",
+        },
+        "summary": approval.summary(),
+    })
 }
 
 #[cfg(test)]

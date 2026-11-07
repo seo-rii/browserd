@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
+use crate::route::RegistryClock;
 use async_trait::async_trait;
 use browserd_core::EgressFence;
 use nix::sys::stat::fstat;
@@ -17,7 +18,7 @@ use crate::{
     AcceptedRouteIngress, ActiveAttachmentReceipt, AttachmentError, AttachmentExpiry,
     AttachmentRegistry, AttachmentStatus, BindingDigest, CancelledAttachmentReceipt, DaemonEpoch,
     InstallReceipt, InstallingAttachmentReceipt, MonotonicMillis, PreparedAttachmentReceipt,
-    ReleasedAttachmentReceipt, RouteBinding, RouteClaim, RouteEndpoint, RouteError,
+    QuotaError, ReleasedAttachmentReceipt, RouteBinding, RouteClaim, RouteEndpoint, RouteError,
     RouteIngressError, RouteIngressListener, RouteRegistry,
 };
 
@@ -47,7 +48,7 @@ pub struct AttachmentManager {
 }
 
 struct ManagerInner {
-    clock: ManagerClock,
+    clock: RegistryClock,
     handler: Arc<dyn AcceptedIngressHandler>,
     routes: RouteRegistry,
     state: Mutex<ManagerState>,
@@ -91,25 +92,7 @@ enum ManagedPhase {
 struct DescriptorIdentity {
     device: u64,
     inode: u64,
-}
-
-#[derive(Clone, Copy)]
-struct ManagerClock {
-    origin: tokio::time::Instant,
-}
-
-impl ManagerClock {
-    fn new() -> Self {
-        Self {
-            origin: tokio::time::Instant::now(),
-        }
-    }
-
-    fn now(self) -> MonotonicMillis {
-        let elapsed = self.origin.elapsed().as_millis();
-        let elapsed = u64::try_from(elapsed).unwrap_or(u64::MAX);
-        MonotonicMillis::new(elapsed)
-    }
+    namespace_cookie: Option<u64>,
 }
 
 impl AttachmentManager {
@@ -132,7 +115,7 @@ impl AttachmentManager {
     ) -> Self {
         Self {
             inner: Arc::new(ManagerInner {
-                clock: ManagerClock::new(),
+                clock: routes.clock(),
                 handler,
                 routes,
                 state: Mutex::new(ManagerState {
@@ -155,15 +138,42 @@ impl AttachmentManager {
         fence: EgressFence,
         binding_digest: BindingDigest,
     ) -> Result<PreparedAttachmentReceipt, AttachmentManagerError> {
+        self.prepare_route(fence, binding_digest, false)
+    }
+
+    pub fn prepare_context_route(
+        &self,
+        fence: EgressFence,
+        binding_digest: BindingDigest,
+    ) -> Result<PreparedAttachmentReceipt, AttachmentManagerError> {
+        self.prepare_route(fence, binding_digest, true)
+    }
+
+    fn prepare_route(
+        &self,
+        fence: EgressFence,
+        binding_digest: BindingDigest,
+        shared_context: bool,
+    ) -> Result<PreparedAttachmentReceipt, AttachmentManagerError> {
         let mut state = self.inner.lock_state();
         if state.shutting_down {
             return Err(AttachmentManagerError::ShuttingDown);
         }
+        self.inner
+            .routes
+            .prepare_shard(fence.shard())
+            .map_err(AttachmentManagerError::Route)?;
         let daemon_epoch = state.attachments.daemon_epoch();
-        let prepared = state
-            .attachments
-            .prepare(daemon_epoch, fence.clone(), binding_digest)
-            .map_err(AttachmentManagerError::Attachment)?;
+        let prepared = if shared_context {
+            state
+                .attachments
+                .prepare_context_route(daemon_epoch, fence.clone(), binding_digest)
+        } else {
+            state
+                .attachments
+                .prepare(daemon_epoch, fence.clone(), binding_digest)
+        }
+        .map_err(AttachmentManagerError::Attachment)?;
         state
             .records
             .entry(fence)
@@ -189,7 +199,7 @@ impl AttachmentManager {
         binding: RouteBinding,
         descriptor: OwnedFd,
     ) -> Result<ActiveAttachmentReceipt, AttachmentManagerError> {
-        let descriptor_identity = descriptor_identity(&descriptor)?;
+        let descriptor_identity = descriptor_identity(&descriptor, prepared.is_shared_context())?;
         let fence = prepared.fence().clone();
         let (claim, cancellation) = loop {
             let action = {
@@ -207,6 +217,11 @@ impl AttachmentManager {
                     ))?;
                 match phase {
                     ManagedPhase::Prepared => {
+                        validate_shared_namespace(
+                            &state,
+                            &fence,
+                            descriptor_identity.namespace_cookie,
+                        )?;
                         let endpoint = state.allocate_endpoint()?;
                         let claim = RouteClaim::new(endpoint, fence.clone());
                         let record = state
@@ -597,6 +612,33 @@ impl AttachmentManager {
         }
     }
 
+    /// Final shard retirement is separate from per-context release and rejects live siblings.
+    pub fn retire_shard(
+        &self,
+        fence: &browserd_core::ShardFence,
+    ) -> Result<(), AttachmentManagerError> {
+        let state = self.inner.lock_state();
+        if state
+            .records
+            .iter()
+            .any(|(route, record)| route.shard() == fence && record.phase != ManagedPhase::Released)
+        {
+            return Err(AttachmentManagerError::Route(RouteError::ShardNotDrained));
+        }
+        match self.inner.routes.prepare_shard(fence) {
+            Ok(()) | Err(RouteError::ShardReleased) => {}
+            Err(error) => return Err(AttachmentManagerError::Route(error)),
+        }
+        self.inner
+            .routes
+            .revoke_shard(fence)
+            .map_err(AttachmentManagerError::Route)?;
+        self.inner
+            .routes
+            .release_shard(fence)
+            .map_err(AttachmentManagerError::Route)
+    }
+
     pub async fn shutdown(&self) -> Result<(), AttachmentManagerError> {
         {
             self.inner.lock_state().shutting_down = true;
@@ -694,9 +736,15 @@ impl ManagerInner {
             cancelled
         };
 
-        let _ = self.routes.revoke(claim);
-        let _ = self.routes.revoke_shard(fence.shard());
-        let _ = self.routes.release_shard(fence.shard());
+        match self.routes.revoke(claim) {
+            Ok(()) => {
+                if self.routes.release_route(claim).is_err() {
+                    return;
+                }
+            }
+            Err(RouteError::RouteNotFound) => {} // This install owner never registered a route.
+            Err(_) => return,
+        }
 
         let mut state = self.lock_state();
         let Ok(released) = state.attachments.release_cancelled(&cancelled) else {
@@ -780,10 +828,7 @@ impl ManagerInner {
             .revoke(&claim)
             .map_err(AttachmentManagerError::Route)?;
         self.routes
-            .revoke_shard(fence.shard())
-            .map_err(AttachmentManagerError::Route)?;
-        self.routes
-            .release_shard(fence.shard())
+            .release_route(&claim)
             .map_err(AttachmentManagerError::Route)?;
 
         let mut state = self.lock_state();
@@ -863,12 +908,41 @@ fn ensure_exact_install(
     Ok(())
 }
 
-fn descriptor_identity(descriptor: &OwnedFd) -> Result<DescriptorIdentity, AttachmentManagerError> {
+fn validate_shared_namespace(
+    state: &ManagerState,
+    fence: &EgressFence,
+    namespace_cookie: Option<u64>,
+) -> Result<(), AttachmentManagerError> {
+    if let Some(cookie) = namespace_cookie
+        && state.records.iter().any(|(other, record)| {
+            other.shard() == fence.shard()
+                && record
+                    .descriptor
+                    .is_some_and(|identity| identity.namespace_cookie != Some(cookie))
+        })
+    {
+        return Err(AttachmentManagerError::DescriptorConflict);
+    }
+    Ok(())
+}
+
+fn descriptor_identity(
+    descriptor: &OwnedFd,
+    shared_context: bool,
+) -> Result<DescriptorIdentity, AttachmentManagerError> {
     let metadata = fstat(descriptor)
         .map_err(|error| AttachmentManagerError::InvalidDescriptor(io::Error::from(error)))?;
     Ok(DescriptorIdentity {
         device: metadata.st_dev,
         inode: metadata.st_ino,
+        namespace_cookie: if shared_context {
+            Some(
+                browserd_local_ipc::socket_network_namespace_cookie(descriptor.as_fd())
+                    .map_err(AttachmentManagerError::InvalidDescriptor)?,
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -915,11 +989,17 @@ async fn run_listener_actor(
                     );
                 }
             }
-            accepted = listener.accept(|| manager.clock.now()) => {
+            accepted = listener.accept_current() => {
                 match accepted {
                     Ok(ingress) => {
                         let handler = manager.handler.clone();
                         handlers.spawn(async move { handler.handle(ingress).await });
+                    }
+                    Err(RouteIngressError::Route(RouteError::Quota(
+                        QuotaError::ConcurrentConnections | QuotaError::ConnectionCreationRate,
+                    ))) => {
+                        // A rejected new socket never owns the admitted flows or listener.
+                        continue;
                     }
                     Err(_) => {
                         break 'actor matches!(
@@ -994,5 +1074,72 @@ impl Error for AttachmentManagerError {
             | Self::EndpointExhausted
             | Self::InconsistentState => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod context_namespace_tests {
+    #![allow(clippy::expect_used)]
+    use super::*;
+    use browserd_core::{
+        LaunchGeneration, OwnerFence, RouteGeneration, SessionId, SessionIncarnation, ShardFence,
+        ShardId, WorkerEpoch, WorkerId,
+    };
+    #[test]
+    fn first_adopt_pins_namespace_through_release_and_rejects_other_namespace_before_admission() {
+        let epoch = DaemonEpoch::new(1).expect("epoch");
+        let mut state = ManagerState {
+            attachments: AttachmentRegistry::new(epoch),
+            records: HashMap::new(),
+            next_endpoint: 1,
+            shutting_down: false,
+        };
+        let shard = ShardFence::new(
+            OwnerFence::new(
+                WorkerId::new("cookie-worker").expect("worker"),
+                WorkerEpoch::new(1).expect("epoch"),
+            ),
+            ShardId::new(),
+            LaunchGeneration::new(1).expect("launch"),
+        );
+        let first = EgressFence::new(
+            shard.clone(),
+            RouteGeneration::new(1).expect("route"),
+            SessionId::new(),
+            SessionIncarnation::new(1).expect("incarnation"),
+        );
+        let second = EgressFence::new(
+            shard,
+            RouteGeneration::new(2).expect("route"),
+            SessionId::new(),
+            SessionIncarnation::new(1).expect("incarnation"),
+        );
+        let receipt = state
+            .attachments
+            .prepare_context_route(epoch, first.clone(), BindingDigest::new([1; 32]))
+            .expect("prepare");
+        let mut record = ManagedAttachment::new(receipt);
+        assert!(validate_shared_namespace(&state, &first, Some(71)).is_ok());
+        record.descriptor = Some(DescriptorIdentity {
+            device: 1,
+            inode: 2,
+            namespace_cookie: Some(71),
+        });
+        record.phase = ManagedPhase::Adopting;
+        state.records.insert(first.clone(), record);
+        assert!(validate_shared_namespace(&state, &second, Some(71)).is_ok());
+        assert!(matches!(
+            validate_shared_namespace(&state, &second, Some(72)),
+            Err(AttachmentManagerError::DescriptorConflict)
+        ));
+        state.records.get_mut(&first).expect("retained").phase = ManagedPhase::Released;
+        assert!(
+            matches!(
+                validate_shared_namespace(&state, &second, Some(72)),
+                Err(AttachmentManagerError::DescriptorConflict)
+            ),
+            "released descriptor identity remains a shard-lifetime fence"
+        );
+        assert!(validate_shared_namespace(&state, &second, Some(71)).is_ok());
     }
 }

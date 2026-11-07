@@ -15,6 +15,76 @@ use uuid::Uuid;
 
 const DAY: Duration = MINIMUM_EVENT_RETENTION;
 
+#[path = "support/event_outbox_projection.rs"]
+mod projection_cases;
+
+#[tokio::test]
+async fn postgres_projection_retention_gaps_parallel_and_legacy_conformance() {
+    let Some(store) = setup().await else {
+        return;
+    };
+    let tenants = [
+        TenantId::new(),
+        TenantId::new(),
+        TenantId::new(),
+        TenantId::new(),
+        TenantId::new(),
+    ];
+    projection_cases::retry_after_retention_does_not_resurrect(&store, &tenants[0]).await;
+    projection_cases::gaps_fail_without_blocking_other_sessions(&store, &tenants[1]).await;
+    projection_cases::concurrent_relays_append_once(&store, &tenants[2]).await;
+    projection_cases::normal_append_can_precede_projection(&store, &tenants[3]).await;
+    projection_cases::source_lanes_are_independent_and_survive_retention(&store, &tenants[4]).await;
+    for tenant in &tenants {
+        cleanup(&store, tenant).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_projection_watermark_survives_reconnect_after_pruning() {
+    let Some(store) = setup().await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let first = projection_cases::projection(&tenant, &session, 1);
+    store
+        .append_projection(first.clone(), at(0))
+        .await
+        .expect("project");
+    store
+        .read_from(&tenant, EventCursor::start(), 10, at(90_000))
+        .await
+        .expect("prune");
+    let restarted = setup().await.expect("reconnect configured database");
+    restarted
+        .append_projection(first, at(90_001))
+        .await
+        .expect("retry after lost source acknowledgement");
+    assert!(
+        restarted
+            .read_from(&tenant, EventCursor::start(), 10, at(90_001))
+            .await
+            .expect("no resurrection")
+            .events()
+            .is_empty()
+    );
+    restarted
+        .append_projection(
+            projection_cases::projection(&tenant, &session, 2),
+            at(90_002),
+        )
+        .await
+        .expect("next projection");
+    let page = restarted
+        .read_from(&tenant, EventCursor::from_position(1), 10, at(90_002))
+        .await
+        .expect("next page");
+    assert_eq!(page.events().len(), 1);
+    assert_eq!(page.next_cursor().position(), 2);
+    cleanup(&store, &tenant).await;
+}
+
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000 + seconds, 0)
         .single()
@@ -40,6 +110,11 @@ async fn setup() -> Option<PostgresEventOutbox> {
 }
 
 async fn cleanup(store: &PostgresEventOutbox, tenant: &TenantId) {
+    sqlx::query("DELETE FROM browserd_event_projection_watermark WHERE tenant_id = $1")
+        .bind(tenant.as_uuid())
+        .execute(store.pool())
+        .await
+        .expect("projection watermarks should be deletable in fixture cleanup");
     sqlx::query("DELETE FROM browserd_event_outbox WHERE tenant_id = $1")
         .bind(tenant.as_uuid())
         .execute(store.pool())
@@ -309,5 +384,30 @@ async fn postgres_retention_prunes_aged_events_and_reports_the_gap() {
     assert_eq!(page.events().len(), 1);
     assert_eq!(page.events()[0].cursor().position(), 3);
 
+    cleanup(&store, &tenant).await;
+}
+
+#[path = "support/event_outbox_notifications.rs"]
+mod notification_cases;
+
+#[tokio::test]
+async fn postgres_notifications_preserve_all_nine_typed_kinds_and_immutable_wire() {
+    let Some(store) = setup().await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    notification_cases::all_kinds(&store, &tenant, at(0)).await;
+    let before = store
+        .read_from(&tenant, EventCursor::start(), 20, at(0))
+        .await
+        .expect("before restart");
+    let reopened = setup().await.expect("reopen");
+    assert_eq!(
+        reopened
+            .read_from(&tenant, EventCursor::start(), 20, at(0))
+            .await
+            .expect("restored typed state"),
+        before
+    );
     cleanup(&store, &tenant).await;
 }

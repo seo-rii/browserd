@@ -1,17 +1,21 @@
 use std::collections::HashMap;
+use std::fmt;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::{DelayQueue, delay_queue};
+use zeroize::Zeroizing;
 
 use crate::{
     CdpCommand, CdpError, CdpFrameCodec, CdpIncoming, CdpProtocolError, PendingRegistry,
@@ -57,6 +61,7 @@ impl CdpTransportConfig {
 pub struct CdpClient {
     requests: mpsc::Sender<CommandRequest>,
     closed: Arc<AtomicBool>,
+    sensitive_frame_limit: usize,
 }
 
 impl CdpClient {
@@ -73,9 +78,10 @@ impl CdpClient {
         let (response, receiver) = oneshot::channel();
         let request = CommandRequest {
             method: method.into(),
-            params,
+            params: CommandParams::Ordinary(params),
             session_id,
             timeout,
+            expires_at: None,
             response,
         };
         match self.requests.try_send(request) {
@@ -92,19 +98,135 @@ impl CdpClient {
             .unwrap_or(Err(CdpCommandError::TransportClosed))
     }
 
+    /// Serializes borrowed secret arguments without constructing a `Value` or using the
+    /// ordinary codec's reusable write buffer. Method/session identifiers must not be secret.
+    pub async fn command_sensitive<T: Serialize + ?Sized>(
+        &self,
+        method: impl Into<String>,
+        params: &T,
+        session_id: Option<String>,
+        deadline: Instant,
+    ) -> Result<Value, CdpCommandError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(CdpCommandError::TransportClosed);
+        }
+        if Instant::now() >= deadline {
+            return Err(CdpCommandError::TimedOut);
+        }
+        let mut encoded = SensitiveBuffer::new(self.sensitive_frame_limit);
+        serde_json::to_writer(&mut encoded, params)
+            .map_err(|_| CdpCommandError::SensitivePayloadRejected)?;
+        let (response, receiver) = oneshot::channel();
+        let request = CommandRequest {
+            method: method.into(),
+            params: CommandParams::Sensitive(encoded.bytes),
+            session_id,
+            timeout: None,
+            expires_at: Some(deadline),
+            response,
+        };
+        match self.requests.try_send(request) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(CdpCommandError::CommandQueueFull);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(CdpCommandError::TransportClosed);
+            }
+        }
+        match tokio::time::timeout_at(deadline.into(), receiver).await {
+            Ok(result) => result.unwrap_or(Err(CdpCommandError::TransportClosed)),
+            Err(_) => Err(CdpCommandError::TimedOut),
+        }
+    }
+
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 }
 
-#[derive(Debug)]
 struct CommandRequest {
     method: String,
-    params: Value,
+    params: CommandParams,
     session_id: Option<String>,
     timeout: Option<Duration>,
+    expires_at: Option<Instant>,
     response: oneshot::Sender<Result<Value, CdpCommandError>>,
+}
+
+impl fmt::Debug for CommandRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommandRequest { params: [REDACTED], .. }")
+    }
+}
+
+enum CommandParams {
+    Ordinary(Value),
+    Sensitive(Zeroizing<Vec<u8>>),
+}
+
+struct PendingResponse {
+    response: oneshot::Sender<Result<Value, CdpCommandError>>,
+    sensitive: bool,
+}
+
+// Allocate the entire bound once: growing a Vec could leave an earlier secret allocation
+// unzeroized. The delimiter has its own reserved byte, outside the protocol frame limit.
+struct SensitiveBuffer {
+    bytes: Zeroizing<Vec<u8>>,
+    limit: usize,
+}
+
+impl SensitiveBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Zeroizing::new(Vec::with_capacity(limit + 1)),
+            limit,
+        }
+    }
+}
+
+impl Write for SensitiveBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            return Err(io::Error::other("sensitive CDP frame exceeds its bound"));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn sensitive_frame(
+    id: u64,
+    method: &str,
+    params: &[u8],
+    session_id: Option<&str>,
+    limit: usize,
+) -> Result<Zeroizing<Vec<u8>>, CdpCommandError> {
+    let mut frame = SensitiveBuffer::new(limit);
+    let encode = || -> io::Result<()> {
+        frame.write_all(b"{\"id\":")?;
+        serde_json::to_writer(&mut frame, &id)?;
+        frame.write_all(b",\"method\":")?;
+        serde_json::to_writer(&mut frame, method)?;
+        frame.write_all(b",\"params\":")?;
+        frame.write_all(params)?;
+        if let Some(session) = session_id {
+            frame.write_all(b",\"sessionId\":")?;
+            serde_json::to_writer(&mut frame, session)?;
+        }
+        frame.write_all(b"}")?;
+        Ok(())
+    };
+    let mut encode = encode;
+    encode().map_err(|_| CdpCommandError::SensitivePayloadRejected)?;
+    frame.bytes.push(0);
+    Ok(frame.bytes)
 }
 
 #[derive(Debug)]
@@ -160,6 +282,8 @@ impl CdpTransport {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        // Allows worst-case JSON escaping of a 16 KiB secret plus fixed invocation metadata.
+        let sensitive_frame_limit = config.max_frame_bytes.min(128 * 1024);
         let (request_tx, request_rx) =
             mpsc::channel::<CommandRequest>(config.command_queue_capacity.max(1));
         let (event_tx, event_rx) = mpsc::channel::<CdpIncoming>(config.event_queue_capacity.max(1));
@@ -182,8 +306,7 @@ impl CdpTransport {
             let mut incoming = FramedRead::new(reader, CdpFrameCodec::new(config.max_frame_bytes));
             let mut outgoing = FramedWrite::new(writer, CdpFrameCodec::new(config.max_frame_bytes));
             let mut pending = PendingRegistry::new(config.max_pending_commands);
-            let mut responders =
-                HashMap::<u64, oneshot::Sender<Result<Value, CdpCommandError>>>::new();
+            let mut responders = HashMap::<u64, PendingResponse>::new();
             let mut deadlines = DelayQueue::<u64>::new();
             let mut deadline_keys = HashMap::<u64, delay_queue::Key>::new();
             let mut requests_open = true;
@@ -195,7 +318,7 @@ impl CdpTransport {
                         deadline_keys.remove(&id);
                         pending.abandon(id);
                         if let Some(response) = responders.remove(&id) {
-                            let _sent = response.send(Err(CdpCommandError::TimedOut));
+                            let _sent = response.response.send(Err(CdpCommandError::TimedOut));
                         }
                     }
                     message = incoming.next() => {
@@ -206,7 +329,7 @@ impl CdpTransport {
                                         deadlines.try_remove(&key);
                                     }
                                     if let Some(response) = responders.remove(&id) {
-                                        let _sent = response.send(Ok(result));
+                                        let _sent = response.response.send(Ok(result));
                                     }
                                 }
                             }
@@ -216,7 +339,12 @@ impl CdpTransport {
                                         deadlines.try_remove(&key);
                                     }
                                     if let Some(response) = responders.remove(&id) {
-                                        let _sent = response.send(Err(CdpCommandError::Protocol(error)));
+                                        let error = if response.sensitive {
+                                            CdpCommandError::SensitiveProtocol { code: error.code }
+                                        } else {
+                                            CdpCommandError::Protocol(error)
+                                        };
+                                        let _sent = response.response.send(Err(error));
                                     }
                                 }
                             }
@@ -234,7 +362,14 @@ impl CdpTransport {
                             requests_open = false;
                             continue;
                         };
-                        let command_timeout = request.timeout.unwrap_or(config.default_command_timeout);
+                        let sensitive = matches!(request.params, CommandParams::Sensitive(_));
+                        if sensitive && request.response.is_closed() {
+                            // A canceled caller has not committed a queued frame to the writer.
+                            continue;
+                        }
+                        let command_timeout = request.expires_at.map_or_else(
+                            || request.timeout.unwrap_or(config.default_command_timeout),
+                            |expiry| expiry.saturating_duration_since(Instant::now()));
                         if command_timeout.is_zero() {
                             let _sent = request.response.send(Err(CdpCommandError::TimedOut));
                             continue;
@@ -255,19 +390,47 @@ impl CdpTransport {
                             }
                         };
                         let id = registered.id();
-                        let mut command = CdpCommand::new(id, request.method, request.params);
-                        if let Some(session_id) = request.session_id {
-                            command = command.with_session_id(session_id);
-                        }
-                        let written = tokio::time::timeout(
-                            config.write_timeout,
-                            outgoing.send(command),
-                        )
-                        .await;
+                        let written = match request.params {
+                            CommandParams::Ordinary(params) => {
+                                let mut command = CdpCommand::new(id, request.method, params);
+                                if let Some(session_id) = request.session_id {
+                                    command = command.with_session_id(session_id);
+                                }
+                                tokio::time::timeout(config.write_timeout, outgoing.send(command))
+                                    .await.map(|result| result.map_err(|_| ()))
+                            }
+                            CommandParams::Sensitive(params) => {
+                                let frame = match sensitive_frame(id, &request.method, &params,
+                                    request.session_id.as_deref(), sensitive_frame_limit) {
+                                    Ok(frame) => frame,
+                                    Err(error) => {
+                                        pending.abandon(id);
+                                        let _sent = request.response.send(Err(error));
+                                        continue;
+                                    }
+                                };
+                                drop(params);
+                                // Flush ordinary frames first, then use the same writer directly:
+                                // the codec's reusable BytesMut never receives secret bytes.
+                                let write_timeout = request.expires_at.map_or(config.write_timeout,
+                                    |expiry| config.write_timeout.min(expiry.saturating_duration_since(Instant::now())));
+                                tokio::time::timeout(write_timeout, async {
+                                    outgoing.flush().await.map_err(|_| ())?;
+                                    if request.response.is_closed()
+                                        || request.expires_at.is_some_and(|expiry| Instant::now() >= expiry) {
+                                        return Err(());
+                                    }
+                                    outgoing.get_mut().write_all(&frame).await.map_err(|_| ())?;
+                                    outgoing.get_mut().flush().await.map_err(|_| ())
+                                }).await
+                            }
+                        };
                         match written {
                             Ok(Ok(())) => {
-                                responders.insert(id, request.response);
-                                let key = deadlines.insert(id, command_timeout);
+                                responders.insert(id, PendingResponse { response: request.response, sensitive });
+                                let remaining = request.expires_at.map_or(command_timeout,
+                                    |expiry| expiry.saturating_duration_since(Instant::now()));
+                                let key = deadlines.insert(id, remaining);
                                 deadline_keys.insert(id, key);
                             }
                             Ok(Err(_)) | Err(_) => {
@@ -283,7 +446,9 @@ impl CdpTransport {
             task_closed.store(true, Ordering::Release);
             let _closed_commands = pending.close();
             for (_, response) in responders {
-                let _sent = response.send(Err(CdpCommandError::TransportClosed));
+                let _sent = response
+                    .response
+                    .send(Err(CdpCommandError::TransportClosed));
             }
             requests.close();
             while let Some(request) = requests.recv().await {
@@ -295,6 +460,7 @@ impl CdpTransport {
             CdpClient {
                 requests: request_tx,
                 closed,
+                sensitive_frame_limit,
             },
             event_rx,
             CdpDriver {
@@ -316,6 +482,10 @@ pub enum CdpCommandError {
     SequenceExhausted,
     #[error("CDP rejected the command: {0:?}")]
     Protocol(CdpProtocolError),
+    #[error("sensitive CDP command serialization was rejected")]
+    SensitivePayloadRejected,
+    #[error("sensitive CDP command was rejected (code {code})")]
+    SensitiveProtocol { code: i64 },
     #[error("CDP command deadline expired")]
     TimedOut,
     #[error("CDP write may have been partially dispatched")]
@@ -338,4 +508,34 @@ pub enum CdpTransportError {
     TransportClosed,
     #[error("CDP driver task failed")]
     DriverTaskFailed,
+}
+
+#[cfg(test)]
+mod sensitive_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_serialization_never_reallocates_and_request_debug_is_redacted() {
+        let secret = "dummy-한글-sensitive";
+        let mut buffer = SensitiveBuffer::new(256);
+        let allocation = buffer.bytes.as_ptr();
+        assert!(serde_json::to_writer(&mut buffer, secret).is_ok());
+        assert_eq!(buffer.bytes.as_ptr(), allocation);
+        assert!(buffer.write_all(&[b'x'; 256]).is_err());
+        assert_eq!(buffer.bytes.as_ptr(), allocation);
+        let (response, _receiver) = oneshot::channel();
+        let request = CommandRequest {
+            method: "Runtime.callFunctionOn".to_owned(),
+            params: CommandParams::Sensitive(buffer.bytes),
+            session_id: None,
+            timeout: None,
+            expires_at: None,
+            response,
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("REDACTED"));
+        assert!(!debug.contains(secret));
+        // Dropping or rejecting a queue entry drops its Zeroizing buffer, without a copy.
+        drop(request);
+    }
 }

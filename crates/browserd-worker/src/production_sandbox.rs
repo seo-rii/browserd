@@ -1,3 +1,4 @@
+use browserd_sandbox::{ContextEgressBinding, ContextEgressReleaseReceipt, ContextEgressRequest};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,6 +108,26 @@ fn valid_profile(value: &str) -> bool {
 
 #[async_trait]
 pub trait SandboxShardRpc: Send + Sync + 'static {
+    async fn attach_context_egress(
+        &self,
+        _request: &ContextEgressRequest,
+    ) -> Result<ContextEgressBinding, ShardRuntimeError> {
+        Err(ShardRuntimeError::Rejected)
+    }
+    async fn renew_context_egress(
+        &self,
+        _binding: &ContextEgressBinding,
+        _ttl: Duration,
+    ) -> Result<(), ShardRuntimeError> {
+        Err(ShardRuntimeError::Rejected)
+    }
+    async fn release_context_egress(
+        &self,
+        _request: &ContextEgressRequest,
+    ) -> Result<ContextEgressReleaseReceipt, ShardRuntimeError> {
+        Err(ShardRuntimeError::Rejected)
+    }
+
     async fn create_shard(
         &self,
         spec: LaunchSpec,
@@ -146,6 +167,32 @@ pub trait SandboxShardRpc: Send + Sync + 'static {
 
 #[async_trait]
 impl SandboxShardRpc for SandboxRpcClient {
+    async fn attach_context_egress(
+        &self,
+        request: &ContextEgressRequest,
+    ) -> Result<ContextEgressBinding, ShardRuntimeError> {
+        SandboxRpcClient::attach_context_egress(self, request)
+            .await
+            .map_err(map_rpc_error)
+    }
+    async fn renew_context_egress(
+        &self,
+        binding: &ContextEgressBinding,
+        ttl: Duration,
+    ) -> Result<(), ShardRuntimeError> {
+        SandboxRpcClient::renew_context_egress(self, binding, ttl)
+            .await
+            .map_err(map_rpc_error)
+    }
+    async fn release_context_egress(
+        &self,
+        request: &ContextEgressRequest,
+    ) -> Result<ContextEgressReleaseReceipt, ShardRuntimeError> {
+        SandboxRpcClient::release_context_egress(self, request)
+            .await
+            .map_err(map_rpc_error)
+    }
+
     async fn create_shard(
         &self,
         spec: LaunchSpec,

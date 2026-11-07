@@ -11,20 +11,34 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+base64.workspace = true
+browserd-artifacts = { path = "../../crates/browserd-artifacts" }
 browserd-chromium = { path = "../../crates/browserd-chromium" }
 browserd-core = { path = "../../crates/browserd-core" }
+browserd-egress = { path = "../../crates/browserd-egress" }
+browserd-coordination = { path = "../../crates/browserd-coordination" }
+browserd-features = { path = "../../crates/browserd-features" }
 browserd-observability = { path = "../../crates/browserd-observability" }
 browserd-policy = { path = "../../crates/browserd-policy" }
 browserd-sandbox = { path = "../../crates/browserd-sandbox" }
 browserd-session = { path = "../../crates/browserd-session" }
+browserd-viewer = { path = "../../crates/browserd-viewer" }
 browserd-worker = { path = "../../crates/browserd-worker" }
+browser-sandboxd = { path = "../browser-sandboxd" }
+bytes.workspace = true
+chrono.workspace = true
 hex.workspace = true
+nix.workspace = true
+reqwest.workspace = true
+url.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+uuid.workspace = true
+
 [dev-dependencies]
 browserd-cdp = { path = "../../crates/browserd-cdp" }
-nix.workspace = true
-sha2.workspace = true
 tempfile.workspace = true

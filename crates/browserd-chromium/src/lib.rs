@@ -1,10 +1,15 @@
 //! Immutable Chromium compatibility artifacts and launch qualification gates.
 
 mod connection;
+mod native_profile;
 
 pub use connection::{
     ChromiumConnection, ChromiumConnectionConfig, ChromiumConnectionError, ChromiumVersion,
     VerifiedChromiumDriverOwner,
+};
+pub use native_profile::{
+    NativeLocaleResource, NativeProfileCatalogV1, NativeProfileError, VerifiedNativeLocaleResource,
+    VerifiedNativeProfileCatalog,
 };
 
 use std::collections::BTreeMap;

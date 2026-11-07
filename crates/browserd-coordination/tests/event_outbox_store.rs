@@ -14,6 +14,68 @@ use chrono::{DateTime, TimeZone, Utc};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
+#[path = "support/event_outbox_projection.rs"]
+mod projection_cases;
+
+#[tokio::test]
+async fn projection_sources_have_independent_permanent_watermarks() {
+    projection_cases::source_lanes_are_independent_and_survive_retention(
+        &MemoryEventOutbox::default(),
+        &TenantId::new(),
+    )
+    .await;
+}
+
+#[test]
+fn legacy_projection_deserialization_defaults_to_the_terminal_source() {
+    let projection = projection_cases::projection(&TenantId::new(), &SessionId::new(), 1);
+    let mut json = serde_json::to_value(&projection).expect("projection JSON");
+    json.as_object_mut().expect("object").remove("source");
+    let restored: browserd_coordination::GatewayEventProjection =
+        serde_json::from_value(json).expect("legacy projection");
+    assert_eq!(restored, projection);
+    assert_eq!(
+        restored.source(),
+        browserd_coordination::EventProjectionSource::Terminal
+    );
+}
+
+#[tokio::test]
+async fn projection_retry_survives_event_retention() {
+    projection_cases::retry_after_retention_does_not_resurrect(
+        &MemoryEventOutbox::default(),
+        &TenantId::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn projection_rejects_gaps_per_session() {
+    projection_cases::gaps_fail_without_blocking_other_sessions(
+        &MemoryEventOutbox::default(),
+        &TenantId::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn projection_parallel_relays_append_once() {
+    projection_cases::concurrent_relays_append_once(
+        &MemoryEventOutbox::default(),
+        &TenantId::new(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn projection_legacy_dedup_advances_watermark() {
+    projection_cases::normal_append_can_precede_projection(
+        &MemoryEventOutbox::default(),
+        &TenantId::new(),
+    )
+    .await;
+}
+
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(1_700_000_000 + seconds, 0)
         .single()
@@ -355,4 +417,77 @@ async fn session_lost_and_action_terminal_are_distinct_aggregates() {
     assert_eq!(lost_event.kind(), OutboxEventKind::SessionLost);
     assert_eq!(action_event.cursor().position(), 1);
     assert_eq!(lost_event.cursor().position(), 2);
+}
+
+#[path = "support/event_outbox_notifications.rs"]
+mod notification_cases;
+
+#[tokio::test]
+async fn memory_notifications_preserve_all_nine_typed_kinds_and_immutable_wire() {
+    notification_cases::all_kinds(&MemoryEventOutbox::default(), &TenantId::new(), at(0)).await;
+}
+
+#[test]
+fn event_descriptors_reject_untyped_payloads_and_invalid_state_resource_combinations() {
+    use browserd_coordination::{
+        EventActionState, EventOperationState, EventStateSummary, OutboxAggregate,
+    };
+    use browserd_core::OperationId;
+    let tenant = TenantId::new();
+    let operation = OutboxAggregate::Operation {
+        operation_id: OperationId::new(),
+    };
+    let accepted = OutboxAppend::state_changed(
+        tenant.clone(),
+        operation.clone(),
+        0,
+        OutboxEventKind::OperationStateChanged,
+        EventStateSummary::Operation {
+            state: EventOperationState::Accepted,
+        },
+    )
+    .expect("accepted revision zero");
+    for summary in [
+        serde_json::json!({"type":"operation","state":"https://private.invalid/secret"}),
+        serde_json::json!({"type":"operation","state":"accepted","url":"https://private.invalid"}),
+        serde_json::json!({"type":"operation","state":"accepted","script":"secret"}),
+        serde_json::json!({"type":"action","state":"succeeded","result":{"password":"secret"}}),
+    ] {
+        let mut wire = serde_json::to_value(&accepted).expect("descriptor");
+        wire["summary"] = summary;
+        assert!(serde_json::from_value::<OutboxAppend>(wire).is_err());
+    }
+    assert!(
+        OutboxAppend::state_changed(
+            tenant.clone(),
+            operation.clone(),
+            0,
+            OutboxEventKind::OperationStateChanged,
+            EventStateSummary::Operation {
+                state: EventOperationState::Succeeded
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        OutboxAppend::state_changed(
+            tenant.clone(),
+            operation,
+            1,
+            OutboxEventKind::OperationStateChanged,
+            EventStateSummary::Action {
+                state: EventActionState::Succeeded,
+                resolution: None
+            }
+        )
+        .is_err()
+    );
+    let legacy = OutboxAppend::action_terminal(tenant, SessionId::new(), ActionId::new(), 1);
+    let wire = serde_json::to_value(&legacy).expect("legacy");
+    assert_eq!(wire["kind"], "ActionTerminal");
+    assert!(wire.get("summary").is_none());
+    assert_eq!(
+        serde_json::from_value::<OutboxAppend>(wire).expect("old shape"),
+        legacy
+    );
 }

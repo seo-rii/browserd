@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 
 use crate::ChromiumArtifactIdentity;
 
-const MAX_VERSION_FIELD_BYTES: usize = 1_024;
+// Browser.getVersion reflects the immutable --user-agent process flag. Match the
+// session UA limit so a valid long custom UA does not fail after sandbox launch.
+const MAX_VERSION_FIELD_BYTES: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChromiumConnectionConfig {

@@ -199,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     let rpc_config = WorkerRpcConfig::new(
         &worker_socket,
-        1024 * 1024,
+        browserd_worker::MAX_WORKER_ACTION_RPC_FRAME_BYTES,
         128,
         Duration::from_secs(5),
         Some(current_uid),
@@ -219,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
 
     let worker_rpc = WorkerRpcClient::new(
         &worker_socket,
-        1024 * 1024,
+        browserd_worker::MAX_WORKER_ACTION_RPC_FRAME_BYTES,
         Duration::from_secs(5),
         Some(current_uid),
     )?;

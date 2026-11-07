@@ -1,5 +1,26 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
+#[path = "support/redis_fleet_admission.rs"]
+mod redis_fleet_admission;
+
+#[path = "support/redis_action_custody.rs"]
+mod redis_action_custody;
+
+#[path = "support/redis_terminal_custody_catchup.rs"]
+mod redis_terminal_custody_catchup;
+
+#[path = "support/redis_action_retention.rs"]
+mod redis_action_retention;
+
+#[path = "support/redis_action_recovery.rs"]
+mod redis_action_recovery;
+
+#[path = "support/redis_session_loss_recovery.rs"]
+mod redis_session_loss_recovery;
+
+#[path = "support/redis_session_directory.rs"]
+mod redis_session_directory;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,9 +32,9 @@ use browserd_actions::{
 };
 use browserd_coordination::{
     ClaimGatewayAction, DirectoryFence, GatewayActionClaimOutcome, GatewayActionCoordination,
-    GatewayActionCoordinationError, GatewayActionPlacement, MINIMUM_IDEMPOTENCY_RETENTION,
-    RedisGatewayActionConfig, RedisGatewayActionStore, SessionLossClaim, SessionLossOutcome,
-    StoreConfig,
+    GatewayActionCoordinationError, GatewayActionPlacement, GatewayEventProjection,
+    GatewayEventScanCursor, MINIMUM_IDEMPOTENCY_RETENTION, OutboxAppend, RedisGatewayActionConfig,
+    RedisGatewayActionStore, SessionLossClaim, SessionLossOutcome, StoreConfig,
 };
 use browserd_core::{ActionId, PrincipalId, SessionId, TenantId, WorkerId};
 use chrono::{TimeZone, Utc};
@@ -157,6 +178,492 @@ async fn delete_fixture(fixture: &RedisFixture) {
         .query_async::<usize>(&mut connection)
         .await
         .expect("isolated Redis test keys should be removable");
+}
+
+#[tokio::test]
+async fn redis_projection_discovery_bounds_result_pages_without_scanning_one_key_at_a_time() {
+    let Some(fixture) = redis_fixture("projection-noisy-discovery").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let placement = placement(1, 1);
+    let mut expected = HashSet::new();
+    for index in 0..8 {
+        let session = SessionId::new();
+        let action = ActionId::new();
+        let claimed = fixture
+            .store
+            .claim_action(
+                claim_with_kind(
+                    tenant.clone(),
+                    session.clone(),
+                    action.clone(),
+                    format!("noisy-projection-{index}"),
+                    1,
+                    ActionKind::ReadOnly,
+                    placement.clone(),
+                ),
+                at(1),
+            )
+            .await
+            .expect("claim");
+        fixture
+            .store
+            .cancel_before_dispatch(
+                &tenant,
+                &session,
+                &action,
+                claimed.snapshot().revision(),
+                &placement,
+                at(2),
+            )
+            .await
+            .expect("cancel");
+        expected.insert(session);
+    }
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let mut noise = redis::pipe();
+    for index in 0..4_096 {
+        noise
+            .cmd("SET")
+            .arg(format!("{}:scan-noise:{index}", fixture.prefix))
+            .arg("unrelated")
+            .arg("PX")
+            .arg(300_000_u64)
+            .ignore();
+    }
+    noise
+        .query_async::<()>(&mut connection)
+        .await
+        .expect("private noise fixture");
+    let database_keys: usize = redis::cmd("DBSIZE")
+        .query_async(&mut connection)
+        .await
+        .expect("database size");
+    // COUNT is a hint: allow eight times the scan work expected with COUNT 128,
+    // plus separate pages for every matching scope buffered by the opaque cursor.
+    // This budget measures progress rather than machine-dependent milliseconds.
+    let page_budget = database_keys.div_ceil(16) + expected.len() + 16;
+    let sweep = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut cursor = GatewayEventScanCursor::default();
+        let mut found = HashSet::new();
+        let mut bounded_pages = true;
+        for calls in 1..=page_budget {
+            let page = fixture
+                .store
+                .scan_event_sessions(cursor, 1)
+                .await
+                .expect("scan");
+            bounded_pages &= page.sessions().len() <= 1;
+            for scope in page.sessions() {
+                assert_eq!(scope.tenant_id(), &tenant);
+                found.insert(scope.session_id().clone());
+            }
+            cursor = page.next_cursor().clone();
+            if page.is_complete() {
+                return (true, found, bounded_pages, calls);
+            }
+        }
+        (false, found, bounded_pages, page_budget)
+    })
+    .await;
+    delete_fixture(&fixture).await;
+    let (complete, found, bounded_pages, calls) = sweep.expect("bounded discovery sweep");
+    assert!(
+        bounded_pages,
+        "logical discovery pages must retain their limit"
+    );
+    assert!(
+        complete,
+        "one-result discovery made insufficient progress: {calls} pages for {database_keys} keys"
+    );
+    assert_eq!(found, expected, "no buffered discovery scope may be lost");
+}
+
+#[tokio::test]
+async fn redis_projection_journal_survives_payload_expiry_and_exact_ack() {
+    let Some(fixture) = redis_fixture("projection-restart").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let placement = placement(1, 1);
+    for index in 0..2 {
+        let action = ActionId::new();
+        let claimed = fixture
+            .store
+            .claim_action(
+                claim_with_kind(
+                    tenant.clone(),
+                    session.clone(),
+                    action.clone(),
+                    format!("projection-{index}"),
+                    1,
+                    ActionKind::ReadOnly,
+                    placement.clone(),
+                ),
+                at(1),
+            )
+            .await
+            .expect("claim");
+        fixture
+            .store
+            .cancel_before_dispatch(
+                &tenant,
+                &session,
+                &action,
+                claimed.snapshot().revision(),
+                &placement,
+                at(2),
+            )
+            .await
+            .expect("cancel");
+    }
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let namespace = format!("{}:gateway-action:{{{tenant}:{session}}}", fixture.prefix);
+    // Simulate ordinary source payload TTL expiry independently of the persistent relay intent.
+    redis::cmd("DEL")
+        .arg(format!("{namespace}:actions"))
+        .arg(format!("{namespace}:idempotency"))
+        .arg(format!("{namespace}:pending-v3"))
+        .query_async::<usize>(&mut connection)
+        .await
+        .expect("expire payloads");
+    let ttl: i64 = redis::cmd("PTTL")
+        .arg(format!("{namespace}:events-v1"))
+        .query_async(&mut connection)
+        .await
+        .expect("journal ttl");
+    assert_eq!(ttl, -1);
+    let restarted = RedisGatewayActionStore::connect(fixture.config.clone())
+        .await
+        .expect("restart");
+    let found = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut cursor = GatewayEventScanCursor::default();
+        let mut found = false;
+        loop {
+            let page = restarted
+                .scan_event_sessions(cursor, 1)
+                .await
+                .expect("scan");
+            assert!(page.sessions().len() <= 1);
+            found |= page
+                .sessions()
+                .iter()
+                .any(|scope| scope.session_id() == &session);
+            cursor = page.next_cursor().clone();
+            if page.is_complete() {
+                return found;
+            }
+        }
+    })
+    .await
+    .expect("complete discovery sweep within test timeout");
+    assert!(
+        found,
+        "persistent journal must be rediscoverable after restart"
+    );
+    let first = restarted
+        .peek_event_projection(&tenant, &session)
+        .await
+        .expect("peek")
+        .expect("first");
+    assert_eq!(first.sequence(), 1);
+    let forged = GatewayEventProjection::new(
+        tenant.clone(),
+        session.clone(),
+        1,
+        OutboxAppend::action_terminal(tenant.clone(), session.clone(), ActionId::new(), 1),
+    )
+    .expect("well-formed different payload");
+    assert_eq!(
+        restarted.ack_event_projection(&forged).await,
+        Err(GatewayActionCoordinationError::EventAckConflict)
+    );
+    restarted
+        .ack_event_projection(&first)
+        .await
+        .expect("ack first");
+    let second = restarted
+        .peek_event_projection(&tenant, &session)
+        .await
+        .expect("peek")
+        .expect("second");
+    assert_eq!(second.sequence(), 2);
+    restarted
+        .ack_event_projection(&first)
+        .await
+        .expect("stale ack");
+    assert_eq!(
+        restarted
+            .peek_event_projection(&tenant, &session)
+            .await
+            .expect("peek"),
+        Some(second.clone())
+    );
+    restarted
+        .ack_event_projection(&second)
+        .await
+        .expect("ack second");
+    assert!(
+        restarted
+            .peek_event_projection(&tenant, &session)
+            .await
+            .expect("empty")
+            .is_none()
+    );
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_projection_corruption_rejects_terminal_commit_atomically() {
+    let Some(fixture) = redis_fixture("projection-corrupt").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let action = ActionId::new();
+    let placement = placement(1, 1);
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim_with_kind(
+                tenant.clone(),
+                session.clone(),
+                action.clone(),
+                "corrupt",
+                1,
+                ActionKind::ReadOnly,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("claim")
+        .into_snapshot();
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    redis::cmd("SET")
+        .arg(format!(
+            "{}:gateway-action:{{{tenant}:{session}}}:events-v1",
+            fixture.prefix
+        ))
+        .arg("wrong-type")
+        .query_async::<()>(&mut connection)
+        .await
+        .expect("corrupt journal");
+    assert_eq!(
+        fixture
+            .store
+            .cancel_before_dispatch(
+                &tenant,
+                &session,
+                &action,
+                claimed.revision(),
+                &placement,
+                at(2)
+            )
+            .await,
+        Err(GatewayActionCoordinationError::InvalidRedisResponse)
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_effective_action(&tenant, &session, &action)
+            .await
+            .expect("unchanged"),
+        Some(claimed)
+    );
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_projection_sequences_remain_exact_above_lua_integer_precision() {
+    let Some(fixture) = redis_fixture("projection-integer").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let action = ActionId::new();
+    let placement = placement(1, 1);
+    let claimed = fixture
+        .store
+        .claim_action(
+            claim_with_kind(
+                tenant.clone(),
+                session.clone(),
+                action.clone(),
+                "integer",
+                1,
+                ActionKind::ReadOnly,
+                placement.clone(),
+            ),
+            at(1),
+        )
+        .await
+        .expect("claim")
+        .into_snapshot();
+    let client = redis::Client::open(fixture.endpoint.as_str()).expect("client");
+    let mut connection = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
+    let session_key = format!(
+        "{}:gateway-action:{{{tenant}:{session}}}:session",
+        fixture.prefix
+    );
+    let previous = 9_007_199_254_740_992_u64;
+    redis::cmd("HSET")
+        .arg(&session_key)
+        .arg("event_sequence")
+        .arg(previous.to_string())
+        .arg("event_ack_sequence")
+        .arg(previous.to_string())
+        .query_async::<usize>(&mut connection)
+        .await
+        .expect("simulate high acknowledged sequence");
+    fixture
+        .store
+        .cancel_before_dispatch(
+            &tenant,
+            &session,
+            &action,
+            claimed.revision(),
+            &placement,
+            at(2),
+        )
+        .await
+        .expect("cancel");
+    let projection = fixture
+        .store
+        .peek_event_projection(&tenant, &session)
+        .await
+        .expect("peek")
+        .expect("projection");
+    assert_eq!(projection.sequence(), previous + 1);
+    fixture
+        .store
+        .ack_event_projection(&projection)
+        .await
+        .expect("exact ack");
+    let ack: String = redis::cmd("HGET")
+        .arg(session_key)
+        .arg("event_ack_sequence")
+        .query_async(&mut connection)
+        .await
+        .expect("read ack");
+    assert_eq!(ack, (previous + 1).to_string());
+    delete_fixture(&fixture).await;
+}
+
+#[tokio::test]
+async fn redis_loss_projection_marker_survives_ack_and_materializes_every_batch() {
+    let Some(fixture) = redis_fixture("projection-loss").await else {
+        return;
+    };
+    let tenant = TenantId::new();
+    let session = SessionId::new();
+    let placement = placement(1, 1);
+    for index in 0..3 {
+        fixture
+            .store
+            .claim_action(
+                claim_with_kind(
+                    tenant.clone(),
+                    session.clone(),
+                    ActionId::new(),
+                    format!("loss-{index}"),
+                    1,
+                    ActionKind::ReadOnly,
+                    placement.clone(),
+                ),
+                at(1),
+            )
+            .await
+            .expect("claim");
+    }
+    let loss = SessionLossClaim::new(tenant.clone(), session.clone(), placement, Uuid::now_v7());
+    fixture
+        .store
+        .mark_session_lost(&loss, at(2))
+        .await
+        .expect("loss");
+    let event = fixture
+        .store
+        .peek_event_projection(&tenant, &session)
+        .await
+        .expect("peek")
+        .expect("loss");
+    fixture
+        .store
+        .ack_event_projection(&event)
+        .await
+        .expect("ack loss");
+    let restarted = RedisGatewayActionStore::connect(fixture.config.clone())
+        .await
+        .expect("restart");
+    let found_claim = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut cursor = GatewayEventScanCursor::default();
+        let mut found_claim = None;
+        loop {
+            let page = restarted
+                .scan_event_sessions(cursor, 1)
+                .await
+                .expect("scan");
+            for scope in page.sessions() {
+                if scope.session_id() == &session {
+                    found_claim = scope.loss_claim().cloned();
+                }
+            }
+            cursor = page.next_cursor().clone();
+            if page.is_complete() {
+                return found_claim;
+            }
+        }
+    })
+    .await
+    .expect("complete loss discovery sweep within test timeout");
+    assert_eq!(found_claim, Some(loss.clone()));
+    for sequence in 2..=4 {
+        assert_eq!(
+            restarted
+                .materialize_session_loss(&loss, 1, at(3))
+                .await
+                .expect("batch"),
+            1
+        );
+        let event = restarted
+            .peek_event_projection(&tenant, &session)
+            .await
+            .expect("peek")
+            .expect("action");
+        assert_eq!(event.sequence(), sequence);
+        restarted
+            .ack_event_projection(&event)
+            .await
+            .expect("ack action");
+    }
+    let event_keys = keys_with_prefix(&fixture.endpoint, &fixture.prefix)
+        .await
+        .into_iter()
+        .filter(|key| key.ends_with(":events-v1"))
+        .count();
+    assert_eq!(
+        event_keys, 0,
+        "finished loss marker and acknowledged events must disappear"
+    );
+    delete_fixture(&fixture).await;
 }
 
 #[test]
@@ -651,8 +1158,14 @@ async fn redis_session_action_keys_share_hash_tag_and_live_loss_fence_has_no_ttl
         "session state and retained action/idempotency state must be separate keys"
     );
     let expected_hash_tag = format!("{{{tenant_id}:{session_id}}}");
+    let retained_catalog = format!("{}:gateway-action:retained-v3", fixture.prefix);
+    let retention_index = format!("{}:gateway-action:retention-v3", fixture.prefix);
     assert!(
-        keys.iter().all(|key| key.contains(&expected_hash_tag)),
+        keys.iter()
+            .filter(|key| {
+                !key.contains(":recovery-") && *key != &retained_catalog && *key != &retention_index
+            })
+            .all(|key| key.contains(&expected_hash_tag)),
         "every session/action/loss/idempotency key must share the exact tenant/session Redis hash tag: {keys:?}"
     );
 
@@ -961,7 +1474,11 @@ async fn redis_unknown_mutation_holds_action_keys_persistent_until_resolution() 
     let mut session_keys = Vec::new();
     let mut retained_keys = Vec::new();
     let mut retained_types = Vec::new();
-    for key in keys {
+    for key in keys.into_iter().filter(|key| {
+        [":session", ":actions", ":idempotency", ":pending-v3"]
+            .iter()
+            .any(|suffix| key.ends_with(suffix))
+    }) {
         let key_type: String = redis::cmd("TYPE")
             .arg(&key)
             .query_async(&mut connection)
@@ -1101,18 +1618,43 @@ async fn redis_unknown_mutation_holds_action_keys_persistent_until_resolution() 
         .await
         .expect("resolving the unknown mutation should release the retention hold");
 
-    let maximum_ttl = i64::try_from(StoreConfig::default().retention().as_millis())
-        .expect("configured retention should fit Redis PTTL");
+    for key in &retained_keys {
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .expect("remaining read retains TTL");
+        assert_eq!(
+            ttl, -1,
+            "resolving one mutation must not expire a pending read-only action"
+        );
+    }
+    fixture
+        .store
+        .cancel_before_dispatch(
+            &tenant_id,
+            &session_id,
+            read_only.snapshot().action_id(),
+            read_only.snapshot().revision(),
+            &placement,
+            at(6),
+        )
+        .await
+        .expect("finish remaining pending read");
     for key in &retained_keys {
         let ttl: i64 = redis::cmd("PTTL")
             .arg(key)
             .query_async(&mut connection)
             .await
             .expect("released coordination key TTL should be readable");
-        assert!(
-            ttl > 0 && ttl <= maximum_ttl,
-            "resolution must restore a positive bounded retention TTL, got {ttl}ms"
-        );
+        if key.ends_with(":pending-v3") {
+            assert_eq!(ttl, -2, "last completed action removes the pending index");
+        } else {
+            assert_eq!(
+                ttl, -1,
+                "v3 reclaims individual records after their fixed horizons"
+            );
+        }
     }
     delete_fixture(&fixture).await;
 }

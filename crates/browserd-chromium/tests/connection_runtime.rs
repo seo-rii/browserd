@@ -479,3 +479,37 @@ async fn cancelling_connect_closes_both_uncommitted_capabilities() {
         tokio::time::timeout(Duration::from_millis(100), event_writer.write_all(b"{}\0")).await;
     assert!(matches!(closed, Ok(Err(_))));
 }
+
+#[tokio::test]
+async fn default_version_probe_accepts_the_session_user_agent_bound_and_rejects_overflow() {
+    for bytes in [4096, 4097] {
+        let expected = identity();
+        let (pipes, mut reader, mut writer) = pipe_pair();
+        let mut connection_config = config();
+        connection_config.max_version_field_bytes =
+            ChromiumConnectionConfig::default().max_version_field_bytes;
+        let connect = tokio::spawn(async move {
+            ChromiumConnection::connect(pipes, &expected, connection_config).await
+        });
+        let request = read_command(&mut reader).await;
+        write_message(
+            &mut writer,
+            json!({"id":request["id"], "result":{
+                "protocolVersion":"1.3", "product":"HeadlessChrome/149.0.7827.55",
+                "revision":"r1234567", "userAgent":"a".repeat(bytes), "jsVersion":"14.9"
+            }}),
+        )
+        .await;
+        let result = connect.await.unwrap();
+        if bytes == 4096 {
+            let connection = result.expect("maximum custom UA must connect");
+            assert_eq!(connection.version().user_agent.len(), bytes);
+            connection.shutdown().await;
+        } else {
+            assert!(matches!(
+                result,
+                Err(ChromiumConnectionError::InvalidVersionField { field: "userAgent" })
+            ));
+        }
+    }
+}

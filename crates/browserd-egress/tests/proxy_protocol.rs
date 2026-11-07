@@ -11,6 +11,29 @@ fn limits() -> ProxyProtocolLimits {
 }
 
 #[test]
+fn absolute_form_preserves_wire_path_separators_and_query_order() {
+    for target in [
+        "/a//b",
+        "/a///b//",
+        "/a/%2F/b%2fb?z=1&a=2&z=3",
+        "/a/./b/../c?b=2&a=1",
+    ] {
+        let bytes = format!("GET http://example.com{target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let request = ProxyRequest::parse(bytes.as_bytes(), limits());
+        assert!(request.is_ok());
+        let Ok(request) = request else {
+            continue;
+        };
+        assert!(
+            request
+                .upstream_head()
+                .starts_with(format!("GET {target} HTTP/1.1\r\n").as_bytes()),
+            "wire target changed: {target}"
+        );
+    }
+}
+
+#[test]
 fn connect_authority_is_canonicalized_without_forwarding_proxy_headers() {
     let bytes = b"CONNECT Example.COM.:443 HTTP/1.1\r\nHost: Example.COM.:443\r\nProxy-Connection: keep-alive\r\n\r\nclient-hello";
     let request = ProxyRequest::parse(bytes, limits());
@@ -40,7 +63,7 @@ fn absolute_form_http_is_rewritten_to_origin_form_and_hop_headers_are_removed() 
     assert_eq!(request.url().path_and_query(), "/submit?q=1");
     assert_eq!(request.buffered_after_head(), b"data");
     let head = String::from_utf8_lossy(request.upstream_head());
-    assert!(head.starts_with("POST /submit?q=1 HTTP/1.1\r\n"));
+    assert!(head.starts_with("POST /a/../submit?q=1 HTTP/1.1\r\n"));
     assert!(head.contains("Host: example.com:8080\r\n"));
     assert!(head.contains("Content-Length: 4\r\n"));
     assert!(head.contains("X-Trace: safe\r\n"));

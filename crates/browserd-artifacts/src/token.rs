@@ -14,6 +14,23 @@ pub struct DownloadToken {
     second: ArtifactId,
 }
 
+impl DownloadToken {
+    /// Creates an opaque identifier. Authorization requires an entry in the issuing registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            first: ArtifactId::new(),
+            second: ArtifactId::new(),
+        }
+    }
+}
+
+impl Default for DownloadToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hash for DownloadToken {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.first.hash(state);

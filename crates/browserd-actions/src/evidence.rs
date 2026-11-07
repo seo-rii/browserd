@@ -212,6 +212,20 @@ impl ActionEvidence {
         self.record_terminal(terminal)
     }
 
+    /// Records non-delivery only while the action has never crossed the dispatch boundary.
+    /// The coordination caller must atomically prove expiry of the exact submission lease.
+    pub fn expire_before_dispatch(
+        &mut self,
+    ) -> Result<ActionEvidenceMutation, ActionEvidenceError> {
+        if !matches!(self.delivery, ActionDeliveryEvidence::NotAttempted) {
+            return Err(ActionEvidenceError::DeliveryEvidenceConflict);
+        }
+        self.record_terminal(ActionTerminalEvidence::new(
+            TerminalDetail::FailedKnown(KnownFailureReason::NotDispatched),
+            ActionTerminalSource::ProvenNonDelivery,
+        ))
+    }
+
     pub fn cancel_before_dispatch(
         &mut self,
     ) -> Result<ActionEvidenceMutation, ActionEvidenceError> {

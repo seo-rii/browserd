@@ -25,6 +25,9 @@ use tokio::net::UnixStream;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/session_ownership_receipt.rs"]
+mod session_ownership_receipt;
+
 struct BlockingCreateHandler {
     calls: AtomicUsize,
     started: Semaphore,
@@ -63,6 +66,8 @@ impl WorkerRpcHandler for LargeResponseHandler {
             terminal_detail: None,
             result: Some(vec![0; 256 * 1024]),
             resolution: None,
+            custody: None,
+            custody_requirement: None,
         })
     }
 }
@@ -127,6 +132,8 @@ impl WorkerRpcHandler for MismatchedActionHandler {
             terminal_detail: None,
             result: None,
             resolution: None,
+            custody: None,
+            custody_requirement: None,
         })
     }
 }
@@ -155,6 +162,7 @@ impl WorkerRpcHandler for KeyedCreateHandler {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 }
@@ -605,6 +613,7 @@ async fn accepted_create_survives_caller_disconnect_and_retry_returns_the_same_r
         worker_epoch: 41,
         placement_version: 9,
         existing: false,
+        restored_checkpoint: None,
     };
     let handler = Arc::new(BlockingCreateHandler {
         calls: AtomicUsize::new(0),

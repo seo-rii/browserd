@@ -15,7 +15,7 @@ use browserd_core::{
 use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 use nix::sys::socket::{Shutdown, shutdown};
 use nix::unistd::dup;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
@@ -191,6 +191,24 @@ async fn wait_for_state(
     })
     .await
     .expect("attachment reaches expected state")
+}
+
+#[tokio::test]
+async fn managers_with_one_registry_share_its_clock_origin() {
+    let routes = crate::RouteRegistry::new(Duration::from_secs(30));
+    let first = AttachmentManager::with_registry(
+        daemon_epoch(),
+        routes.clone(),
+        Arc::new(DropHandler::default()),
+    );
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let observed = first.now();
+    let second =
+        AttachmentManager::with_registry(daemon_epoch(), routes, Arc::new(DropHandler::default()));
+    assert!(
+        second.now() >= observed,
+        "a later manager must retain the shared registry's origin"
+    );
 }
 
 #[tokio::test]
@@ -550,6 +568,78 @@ async fn concurrent_renew_and_revoke_never_resurrect_the_listener() {
 }
 
 #[tokio::test]
+async fn connection_admission_quota_rejects_only_the_new_socket_and_reuses_the_slot() {
+    let handler = Arc::new(HoldingHandler::default());
+    let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(30), handler.clone());
+    let route_fence = fence(61);
+    let (address, descriptor) = listener();
+    let prepared = manager
+        .prepare(route_fence.clone(), digest(61))
+        .expect("prepare");
+    let mut quota = limits();
+    quota.max_concurrent_connections = 1;
+    let route_binding = RouteBinding::new(
+        TenantId::new(),
+        route_fence.session_id().clone(),
+        route_fence.shard().shard_id().clone(),
+        route_fence.shard().owner().worker_epoch().get(),
+        EgressPolicy::public_web_default(),
+        quota,
+        MonotonicMillis::new(manager.now().value() + 10_000),
+    );
+    let active = manager
+        .install(&prepared, route_binding, descriptor)
+        .await
+        .expect("install");
+    let mut first = TcpStream::connect(address).await.expect("first connection");
+    handler.started.notified().await;
+    let mut rejected = TcpStream::connect(address)
+        .await
+        .expect("second TCP handshake");
+    let mut byte = [0_u8; 1];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut byte))
+            .await
+            .expect("over-quota socket closes")
+            .expect("read rejected socket"),
+        0
+    );
+    assert_eq!(
+        manager
+            .status(daemon_epoch(), &route_fence)
+            .expect("status")
+            .state(),
+        AttachmentState::Active
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), first.read(&mut byte))
+            .await
+            .is_err(),
+        "the admitted socket remains open"
+    );
+    handler.release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), first.read(&mut byte))
+            .await
+            .expect("first handler drains")
+            .expect("read first socket"),
+        0
+    );
+    let third = TcpStream::connect(address)
+        .await
+        .expect("slot can be reused");
+    tokio::time::timeout(Duration::from_secs(1), handler.started.notified())
+        .await
+        .expect("third is admitted");
+    handler.release.notify_one();
+    drop(third);
+    manager
+        .revoke(&active)
+        .await
+        .expect("exact attachment cleanup");
+}
+
+#[tokio::test]
 async fn normal_per_connection_handler_errors_do_not_revoke_the_listener() {
     let handler = Arc::new(FailingHandler::default());
     let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(30), handler.clone());
@@ -696,4 +786,75 @@ async fn shutdown_revokes_and_joins_every_active_listener_actor() {
         manager.prepare(fence(9), digest(9)),
         Err(AttachmentManagerError::ShuttingDown)
     ));
+}
+
+#[tokio::test]
+async fn context_route_close_preserves_sibling_and_final_retirement_requires_all_released() {
+    let handler = Arc::new(DropHandler::default());
+    let manager = AttachmentManager::new(daemon_epoch(), Duration::from_secs(30), handler.clone());
+    let first_fence = fence(71);
+    let second_fence = EgressFence::new(
+        first_fence.shard().clone(),
+        RouteGeneration::new(72).expect("route"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("incarnation"),
+    );
+    let (first_address, first_fd) = listener();
+    let (second_address, second_fd) = listener();
+    let first_prepared = manager
+        .prepare_context_route(first_fence.clone(), digest(71))
+        .expect("shared primary");
+    let second_prepared = manager
+        .prepare_context_route(second_fence.clone(), digest(71))
+        .expect("shared sibling");
+    let first = manager
+        .install(
+            &first_prepared,
+            binding(&manager, &first_fence, Duration::from_secs(10)),
+            first_fd,
+        )
+        .await
+        .expect("primary install");
+    let second = manager
+        .install(
+            &second_prepared,
+            binding(&manager, &second_fence, Duration::from_secs(10)),
+            second_fd,
+        )
+        .await
+        .expect("sibling install");
+    assert!(manager.retire_shard(first_fence.shard()).is_err());
+    manager
+        .revoke(&first)
+        .await
+        .expect("first closes only first");
+    StdTcpListener::bind(first_address).expect("first listener closed");
+    assert!(matches!(
+        manager
+            .status(daemon_epoch(), &second_fence)
+            .expect("second status"),
+        AttachmentStatus::Active(_)
+    ));
+    let connection = TcpStream::connect(second_address)
+        .await
+        .expect("sibling accepts");
+    tokio::time::timeout(Duration::from_secs(1), handler.notify.notified())
+        .await
+        .expect("sibling accepted");
+    drop(connection);
+    assert!(manager.retire_shard(first_fence.shard()).is_err());
+    manager.revoke(&second).await.expect("second closes");
+    manager
+        .retire_shard(first_fence.shard())
+        .expect("positive whole-shard retirement");
+    manager
+        .retire_shard(first_fence.shard())
+        .expect("lost retirement response retry");
+    let third = EgressFence::new(
+        first_fence.shard().clone(),
+        RouteGeneration::new(73).expect("route"),
+        SessionId::new(),
+        SessionIncarnation::new(1).expect("incarnation"),
+    );
+    assert!(manager.prepare_context_route(third, digest(71)).is_err());
 }

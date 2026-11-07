@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LifecycleBackendError;
+
+type ExpirationOperation = Pin<Box<dyn Future<Output = Result<(), LifecycleBackendError>> + Send>>;
 
 #[async_trait]
 pub trait WorkerLifecycleBackend: Send + Sync + 'static {
@@ -74,6 +78,7 @@ where
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut expiration = interval(bounds.expiration_interval);
     expiration.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut expiring: Option<ExpirationOperation> = None;
 
     let primary_error = loop {
         tokio::select! {
@@ -85,14 +90,27 @@ where
                     break Some(LifecycleError::Heartbeat);
                 }
             }
-            _ = expiration.tick() => {
-                if backend.expire_due().await.is_err() {
+            result = async {
+                match expiring.as_mut() {
+                    Some(operation) => operation.await,
+                    None => std::future::pending().await,
+                }
+            }, if expiring.is_some() => {
+                expiring = None;
+                if result.is_err() {
                     cancellation.cancel();
                     break Some(LifecycleError::Expiration);
                 }
             }
+            _ = expiration.tick(), if expiring.is_none() => {
+                let expirer = Arc::clone(&backend);
+                expiring = Some(Box::pin(async move { expirer.expire_due().await }));
+            }
         }
     };
+    // No overlapping expiry pass is started. The control-plane owns any blocking
+    // cleanup already handed off; shutdown observes the same per-session guard.
+    drop(expiring);
 
     let drain_error = backend.begin_drain().await.err();
     let shutdown_result =

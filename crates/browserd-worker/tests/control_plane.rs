@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
+#[path = "support/heartbeat_clock.rs"]
+mod review_heartbeat_clock;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,6 +35,15 @@ use browserd_worker::{
 };
 use sha2::{Digest, Sha256};
 
+#[path = "support/capture_finalization.rs"]
+mod capture_finalization;
+#[path = "support/privileged_evaluate.rs"]
+mod privileged_evaluate;
+#[path = "support/review_snapshot_budget.rs"]
+mod review_snapshot_budget;
+#[path = "support/viewer_control.rs"]
+mod viewer_control;
+
 struct TestClock;
 
 impl WorkerClock for TestClock {
@@ -41,17 +52,125 @@ impl WorkerClock for TestClock {
     }
 }
 
+type EvaluateBoundaryHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Default)]
 struct FakeDriver {
+    action_effects: AtomicUsize,
+    evaluate_callbacks: AtomicUsize,
+    approved_callbacks: AtomicUsize,
+    evaluate_boundary: Mutex<Option<EvaluateBoundaryHook>>,
+    evaluate_cancel_observed: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    capture_mode: AtomicUsize,
+    capture_aborts: Arc<AtomicUsize>,
+    capture_requests: Mutex<Vec<browserd_worker::GeneratedArtifactRequest>>,
     qualified: bool,
     executions: Mutex<VecDeque<ActionExecutionResult>>,
     cleanup_count: Mutex<usize>,
     qualification_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     execution_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     approved_effect_gate: Mutex<()>,
+    viewer_inputs: AtomicUsize,
+    viewer_cleanup_fails: AtomicBool,
 }
 
 impl ChromiumDriver for FakeDriver {
+    fn execute_privileged_evaluate_until(
+        &self,
+        _tenant_id: &TenantId,
+        session_id: &browserd_core::SessionId,
+        page_id: &PageId,
+        _fence: &OwnershipFence,
+        payload: &[u8],
+        deadline: std::time::Instant,
+        authorize_and_commit: &mut dyn FnMut(
+            &LiveApprovalContext,
+        ) -> Result<(), ApprovedActionError>,
+    ) -> Result<ActionExecutionResult, ApprovedActionError> {
+        privileged_evaluate::execute(
+            self,
+            session_id,
+            page_id,
+            payload,
+            deadline,
+            authorize_and_commit,
+        )
+    }
+
+    fn execute_capture_until(
+        &self,
+        _session: &browserd_core::SessionId,
+        _page: &PageId,
+        _command: browserd_features::CaptureCommand,
+        request: browserd_worker::GeneratedArtifactRequest,
+        _store: Arc<dyn SandboxClient>,
+        _deadline: std::time::Instant,
+    ) -> Result<browserd_worker::GeneratedCaptureResult, DependencyError> {
+        capture_finalization::capture(self, request)
+    }
+
+    fn viewer_start(
+        &self,
+        _session: &browserd_core::SessionId,
+        _page: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+    fn viewer_stop(
+        &self,
+        _session: &browserd_core::SessionId,
+        _page: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<(), DependencyError> {
+        Ok(())
+    }
+    fn viewer_rebind(
+        &self,
+        _session: &browserd_core::SessionId,
+        _page: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<u64, DependencyError> {
+        Ok(1)
+    }
+    fn viewer_frame(
+        &self,
+        _session: &browserd_core::SessionId,
+        page: &PageId,
+        _fence: &OwnershipFence,
+    ) -> Result<Option<browserd_worker::WorkerViewerFrame>, DependencyError> {
+        Ok(Some(browserd_worker::WorkerViewerFrame {
+            frame_id: 1,
+            page_id: page.clone(),
+            frame_transform_id: 1,
+            metadata: b"{}".to_vec(),
+            jpeg_base64: "AA==".to_owned(),
+        }))
+    }
+    fn viewer_input(
+        &self,
+        _session: &browserd_core::SessionId,
+        _page: &PageId,
+        _fence: &OwnershipFence,
+        _transform: u64,
+        _message: &browserd_worker::ViewerClientMessage,
+    ) -> Result<(), DependencyError> {
+        self.viewer_inputs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn viewer_cleanup(
+        &self,
+        _session: &browserd_core::SessionId,
+        _page: &PageId,
+        _fence: &OwnershipFence,
+        _cleanup: &browserd_viewer::InputCleanup,
+    ) -> Result<(), DependencyError> {
+        if self.viewer_cleanup_fails.load(Ordering::SeqCst) {
+            Err(DependencyError::OutcomeUncertain)
+        } else {
+            Ok(())
+        }
+    }
     fn qualify(&self) -> Result<(), DependencyError> {
         let barriers = self
             .qualification_barriers
@@ -134,6 +253,7 @@ impl ChromiumDriver for FakeDriver {
         _page_id: Option<&PageId>,
         _payload: &[u8],
     ) -> ActionExecutionResult {
+        self.action_effects.fetch_add(1, Ordering::SeqCst);
         let barriers = self
             .execution_barriers
             .lock()
@@ -192,6 +312,7 @@ impl ChromiumDriver for FakeDriver {
         if let Some(reason) = inspected.stale_reason(&observed) {
             return Err(ApprovedActionError::ApprovalStale(reason));
         }
+        self.approved_callbacks.fetch_add(1, Ordering::SeqCst);
         authorize_and_commit(&observed)?;
         Ok(self.execute_action(session_id, Some(page_id), payload))
     }
@@ -205,6 +326,14 @@ impl ChromiumDriver for FakeDriver {
             .approved_effect_gate
             .lock()
             .map_err(|_| DependencyError::Unavailable)?;
+        if let Some(sender) = self
+            .evaluate_cancel_observed
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?
+            .as_ref()
+        {
+            sender.send(()).map_err(|_| DependencyError::Unavailable)?;
+        }
         Ok(true)
     }
 }
@@ -323,6 +452,35 @@ impl SandboxClient for FakeSandbox {
             ArtifactObjectGeneration::new([1; ArtifactObjectGeneration::LENGTH]),
             verdict,
         )
+        .and_then(|receipt| {
+            if verdict != ArtifactScanVerdict::Clean {
+                return Ok(receipt);
+            }
+            let evidence = browserd_worker::ArtifactScanAttestation::new(
+                receipt.key(),
+                request.fence(),
+                receipt.source(),
+                receipt.object_generation(),
+                receipt.size_bytes(),
+                *receipt.checksum(),
+                browserd_worker::ArtifactScannerObservation {
+                    schema_version: 1,
+                    program_version: "fixture-1".to_owned(),
+                    database_version: 1,
+                    database_built_at_unix_millis: 0,
+                    observed_before_unix_millis: 0,
+                    observed_after_unix_millis: 0,
+                    expected_peer_uid: 1000,
+                    peer_uid: 1000,
+                    version_metadata_sha256: [1; 32],
+                    scanned_size_bytes: receipt.size_bytes(),
+                    scanned_checksum_sha256: *receipt.checksum().as_bytes(),
+                    max_database_age_millis: 7 * 24 * 60 * 60 * 1000,
+                    max_future_skew_millis: 0,
+                },
+            )?;
+            receipt.with_scan_attestation(evidence)
+        })
         .map_err(|_| DependencyError::Rejected)
     }
 }
@@ -2449,7 +2607,7 @@ fn standard_profile_session_denies_evaluate_before_dispatch() {
         ActionKind::Mutating,
         Some(BuiltinFeature::PrivilegedEvaluate),
         Some(created.primary_page_id.clone()),
-        br#"{"type":"evaluate"}"#.to_vec(),
+        br#"{"type":"evaluate","expression":"1 + 1"}"#.to_vec(),
         None,
         SessionTime::new(1),
     );
@@ -2492,66 +2650,7 @@ fn standard_profile_session_denies_evaluate_before_dispatch() {
 
 #[test]
 fn privileged_profile_session_allows_evaluate_dispatch() {
-    // The same command in a privileged-profile session passes the gate and dispatches normally.
-    let Some((worker, peer, driver, _sandbox)) = ready_worker(1) else {
-        return;
-    };
-    let created = worker.create_session_with_options(
-        &peer,
-        create_command(TenantId::new(), "evaluate-privileged", 62),
-        &session_options("privileged"),
-        SessionTime::new(0),
-    );
-    assert!(created.is_ok());
-    let Some(created) = created.ok() else {
-        return;
-    };
-    if let Ok(mut executions) = driver.executions.lock() {
-        executions.push_back(ActionExecutionResult::Succeeded(br#"{"ok":true}"#.to_vec()));
-    }
-    let action_id = worker.submit_action(
-        &peer,
-        PrincipalId::new(),
-        &created.session_id,
-        &created.fence,
-        "evaluate-privileged",
-        [8; 32],
-        ActionKind::Mutating,
-        Some(BuiltinFeature::PrivilegedEvaluate),
-        Some(created.primary_page_id.clone()),
-        br#"{"type":"evaluate"}"#.to_vec(),
-        None,
-        SessionTime::new(1),
-    );
-    assert!(action_id.is_ok());
-    let Some(action_id) = action_id.ok() else {
-        return;
-    };
-    assert!(
-        worker
-            .run_next_action(
-                &peer,
-                &created.session_id,
-                &created.fence,
-                SessionTime::new(2)
-            )
-            .is_ok()
-    );
-    let snapshot = worker.get_action(&peer, &created.session_id, &action_id, &created.fence);
-    assert!(snapshot.is_ok());
-    let Some(snapshot) = snapshot.ok() else {
-        return;
-    };
-    assert_eq!(snapshot.status, ActionStatus::Succeeded);
-    // The browser WAS dispatched: the preloaded execution result was consumed.
-    assert_eq!(
-        driver
-            .executions
-            .lock()
-            .ok()
-            .map(|executions| executions.len()),
-        Some(0)
-    );
+    privileged_evaluate::assert_success_and_idempotency();
 }
 
 #[test]

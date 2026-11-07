@@ -200,3 +200,31 @@ fn materialized_loss_terminal_matches_query_time_derivation() {
         );
     }
 }
+
+#[test]
+fn expired_submission_is_proven_non_delivery_and_never_cancellation_or_armed_expiry() {
+    let mut evidence = ActionEvidence::new();
+    assert_eq!(
+        evidence.expire_before_dispatch(),
+        Ok(ActionEvidenceMutation::Recorded)
+    );
+    assert_eq!(
+        evidence.expire_before_dispatch(),
+        Ok(ActionEvidenceMutation::AlreadyRecorded)
+    );
+    assert_eq!(
+        evidence.terminal(),
+        Some(&ActionTerminalEvidence::new(
+            TerminalDetail::FailedKnown(KnownFailureReason::NotDispatched),
+            ActionTerminalSource::ProvenNonDelivery,
+        ))
+    );
+    assert!(evidence.arm_dispatch(DispatchId::new()).is_err());
+    let mut armed = ActionEvidence::new();
+    armed.arm_dispatch(DispatchId::new()).expect("arm");
+    assert_eq!(
+        armed.expire_before_dispatch(),
+        Err(ActionEvidenceError::DeliveryEvidenceConflict)
+    );
+    assert!(armed.terminal().is_none());
+}

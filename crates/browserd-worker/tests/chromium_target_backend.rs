@@ -182,6 +182,43 @@ async fn bootstrap_empty(
     assert_eq!(bootstrap.await.unwrap(), Ok(()));
 }
 
+const PAGE_BOOTSTRAP_METHODS: [&str; 7] = [
+    "Target.setAutoAttach",
+    "Network.enable",
+    "Runtime.enable",
+    "Page.enable",
+    "Page.getFrameTree",
+    "Page.setInterceptFileChooserDialog",
+    "Runtime.runIfWaitingForDebugger",
+];
+
+async fn respond_page_bootstrap(writer: &mut Sender, command: &Value) {
+    let session = command["sessionId"]
+        .as_str()
+        .expect("page bootstrap must have a flattened route");
+    // Keep the protocol FrameId distinct from the TargetId, and bind its default realm.
+    let frame = format!("frame-{session}");
+    if command["method"] == "Runtime.enable" {
+        write_message(
+            writer,
+            json!({
+                "method":"Runtime.executionContextCreated", "sessionId":session,
+                "params":{"context":{
+                    "id":1,"uniqueId":format!("realm-{session}"),"origin":"about:blank","name":"",
+                    "auxData":{"isDefault":true,"type":"default","frameId":frame}
+                }}
+            }),
+        )
+        .await;
+    }
+    let result = if command["method"] == "Page.getFrameTree" {
+        json!({"frameTree":{"frame":{"id":frame,"url":"about:blank"}}})
+    } else {
+        json!({})
+    };
+    respond(writer, command, result).await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn create_owned_primary(
     driver: CdpChromiumDriver,
@@ -208,9 +245,11 @@ async fn create_owned_primary(
     )
     .await;
     respond(writer, &target, json!({"targetId": target_id})).await;
-    for _ in 0..6 {
+    for method in PAGE_BOOTSTRAP_METHODS {
         let command = read_command(reader).await;
-        respond(writer, &command, json!({})).await;
+        assert_eq!(command["method"], method);
+        assert_eq!(command["sessionId"], flat_session_id);
+        respond_page_bootstrap(writer, &command).await;
     }
     create.await.unwrap().unwrap()
 }
@@ -660,10 +699,13 @@ async fn attach_observed_while_a_stage_command_is_pending_is_not_lost() {
     .await
     .expect("the attached target must reach the manager event pump");
     assert_eq!(first_late_command["method"], "Target.setAutoAttach");
-    respond(&mut event_writer, &first_late_command, json!({})).await;
-    for _ in 1..6 {
+    assert_eq!(first_late_command["sessionId"], "flat-two");
+    respond_page_bootstrap(&mut event_writer, &first_late_command).await;
+    for method in PAGE_BOOTSTRAP_METHODS.iter().skip(1) {
         let command = read_command(&mut command_reader).await;
-        respond(&mut event_writer, &command, json!({})).await;
+        assert_eq!(command["method"], *method);
+        assert_eq!(command["sessionId"], "flat-two");
+        respond_page_bootstrap(&mut event_writer, &command).await;
     }
     tokio::time::timeout(Duration::from_millis(200), async {
         while manager.ready_target_count() != 2 {
@@ -877,4 +919,320 @@ async fn owner_event_forwarding_overflow_is_fail_closed() {
     .await
     .expect("bounded ingress overflow must drain immediately");
     assert!(manager.is_tainted());
+}
+
+mod pooled_contexts {
+    use super::*;
+    use browserd_core::{
+        EgressFence, LeaseId, PlacementFence, RouteGeneration, SessionIncarnation,
+    };
+    use browserd_sandbox::{
+        ChromiumBinaryDigest, ChromiumProcessProfile, ContextEgressBinding,
+        ContextEgressReleaseReceipt, ContextEgressRequest, ContextRoutePolicy,
+        DedicatedEgressProxyBinding, DedicatedEgressSpec, EgressPolicyBinding, LaunchSpec,
+    };
+    use browserd_worker::{
+        DependencyError, OwnerContextPolicy, WorkerSessionOptionsV1, WorkerViewport,
+    };
+    use std::time::Instant;
+
+    struct Session {
+        tenant: TenantId,
+        id: SessionId,
+        owner: OwnershipFence,
+        binding: ContextEgressBinding,
+    }
+
+    fn session(shard: &ShardFence, tenant: TenantId, route: u64) -> Session {
+        let id = SessionId::new();
+        let owner = OwnershipFence::new(shard.owner().worker_id().clone(), 11, route + 6, 3);
+        let request = ContextEgressRequest::new(
+            tenant.clone(),
+            owner.as_placement_fence(),
+            DedicatedEgressSpec::new(
+                EgressFence::new(
+                    shard.clone(),
+                    RouteGeneration::new(route).unwrap(),
+                    id.clone(),
+                    SessionIncarnation::new(3).unwrap(),
+                ),
+                EgressPolicyBinding::new("public", [3; 32]).unwrap(),
+                Duration::from_secs(120),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let proxy: DedicatedEgressProxyBinding = serde_json::from_value(json!({
+            "tenant_id":tenant,"egress_fence":request.egress().egress_fence(),
+            "policy_binding":request.egress().policy_binding(),"namespace_identity":{"device":7,"inode":42},
+            "reservation_generation":LeaseId::new(),"attachment_generation":LeaseId::new(),
+            "proxy_address":format!("127.0.0.1:{}",4100+route)
+        })).unwrap();
+        Session {
+            tenant,
+            id,
+            owner,
+            binding: ContextEgressBinding::new(request, 19, 23, proxy, Duration::from_secs(60))
+                .unwrap(),
+        }
+    }
+
+    fn options() -> WorkerSessionOptionsV1 {
+        WorkerSessionOptionsV1 {
+            workload_class_hint: "interactive".to_owned(),
+            viewport: WorkerViewport {
+                width: 800,
+                height: 600,
+                device_scale_factor: 1,
+            },
+            locale: "en-US".to_owned(),
+            timezone: "UTC".to_owned(),
+            user_agent: None,
+            network_policy_id: "public".to_owned(),
+            network_class: "public".to_owned(),
+            checkpoint_ref: None,
+            dialog_policy: "auto_dismiss".to_owned(),
+            feature_profile: "standard".to_owned(),
+            ttl_seconds: 1800,
+            idle_timeout_seconds: 600,
+            metadata: Default::default(),
+        }
+    }
+
+    async fn register(owner: &Arc<ChromiumConnectionOwner<Drain>>, session: &Session) {
+        let backend = owner.target_manager_backend();
+        let tenant = session.tenant.clone();
+        let id = session.id.clone();
+        let fence = session.owner.clone();
+        let binding = session.binding.clone();
+        let valid_until = Instant::now() + Duration::from_secs(30);
+        assert_eq!(
+            tokio::task::spawn_blocking(move || backend.register_context_egress(
+                tenant,
+                id,
+                fence,
+                binding,
+                valid_until
+            ))
+            .await
+            .unwrap(),
+            Ok(())
+        );
+    }
+
+    async fn create(
+        owner: &Arc<ChromiumConnectionOwner<Drain>>,
+        session: &Session,
+        ordinal: u64,
+        reader: &mut Receiver,
+        writer: &mut Sender,
+    ) {
+        let driver = owner.chromium_driver(IsolationProfile::SharedContext);
+        let tenant = session.tenant.clone();
+        let id = session.id.clone();
+        let fence = session.owner.clone();
+        let create = tokio::task::spawn_blocking(move || {
+            driver.create_context_owned_with_options(&tenant, &id, &fence, &options())
+        });
+        let context = format!("pooled-context-{ordinal}");
+        let target = format!("pooled-page-{ordinal}");
+        let flat = format!("pooled-flat-{ordinal}");
+        let command = read_command(reader).await;
+        assert_eq!(command["method"], "Target.createBrowserContext");
+        assert_eq!(
+            command["params"],
+            json!({"disposeOnDetach":true,
+            "proxyServer":format!("http://{}",session.binding.proxy_binding().proxy_address()),"proxyBypassList":"<-loopback>"})
+        );
+        respond(writer, &command, json!({"browserContextId":context})).await;
+        let command = read_command(reader).await;
+        assert_eq!(command["method"], "Browser.setDownloadBehavior");
+        assert_eq!(
+            command["params"],
+            json!({"behavior":"deny","browserContextId":context,"eventsEnabled":true})
+        );
+        respond(writer, &command, json!({})).await;
+        let command = read_command(reader).await;
+        assert_eq!(command["method"], "Target.createTarget");
+        assert_eq!(command["params"]["browserContextId"], context);
+        write_message(writer, attached(&target, &flat, &context, "page")).await;
+        respond(writer, &command, json!({"targetId":target})).await;
+        for method in [
+            "Target.setAutoAttach",
+            "Emulation.setDeviceMetricsOverride",
+            "Network.setUserAgentOverride",
+            "Network.enable",
+            "Runtime.enable",
+            "Page.enable",
+            "Page.getFrameTree",
+            "Page.setInterceptFileChooserDialog",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            let command = read_command(reader).await;
+            assert_eq!(command["method"], method);
+            assert_eq!(command["sessionId"], flat);
+            respond_page_bootstrap(writer, &command).await;
+        }
+        assert!(create.await.unwrap().is_ok());
+    }
+
+    async fn attach_worker(ordinal: u64, kind: &str, reader: &mut Receiver, writer: &mut Sender) {
+        let target = format!("pooled-{kind}-{ordinal}");
+        let flat = format!("flat-{kind}-{ordinal}");
+        write_message(
+            writer,
+            attached(&target, &flat, &format!("pooled-context-{ordinal}"), kind),
+        )
+        .await;
+        for method in [
+            "Target.setAutoAttach",
+            "Network.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            let command = read_command(reader).await;
+            assert_eq!(command["method"], method);
+            assert_eq!(command["sessionId"], flat);
+            respond(writer, &command, json!({})).await;
+        }
+    }
+
+    async fn verify_sibling_cleanup(unknown: bool) {
+        let drain = Arc::new(Drain(AtomicBool::new(false)));
+        let shard = fence();
+        let first = session(&shard, TenantId::new(), 1);
+        let second = session(&shard, TenantId::new(), 2);
+        let mut expected = identity();
+        expected.launch_profile_digest = Sha256Digest::from_hex(&"03".repeat(32)).unwrap();
+        let launch = LaunchSpec::production(
+            first.tenant.clone(),
+            first.binding.request().egress().clone(),
+            ChromiumBinaryDigest::new([0; 32]),
+        )
+        .with_process_profile(
+            ChromiumProcessProfile::native_locale(
+                "en-US",
+                "UTC",
+                ChromiumBinaryDigest::new([3; 32]),
+                ChromiumBinaryDigest::new([4; 32]),
+                ChromiumBinaryDigest::new([5; 32]),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_context_route_policy(
+            ContextRoutePolicy::new(PlacementFence::new(11, 7, 3), false, 8, 500).unwrap(),
+        )
+        .unwrap();
+        let (owner, manager) = ChromiumConnectionOwner::new_bounded_for_pooled_launch(
+            expected,
+            connection_config(),
+            shard,
+            16,
+            drain.clone(),
+            launch,
+            OwnerContextPolicy::shared(8, 500).unwrap(),
+        )
+        .unwrap();
+        let (pipes, mut reader, mut writer) = pipe_pair();
+        let pipes = pipes
+            .with_egress_proxy_binding(first.binding.proxy_binding().clone())
+            .unwrap();
+        let accept = tokio::spawn({
+            let owner = owner.clone();
+            async move { owner.accept_cdp_pipes(pipes).await }
+        });
+        qualify(&mut reader, &mut writer).await;
+        assert_eq!(accept.await.unwrap(), Ok(()));
+        bootstrap_empty(manager.clone(), &mut reader, &mut writer).await;
+        register(&owner, &first).await;
+        create(&owner, &first, 1, &mut reader, &mut writer).await;
+        register(&owner, &second).await;
+        create(&owner, &second, 2, &mut reader, &mut writer).await;
+        for ordinal in [1, 2] {
+            for kind in ["shared_worker", "service_worker"] {
+                attach_worker(ordinal, kind, &mut reader, &mut writer).await;
+            }
+        }
+        let backend = owner.target_manager_backend();
+        let early =
+            ContextEgressReleaseReceipt::new(first.binding.request().clone(), 19, 23).unwrap();
+        assert!(
+            tokio::task::spawn_blocking(move || backend.confirm_context_egress_released(early))
+                .await
+                .unwrap()
+                .is_err(),
+            "active Chromium ownership prevents route release"
+        );
+        let driver = owner.chromium_driver(IsolationProfile::SharedContext);
+        let id = first.id.clone();
+        let fence = first.owner.clone();
+        let close = tokio::task::spawn_blocking(move || driver.close_context_fenced(&id, &fence));
+        let command = read_command(&mut reader).await;
+        assert_eq!(command["method"], "Target.disposeBrowserContext");
+        assert_eq!(
+            command["params"],
+            json!({"browserContextId":"pooled-context-1"})
+        );
+        respond(&mut writer, &command, json!({})).await;
+        let command = read_command(&mut reader).await;
+        assert_eq!(command["method"], "Target.getTargets");
+        let mut targets = vec![
+            json!({"targetId":"pooled-page-2","type":"page","browserContextId":"pooled-context-2"}),
+            json!({"targetId":"pooled-shared_worker-2","type":"shared_worker"}),
+            json!({"targetId":"pooled-service_worker-2","type":"service_worker","browserContextId":"pooled-context-2"}),
+        ];
+        if unknown {
+            targets.push(json!({"targetId":"foreign-worker","type":"service_worker"}));
+        }
+        respond(&mut writer, &command, json!({"targetInfos":targets})).await;
+        if unknown {
+            assert_eq!(close.await.unwrap(), Err(DependencyError::OutcomeUncertain));
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !drain.0.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await
+                }
+            })
+            .await
+            .unwrap();
+            assert!(manager.is_tainted());
+            return;
+        }
+        let command = read_command(&mut reader).await;
+        assert_eq!(command["method"], "Target.getBrowserContexts");
+        respond(
+            &mut writer,
+            &command,
+            json!({"browserContextIds":["pooled-context-2"]}),
+        )
+        .await;
+        assert_eq!(close.await.unwrap(), Ok(()));
+        assert!(manager.has_ready_target("pooled-page-2"));
+        assert!(manager.has_ready_target("pooled-shared_worker-2"));
+        assert!(!manager.has_ready_target("pooled-page-1"));
+        assert!(!drain.0.load(Ordering::SeqCst));
+        assert!(!manager.is_tainted());
+        let backend = owner.target_manager_backend();
+        let released =
+            ContextEgressReleaseReceipt::new(first.binding.request().clone(), 19, 23).unwrap();
+        assert_eq!(
+            tokio::task::spawn_blocking(move || {
+                backend.confirm_context_egress_released(released.clone())?;
+                backend.confirm_context_egress_released(released)
+            })
+            .await
+            .unwrap(),
+            Ok(())
+        );
+        assert_eq!(owner.shutdown_cdp().await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn native_options_sibling_pages_and_workers_survive_exact_context_retirement() {
+        verify_sibling_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn unowned_contextless_worker_in_disposal_proof_taints_the_shard() {
+        verify_sibling_cleanup(true).await;
+    }
 }

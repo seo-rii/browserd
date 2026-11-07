@@ -1,6 +1,7 @@
 use browserd_actions::{
-    ActionKind, ActionSequence, ApprovalDecision as ActionApprovalDecision, KnownFailureReason,
-    OutcomeUnknownReason, ResolutionAnnotation, ResolutionKind, TerminalDetail,
+    ActionKind, ActionSequence, ApprovalDecision as ActionApprovalDecision, CanonicalRequestHash,
+    JournalSessionScope, KnownFailureReason, OutcomeUnknownReason, ResolutionAnnotation,
+    ResolutionKind, TerminalCustodyReceipt, TerminalCustodyRequirement, TerminalDetail,
 };
 use browserd_core::{
     ActionId, ApprovalId, ArtifactId, PageId, PrincipalId, SessionId, TenantId, WorkerId,
@@ -12,7 +13,8 @@ use browserd_worker::{
     WorkerApprovalActionType, WorkerApprovalDecision, WorkerApprovalReceipt, WorkerApprovalState,
     WorkerArtifactReceipt, WorkerArtifactSource, WorkerArtifactState,
     WorkerCanonicalActionProposal, WorkerNavigateWaitUntil, WorkerPageReceipt, WorkerProbeReceipt,
-    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerWaitCondition,
+    WorkerRpcRequest, WorkerRpcResponse, WorkerSessionFence, WorkerTerminalCustodyReceipt,
+    WorkerWaitCondition,
 };
 
 fn fence() -> WorkerSessionFence {
@@ -23,6 +25,443 @@ fn fence() -> WorkerSessionFence {
         placement_version: 3,
         session_incarnation: 2,
     }
+}
+
+#[test]
+fn historical_custody_wire_preserves_original_scope_and_rejects_capability_contradictions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fence = fence();
+    let worker_id = WorkerId::new("historical-custody-wire")?;
+    let action_id = ActionId::new();
+    let sequence = ActionSequence::new(u64::MAX);
+    let scope = JournalSessionScope::new(
+        fence.tenant_id.clone(),
+        fence.session_id.clone(),
+        worker_id.clone(),
+        browserd_core::PlacementFence::new(
+            fence.worker_epoch,
+            fence.placement_version,
+            fence.session_incarnation,
+        ),
+    )?;
+    let custody = TerminalCustodyReceipt::new(
+        scope.clone(),
+        action_id.clone(),
+        sequence,
+        ActionKind::Mutating,
+        CanonicalRequestHash::new([31; 32]),
+        None,
+        TerminalDetail::CancelledBeforeDispatch,
+        None,
+    )?;
+    let proof = WorkerTerminalCustodyReceipt {
+        worker_id: worker_id.clone(),
+        worker_epoch: 8,
+        receipt: Box::new(custody.clone()),
+    };
+    proof.validate_for(
+        &worker_id,
+        8,
+        &scope,
+        &action_id,
+        sequence,
+        ActionKind::Mutating,
+    )?;
+    assert_eq!(
+        serde_json::from_slice::<WorkerTerminalCustodyReceipt>(&serde_json::to_vec(&proof)?)?,
+        proof
+    );
+    for (epoch, action, seq, kind) in [
+        (7, action_id.clone(), sequence, ActionKind::Mutating),
+        (8, ActionId::new(), sequence, ActionKind::Mutating),
+        (
+            8,
+            action_id.clone(),
+            ActionSequence::new(u64::MAX - 1),
+            ActionKind::Mutating,
+        ),
+        (8, action_id.clone(), sequence, ActionKind::ReadOnly),
+    ] {
+        assert!(
+            proof
+                .validate_for(&worker_id, epoch, &scope, &action, seq, kind)
+                .is_err()
+        );
+    }
+    let wrong_scope = JournalSessionScope::new(
+        TenantId::new(),
+        scope.session_id().clone(),
+        worker_id.clone(),
+        scope.fence(),
+    )?;
+    assert!(
+        proof
+            .validate_for(
+                &worker_id,
+                8,
+                &wrong_scope,
+                &action_id,
+                sequence,
+                ActionKind::Mutating
+            )
+            .is_err()
+    );
+    let request = WorkerRpcRequest::GetTerminalCustody {
+        expected_serving_worker_id: worker_id,
+        expected_serving_worker_epoch: 8,
+        scope,
+        action_id: action_id.clone(),
+        action_sequence: sequence,
+        kind: ActionKind::Mutating,
+    };
+    assert_eq!(
+        serde_json::from_slice::<WorkerRpcRequest>(&serde_json::to_vec(&request)?)?,
+        request
+    );
+    let mut receipt = WorkerActionReceipt {
+        fence,
+        action_id,
+        action_sequence: sequence,
+        idempotency_key: "custody-wire".to_owned(),
+        canonical_request_hash: [11; 32],
+        kind: ActionKind::Mutating,
+        status: WorkerActionStatus::CancelledBeforeDispatch,
+        dispatch_acknowledged: false,
+        approval_decision: None,
+        terminal_detail: Some(TerminalDetail::CancelledBeforeDispatch),
+        result: None,
+        resolution: None,
+        custody: Some(Box::new(custody)),
+        custody_requirement: Some(TerminalCustodyRequirement::Required),
+    };
+    receipt.to_action_snapshot()?;
+    receipt.custody_requirement = Some(TerminalCustodyRequirement::Unsupported);
+    assert!(receipt.to_action_snapshot().is_err());
+    receipt.custody = None;
+    receipt.to_action_snapshot()?;
+    receipt.custody_requirement = None;
+    receipt.to_action_snapshot()?; // Legacy absence is accepted on the wire; the store pins it.
+    receipt.status = WorkerActionStatus::Running;
+    receipt.terminal_detail = None;
+    receipt.custody_requirement = Some(TerminalCustodyRequirement::Required);
+    assert!(receipt.to_action_snapshot().is_err());
+    Ok(())
+}
+
+#[test]
+fn query_all_rpc_frame_path_is_optional_bounded_and_read_only()
+-> Result<(), Box<dyn std::error::Error>> {
+    let legacy = serde_json::json!({"type":"query_all","selector":"input"});
+    let omitted: WorkerActionCommand = serde_json::from_value(legacy.clone())?;
+    let empty: WorkerActionCommand = serde_json::from_value(serde_json::json!({
+        "type":"query_all","selector":"input","frame_path":[],
+    }))?;
+    assert_eq!(omitted, empty);
+    assert_eq!(serde_json::to_value(&empty)?, legacy);
+    for frame_path in [
+        vec![],
+        vec!["iframe".to_owned(); 8],
+        vec!["a".repeat(8192); 4],
+        vec!["é".repeat(4096); 4],
+        vec!["iframe#outer".to_owned(), "iframe#inner".to_owned()],
+    ] {
+        let command = WorkerActionCommand::QueryAll {
+            selector: "input".to_owned(),
+            frame_path: frame_path.clone(),
+        };
+        assert!(command.is_valid());
+        assert_eq!(command.kind(), ActionKind::ReadOnly);
+        assert_eq!(command.required_feature(), None);
+        assert_eq!(
+            serde_json::from_value::<WorkerActionCommand>(serde_json::to_value(&command)?)?,
+            command
+        );
+        if !frame_path.is_empty() {
+            assert_eq!(
+                serde_json::to_value(&command)?["frame_path"],
+                serde_json::json!(frame_path)
+            );
+        }
+    }
+    for frame_path in [
+        vec![String::new()],
+        vec!["iframe\n".to_owned()],
+        vec!["a".repeat(8193)],
+        vec!["é".repeat(4097)],
+        vec!["iframe".to_owned(); 9],
+        vec!["a".repeat(8192); 5],
+        vec![
+            "a".repeat(8192),
+            "b".repeat(8192),
+            "c".repeat(8192),
+            "d".repeat(8192),
+            "e".to_owned(),
+        ],
+    ] {
+        assert!(
+            !WorkerActionCommand::QueryAll {
+                selector: "input".to_owned(),
+                frame_path
+            }
+            .is_valid()
+        );
+    }
+    for path in [
+        serde_json::Value::Null,
+        serde_json::json!("iframe"),
+        serde_json::json!([1]),
+    ] {
+        assert!(
+            serde_json::from_value::<WorkerActionCommand>(serde_json::json!({
+                "type":"query_all","selector":"input","frame_path":path,
+            }))
+            .is_err()
+        );
+    }
+    for forbidden in ["frame_ref", "frame_id", "cdp_session_id"] {
+        let mut invalid = legacy.clone();
+        invalid[forbidden] = serde_json::json!("caller-route");
+        assert!(serde_json::from_value::<WorkerActionCommand>(invalid).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_rpc_defaults_to_cookies_and_admits_only_exact_bounded_origins()
+-> Result<(), Box<dyn std::error::Error>> {
+    let legacy: WorkerActionCommand =
+        serde_json::from_value(serde_json::json!({"type":"checkpoint"}))?;
+    assert_eq!(legacy, WorkerActionCommand::Checkpoint { origins: vec![] });
+    for origins in [
+        vec![],
+        vec![
+            "https://example.test".to_owned(),
+            "http://example.test:8080".to_owned(),
+        ],
+        (0..16)
+            .map(|i| format!("https://origin-{i}.test"))
+            .collect(),
+    ] {
+        let command = WorkerActionCommand::Checkpoint {
+            origins: origins.clone(),
+        };
+        assert!(command.is_valid());
+        assert_eq!(command.kind(), ActionKind::ReadOnly);
+        assert_eq!(command.required_feature(), Some(BuiltinFeature::Checkpoint));
+        assert!(command.capture_command().is_none());
+        let encoded = serde_json::to_value(&command)?;
+        assert_eq!(
+            encoded,
+            serde_json::json!({"type":"checkpoint","origins":origins})
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkerActionCommand>(encoded)?,
+            command
+        );
+    }
+    for origins in [
+        vec![String::new()],
+        vec!["https://example.test/".to_owned()],
+        vec!["https://example.test/path".to_owned()],
+        vec!["https://example.test?".to_owned()],
+        vec!["https://example.test#".to_owned()],
+        vec!["https://user:pass@example.test".to_owned()],
+        vec!["https://EXAMPLE.test".to_owned()],
+        vec!["https://example.test:443".to_owned()],
+        vec!["file:///tmp/private".to_owned()],
+        vec!["null".to_owned()],
+        vec![" https://example.test".to_owned()],
+        vec!["https://example.test\n".to_owned()],
+        vec![format!("https://{}", "a".repeat(2041))],
+        vec!["https://example.test".to_owned(); 2],
+        (0..17)
+            .map(|i| format!("https://origin-{i}.test"))
+            .collect(),
+    ] {
+        assert!(!WorkerActionCommand::Checkpoint { origins }.is_valid());
+    }
+    for value in [
+        serde_json::json!({"type":"checkpoint","origins":null}),
+        serde_json::json!({"type":"checkpoint","cookies":[]}),
+        serde_json::json!({"type":"checkpoint","local_storage":{}}),
+    ] {
+        assert!(serde_json::from_value::<WorkerActionCommand>(value).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_restore_receipt_is_strict_and_legacy_create_receipts_default_to_none()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut value = serde_json::json!({
+        "operation_id":browserd_core::OperationId::new(),"tenant_id":TenantId::new(),
+        "session_id":SessionId::new(),"session_incarnation":1,"effective_isolation":"shared_context",
+        "primary_page_id":PageId::new(),"worker_epoch":7,"placement_version":3,"existing":false,
+    });
+    let legacy: browserd_worker::WorkerCreateSessionReceipt =
+        serde_json::from_value(value.clone())?;
+    assert!(legacy.restored_checkpoint.is_none());
+    let source = SessionId::new();
+    value["restored_checkpoint"] =
+        serde_json::json!({"checkpoint_ref":"opaque-checkpoint","source_session_id":source});
+    let restored: browserd_worker::WorkerCreateSessionReceipt =
+        serde_json::from_value(value.clone())?;
+    assert_eq!(
+        restored.restored_checkpoint,
+        Some(browserd_worker::WorkerCheckpointRestoreReceipt {
+            checkpoint_ref: "opaque-checkpoint".to_owned(),
+            source_session_id: source,
+        })
+    );
+    value["restored_checkpoint"]["cookies"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<browserd_worker::WorkerCreateSessionReceipt>(value).is_err());
+    Ok(())
+}
+
+#[test]
+fn fill_secret_rpc_carries_only_a_bounded_reference() -> Result<(), Box<dyn std::error::Error>> {
+    for secret_ref in ["credential.login".to_owned(), "s".repeat(1024)] {
+        let command = WorkerActionCommand::FillSecret {
+            node_ref: "0000000000000001".to_owned(),
+            secret_ref: secret_ref.clone(),
+        };
+        assert!(command.is_valid());
+        assert_eq!(command.kind(), ActionKind::Mutating);
+        assert_eq!(command.required_feature(), None);
+        let value = serde_json::to_value(&command)?;
+        assert_eq!(
+            value,
+            serde_json::json!({"type":"fill_secret","node_ref":"0000000000000001","secret_ref":secret_ref})
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkerActionCommand>(value).ok(),
+            Some(command)
+        );
+    }
+    for secret_ref in [
+        "".to_owned(),
+        " secret".to_owned(),
+        "secret ".to_owned(),
+        "\u{a0}secret".to_owned(),
+        "sec\nret".to_owned(),
+        "sec\u{7f}ret".to_owned(),
+        "s".repeat(1025),
+        "한".repeat(342),
+    ] {
+        assert!(
+            !WorkerActionCommand::FillSecret {
+                node_ref: "0000000000000001".to_owned(),
+                secret_ref
+            }
+            .is_valid()
+        );
+    }
+    for node_ref in [
+        "".to_owned(),
+        " node".to_owned(),
+        "node ".to_owned(),
+        "no\nde".to_owned(),
+        "n".repeat(1025),
+    ] {
+        assert!(
+            !WorkerActionCommand::FillSecret {
+                node_ref,
+                secret_ref: "credential.login".to_owned()
+            }
+            .is_valid()
+        );
+    }
+    for field in [
+        "value",
+        "secret_value",
+        "resolved_value",
+        "password",
+        "unexpected",
+    ] {
+        let mut value = serde_json::json!({"type":"fill_secret","node_ref":"0000000000000001","secret_ref":"credential.login"});
+        value[field] = serde_json::json!("synthetic-plaintext-not-a-secret");
+        assert!(serde_json::from_value::<WorkerActionCommand>(value).is_err());
+    }
+    assert!(serde_json::from_value::<WorkerActionCommand>(serde_json::json!({"type":"fill_secret","node_ref":"node","value":"synthetic-plaintext-not-a-secret"})).is_err());
+    Ok(())
+}
+
+#[test]
+fn set_files_is_a_bounded_typed_mutation_without_local_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    for count in [1, 128] {
+        let command = WorkerActionCommand::SetFiles {
+            node_ref: "0000000000000001".to_owned(),
+            artifact_ids: (0..count).map(|_| ArtifactId::new()).collect(),
+        };
+        assert!(command.is_valid());
+        assert_eq!(command.kind(), ActionKind::Mutating);
+        assert_eq!(command.required_feature(), None);
+        let encoded = serde_json::to_value(&command)?;
+        assert_eq!(
+            serde_json::from_value::<WorkerActionCommand>(encoded).ok(),
+            Some(command)
+        );
+    }
+    let id = ArtifactId::new();
+    for (node_ref, artifact_ids) in [
+        ("0000000000000001", Vec::new()),
+        ("0000000000000001", vec![id.clone(), id]),
+        (
+            "0000000000000001",
+            (0..129).map(|_| ArtifactId::new()).collect(),
+        ),
+        ("node\ninvalid", vec![ArtifactId::new()]),
+        ("", vec![ArtifactId::new()]),
+    ] {
+        assert!(
+            !WorkerActionCommand::SetFiles {
+                node_ref: node_ref.to_owned(),
+                artifact_ids
+            }
+            .is_valid()
+        );
+    }
+    for field in ["paths", "files", "local_path", "unexpected"] {
+        let mut encoded = serde_json::json!({"type":"set_files", "node_ref":"0000000000000001", "artifact_ids":[ArtifactId::new()]});
+        encoded[field] = serde_json::json!(["/tmp/file"]);
+        assert!(serde_json::from_value::<WorkerActionCommand>(encoded).is_err());
+    }
+    assert!(serde_json::from_value::<WorkerActionCommand>(serde_json::json!({"type":"set_files", "node_ref":"0000000000000001", "artifact_ids":["/tmp/file"]})).is_err());
+    Ok(())
+}
+
+#[test]
+fn named_upload_rpc_preserves_filename_and_keeps_legacy_store_shape()
+-> Result<(), Box<dyn std::error::Error>> {
+    let named = WorkerRpcRequest::UploadNamedArtifact {
+        fence: fence(),
+        bytes: b"hello".to_vec(),
+        content_type: "text/plain".to_owned(),
+        display_filename: "첨부 문서.txt".to_owned(),
+        now_unix_millis: 10,
+    };
+    assert_eq!(round_trip_request(named.clone()), named);
+    let mut wire = serde_json::to_value(named)?;
+    wire["params"]["local_path"] = serde_json::json!("/tmp/file");
+    assert!(serde_json::from_value::<WorkerRpcRequest>(wire.clone()).is_err());
+    wire["params"]
+        .as_object_mut()
+        .ok_or("params")?
+        .remove("local_path");
+    wire["params"]
+        .as_object_mut()
+        .ok_or("params")?
+        .remove("display_filename");
+    assert!(serde_json::from_value::<WorkerRpcRequest>(wire).is_err());
+    let legacy = WorkerRpcRequest::StoreArtifact {
+        fence: fence(),
+        bytes: vec![1],
+        content_type: "application/octet-stream".to_owned(),
+        now_unix_millis: 10,
+    };
+    assert_eq!(round_trip_request(legacy.clone()), legacy);
+    Ok(())
 }
 
 fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
@@ -38,7 +477,7 @@ fn round_trip_request(request: WorkerRpcRequest) -> WorkerRpcRequest {
 
 #[test]
 fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() {
-    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 22);
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 33);
     let fence = fence();
     let page_id = PageId::new();
     let action_id = ActionId::new();
@@ -161,6 +600,8 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
             11,
             "operator verified no effect",
         )),
+        custody: None,
+        custody_requirement: None,
     };
     let public_action = action.to_action_snapshot();
     assert!(public_action.is_ok());
@@ -183,6 +624,7 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
         source: WorkerArtifactSource::ClientUpload,
         origin: "browserd-worker-upload".to_owned(),
         object_generation: [9; 32],
+        display_filename: None,
     };
     let proposal = WorkerCanonicalActionProposal {
         tenant_id: fence.tenant_id.clone(),
@@ -199,6 +641,7 @@ fn runtime_rpc_contract_carries_tenant_fences_and_complete_resource_snapshots() 
         node_ref: Some("node-opaque".to_owned()),
         credential_refs_hash: [3; 32],
         expires_at_unix_millis: 20,
+        typed_binding: None,
     };
     let canonical = proposal.to_canonical();
     assert!(canonical.is_ok());
@@ -265,6 +708,8 @@ fn action_receipt_rejects_results_and_dispatch_acknowledgements_that_contradict_
         terminal_detail: None,
         result: None,
         resolution: None,
+        custody: None,
+        custody_requirement: None,
     };
     assert!(base.to_action_snapshot().is_ok());
 
@@ -478,6 +923,7 @@ fn raw_input_commands_are_bounded_typed_mutations() {
 fn query_all_is_a_bounded_read_only_selector() {
     let query = WorkerActionCommand::QueryAll {
         selector: "a.link".to_owned(),
+        frame_path: Vec::new(),
     };
     assert_eq!(
         serde_json::to_value(&query).ok(),
@@ -488,14 +934,16 @@ fn query_all_is_a_bounded_read_only_selector() {
 
     assert!(
         !WorkerActionCommand::QueryAll {
-            selector: String::new()
+            selector: String::new(),
+            frame_path: Vec::new(),
         }
         .is_valid(),
         "an empty selector is out of bounds"
     );
     assert!(
         !WorkerActionCommand::QueryAll {
-            selector: "a\nb".to_owned()
+            selector: "a\nb".to_owned(),
+            frame_path: Vec::new(),
         }
         .is_valid(),
         "a control character in a selector is out of bounds"
@@ -881,4 +1329,193 @@ fn session_option_support_flags_the_first_unsupported_option() {
         support.unsupported_option(&with_checkpoint),
         Some("checkpoint_ref")
     );
+}
+
+#[test]
+fn capture_commands_require_their_registered_feature() -> Result<(), serde_json::Error> {
+    use browserd_features::BuiltinFeature;
+    use browserd_worker::WorkerActionCommand;
+    for (kind, feature) in [
+        ("screenshot", BuiltinFeature::Screenshot),
+        ("pdf", BuiltinFeature::Pdf),
+        ("scrape", BuiltinFeature::Scrape),
+    ] {
+        let command: WorkerActionCommand =
+            serde_json::from_value(serde_json::json!({"type":kind}))?;
+        assert_eq!(command.required_feature(), Some(feature));
+    }
+    Ok(())
+}
+
+#[allow(clippy::unwrap_used)]
+fn typed_approval_receipt() -> WorkerApprovalReceipt {
+    use browserd_policy::{
+        ApprovalActionKind, ApprovalContextScope, ApprovalNodeBinding, ApprovalWorkerFence,
+        CredentialRefsHash, TypedActionPayload, TypedActionProposalBinding,
+    };
+    let fence = WorkerSessionFence {
+        tenant_id: TenantId::new(),
+        session_id: SessionId::new(),
+        worker_epoch: 7,
+        placement_version: 3,
+        session_incarnation: 5,
+    };
+    let action_id = ActionId::new();
+    let proposal = WorkerCanonicalActionProposal {
+        tenant_id: fence.tenant_id.clone(),
+        requester_principal_id: PrincipalId::new(),
+        session_id: fence.session_id.clone(),
+        session_incarnation: 5,
+        page_id: PageId::new(),
+        target_incarnation: 9,
+        frame_document_epoch: 11,
+        current_origin: "https://example.test".to_owned(),
+        url_revision: 13,
+        action_type: WorkerApprovalActionType::Click,
+        canonical_arguments_hash: [2; 32],
+        node_ref: Some("opaque-node".to_owned()),
+        credential_refs_hash: *CredentialRefsHash::digest([]).as_bytes(),
+        expires_at_unix_millis: 1000,
+        typed_binding: Some(Box::new(TypedActionProposalBinding {
+            schema_version: 2,
+            action_id: action_id.clone(),
+            sequence: 1,
+            fence: ApprovalWorkerFence {
+                worker_id: WorkerId::new("approval-worker").unwrap(),
+                worker_epoch: 7,
+                placement_version: 3,
+                session_incarnation: 5,
+            },
+            policy_digest: [4; 32],
+            target_binding_sha256: [5; 32],
+            context_scope: ApprovalContextScope::HttpOrigin {
+                origin: "https://example.test".to_owned(),
+            },
+            payload: TypedActionPayload::Browser {
+                action: ApprovalActionKind::Click,
+                arguments_sha256: [2; 32],
+                node: Some(ApprovalNodeBinding {
+                    node_ref: "opaque-node".to_owned(),
+                    binding_sha256: [6; 32],
+                    role: None,
+                    name: None,
+                }),
+                navigation_destination: None,
+            },
+        })),
+    };
+    WorkerApprovalReceipt {
+        fence,
+        approval_id: ApprovalId::new(),
+        action_id,
+        state: WorkerApprovalState::Pending,
+        proposal_hash: *proposal.to_canonical().unwrap().hash().as_bytes(),
+        proposal,
+    }
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn typed_approval_wire_binds_action_full_numeric_fence_policy_and_payload() {
+    let valid = typed_approval_receipt();
+    assert_eq!(WORKER_RPC_PROTOCOL_VERSION, 33);
+    assert_eq!(valid.canonical_proposal().unwrap().schema_version(), 2);
+    let encoded = serde_json::to_value(&valid).unwrap();
+    assert_eq!(
+        serde_json::from_value::<WorkerApprovalReceipt>(encoded.clone()).unwrap(),
+        valid
+    );
+    for field in [
+        "action_id",
+        "worker_epoch",
+        "placement_version",
+        "session_incarnation",
+    ] {
+        let mut changed = valid.clone();
+        match field {
+            "action_id" => changed.action_id = ActionId::new(),
+            "worker_epoch" => changed.fence.worker_epoch += 1,
+            "placement_version" => changed.fence.placement_version += 1,
+            _ => changed.fence.session_incarnation += 1,
+        }
+        assert!(changed.canonical_proposal().is_err(), "{field}");
+    }
+    for field in [
+        "policy_digest",
+        "target_binding_sha256",
+        "sequence",
+        "arguments_sha256",
+    ] {
+        let mut changed = valid.clone();
+        let binding = changed.proposal.typed_binding.as_mut().unwrap();
+        match field {
+            "policy_digest" => binding.policy_digest = [0; 32],
+            "target_binding_sha256" => binding.target_binding_sha256 = [0; 32],
+            "sequence" => binding.sequence = 0,
+            _ => {
+                if let browserd_policy::TypedActionPayload::Browser {
+                    arguments_sha256, ..
+                } = &mut binding.payload
+                {
+                    *arguments_sha256 = [99; 32];
+                }
+            }
+        }
+        assert!(changed.proposal.to_canonical().is_err(), "{field}");
+    }
+    let mut unknown = encoded.clone();
+    unknown["proposal"]["typed_binding"]["payload"]["script"] =
+        serde_json::json!("do_not_accept()");
+    assert!(serde_json::from_value::<WorkerApprovalReceipt>(unknown).is_err());
+    let mut null_binding = encoded;
+    null_binding["proposal"]["typed_binding"] = serde_json::Value::Null;
+    assert!(serde_json::from_value::<WorkerApprovalReceipt>(null_binding).is_err());
+
+    let mut legacy = valid.proposal;
+    legacy.typed_binding = None;
+    let encoded = serde_json::to_value(&legacy).unwrap();
+    assert!(encoded.get("typed_binding").is_none());
+    assert_eq!(
+        serde_json::from_value::<WorkerCanonicalActionProposal>(encoded).unwrap(),
+        legacy
+    );
+    assert_eq!(legacy.to_canonical().unwrap().schema_version(), 1);
+}
+
+#[test]
+#[allow(clippy::unwrap_used)]
+fn non_http_approval_scopes_require_valid_typed_payloads() {
+    use browserd_policy::{ApprovalActionKind, ApprovalContextScope, TypedActionPayload};
+    let mut checkpoint = typed_approval_receipt().proposal;
+    checkpoint.current_origin = "browserd:context".to_owned();
+    checkpoint.node_ref = None;
+    checkpoint.action_type = WorkerApprovalActionType::Custom("browser:checkpoint".to_owned());
+    let binding = checkpoint.typed_binding.as_mut().unwrap();
+    binding.context_scope = ApprovalContextScope::BrowserContext;
+    binding.payload = TypedActionPayload::Checkpoint {
+        origins: vec!["https://example.test".to_owned()],
+        build_identity_sha256: [8; 32],
+    };
+    assert!(checkpoint.to_canonical().is_ok());
+    let mut legacy = checkpoint.clone();
+    legacy.typed_binding = None;
+    assert!(legacy.to_canonical().is_err());
+    checkpoint.typed_binding.as_mut().unwrap().context_scope = ApprovalContextScope::OpaqueDocument;
+    assert!(checkpoint.to_canonical().is_err());
+
+    let mut opaque = typed_approval_receipt().proposal;
+    opaque.current_origin = "null".to_owned();
+    opaque.node_ref = None;
+    opaque.action_type = WorkerApprovalActionType::Navigate;
+    let binding = opaque.typed_binding.as_mut().unwrap();
+    binding.context_scope = ApprovalContextScope::OpaqueDocument;
+    binding.payload = TypedActionPayload::Browser {
+        action: ApprovalActionKind::Navigate,
+        arguments_sha256: [2; 32],
+        node: None,
+        navigation_destination: Some("https://example.test/".to_owned()),
+    };
+    assert!(opaque.to_canonical().is_ok());
+    opaque.typed_binding = None;
+    assert!(opaque.to_canonical().is_err());
 }

@@ -90,6 +90,23 @@ impl RouteIngressListener {
             accepted_at,
         })
     }
+
+    pub(crate) async fn accept_current(&self) -> Result<AcceptedRouteIngress, RouteIngressError> {
+        let (stream, _) = self
+            .listener
+            .accept()
+            .await
+            .map_err(RouteIngressError::Io)?;
+        let (guard, accepted_at) = self
+            .registry
+            .begin_live_ingress(&self.claim)
+            .map_err(RouteIngressError::Route)?;
+        Ok(AcceptedRouteIngress {
+            stream,
+            guard,
+            accepted_at,
+        })
+    }
 }
 
 #[derive(Debug)]

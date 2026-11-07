@@ -809,3 +809,79 @@ async fn retention_is_at_least_24_hours_and_only_terminal_rows_are_purged() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn only_exact_dispatch_owner_can_defer_unexposed_create_and_reacquire() {
+    let store = MemoryCreateSessionStore::default();
+    let tenant = TenantId::new();
+    let (creating, token) = advance_to_creating(&store, tenant.clone(), "fleet-defer").await;
+    for mutation in [
+        OperationMutation::transition(CreateOperationState::Queued),
+        OperationMutation::defer_with_lease(DispatchLeaseToken::new()),
+    ] {
+        assert!(
+            store
+                .compare_and_set(
+                    &tenant,
+                    creating.operation_id(),
+                    creating.revision(),
+                    creating.state(),
+                    mutation,
+                    at(2)
+                )
+                .await
+                .is_err()
+        );
+    }
+    let queued = store
+        .compare_and_set(
+            &tenant,
+            creating.operation_id(),
+            creating.revision(),
+            creating.state(),
+            OperationMutation::defer_with_lease(token.clone()),
+            at(2),
+        )
+        .await
+        .expect("exact defer");
+    assert_eq!(queued.state(), CreateOperationState::Queued);
+    assert!(queued.dispatch_lease().is_none());
+    assert_eq!(queued.intent(), creating.intent());
+    assert_eq!(queued.request_hash(), creating.request_hash());
+    let reserving = store
+        .compare_and_set(
+            &tenant,
+            queued.operation_id(),
+            queued.revision(),
+            queued.state(),
+            OperationMutation::transition(CreateOperationState::Reserving),
+            at(2),
+        )
+        .await
+        .expect("reserve again");
+    let fresh = store
+        .acquire_dispatch_lease(
+            &tenant,
+            reserving.operation_id(),
+            reserving.revision(),
+            DispatchLeaseToken::new(),
+            std::time::Duration::from_secs(30),
+            at(2),
+        )
+        .await
+        .expect("new exact lease");
+    assert!(fresh.dispatch_generation() > creating.dispatch_generation());
+    assert!(matches!(
+        store
+            .compare_and_set(
+                &tenant,
+                fresh.operation_id(),
+                fresh.revision(),
+                fresh.state(),
+                OperationMutation::defer_with_lease(token),
+                at(2)
+            )
+            .await,
+        Err(CoordinationError::DispatchLeaseMismatch)
+    ));
+}

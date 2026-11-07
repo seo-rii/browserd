@@ -8,7 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use browserd_actions::{
-    ActionJournalLimits, ActionKind, ActionLedger, FileActionJournal, LedgerSession,
+    ActionJournalLimits, ActionKind, ActionLedger, FileActionJournal, KnownFailureReason,
+    LedgerSession, TerminalDetail,
 };
 use browserd_core::{
     ActionId, ActionState, IsolationProfile, PageId, PrincipalId, SessionId, TenantId, WorkerId,
@@ -30,6 +31,8 @@ use sha2::{Digest, Sha256};
 #[derive(Default)]
 struct Driver {
     executions: AtomicUsize,
+    approval_inspections: AtomicUsize,
+    authorization_attempts: AtomicUsize,
     cancellation_attempts: AtomicUsize,
     approved_effect_occurred: AtomicBool,
     skip_authorization_callback: AtomicBool,
@@ -46,6 +49,7 @@ struct Driver {
     page_create_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     page_activation_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
     page_close_barriers: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
+    close_context_started: Mutex<Option<mpsc::Sender<()>>>,
     approved_effect_gate: Mutex<()>,
 }
 
@@ -59,6 +63,14 @@ impl ChromiumDriver for Driver {
     }
 
     fn close_context(&self, _session_id: &SessionId) -> Result<(), DependencyError> {
+        if let Some(started) = self
+            .close_context_started
+            .lock()
+            .map_err(|_| DependencyError::Unavailable)?
+            .take()
+        {
+            started.send(()).map_err(|_| DependencyError::Unavailable)?;
+        }
         let _gate = self
             .approved_effect_gate
             .lock()
@@ -133,6 +145,7 @@ impl ChromiumDriver for Driver {
         _page_id: &PageId,
         _proposal: &CanonicalActionProposal,
     ) -> Result<LiveApprovalContext, DependencyError> {
+        self.approval_inspections.fetch_add(1, Ordering::AcqRel);
         let barriers = self
             .inspection_barriers
             .lock()
@@ -205,6 +218,7 @@ impl ChromiumDriver for Driver {
             self.approved_effect_occurred.store(true, Ordering::Release);
             return Ok(self.execute_action(session_id, Some(page_id), payload));
         }
+        self.authorization_attempts.fetch_add(1, Ordering::AcqRel);
         if let Err(error) = authorize_and_commit(observed)
             && !self
                 .ignore_authorization_error
@@ -216,6 +230,7 @@ impl ChromiumDriver for Driver {
             .invoke_authorization_callback_twice
             .swap(false, Ordering::AcqRel)
         {
+            self.authorization_attempts.fetch_add(1, Ordering::AcqRel);
             authorize_and_commit(observed)?;
         }
         let barriers = self
@@ -561,6 +576,132 @@ fn proposal_requester_must_match_the_trusted_requester_before_any_durable_mutati
             .action_sequence
             .get(),
         1
+    );
+}
+
+#[test]
+fn manually_approved_fill_secret_is_rejected_before_token_consumption_or_browser_dispatch() {
+    let fixture = Fixture::new();
+    let payload =
+        br#"{"type":"fill_secret","node_ref":"credential-node","secret_ref":"login-password"}"#;
+    let action_type = ActionType::Custom("browser:fill_secret".to_owned());
+    let proposal = fixture
+        .proposal(payload)
+        .with_action_type(action_type.clone())
+        .with_credential_refs_hash(CredentialRefsHash::digest(["login-password"]));
+    fixture
+        .driver
+        .live_context
+        .lock()
+        .expect("live context lock should work")
+        .as_mut()
+        .expect("live context should exist")
+        .credential_refs = vec!["login-password".to_owned()];
+    let action_id = fixture
+        .worker
+        .submit_action(
+            &fixture.peer,
+            fixture.requester.clone(),
+            &fixture.session_id,
+            &fixture.fence,
+            "approved-secret",
+            [7; 32],
+            ActionKind::Mutating,
+            None,
+            Some(fixture.page_id.clone()),
+            payload.to_vec(),
+            Some(ActionApprovalRequirement::new(proposal, action_type, true)),
+            SessionTime::new(1),
+        )
+        .expect("secret action with manual approval should be accepted");
+    let approval_id = fixture
+        .worker
+        .approval_for_action(
+            &fixture.peer,
+            &fixture.session_id,
+            &action_id,
+            &fixture.fence,
+        )
+        .expect("approval should exist");
+    let approved = fixture
+        .worker
+        .decide_approval(
+            &fixture.peer,
+            &fixture.session_id,
+            &approval_id,
+            &fixture.fence,
+            ApprovalDecision::Approve,
+            PrincipalId::new(),
+            SessionTime::new(2),
+        )
+        .expect("manual approval should be recorded");
+
+    let completed = fixture
+        .worker
+        .run_next_action(
+            &fixture.peer,
+            &fixture.session_id,
+            &fixture.fence,
+            SessionTime::new(3),
+        )
+        .expect("unsupported secret approval should terminalize cleanly")
+        .expect("queued secret action should be processed");
+    assert_eq!(completed.status, browserd_worker::ActionStatus::FailedKnown);
+    assert_eq!(completed.result, None);
+    let durable = fixture
+        .worker
+        .get_action(
+            &fixture.peer,
+            &fixture.session_id,
+            &action_id,
+            &fixture.fence,
+        )
+        .expect("terminal secret action should remain queryable");
+    assert_eq!(
+        durable.terminal_detail,
+        Some(TerminalDetail::FailedKnown(
+            KnownFailureReason::NotDispatched
+        ))
+    );
+    assert_eq!(
+        fixture
+            .worker
+            .get_approval(
+                &fixture.peer,
+                &fixture.session_id,
+                &approval_id,
+                &fixture.fence,
+            )
+            .expect("rejection should preserve the recorded approval"),
+        approved
+    );
+    assert_eq!(
+        fixture.worker.run_next_action(
+            &fixture.peer,
+            &fixture.session_id,
+            &fixture.fence,
+            SessionTime::new(4),
+        ),
+        Ok(None)
+    );
+    assert_eq!(
+        fixture.driver.approval_inspections.load(Ordering::Acquire),
+        0
+    );
+    // The callback is the only approval-token consumption boundary in this driver.
+    assert_eq!(
+        fixture
+            .driver
+            .authorization_attempts
+            .load(Ordering::Acquire),
+        0
+    );
+    assert_eq!(fixture.driver.executions.load(Ordering::Acquire), 0);
+    assert!(
+        !fixture
+            .driver
+            .approved_effect_occurred
+            .load(Ordering::Acquire)
     );
 }
 
@@ -2722,6 +2863,12 @@ fn close_waiting_on_an_admitted_effect_does_not_block_action_queries() {
     });
     started.wait();
 
+    let (close_started_tx, close_started_rx) = mpsc::channel();
+    *fixture
+        .driver
+        .close_context_started
+        .lock()
+        .expect("close-context signal lock should work") = Some(close_started_tx);
     let (closed_tx, closed_rx) = mpsc::channel();
     let worker = Arc::clone(&fixture.worker);
     let peer = fixture.peer.clone();
@@ -2732,8 +2879,11 @@ fn close_waiting_on_an_admitted_effect_does_not_block_action_queries() {
             .send(worker.close_session(&peer, &session_id, &fence, SessionTime::new(4)))
             .expect("test receiver remains");
     });
+    close_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close should reach the driver while the admitted effect remains blocked");
     assert!(
-        closed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        matches!(closed_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
         "close should wait for the admitted effect gate"
     );
     let (queried_tx, queried_rx) = mpsc::channel();
@@ -2747,7 +2897,9 @@ fn close_waiting_on_an_admitted_effect_does_not_block_action_queries() {
             .send(worker.get_action(&peer, &session_id, &query_action_id, &fence))
             .expect("test receiver remains");
     });
-    let query_while_effect_blocked = queried_rx.recv_timeout(Duration::from_millis(50)).ok();
+    // This bound detects a held state mutex; it is not a query latency contract.
+    // The driver entry signal above establishes that cleanup is actually waiting.
+    let query_while_effect_blocked = queried_rx.recv_timeout(Duration::from_secs(1)).ok();
     let query_completed_while_effect_blocked = query_while_effect_blocked.is_some();
     release.wait();
 
@@ -2843,6 +2995,12 @@ fn expiry_waiting_on_an_admitted_effect_does_not_block_action_queries() {
             .expect("lease should be renewed beyond the absolute session deadline");
     }
 
+    let (close_started_tx, close_started_rx) = mpsc::channel();
+    *fixture
+        .driver
+        .close_context_started
+        .lock()
+        .expect("close-context signal lock should work") = Some(close_started_tx);
     let (expired_tx, expired_rx) = mpsc::channel();
     let worker = Arc::clone(&fixture.worker);
     let peer = fixture.peer.clone();
@@ -2851,8 +3009,11 @@ fn expiry_waiting_on_an_admitted_effect_does_not_block_action_queries() {
             .send(worker.expire_due(&peer, SessionTime::new(60_001)))
             .expect("test receiver remains");
     });
+    close_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("expiry should reach the driver while the admitted effect remains blocked");
     assert!(
-        expired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        matches!(expired_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
         "expiry cleanup should wait for the admitted effect gate"
     );
     let (queried_tx, queried_rx) = mpsc::channel();
@@ -2866,7 +3027,9 @@ fn expiry_waiting_on_an_admitted_effect_does_not_block_action_queries() {
             .send(worker.get_action(&peer, &session_id, &query_action_id, &fence))
             .expect("test receiver remains");
     });
-    let query_while_effect_blocked = queried_rx.recv_timeout(Duration::from_millis(50)).ok();
+    // This bound detects a held state mutex; it is not a query latency contract.
+    // The driver entry signal above establishes that cleanup is actually waiting.
+    let query_while_effect_blocked = queried_rx.recv_timeout(Duration::from_secs(1)).ok();
     let query_completed_while_effect_blocked = query_while_effect_blocked.is_some();
     release.wait();
 

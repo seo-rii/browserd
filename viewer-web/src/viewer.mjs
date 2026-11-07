@@ -51,6 +51,11 @@ export class BrowserViewer {
   #control = null;
   #inputSequence = 0;
   #latestTransformEpoch = -1n;
+  #setInterval;
+  #clearInterval;
+  #heartbeat = null;
+  #compositionActive = false;
+  #committedText = null;
 
   constructor({
     sessionId,
@@ -61,6 +66,8 @@ export class BrowserViewer {
     onFrame = () => {},
     onState = () => {},
     frameLimits = {},
+    setIntervalImpl = globalThis.setInterval,
+    clearIntervalImpl = globalThis.clearInterval,
   }) {
     if (typeof fetchTicket !== "function") {
       throw new ViewerError("fetchTicket must be a function");
@@ -79,6 +86,8 @@ export class BrowserViewer {
     this.#onFrame = onFrame;
     this.#onState = onState;
     this.#frameLimits = frameLimits;
+    this.#setInterval = setIntervalImpl;
+    this.#clearInterval = clearIntervalImpl;
   }
 
   get state() {
@@ -96,6 +105,7 @@ export class BrowserViewer {
       throw new ViewerError("viewer is already connecting or connected");
     }
     this.#setPhase("ticketing");
+    this.#latestTransformEpoch = -1n;
 
     let ticketResponse;
     try {
@@ -122,13 +132,26 @@ export class BrowserViewer {
     this.#setPhase("connecting");
 
     socket.onopen = () => {
+      if (this.#socket !== socket) return;
       this.#setPhase("connected");
+      this.#heartbeat = this.#setInterval(() => {
+        if (this.#socket === socket && socket.readyState === 1) this.ping();
+      }, 5000);
     };
-    socket.onmessage = (event) => this.#receive(event.data);
-    socket.onerror = () => this.#setPhase("error");
+    socket.onmessage = (event) => {
+      if (this.#socket === socket) this.#receive(event.data);
+    };
+    socket.onerror = () => {
+      if (this.#socket === socket) this.#setPhase("error");
+    };
     socket.onclose = () => {
+      if (this.#socket !== socket) return;
+      if (this.#heartbeat !== null) this.#clearInterval(this.#heartbeat);
+      this.#heartbeat = null;
       this.#control = null;
       this.#inputSequence = 0;
+      this.#compositionActive = false;
+      this.#committedText = null;
       this.#socket = null;
       this.#setPhase("disconnected");
     };
@@ -184,6 +207,8 @@ export class BrowserViewer {
 
   compositionStart() {
     this.sendInput("composition_start");
+    this.#compositionActive = true;
+    this.#committedText = null;
   }
 
   compositionUpdate(text) {
@@ -192,10 +217,30 @@ export class BrowserViewer {
 
   compositionCommit(text) {
     this.sendInput("composition_commit", { text: String(text) });
+    this.#compositionActive = false;
+    const committed = { text: String(text) };
+    this.#committedText = committed;
+    // Some browser event sequences follow compositionend with an insertText beforeinput.
+    // Suppress only that same-turn echo, never a later intentional insertion of equal text.
+    queueMicrotask(() => {
+      if (this.#committedText === committed) this.#committedText = null;
+    });
   }
 
   compositionCancel() {
     this.sendInput("composition_cancel");
+    this.#compositionActive = false;
+    this.#committedText = null;
+  }
+
+  beforeInput({ data, isComposing, inputType }) {
+    if (!data || isComposing || this.#compositionActive ||
+      inputType === "insertCompositionText" || inputType === "insertFromComposition") return;
+    if (this.#committedText?.text === String(data)) {
+      this.#committedText = null;
+      return;
+    }
+    this.sendInput("insert_text", { text: String(data) });
   }
 
   #receive(data) {
@@ -246,15 +291,22 @@ export class BrowserViewer {
         this.#socket?.close(1002, "invalid control lease");
         return;
       }
+      const sameLease = this.#control?.leaseEpoch === message.lease_epoch;
       this.#control = {
         leaseEpoch: message.lease_epoch,
         pageId: message.page_id,
         frameTransformId: message.frame_transform_id,
       };
-      this.#inputSequence = 0;
+      if (!sameLease) {
+        this.#inputSequence = 0;
+        this.#compositionActive = false;
+        this.#committedText = null;
+      }
     } else {
       this.#control = null;
       this.#inputSequence = 0;
+      this.#compositionActive = false;
+      this.#committedText = null;
     }
     this.#onState(this.state);
   }

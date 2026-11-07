@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -26,7 +26,8 @@ use browserd_auth::{
 use browserd_coordination::{
     ClaimGatewayAction, CoordinationActorConfig, GatewayActionClaimOutcome,
     GatewayActionCoordination, GatewayActionCoordinationError, GatewayActionPlacement,
-    GatewayActionSnapshot, SessionLossClaim, SessionLossOutcome,
+    GatewayActionSnapshot, MemoryGatewayActionStore, SessionLossClaim, SessionLossOutcome,
+    SessionLossReceipt,
 };
 use browserd_core::{
     ActionId, ErrorCode, PageId, PrincipalId, SessionId, SessionLifecycle, TenantId, WorkerId,
@@ -34,7 +35,7 @@ use browserd_core::{
 use browserd_worker::{
     WorkerCreateSessionReceipt, WorkerCreateSessionRequest, WorkerIsolationProfile,
     WorkerRpcCompletionError, WorkerRpcEnqueueError, WorkerRpcError, WorkerRpcRequest,
-    WorkerRpcResponse, WorkerSessionLifecycle, WorkerSessionReceipt,
+    WorkerRpcResponse, WorkerSessionLifecycle, WorkerSessionOwnershipReceipt, WorkerSessionReceipt,
 };
 use chrono::{DateTime, Utc};
 use jsonwebtoken::Algorithm;
@@ -98,6 +99,7 @@ struct BlockingCloseWorker {
     close_entered: mpsc::Sender<()>,
     close_gate: Arc<ReleaseGate>,
     enqueue_calls: AtomicUsize,
+    closed: AtomicBool,
 }
 
 impl GatewayWorkerClient for BlockingCloseWorker {
@@ -120,20 +122,43 @@ impl GatewayWorkerClient for BlockingCloseWorker {
             worker_epoch: request.expected_worker_epoch,
             placement_version: request.placement_version,
             existing: false,
+            restored_checkpoint: None,
         })
     }
 
     fn request(&self, request: WorkerRpcRequest) -> Result<WorkerRpcResponse, WorkerRpcError> {
-        let WorkerRpcRequest::CloseSession { fence, .. } = request else {
-            return Err(WorkerRpcError::InvalidRequest);
+        let (fence, inspected_worker) = match request {
+            WorkerRpcRequest::CloseSession { fence, .. } => (fence, None),
+            WorkerRpcRequest::InspectSession {
+                expected_worker_id,
+                fence,
+            } => (fence, Some(expected_worker_id)),
+            _ => return Err(WorkerRpcError::InvalidRequest),
         };
         if fence.tenant_id != self.tenant_id || fence.session_id != self.session_id {
             return Err(WorkerRpcError::Protocol);
+        }
+        if let Some(worker_id) = inspected_worker {
+            return Ok(WorkerRpcResponse::SessionOwnership(
+                WorkerSessionOwnershipReceipt {
+                    worker_id,
+                    session: WorkerSessionReceipt {
+                        fence,
+                        lifecycle: if self.closed.load(Ordering::Acquire) {
+                            WorkerSessionLifecycle::Closed
+                        } else {
+                            WorkerSessionLifecycle::Ready
+                        },
+                        primary_page_id: self.page_id.clone(),
+                    },
+                },
+            ));
         }
         self.close_entered
             .send(())
             .map_err(|_| WorkerRpcError::Runtime)?;
         self.close_gate.wait()?;
+        self.closed.store(true, Ordering::Release);
         Ok(WorkerRpcResponse::SessionClosed(WorkerSessionReceipt {
             fence,
             lifecycle: WorkerSessionLifecycle::Closed,
@@ -153,6 +178,7 @@ impl GatewayWorkerClient for BlockingCloseWorker {
 #[derive(Default)]
 struct ClaimProbeStore {
     claim_calls: AtomicUsize,
+    losses: MemoryGatewayActionStore,
 }
 
 impl ClaimProbeStore {
@@ -279,19 +305,29 @@ impl GatewayActionCoordination for ClaimProbeStore {
 
     async fn mark_session_lost(
         &self,
-        _claim: &SessionLossClaim,
-        _now: DateTime<Utc>,
+        claim: &SessionLossClaim,
+        now: DateTime<Utc>,
     ) -> Result<SessionLossOutcome, GatewayActionCoordinationError> {
-        self.reject()
+        self.losses.mark_session_lost(claim, now).await
+    }
+
+    async fn ensure_session_lost(
+        &self,
+        proposed: &SessionLossClaim,
+        now: DateTime<Utc>,
+    ) -> Result<SessionLossReceipt, GatewayActionCoordinationError> {
+        self.losses.ensure_session_lost(proposed, now).await
     }
 
     async fn materialize_session_loss(
         &self,
-        _claim: &SessionLossClaim,
-        _limit: usize,
-        _now: DateTime<Utc>,
+        claim: &SessionLossClaim,
+        limit: usize,
+        now: DateTime<Utc>,
     ) -> Result<usize, GatewayActionCoordinationError> {
-        self.reject()
+        self.losses
+            .materialize_session_loss(claim, limit, now)
+            .await
     }
 }
 
@@ -336,6 +372,7 @@ fn close_linearizes_before_action_claim_and_worker_enqueue() -> Result<(), Box<d
         close_entered: close_entered_sender,
         close_gate: Arc::clone(&close_gate),
         enqueue_calls: AtomicUsize::new(0),
+        closed: AtomicBool::new(false),
     });
     let action_store = Arc::new(ClaimProbeStore::default());
     let placement = GatewayWorkerPlacement::new(WorkerId::new("closing-race-worker")?, 41, 7, 29)?;

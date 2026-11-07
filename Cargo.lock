@@ -241,12 +241,14 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "browserd-coordination",
  "browserd-core",
  "browserd-egress",
  "browserd-egress-control",
  "hex",
  "nix",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "subtle",
  "tokio",
@@ -261,25 +263,38 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
+ "browser-worker",
  "browserd-actions",
  "browserd-api",
  "browserd-artifacts",
  "browserd-auth",
  "browserd-coordination",
  "browserd-core",
+ "browserd-egress",
  "browserd-http",
+ "browserd-observability",
  "browserd-operations",
  "browserd-policy",
+ "browserd-sandbox",
+ "browserd-session",
  "browserd-viewer",
  "browserd-worker",
  "chrono",
  "hex",
+ "hmac 0.12.1",
  "jsonwebtoken",
+ "nix",
+ "reqwest",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -290,6 +305,7 @@ dependencies = [
  "async-trait",
  "axum",
  "browser-egressd",
+ "browserd-chromium",
  "browserd-core",
  "browserd-egress-control",
  "browserd-sandbox",
@@ -313,20 +329,34 @@ name = "browser-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
+ "browser-sandboxd",
+ "browserd-artifacts",
  "browserd-cdp",
  "browserd-chromium",
+ "browserd-coordination",
  "browserd-core",
+ "browserd-egress",
+ "browserd-features",
+ "browserd-observability",
  "browserd-policy",
  "browserd-sandbox",
  "browserd-session",
+ "browserd-viewer",
  "browserd-worker",
+ "bytes",
+ "chrono",
  "hex",
  "nix",
+ "reqwest",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-util",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -375,6 +405,7 @@ dependencies = [
  "browserd-auth",
  "browserd-coordination",
  "browserd-core",
+ "browserd-features",
  "browserd-operations",
  "browserd-policy",
  "browserd-session",
@@ -386,6 +417,7 @@ dependencies = [
  "sha2 0.10.9",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -395,6 +427,7 @@ dependencies = [
  "browserd-core",
  "bytes",
  "chrono",
+ "nix",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
@@ -423,6 +456,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "zeroize",
 ]
 
 [[package]]
@@ -451,6 +485,7 @@ dependencies = [
  "browserd-core",
  "chrono",
  "hex",
+ "nix",
  "redis",
  "serde",
  "serde_json",
@@ -458,6 +493,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "url",
  "uuid",
 ]
 
@@ -467,6 +503,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tokio-util",
  "uuid",
 ]
 
@@ -476,6 +514,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "browserd-core",
+ "browserd-local-ipc",
  "nix",
  "tokio",
  "tokio-util",
@@ -498,12 +537,16 @@ dependencies = [
 [[package]]
 name = "browserd-features"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "browserd-fleet"
 version = "0.1.0"
 dependencies = [
  "browserd-core",
+ "serde",
 ]
 
 [[package]]
@@ -517,6 +560,7 @@ dependencies = [
  "browserd-api",
  "browserd-artifacts",
  "browserd-auth",
+ "browserd-coordination",
  "browserd-core",
  "browserd-policy",
  "browserd-session",
@@ -539,6 +583,8 @@ dependencies = [
 name = "browserd-launch-gate"
 version = "0.1.0"
 dependencies = [
+ "nix",
+ "serde_json",
  "tempfile",
 ]
 
@@ -577,8 +623,13 @@ name = "browserd-policy"
 version = "0.1.0"
 dependencies = [
  "browserd-core",
+ "nix",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -620,6 +671,7 @@ name = "browserd-viewer"
 version = "0.1.0"
 dependencies = [
  "browserd-core",
+ "serde",
 ]
 
 [[package]]
@@ -627,6 +679,7 @@ name = "browserd-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "browserd-actions",
  "browserd-artifacts",
  "browserd-cdp",
@@ -634,6 +687,7 @@ dependencies = [
  "browserd-core",
  "browserd-features",
  "browserd-fleet",
+ "browserd-observability",
  "browserd-operations",
  "browserd-policy",
  "browserd-sandbox",
@@ -641,7 +695,9 @@ dependencies = [
  "browserd-targets",
  "browserd-viewer",
  "futures",
+ "hex",
  "nix",
+ "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -649,7 +705,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

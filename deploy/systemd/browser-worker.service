@@ -1,0 +1,23 @@
+[Unit]
+Description=browserd dedicated-process worker (one worker)
+Requires=browser-sandboxd.service
+BindsTo=browser-sandboxd.service
+After=browser-sandboxd.service
+
+[Service]
+Type=exec
+User=browserd
+Group=browserd
+EnvironmentFile=/etc/browserd/browserd.env
+ExecStart=/usr/bin/env ${BROWSERD_RELEASE_ROOT}/bin/browser-worker
+ExecStartPost=/usr/bin/python3 ${BROWSERD_RELEASE_ROOT}/deploy/wait_ready.py worker
+StateDirectory=browserd/worker browserd/worker/actions browserd/worker/artifacts
+StateDirectoryMode=0700
+UMask=0077
+Restart=no
+TimeoutStartSec=120
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,259 @@
+{
+  "schema_version": 1,
+  "ids": {
+    "session": "019a1000-0000-7000-8000-000000000001",
+    "operation": "019a1000-0000-7000-8000-000000000002",
+    "action": "019a1000-0000-7000-8000-000000000003",
+    "event": "019a1000-0000-7000-8000-000000000004",
+    "page": "719a1000-0000-4000-8000-000000000005",
+    "trace": "019a1000-0000-7000-8000-000000000006"
+  },
+  "responses": {
+    "operation_succeeded": {
+      "data": {
+        "operation": {
+          "id": "019a1000-0000-7000-8000-000000000002",
+          "state": "succeeded",
+          "poll_url": "/v1/operations/019a1000-0000-7000-8000-000000000002",
+          "session": {
+            "id": "019a1000-0000-7000-8000-000000000001",
+            "state": "ready",
+            "lifecycle": "ready",
+            "incarnation": 3,
+            "requested_isolation": "shared_context",
+            "effective_isolation": "dedicated_process",
+            "metadata": {
+              "run": "contract"
+            }
+          },
+          "failure": null
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "operation_queued": {
+      "data": {
+        "operation": {
+          "id": "019a1000-0000-7000-8000-000000000002",
+          "state": "queued",
+          "poll_url": "/v1/operations/019a1000-0000-7000-8000-000000000002",
+          "session": null,
+          "failure": null
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "operation_failed": {
+      "data": {
+        "operation": {
+          "id": "019a1000-0000-7000-8000-000000000002",
+          "state": "failed",
+          "poll_url": "/v1/operations/019a1000-0000-7000-8000-000000000002",
+          "session": null,
+          "failure": {
+            "code": "browser_start_failed",
+            "message": "browser startup failed",
+            "retryable": true,
+            "details": {}
+          }
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "operation_timed_out": {
+      "data": {
+        "operation": {
+          "id": "019a1000-0000-7000-8000-000000000002",
+          "state": "timed_out",
+          "poll_url": "/v1/operations/019a1000-0000-7000-8000-000000000002",
+          "session": null,
+          "failure": {
+            "code": "admission_timeout",
+            "message": "create admission deadline elapsed",
+            "retryable": false,
+            "details": {}
+          }
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "session": {
+      "data": {
+        "session": {
+          "id": "019a1000-0000-7000-8000-000000000001",
+          "state": "ready",
+          "lifecycle": "ready",
+          "incarnation": 3,
+          "requested_isolation": "shared_context",
+          "effective_isolation": "dedicated_process",
+          "metadata": {
+            "run": "contract"
+          }
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "sessions": {
+      "data": {
+        "sessions": [
+          {
+            "id": "019a1000-0000-7000-8000-000000000001",
+            "state": "ready",
+            "lifecycle": "ready",
+            "incarnation": 3,
+            "requested_isolation": "shared_context",
+            "effective_isolation": "dedicated_process",
+            "metadata": {
+              "run": "contract"
+            }
+          }
+        ],
+        "next_page_token": null
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "page": {
+      "data": {
+        "page": {
+          "id": "719a1000-0000-4000-8000-000000000005",
+          "session_id": "019a1000-0000-7000-8000-000000000001",
+          "active": true,
+          "target_incarnation": 2,
+          "document_epoch": 7,
+          "url_revision": 9
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "pages": {
+      "data": {
+        "pages": [
+          {
+            "id": "719a1000-0000-4000-8000-000000000005",
+            "session_id": "019a1000-0000-7000-8000-000000000001",
+            "active": true,
+            "target_incarnation": 2,
+            "document_epoch": 7,
+            "url_revision": 9
+          }
+        ]
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "page_deleted": {
+      "data": {
+        "page": {
+          "id": "719a1000-0000-4000-8000-000000000005",
+          "deleted": true
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "action_queued": {
+      "data": {
+        "action_id": "019a1000-0000-7000-8000-000000000003",
+        "status": "queued",
+        "session_sequence": 1
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "action_unknown": {
+      "data": {
+        "action_id": "019a1000-0000-7000-8000-000000000003",
+        "status": "outcome_unknown",
+        "session_sequence": 1,
+        "reason": "ambiguous_transport_loss",
+        "retryable": false
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "event_page": {
+      "data": {
+        "events": [
+          {
+            "event_id": "019a1000-0000-7000-8000-000000000004",
+            "kind": "operation.state_changed",
+            "created_at": "2026-10-12T00:00:00Z",
+            "resource": {
+              "type": "operation",
+              "id": "019a1000-0000-7000-8000-000000000002"
+            },
+            "aggregate_revision": 0
+          }
+        ],
+        "gap": false,
+        "next_cursor": "019a1000-0000-7000-8000-000000000004"
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "event_gap": {
+      "data": {
+        "events": [],
+        "gap": true,
+        "next_cursor": "019a1000-0000-7000-8000-000000000004"
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "ownership": {
+      "data": {
+        "ownership": {
+          "worker_id": "worker-contract",
+          "worker_epoch": 2,
+          "placement_version": 3,
+          "session_incarnation": 3
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "artifact": {
+      "data": {
+        "artifact": {
+          "id": "019a1000-0000-7000-8000-000000000003",
+          "state": "available",
+          "size_bytes": 12,
+          "content_type": "text/plain",
+          "display_filename": null
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "artifacts": {
+      "data": {
+        "artifacts": [],
+        "next_cursor": null
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "approval": {
+      "data": {
+        "approval": {
+          "id": "019a1000-0000-7000-8000-000000000003",
+          "session_id": "019a1000-0000-7000-8000-000000000001",
+          "action_id": "019a1000-0000-7000-8000-000000000003",
+          "state": "pending",
+          "summary": {}
+        }
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "approvals": {
+      "data": {
+        "approvals": [],
+        "next_page_token": null
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "viewer_ticket": {
+      "data": {
+        "ticket_issued": true
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    },
+    "artifact_download": {
+      "data": {
+        "download_token": "download-contract"
+      },
+      "trace_id": "019a1000-0000-7000-8000-000000000006"
+    }
+  }
+}

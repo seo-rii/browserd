@@ -1,14 +1,16 @@
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::watch;
 use tokio::time::timeout;
 
 #[cfg(test)]
 use crate::RouteClaim;
 use crate::ingress::AcceptedRouteIngress;
-use crate::route::RouteIngressGuard;
+use crate::route::{RouteIngressGuard, RoutePermit};
 use crate::{
     DnsResolution, InspectedSocketAddr, MonotonicMillis, ProxyProtocolError, ProxyProtocolLimits,
     ProxyRequest, ProxyRequestKind, RouteError, RouteRegistry,
@@ -161,6 +163,20 @@ pub struct DataPlane<R, C> {
     limits: DataPlaneLimits,
 }
 
+#[derive(Clone, Copy)]
+enum TunnelDirection {
+    Request,
+    Response,
+}
+
+#[derive(Clone, Copy)]
+struct TunnelRelay<'a> {
+    permit: &'a Mutex<RoutePermit>,
+    activity: &'a watch::Sender<tokio::time::Instant>,
+    baseline: MonotonicMillis,
+    started_at: tokio::time::Instant,
+}
+
 impl<R, C> DataPlane<R, C>
 where
     R: Resolver,
@@ -221,6 +237,50 @@ where
     }
 
     async fn serve_attributed_connection<S>(
+        &self,
+        ingress: RouteIngressGuard,
+        client: S,
+        now: MonotonicMillis,
+    ) -> Result<(), DataPlaneError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let Some(cache) = ingress.runtime_safety() else {
+            return self
+                .serve_attributed_connection_inner(ingress, client, now)
+                .await;
+        };
+        let mut generation = cache
+            .generation()
+            .map_err(|_| DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable))?;
+        let cancellation = generation.cancellation_token();
+        let work = self.serve_attributed_connection_inner(ingress, client, now);
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Err(DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable));
+                }
+                () = tokio::time::sleep_until(generation.expires_at().into()) => {
+                    let current = cache.generation().map_err(|_| {
+                        DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable)
+                    })?;
+                    if cancellation.is_cancelled()
+                        || current.namespace_id() != generation.namespace_id()
+                        || current.version() != generation.version()
+                    {
+                        return Err(DataPlaneError::Route(RouteError::RuntimeSafetyUnavailable));
+                    }
+                    // Exact polls extend freshness without replacing this flow's generation.
+                    generation = current;
+                }
+                result = &mut work => return result,
+            }
+        }
+    }
+
+    async fn serve_attributed_connection_inner<S>(
         &self,
         ingress: RouteIngressGuard,
         mut client: S,
@@ -301,6 +361,7 @@ where
             )),
         )?;
         let target = permit.plan().inspected_socket_addr();
+        permit.authorize_connect()?;
         let cancellation = permit.cancellation_token();
         let mut upstream = tokio::select! {
             biased;
@@ -517,8 +578,8 @@ where
             }
         }
 
-        let (mut client_reader, mut client_writer) = tokio::io::split(client);
-        let (mut upstream_reader, mut upstream_writer) = tokio::io::split(upstream);
+        let (client_reader, mut client_writer) = tokio::io::split(client);
+        let (mut upstream_reader, upstream_writer) = tokio::io::split(upstream);
         let mut upstream_chunk = vec![0_u8; self.limits.io_buffer_bytes];
         if !tunnel_established {
             loop {
@@ -572,93 +633,130 @@ where
             }
         }
 
-        let mut client_chunk = vec![0_u8; self.limits.io_buffer_bytes];
+        let permit = Mutex::new(permit);
+        let (activity, mut observed_activity) = watch::channel(tokio::time::Instant::now());
+        let relay = TunnelRelay {
+            permit: &permit,
+            activity: &activity,
+            baseline: now,
+            started_at,
+        };
+        let relay_both = async {
+            tokio::try_join!(
+                self.relay_tunnel_direction(
+                    client_reader,
+                    upstream_writer,
+                    relay,
+                    TunnelDirection::Request
+                ),
+                self.relay_tunnel_direction(
+                    upstream_reader,
+                    client_writer,
+                    relay,
+                    TunnelDirection::Response
+                ),
+            )?;
+            Ok::<(), DataPlaneError>(())
+        };
+        let idle = async {
+            loop {
+                let deadline = *observed_activity.borrow_and_update() + self.limits.idle_timeout;
+                tokio::select! {
+                    biased;
+                    changed = observed_activity.changed() => {
+                        if changed.is_err() {
+                            return Err(DataPlaneError::Timeout("tunnel idle"));
+                        }
+                    }
+                    () = tokio::time::sleep_until(deadline) => {
+                        // A progress notification and timer can become ready together.
+                        if tokio::time::Instant::now() >= *observed_activity.borrow() + self.limits.idle_timeout {
+                            return Err(DataPlaneError::Timeout("tunnel idle"));
+                        }
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(DataPlaneError::RouteRevoked),
+            result = relay_both => result,
+            result = idle => result,
+        }
+    }
+
+    async fn relay_tunnel_direction<A, B>(
+        &self,
+        mut reader: A,
+        mut writer: B,
+        relay: TunnelRelay<'_>,
+        direction: TunnelDirection,
+    ) -> Result<(), DataPlaneError>
+    where
+        A: AsyncRead + Unpin,
+        B: AsyncWrite + Unpin,
+    {
+        let (write_stage, shutdown_stage) = match direction {
+            TunnelDirection::Request => ("upstream write", "upstream shutdown"),
+            TunnelDirection::Response => ("client write", "client shutdown"),
+        };
+        let mut buffer = vec![0_u8; self.limits.io_buffer_bytes];
+        let mut start = 0;
+        let mut end = 0;
+        let mut eof = false;
+        let mut write_deadline = tokio::time::Instant::now() + self.limits.write_timeout;
         loop {
+            if start != 0 {
+                buffer.copy_within(start..end, 0);
+                end -= start;
+                start = 0;
+            }
+            if eof && end == 0 {
+                timeout(self.limits.write_timeout, writer.shutdown())
+                    .await
+                    .map_err(|_| DataPlaneError::Timeout(shutdown_stage))??;
+                return Ok(());
+            }
+            let capacity = buffer.len();
+            let (pending, available) = buffer.split_at_mut(end);
             tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err(DataPlaneError::RouteRevoked),
-                () = tokio::time::sleep(self.limits.idle_timeout) => {
-                    return Err(DataPlaneError::Timeout("tunnel idle"));
+                () = tokio::time::sleep_until(write_deadline), if end != 0 => {
+                    return Err(DataPlaneError::Timeout(write_stage));
                 }
-                result = client_reader.read(&mut client_chunk) => {
+                result = writer.write(pending), if end != 0 => {
+                    let written = result?;
+                    if written == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+                    }
+                    start = written;
+                    // Partial writes do not extend the oldest pending batch's bound.
+                    if written == end {
+                        write_deadline = tokio::time::Instant::now() + self.limits.write_timeout;
+                    }
+                    let _ = relay.activity.send_replace(tokio::time::Instant::now());
+                }
+                result = reader.read(available), if !eof && end < capacity => {
                     let read = result?;
                     if read == 0 {
-                        tokio::select! {
-                            biased;
-                            () = cancellation.cancelled() => {
-                                return Err(DataPlaneError::RouteRevoked);
-                            }
-                            result = timeout(
-                                self.limits.write_timeout,
-                                upstream_writer.shutdown(),
-                            ) => {
-                                result
-                                    .map_err(|_| DataPlaneError::Timeout("upstream shutdown"))??;
-                            }
-                        }
-                        return Ok(());
+                        eof = true;
+                        continue;
                     }
-                    permit.record_request_bytes(
-                        u64::try_from(read).map_err(|_| DataPlaneError::RequestBodyTooLarge)?,
-                        MonotonicMillis::new(
-                            now.value().saturating_add(
-                                u64::try_from(started_at.elapsed().as_millis())
-                                    .unwrap_or(u64::MAX),
-                            ),
-                        ),
-                    )?;
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => {
-                            return Err(DataPlaneError::RouteRevoked);
-                        }
-                        result = timeout(
-                            self.limits.write_timeout,
-                            upstream_writer.write_all(&client_chunk[..read]),
-                        ) => {
-                            result.map_err(|_| DataPlaneError::Timeout("upstream write"))??;
+                    let bytes = u64::try_from(read).map_err(|_| DataPlaneError::RequestBodyTooLarge)?;
+                    let now = MonotonicMillis::new(relay.baseline.value().saturating_add(
+                        u64::try_from(relay.started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ));
+                    {
+                        let mut permit = relay.permit.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match direction {
+                            TunnelDirection::Request => permit.record_request_bytes(bytes, now)?,
+                            TunnelDirection::Response => permit.record_egress_bytes(bytes, now)?,
                         }
                     }
-                }
-                result = upstream_reader.read(&mut upstream_chunk) => {
-                    let read = result?;
-                    if read == 0 {
-                        tokio::select! {
-                            biased;
-                            () = cancellation.cancelled() => {
-                                return Err(DataPlaneError::RouteRevoked);
-                            }
-                            result = timeout(
-                                self.limits.write_timeout,
-                                client_writer.shutdown(),
-                            ) => {
-                                result
-                                    .map_err(|_| DataPlaneError::Timeout("client shutdown"))??;
-                            }
-                        }
-                        return Ok(());
+                    if end == 0 {
+                        write_deadline = tokio::time::Instant::now() + self.limits.write_timeout;
                     }
-                    permit.record_egress_bytes(
-                        read as u64,
-                        MonotonicMillis::new(
-                            now.value().saturating_add(
-                                u64::try_from(started_at.elapsed().as_millis())
-                                    .unwrap_or(u64::MAX),
-                            ),
-                        ),
-                    )?;
-                    tokio::select! {
-                        biased;
-                        () = cancellation.cancelled() => {
-                            return Err(DataPlaneError::RouteRevoked);
-                        }
-                        result = timeout(
-                            self.limits.write_timeout,
-                            client_writer.write_all(&upstream_chunk[..read]),
-                        ) => {
-                            result.map_err(|_| DataPlaneError::Timeout("client write"))??;
-                        }
-                    }
+                    end += read;
+                    let _ = relay.activity.send_replace(tokio::time::Instant::now());
                 }
             }
         }

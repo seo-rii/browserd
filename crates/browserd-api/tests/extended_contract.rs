@@ -1,5 +1,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/action_acceptance.rs"]
+mod action_acceptance;
+#[path = "support/safety.rs"]
+mod safety;
+#[path = "support/webhooks.rs"]
+mod webhooks;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 
@@ -58,6 +65,241 @@ fn principal_with_scopes(
 }
 
 #[test]
+fn query_all_frame_path_preserves_legacy_canonical_hash_and_orders_frame_selection()
+-> Result<(), Box<dyn Error>> {
+    let legacy = serde_json::json!({
+        "page_id":PageId::new(),"if_session_incarnation":1,"execution_timeout_ms":30000,
+        "action":{"type":"query_all","selector":"input[name=email]"},
+    });
+    let canonical_hash = |value: &serde_json::Value| {
+        *browserd_operations::CanonicalRequestHash::from_json(value).as_bytes()
+    };
+    let decoded = browserd_api::decode_action_submit(&legacy.to_string())?;
+    assert_eq!(serde_json::to_value(&decoded)?, legacy);
+    let mut explicit_empty = legacy.clone();
+    explicit_empty["action"]["frame_path"] = serde_json::json!([]);
+    let empty = browserd_api::decode_action_submit(&explicit_empty.to_string())?;
+    assert_eq!(
+        canonical_hash(&serde_json::to_value(empty)?),
+        canonical_hash(&legacy)
+    );
+
+    let mut nested = legacy.clone();
+    nested["action"]["frame_path"] = serde_json::json!(["iframe#outer", "iframe#inner"]);
+    let decoded = browserd_api::decode_action_submit(&nested.to_string())?;
+    assert_eq!(serde_json::to_value(&decoded)?, nested);
+    assert_ne!(canonical_hash(&nested), canonical_hash(&legacy));
+    let mut reversed = nested.clone();
+    reversed["action"]["frame_path"] = serde_json::json!(["iframe#inner", "iframe#outer"]);
+    assert_ne!(canonical_hash(&nested), canonical_hash(&reversed));
+    Ok(())
+}
+
+#[test]
+fn query_all_frame_path_bounds_utf8_depth_and_total_bytes_without_accepting_raw_routes()
+-> Result<(), Box<dyn Error>> {
+    let body = |frame_path| {
+        serde_json::json!({
+            "page_id":PageId::new(),"if_session_incarnation":1,"execution_timeout_ms":30000,
+            "action":{"type":"query_all","selector":"input","frame_path":frame_path},
+        })
+    };
+    for path in [
+        vec![],
+        vec!["iframe".to_owned(); 8],
+        vec!["a".repeat(8192); 4],
+        vec!["é".repeat(4096); 4],
+        vec!["iframe#outer".to_owned(), "iframe#inner".to_owned()],
+    ] {
+        assert!(
+            browserd_api::decode_action_submit(&body(serde_json::json!(path)).to_string()).is_ok()
+        );
+    }
+    for path in [
+        serde_json::json!([""]),
+        serde_json::json!(["iframe\n"]),
+        serde_json::json!(["a".repeat(8193)]),
+        serde_json::json!(["é".repeat(4097)]),
+        serde_json::json!(vec!["iframe"; 9]),
+        serde_json::json!(vec!["a".repeat(8192); 5]),
+        serde_json::json!([
+            "a".repeat(8192),
+            "b".repeat(8192),
+            "c".repeat(8192),
+            "d".repeat(8192),
+            "e"
+        ]),
+        serde_json::Value::Null,
+        serde_json::json!("iframe"),
+        serde_json::json!([1]),
+    ] {
+        assert!(browserd_api::decode_action_submit(&body(path).to_string()).is_err());
+    }
+    for forbidden in ["frame_ref", "frame_id", "cdp_session_id"] {
+        let mut invalid = body(serde_json::json!([]));
+        invalid["action"][forbidden] = serde_json::json!("caller-route");
+        assert!(browserd_api::decode_action_submit(&invalid.to_string()).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_origins_are_explicit_bounded_and_legacy_requests_capture_only_cookies()
+-> Result<(), Box<dyn Error>> {
+    let body = |action| {
+        serde_json::json!({
+            "page_id":PageId::new(),"if_session_incarnation":1,
+            "execution_timeout_ms":30000,"action":action,
+        })
+        .to_string()
+    };
+    let legacy =
+        browserd_api::decode_action_submit(&body(serde_json::json!({"type":"checkpoint"})))?;
+    assert!(matches!(legacy.action, ActionPayload::Checkpoint { origins } if origins.is_empty()));
+    for origins in [
+        vec![],
+        vec![
+            "https://example.test".to_owned(),
+            "http://example.test:8080".to_owned(),
+            "https://[::1]".to_owned(),
+        ],
+        (0..16)
+            .map(|i| format!("https://origin-{i}.test"))
+            .collect(),
+    ] {
+        let decoded = browserd_api::decode_action_submit(&body(
+            serde_json::json!({"type":"checkpoint","origins":origins}),
+        ))?;
+        assert!(
+            matches!(decoded.action, ActionPayload::Checkpoint { origins: actual } if actual == origins)
+        );
+    }
+    for origins in [
+        vec![String::new()],
+        vec!["https://example.test/".to_owned()],
+        vec!["https://example.test/path".to_owned()],
+        vec!["https://example.test?".to_owned()],
+        vec!["https://example.test#".to_owned()],
+        vec!["https://user:pass@example.test".to_owned()],
+        vec!["https://EXAMPLE.test".to_owned()],
+        vec!["https://example.test:443".to_owned()],
+        vec!["file:///tmp/private".to_owned()],
+        vec!["null".to_owned()],
+        vec![" https://example.test".to_owned()],
+        vec!["https://example.test\n".to_owned()],
+        vec![format!("https://{}", "a".repeat(2041))],
+        vec!["https://example.test".to_owned(); 2],
+        (0..17)
+            .map(|i| format!("https://origin-{i}.test"))
+            .collect(),
+    ] {
+        assert!(
+            browserd_api::decode_action_submit(&body(
+                serde_json::json!({"type":"checkpoint","origins":origins})
+            ))
+            .is_err(),
+            "{origins:?}"
+        );
+    }
+    for action in [
+        serde_json::json!({"type":"checkpoint","origins":null}),
+        serde_json::json!({"type":"checkpoint","origins":"https://example.test"}),
+        serde_json::json!({"type":"checkpoint","cookies":[]}),
+        serde_json::json!({"type":"checkpoint","local_storage":{"password":"fixture"}}),
+    ] {
+        assert!(browserd_api::decode_action_submit(&body(action)).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn checkpoint_restore_requires_create_and_read_scopes_before_admission()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::new();
+    let create = |checkpoint_ref| -> Result<ApiRequest, Box<dyn Error>> {
+        let mut body = decode_session_create(include_str!("session_create_fixture.json"))?;
+        body.checkpoint_ref = checkpoint_ref;
+        Ok(ApiRequest::CreateSession {
+            body,
+            idempotency_key: Uuid::new_v4().to_string(),
+            received_at: std::time::Instant::now(),
+        })
+    };
+    let ordinary = principal_with_scopes(tenant.clone(), &["session:create"])?;
+    assert!(create(None)?.authorize(&ordinary).is_ok());
+    for scopes in [
+        &["session:create"][..],
+        &["checkpoint:read"][..],
+        &["session:create", "checkpoint:create"][..],
+    ] {
+        assert!(
+            create(Some("opaque-checkpoint".to_owned()))?
+                .authorize(&principal_with_scopes(tenant.clone(), scopes)?)
+                .is_err()
+        );
+    }
+    assert!(
+        create(Some("opaque-checkpoint".to_owned()))?
+            .authorize(&principal_with_scopes(
+                tenant,
+                &["session:create", "checkpoint:read"]
+            )?)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn privileged_session_creation_requires_evaluate_scope_and_accumulates_restore_scope()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::new();
+    for restore in [false, true] {
+        let mut body = decode_session_create(include_str!("session_create_fixture.json"))?;
+        body.feature_profile = "privileged".to_owned();
+        body.checkpoint_ref = restore.then(|| "opaque-checkpoint".to_owned());
+        let request = ApiRequest::CreateSession {
+            body,
+            idempotency_key: Uuid::new_v4().to_string(),
+            received_at: std::time::Instant::now(),
+        };
+        for scopes in [
+            vec![],
+            vec!["session:create"],
+            vec!["browser:evaluate"],
+            vec!["session:create", "checkpoint:read"],
+            vec!["browser:evaluate", "checkpoint:read"],
+            vec!["session:create", "browser:act", "browser:*"],
+        ] {
+            assert!(
+                request
+                    .authorize(&principal_with_scopes(tenant.clone(), &scopes)?)
+                    .is_err(),
+                "restore={restore}, scopes={scopes:?}"
+            );
+        }
+        let evaluate =
+            principal_with_scopes(tenant.clone(), &["session:create", "browser:evaluate"])?;
+        assert_eq!(request.authorize(&evaluate).is_ok(), !restore);
+        let full = principal_with_scopes(
+            tenant.clone(),
+            &["session:create", "browser:evaluate", "checkpoint:read"],
+        )?;
+        assert!(request.authorize(&full).is_ok());
+    }
+    let ordinary = ApiRequest::CreateSession {
+        body: decode_session_create(include_str!("session_create_fixture.json"))?,
+        idempotency_key: Uuid::new_v4().to_string(),
+        received_at: std::time::Instant::now(),
+    };
+    assert!(
+        ordinary
+            .authorize(&principal_with_scopes(tenant, &["session:create"])?)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
 fn required_extended_v1_routes_are_manifested() {
     let routes = PUBLIC_ROUTES.iter().copied().collect::<HashSet<_>>();
     for route in [
@@ -67,12 +309,43 @@ fn required_extended_v1_routes_are_manifested() {
         "DELETE /v1/sessions/{session_id}/pages/{page_id}",
         "POST /v1/sessions/{session_id}/pages/{page_id}/activate",
         "POST /v1/sessions/{session_id}/artifacts/uploads",
+        "GET /v1/sessions/{session_id}/artifacts",
         "GET /v1/approvals",
         "GET /v1/approvals/{approval_id}",
         "POST /v1/approvals/{approval_id}/decision",
     ] {
         assert!(routes.contains(route), "missing route {route}");
     }
+}
+
+#[test]
+fn artifact_discovery_requires_artifact_scope_and_bounded_typed_cursor()
+-> Result<(), Box<dyn Error>> {
+    let tenant = TenantId::new();
+    let reader = principal_with_scopes(tenant.clone(), &["artifact:read"])?;
+    let session_reader = principal_with_scopes(tenant, &["session:read"])?;
+    for limit in [1, 50, 100] {
+        let request = ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+            session_id: SessionId::new(),
+            after: Some(ArtifactId::new()),
+            limit,
+        });
+        assert!(request.validate().is_ok());
+        assert!(request.authorize(&reader).is_ok());
+        assert!(request.authorize(&session_reader).is_err());
+    }
+    for limit in [0, 101, usize::MAX] {
+        assert!(
+            ApiRequest::ListArtifacts(browserd_api::ArtifactListRequest {
+                session_id: SessionId::new(),
+                after: None,
+                limit,
+            })
+            .validate()
+            .is_err()
+        );
+    }
+    Ok(())
 }
 
 #[test]
@@ -234,6 +507,7 @@ fn action_variants_enforce_field_cardinality_numeric_and_total_body_bounds() {
         },
         ActionPayload::QueryAll {
             selector: "s".repeat(8_193),
+            frame_path: Vec::new(),
         },
         ActionPayload::NewPage {
             url: Some(format!("https://example.com/{}", "x".repeat(8_193))),
@@ -316,7 +590,11 @@ fn privileged_actions_require_base_and_conditional_scopes() -> Result<(), Box<dy
         .authorize(&base)
         .is_err()
     );
-    assert!(command(ActionPayload::Checkpoint).authorize(&base).is_err());
+    assert!(
+        command(ActionPayload::Checkpoint { origins: vec![] })
+            .authorize(&base)
+            .is_err()
+    );
     assert!(
         command(ActionPayload::SetFiles {
             node_ref: "node".to_owned(),
@@ -340,7 +618,10 @@ fn privileged_actions_require_base_and_conditional_scopes() -> Result<(), Box<dy
                 secret_ref: "secret".to_owned(),
             },
         ),
-        ("checkpoint:create", ActionPayload::Checkpoint),
+        (
+            "checkpoint:create",
+            ActionPayload::Checkpoint { origins: vec![] },
+        ),
         (
             "artifact:read",
             ActionPayload::SetFiles {
@@ -359,6 +640,65 @@ fn privileged_actions_require_base_and_conditional_scopes() -> Result<(), Box<dy
         assert!(command(action).authorize(&authorized).is_ok());
     }
     Ok(())
+}
+
+#[test]
+fn fill_secret_public_body_rejects_plaintext_fields_and_invalid_references() {
+    let request = |reference: &str| {
+        serde_json::json!({
+            "page_id":PageId::new(), "if_session_incarnation":1, "execution_timeout_ms":30000,
+            "action":{"type":"fill_secret","node_ref":"0000000000000001","secret_ref":reference}
+        })
+    };
+    for reference in ["credential.login".to_owned(), "s".repeat(1024)] {
+        assert!(browserd_api::decode_action_submit(&request(&reference).to_string()).is_ok());
+    }
+    for reference in [
+        "".to_owned(),
+        " secret".to_owned(),
+        "secret ".to_owned(),
+        "sec\nret".to_owned(),
+        "s".repeat(1025),
+        "한".repeat(342),
+    ] {
+        assert!(browserd_api::decode_action_submit(&request(&reference).to_string()).is_err());
+    }
+    for field in ["value", "secret_value", "resolved_value", "password"] {
+        let mut body = request("credential.login");
+        body["action"][field] = serde_json::json!("synthetic-plaintext-not-a-secret");
+        assert!(browserd_api::decode_action_submit(&body.to_string()).is_err());
+    }
+}
+
+#[test]
+fn set_files_public_body_requires_unique_typed_artifact_ids() {
+    let valid = |ids: Vec<ArtifactId>| {
+        serde_json::json!({
+            "page_id":PageId::new(), "if_session_incarnation":1, "execution_timeout_ms":30000,
+            "action":{"type":"set_files", "node_ref":"0000000000000001", "artifact_ids":ids}
+        })
+    };
+    for count in [1, 128] {
+        assert!(
+            browserd_api::decode_action_submit(
+                &valid((0..count).map(|_| ArtifactId::new()).collect()).to_string()
+            )
+            .is_ok()
+        );
+    }
+    let id = ArtifactId::new();
+    for ids in [
+        Vec::new(),
+        vec![id.clone(), id],
+        (0..129).map(|_| ArtifactId::new()).collect(),
+    ] {
+        assert!(browserd_api::decode_action_submit(&valid(ids).to_string()).is_err());
+    }
+    for field in ["files", "paths", "local_path"] {
+        let mut body = valid(vec![ArtifactId::new()]);
+        body["action"][field] = serde_json::json!(["/tmp/file"]);
+        assert!(browserd_api::decode_action_submit(&body.to_string()).is_err());
+    }
 }
 
 #[test]
@@ -566,6 +906,153 @@ fn session_catalog_reclaims_terminal_entries_after_retention() -> Result<(), Box
 }
 
 #[test]
+fn session_catalog_gc_is_bounded_and_advances_across_an_active_prefix() -> Result<(), Box<dyn Error>>
+{
+    let catalog = SessionCatalog::default();
+    let tenant = TenantId::new();
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).single().expect("t0");
+    for index in 0..128 {
+        catalog.upsert(
+            tenant.clone(),
+            SessionResource {
+                id: SessionId::from_uuid(Uuid::from_u128(
+                    0x0000_0000_0000_7000_8000_0000_0000_0000 | (index + 1),
+                ))?,
+                lifecycle: if index < 32 {
+                    SessionLifecycle::Ready
+                } else {
+                    SessionLifecycle::Closed
+                },
+                incarnation: 1,
+                requested_isolation: IsolationProfile::DedicatedProcess,
+                effective_isolation: IsolationProfile::DedicatedProcess,
+                metadata: BTreeMap::new(),
+            },
+            t0,
+        )?;
+    }
+    let mut reclaimed = 0;
+    for _ in 0..8 {
+        let count = catalog.reclaim(t0 + ChronoDuration::hours(25), ChronoDuration::hours(24))?;
+        assert!(
+            count <= 32,
+            "one catalog maintenance pass must not sweep every session"
+        );
+        reclaimed += count;
+    }
+    assert_eq!(
+        reclaimed, 96,
+        "cursor must not starve terminal rows behind active sessions"
+    );
+    let page = catalog.list(
+        &tenant,
+        &SessionListQuery {
+            limit: 100,
+            ..SessionListQuery::default()
+        },
+    )?;
+    assert_eq!(page.items().len(), 32);
+    assert!(
+        page.items()
+            .iter()
+            .all(|item| item.lifecycle == SessionLifecycle::Ready)
+    );
+    Ok(())
+}
+
+#[test]
+fn session_catalog_terminal_polling_does_not_extend_retention() -> Result<(), Box<dyn Error>> {
+    let catalog = SessionCatalog::default();
+    let tenant = TenantId::new();
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).single().expect("t0");
+    let session = SessionResource {
+        id: SessionId::new(),
+        lifecycle: SessionLifecycle::Closed,
+        incarnation: 1,
+        requested_isolation: IsolationProfile::DedicatedProcess,
+        effective_isolation: IsolationProfile::DedicatedProcess,
+        metadata: BTreeMap::new(),
+    };
+    catalog.upsert(tenant.clone(), session.clone(), t0)?;
+    catalog.upsert(tenant.clone(), session, t0 + ChronoDuration::hours(23))?;
+    assert_eq!(
+        catalog.reclaim(t0 + ChronoDuration::hours(25), ChronoDuration::hours(24))?,
+        1
+    );
+    assert!(
+        catalog
+            .list(&tenant, &SessionListQuery::default())?
+            .items()
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn session_catalog_sparse_pages_have_bounded_progress_and_tenant_scoped_cursors()
+-> Result<(), Box<dyn Error>> {
+    let catalog = SessionCatalog::default();
+    let tenant = TenantId::new();
+    let other_tenant = TenantId::new();
+    for index in 1..=800 {
+        let session = SessionResource {
+            id: SessionId::from_uuid(Uuid::from_u128(
+                0x0000_0000_0000_7000_8000_0000_0000_0000 | index,
+            ))?,
+            lifecycle: if index == 800 {
+                SessionLifecycle::Closed
+            } else {
+                SessionLifecycle::Ready
+            },
+            incarnation: 1,
+            requested_isolation: IsolationProfile::DedicatedProcess,
+            effective_isolation: IsolationProfile::DedicatedProcess,
+            metadata: BTreeMap::new(),
+        };
+        catalog.upsert(tenant.clone(), session.clone(), Utc::now())?;
+        catalog.upsert(other_tenant.clone(), session, Utc::now())?;
+    }
+    let mut query = SessionListQuery {
+        lifecycle: Some(SessionLifecycle::Closed),
+        limit: 10,
+        ..SessionListQuery::default()
+    };
+    let first = catalog.list(&tenant, &query)?;
+    assert!(
+        first.items().is_empty(),
+        "bounded scan may return an empty page for a sparse filter"
+    );
+    let token = first
+        .next_page_token()
+        .ok_or("bounded progress token")?
+        .to_owned();
+    assert!(
+        catalog
+            .list(
+                &other_tenant,
+                &SessionListQuery {
+                    page_token: Some(token.clone()),
+                    ..query.clone()
+                }
+            )
+            .is_err()
+    );
+    query.page_token = Some(token);
+    let mut total = 0;
+    for _ in 0..4 {
+        let page = catalog.list(&tenant, &query)?;
+        total += page.items().len();
+        let Some(next) = page.next_page_token() else {
+            assert_eq!(total, 1);
+            return Ok(());
+        };
+        assert_ne!(query.page_token.as_deref(), Some(next));
+        query.page_token = Some(next.to_owned());
+    }
+    Err("bounded pagination did not finish".into())
+}
+
+#[test]
 fn approval_catalog_pagination_is_deterministic_tenant_scoped_and_filter_bound()
 -> Result<(), Box<dyn Error>> {
     let catalog = ApprovalCatalog::default();
@@ -601,6 +1088,10 @@ fn approval_catalog_pagination_is_deterministic_tenant_scoped_and_filter_bound()
     let mut expected = Vec::new();
     for _ in 0..3 {
         let approval = resource(tenant_a.clone(), session_id.clone())?;
+        assert_eq!(
+            approval.summary().page_id,
+            Some(approval.proposal.page_id())
+        );
         expected.push(approval.approval_id);
         catalog.upsert(approval)?;
     }
@@ -731,6 +1222,7 @@ fn extended_requests_apply_endpoint_specific_scopes() -> Result<(), Box<dyn Erro
                 display_filename: "input.txt".to_owned(),
                 declared_content_type: Some("text/plain".to_owned()),
                 expected_size_bytes: 32,
+                data_base64: None,
             },
         })
         .authorize(&artifact_reader)
@@ -780,4 +1272,191 @@ fn public_approval_uuid_is_validated_as_the_domain_approval_id() {
     assert!(approval_id.is_ok());
     assert_eq!(approval_id.ok().map(|id| *id.as_uuid()), Some(public));
     assert!(public_approval_id(Uuid::new_v4()).is_err());
+}
+
+#[test]
+fn typed_approval_summary_exposes_review_metadata_without_action_contents()
+-> Result<(), Box<dyn Error>> {
+    use browserd_policy::{
+        ApprovalActionKind, ApprovalArtifactBinding, ApprovalContextScope, ApprovalNodeBinding,
+        ApprovalWorkerFence, TypedActionPayload, TypedActionProposalBinding,
+    };
+    let node = ApprovalNodeBinding {
+        node_ref: "opaque-node".to_owned(),
+        binding_sha256: [3; 32],
+        role: Some("textbox".to_owned()),
+        name: Some("Account login".to_owned()),
+    };
+    let files = vec![
+        ApprovalArtifactBinding {
+            artifact_id: ArtifactId::new(),
+            object_generation: [4; 32],
+            size_bytes: 12,
+            checksum_sha256: [5; 32],
+            effective_filename: "first.txt".to_owned(),
+            publication_sha256: [6; 32],
+            scan_evidence_sha256: Some([7; 32]),
+        },
+        ApprovalArtifactBinding {
+            artifact_id: ArtifactId::new(),
+            object_generation: [8; 32],
+            size_bytes: 4,
+            checksum_sha256: [9; 32],
+            effective_filename: "second.txt".to_owned(),
+            publication_sha256: [10; 32],
+            scan_evidence_sha256: None,
+        },
+    ];
+    let hidden = b"secret-plaintext; arbitrary_script(); file bytes";
+    let hash = ActionArgumentsHash::digest(hidden);
+    let payloads = [
+        TypedActionPayload::Browser {
+            action: ApprovalActionKind::Fill,
+            arguments_sha256: *hash.as_bytes(),
+            node: Some(node.clone()),
+            navigation_destination: None,
+        },
+        TypedActionPayload::Browser {
+            action: ApprovalActionKind::Evaluate,
+            arguments_sha256: *hash.as_bytes(),
+            node: None,
+            navigation_destination: None,
+        },
+        TypedActionPayload::FillSecret {
+            node: node.clone(),
+            secret_ref: "credential/login".to_owned(),
+            grant_metadata_sha256: [11; 32],
+        },
+        TypedActionPayload::SetFiles {
+            node: node.clone(),
+            files,
+        },
+        TypedActionPayload::Checkpoint {
+            origins: vec![
+                "https://second.test".to_owned(),
+                "https://first.test".to_owned(),
+            ],
+            build_identity_sha256: [12; 32],
+        },
+        TypedActionPayload::Checkpoint {
+            origins: vec![],
+            build_identity_sha256: [12; 32],
+        },
+    ];
+    for payload in payloads {
+        let tenant_id = TenantId::new();
+        let session_id = SessionId::new();
+        let action_id = browserd_core::ActionId::new();
+        let context = if matches!(payload, TypedActionPayload::Checkpoint { .. }) {
+            ApprovalContextScope::BrowserContext
+        } else {
+            ApprovalContextScope::HttpOrigin {
+                origin: "https://example.test".to_owned(),
+            }
+        };
+        let credentials = match &payload {
+            TypedActionPayload::FillSecret { secret_ref, .. } => {
+                CredentialRefsHash::digest([secret_ref.as_str()])
+            }
+            _ => CredentialRefsHash::digest([]),
+        };
+        let proposal = CanonicalActionProposal::new(
+            tenant_id.clone(),
+            PrincipalId::new(),
+            session_id.clone(),
+            1,
+            PageId::new(),
+            2,
+            3,
+            if matches!(context, ApprovalContextScope::BrowserContext) {
+                Origin::browser_context_scope()
+            } else {
+                Origin::parse("https://example.test")?
+            },
+            4,
+            payload.action_kind().legacy_action_type(),
+            hash,
+            payload
+                .node()
+                .map(|node| browserd_policy::NodeReference::new(&node.node_ref))
+                .transpose()?,
+            credentials,
+            5000,
+        )
+        .with_typed_binding(TypedActionProposalBinding {
+            schema_version: 2,
+            action_id: action_id.clone(),
+            sequence: 1,
+            fence: ApprovalWorkerFence {
+                worker_id: browserd_core::WorkerId::new("summary-worker")?,
+                worker_epoch: 2,
+                placement_version: 3,
+                session_incarnation: 1,
+            },
+            policy_digest: [13; 32],
+            target_binding_sha256: [14; 32],
+            context_scope: context.clone(),
+            payload: payload.clone(),
+        })?;
+        let approval = ApprovalResource {
+            approval_id: Uuid::now_v7(),
+            tenant_id,
+            session_id,
+            action_id,
+            state: ApprovalState::Pending,
+            proposal,
+        };
+        let summary = serde_json::to_value(approval.summary())?;
+        let encoded = summary.to_string();
+        for forbidden in [
+            "secret-plaintext",
+            "arbitrary_script",
+            "file bytes",
+            "arguments_sha256",
+            "grant_metadata_sha256",
+            "binding_sha256",
+            "publication_sha256",
+        ] {
+            assert!(!encoded.contains(forbidden), "{forbidden}");
+        }
+        if payload.node().is_some() {
+            assert_eq!(summary["node_role"], "textbox");
+            assert_eq!(summary["node_name"], "Account login");
+        } else {
+            assert!(summary.get("node_role").is_none());
+            assert!(summary.get("node_name").is_none());
+        }
+        if matches!(context, ApprovalContextScope::BrowserContext) {
+            assert!(summary.get("page_id").is_none());
+            assert_eq!(summary["context"]["kind"], "browser_context");
+        } else {
+            assert_eq!(summary["page_id"], approval.proposal.page_id().to_string());
+        }
+        assert_eq!(summary["action_kind"], payload.action_kind().as_str());
+        assert_eq!(summary["context"], serde_json::to_value(context)?);
+        assert_eq!(summary["expires_at_unix_millis"], 5000);
+        assert_eq!(summary["policy_digest"], "0d".repeat(32));
+        match payload {
+            TypedActionPayload::FillSecret { .. } => {
+                assert_eq!(summary["secret_ref"], "credential/login")
+            }
+            TypedActionPayload::SetFiles { files, .. } => {
+                assert_eq!(
+                    summary["files"][0]["artifact_id"],
+                    files[0].artifact_id.to_string()
+                );
+                assert_eq!(summary["files"][1]["display_filename"], "second.txt");
+                assert_eq!(summary["files"][0]["size_bytes"], 12);
+            }
+            TypedActionPayload::Checkpoint { origins, .. } => {
+                assert_eq!(summary["checkpoint_origins"], serde_json::json!(origins))
+            }
+            _ => assert!(summary.get("secret_ref").is_none()),
+        }
+        let mut wrong_action = approval.clone();
+        wrong_action.action_id = browserd_core::ActionId::new();
+        assert!(ApprovalCatalog::default().upsert(wrong_action).is_err());
+        ApprovalCatalog::default().upsert(approval)?;
+    }
+    Ok(())
 }
